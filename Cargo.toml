@@ -1,0 +1,65 @@
+[package]
+name = "eks"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.90"
+description = "A fast, keyboard-driven explorer for AWS EKS clusters"
+repository = "https://github.com/nmcginn/eks-wrangler"
+license = "MIT"
+readme = "README.md"
+keywords = ["eks", "kubernetes", "aws", "tui", "cli"]
+categories = ["command-line-utilities"]
+
+[lib]
+name = "eks"
+path = "src/lib.rs"
+
+[[bin]]
+name = "eks"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0.104"
+clap = { version = "4.6.6", features = ["derive", "env", "wrap_help"] }
+directories = "6.0.0"
+ratatui = "0.30.2"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_yaml_ng = "0.10.0"
+thiserror = "2.0.20"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+
+[dev-dependencies]
+insta = "1.44.2"
+tempfile = "3.24.0"
+
+# Release builds optimise for a small, fast single binary. Startup time is a
+# first-class feature of this tool (see CLAUDE.md), so we trade compile time for
+# runtime performance without hesitation.
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = "symbols"
+
+# Keep the dev loop quick, but make dependencies fast enough that a debug build
+# of the TUI still feels responsive when hand-testing.
+[profile.dev.package."*"]
+opt-level = 2
+
+[lints.rust]
+unsafe_code = "forbid"
+missing_debug_implementations = "warn"
+unreachable_pub = "warn"
+
+[lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+# Rendering code reads better with the occasional wide match arm.
+module_name_repetitions = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+# Panicking in a TUI leaves the terminal wedged; make them impossible to add by accident.
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"

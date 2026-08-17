@@ -1,0 +1,106 @@
+name: Release build
+
+# Every merge to master produces optimised binaries, so a broken release build
+# is caught the day it lands rather than at tag time. Tagging `v*` additionally
+# publishes a GitHub Release from those same artifacts.
+on:
+  push:
+    branches: [master]
+    tags: ["v*"]
+  workflow_dispatch:
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            native: true
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            native: true
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            # Cross-compiled from an arm64 runner; running it needs Rosetta,
+            # which may not be present, so skip the smoke test here.
+            native: false
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build
+        run: cargo build --locked --release --target ${{ matrix.target }}
+
+      - name: Smoke-test the binary
+        if: matrix.native
+        run: |
+          ./target/${{ matrix.target }}/release/eks --version
+          ./target/${{ matrix.target }}/release/eks --help
+
+      - name: Package
+        shell: bash
+        run: |
+          set -euo pipefail
+          staging="eks-${{ matrix.target }}"
+          mkdir -p "dist/${staging}"
+          cp "target/${{ matrix.target }}/release/eks" "dist/${staging}/"
+          cp README.md LICENSE "dist/${staging}/"
+          tar -czf "dist/${staging}.tar.gz" -C dist "${staging}"
+          # Checksums travel with the artifact so the install story can verify them.
+          shasum -a 256 "dist/${staging}.tar.gz" > "dist/${staging}.tar.gz.sha256"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: eks-${{ matrix.target }}
+          path: |
+            dist/*.tar.gz
+            dist/*.sha256
+          retention-days: 14
+          if-no-files-found: error
+
+  publish:
+    name: Publish release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Publish
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.tar.gz
+            dist/*.sha256
+          generate_release_notes: true
+          fail_on_unmatched_files: true

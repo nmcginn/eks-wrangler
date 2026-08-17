@@ -1,0 +1,22 @@
+version: 2
+
+updates:
+  # Grouped so routine bumps arrive as one reviewable PR a week rather than a
+  # dozen competing with the nightly feature work.
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+      day: saturday
+    open-pull-requests-limit: 3
+    groups:
+      patch-and-minor:
+        update-types: [minor, patch]
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
+    groups:
+      actions:
+        patterns: ["*"]
