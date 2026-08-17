@@ -49,10 +49,15 @@ pub struct GlobalArgs {
 
 impl GlobalArgs {
     /// Tracing filter implied by the `-v` count.
+    ///
+    /// `kube` logs every failed request at ERROR, and we translate those same
+    /// failures into a sentence that says what to do about it. Printing both
+    /// means the user reads the unhelpful one first, so the quiet default
+    /// silences `kube`'s copy; `-v` brings it back for debugging.
     #[must_use]
     pub fn log_filter(&self) -> &'static str {
         match self.verbose {
-            0 => "warn",
+            0 => "warn,kube_client=off",
             1 => "info",
             2 => "debug",
             _ => "trace",
@@ -85,6 +90,10 @@ pub enum Command {
         #[arg(long, short = 'q')]
         quiet: bool,
     },
+
+    /// List the nodes of a cluster.
+    #[command(visible_alias = "no")]
+    Nodes,
 
     /// Switch the active cluster.
     Use {
@@ -133,6 +142,18 @@ mod tests {
     }
 
     #[test]
+    fn nodes_accepts_a_context_and_its_short_alias() {
+        assert!(matches!(
+            parse(&["eks", "no"]).command,
+            Some(Command::Nodes)
+        ));
+
+        let cli = parse(&["eks", "nodes", "--context", "prod"]);
+        assert!(matches!(cli.command, Some(Command::Nodes)));
+        assert_eq!(cli.global.context.as_deref(), Some("prod"));
+    }
+
+    #[test]
     fn use_requires_a_context_name() {
         assert!(Cli::try_parse_from(["eks", "use"]).is_err());
         let cli = parse(&["eks", "use", "staging"]);
@@ -147,6 +168,20 @@ mod tests {
     }
 
     #[test]
+    fn the_quiet_default_hides_kubes_own_error_logging() {
+        // Our message for a failed request is the one worth reading; `kube`'s
+        // raw ERROR line above it is noise until someone asks for detail.
+        let quiet = GlobalArgs::default();
+        assert!(quiet.log_filter().contains("kube_client=off"));
+
+        let verbose = GlobalArgs {
+            verbose: 1,
+            ..GlobalArgs::default()
+        };
+        assert!(!verbose.log_filter().contains("kube_client=off"));
+    }
+
+    #[test]
     fn verbosity_maps_to_log_filters() {
         let filter = |v| {
             GlobalArgs {
@@ -156,7 +191,7 @@ mod tests {
             .log_filter()
         };
 
-        assert_eq!(filter(0), "warn");
+        assert_eq!(filter(0), "warn,kube_client=off");
         assert_eq!(filter(1), "info");
         assert_eq!(filter(2), "debug");
         assert_eq!(filter(9), "trace");

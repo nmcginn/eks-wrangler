@@ -62,3 +62,47 @@ Work lands as a nightly PR sized for a human to review over coffee — roughly
 200–500 lines. The constraint is the point: it forces tasks to be split into
 independently valuable pieces, keeps `master` releasable, and keeps a human in
 the loop on every change. See `CLAUDE.md`.
+
+### 9. The async runtime is built per command, not around `main`
+
+`#[tokio::main]` would build a runtime for `eks contexts` and `eks use`, which
+never await anything — pure cost against a 50 ms startup budget. Instead
+`commands::block_on` builds a current-thread runtime for the commands that talk
+to a cluster. A one-shot command spends its life waiting on a single request, so
+worker threads would only add startup time.
+
+### 10. `kube` with `rustls`, `ring`, and `http-proxy`
+
+`rustls` over OpenSSL because a single static binary is the install story, and
+linking the system OpenSSL undoes that. `ring` has to be named explicitly: with
+`default-features = false` no crypto provider feature reaches `rustls`, and it
+then *panics* at the first TLS handshake asking to be told which provider to
+use. `http-proxy` because `kube` refuses to build a client at all when
+`HTTPS_PROXY` is set without it, and corporate proxies in front of EKS are
+common enough that failing there would be a support burden.
+
+### 11. Cluster failures are translated at the boundary
+
+`kube` reports an expired SSO session as `ApiError: ... (Status { code: 401 })`.
+Correct, and useless to the person who needs to run `aws sso login`.
+`k8s::client::explain` classifies the error and returns a sentence naming the
+cluster and the next action; the raw error goes to `tracing::debug`, so `-v`
+still has it. The classification is deliberately coarse — five kinds — because
+an arm only earns its place if it leads to advice worth printing, and a
+plausible-but-wrong suggestion costs more time than an honest raw error.
+
+For the same reason the default log filter turns `kube_client` off: it logs
+every failed request at ERROR, and printing that above our own sentence means
+the user reads the unhelpful one first.
+
+### 12. Times come from `jiff`, via `k8s-openapi`
+
+`k8s-openapi` 0.28 exposes timestamps as `jiff::Timestamp` and re-exports the
+crate. We use that re-export rather than depending on `jiff` directly, so the
+version can never drift from the one the API types are built against.
+
+`k8s-openapi`'s `latest` feature picks the newest Kubernetes API version it
+knows. The node fields we read — conditions, `nodeInfo`, object metadata — have
+been stable for many releases and are all optional in the generated types, so an
+older EKS control plane deserialises fine. Pin an explicit `v1_NN` feature if we
+ever reach for an API that only exists in newer releases.

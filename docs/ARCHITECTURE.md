@@ -9,7 +9,9 @@ src/
   cli.rs               clap definitions and argument-derived settings.
   kubeconfig.rs        Reading and safely rewriting kubeconfig files.
   cluster.rs           Turning kubeconfig entries into human-facing views.
+  format.rs            Ages and aligned tables — pure string formatting.
   theme.rs             The entire colour palette and severity thresholds.
+  k8s/                 The Kubernetes client, and translating its failures.
   commands/            One module per user-facing command.
   ui/                  The interactive dashboard.
 ```
@@ -25,8 +27,9 @@ Three layers, and the boundaries are load-bearing:
 functions over plain data. `ClusterIdentity::from_arn`, `render_table`,
 `App::on_key`. All of it is tested directly.
 
-**I/O** — the filesystem and, soon, the Kubernetes and AWS APIs. Confined to
-narrow functions that do nothing but fetch and hand back data.
+**I/O** — the filesystem and the Kubernetes API. Confined to narrow functions
+that do nothing but fetch and hand back data: `KubeConfig::load_from`,
+`k8s::connect`, `k8s::nodes::fetch`.
 
 **Rendering** — `ui::draw` and friends. Takes `&App` and paints. It makes no
 decisions that are not about layout, and it never fetches anything.
@@ -47,9 +50,22 @@ the cluster it references. `ClusterView` is the presentation layer — it is wha
 decides that a user should see `prod (us-east-1)` rather than
 `arn:aws:eks:us-east-1:111122223333:cluster/prod`.
 
-When live cluster data arrives (see `docs/ROADMAP.md`), it enters as a fourth
-stage feeding `App` from a background task over a channel. The render loop will
-never await it.
+Live cluster data enters as a second pipeline, joined to the first by the
+selected context:
+
+```
+ClusterView ──► k8s::connect ──► Client ──► nodes::fetch ──► NodeRow ──► table
+ (choose)         (build)                    (I/O)          (present)   (render)
+```
+
+`NodeRow::from_node` takes an explicit `now`, so ages are computed rather than
+observed and every row in a listing shares one instant.
+
+Only the async commands build a Tokio runtime, and they build it themselves —
+see `commands::block_on`. `eks contexts` still starts with nothing but a file
+read. When the dashboard grows live data (see `docs/ROADMAP.md`), fetching moves
+onto a background task feeding `App` over a channel; the render loop will never
+await it.
 
 ## Testing
 
@@ -69,9 +85,14 @@ Tests that need a fake cluster get fixtures, never live AWS.
 
 ## Error handling
 
-`thiserror` for typed errors at module boundaries (`kubeconfig::Error`),
-`anyhow` at the command layer where the caller is a human, not code. `main`
-prints the whole context chain with `{:#}`.
+`thiserror` for typed errors at module boundaries (`kubeconfig::Error`,
+`k8s::client::Error`), `anyhow` at the command layer where the caller is a
+human, not code. `main` prints the whole context chain with `{:#}`.
+
+Errors from the cluster get one extra step: `k8s::client::explain` turns a
+`kube::Error` into a sentence naming the cluster and what to do next, and the
+raw error goes to `tracing::debug` instead of the user's terminal. It is a pure
+function over a classified failure, so each message is asserted on in a test.
 
 `unwrap`, `expect`, and `panic!` are denied by lint in library code. Ask what
 should happen instead and return a `Result` saying so.
