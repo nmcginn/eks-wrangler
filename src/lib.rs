@@ -6,6 +6,8 @@
 
 pub mod cluster;
 pub mod commands;
+pub mod format;
+pub mod k8s;
 pub mod kubeconfig;
 pub mod theme;
 pub mod ui;

@@ -28,6 +28,7 @@ kubeconfig — `aws eks update-kubeconfig --name <cluster>` if you do not have o
 ```sh
 eks                     # open the dashboard
 eks contexts            # list available clusters
+eks nodes               # list the nodes of the active cluster
 eks use staging         # switch cluster
 eks current             # show the active cluster
 ```
@@ -43,6 +44,21 @@ $ eks contexts
 
 `eks use` takes either that short name or the full context name, and tells you
 when a short name is ambiguous rather than picking one for you.
+
+`eks nodes` is the first command that talks to a cluster. It uses whichever
+context is active, or the one named by `--context`, which also accepts a short
+cluster name:
+
+```
+$ eks nodes --context staging
+NAME                         STATUS                       VERSION              AGE
+ip-10-0-1-9.ec2.internal     Ready                        v1.33.1-eks-1a2b3c4  12d
+ip-10-0-11-200.ec2.internal  NotReady,SchedulingDisabled  v1.32.9-eks-9f8e7d6  10h
+```
+
+Credentials come from the kubeconfig context itself, so whatever works for
+`kubectl` works here. When they have expired, `eks` says so and tells you how to
+refresh them instead of printing an HTTP status code.
 
 ### Options
 

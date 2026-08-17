@@ -16,7 +16,7 @@ tick nothing, and split the remainder into new tasks here.
 The tool currently reads kubeconfig only. This milestone makes it talk to a
 cluster.
 
-- [ ] **Async runtime and Kubernetes client bootstrap.**
+- [x] **Async runtime and Kubernetes client bootstrap.**
   Add `tokio`, `kube`, and `k8s-openapi`. Build a client from the selected
   context. Add `eks nodes` printing name, status, version, age.
   *Acceptance:* works against a real EKS cluster; a missing/expired credential
@@ -41,6 +41,33 @@ cluster.
   Live CPU/memory usage for nodes and pods where `metrics.k8s.io` is available.
   *Acceptance:* absent metrics-server degrades to showing requests with a note,
   never an error; the API call is behind a trait so it can be faked in tests.
+
+### Follow-ups from the client bootstrap
+
+- [ ] **Paginate node listings.**
+  `eks nodes` fetches every node in one request. A cluster with thousands of
+  nodes deserves `limit`/`continue` paging, and eventually a spinner while the
+  pages arrive.
+  *Acceptance:* paging is driven by a tested pure function over the continue
+  token; a fixture with three pages is covered.
+
+- [ ] **Move `eks contexts` onto the shared table renderer.**
+  `format::table` now renders `eks nodes`; `commands::contexts` still has its
+  own copy, which also owns the `*` active-cluster gutter.
+  *Acceptance:* one renderer, existing `contexts` output unchanged to the byte.
+
+- [ ] **Global flags before a subcommand.**
+  `eks --kubeconfig x contexts` is rejected because `args_conflicts_with_subcommands`
+  treats the flag as the bare-dashboard form. Flags after the subcommand work,
+  which makes the failure look arbitrary.
+  *Acceptance:* both orders parse; a test covers each global flag in both
+  positions.
+
+- [ ] **A `--timeout` for cluster requests.**
+  A hung API server currently leaves `eks nodes` waiting forever with no way out
+  but Ctrl-C.
+  *Acceptance:* the default is documented; timing out names the cluster and
+  suggests checking VPN or endpoint access.
 
 ## Milestone 2 — The dashboard
 
@@ -129,7 +156,9 @@ cluster.
 
 ## Done
 
-Nothing yet — this section records completed milestones as the loop ticks along.
+- **Async runtime and Kubernetes client bootstrap** (2026-08-17) — `tokio`,
+  `kube`, and `k8s-openapi` added; `eks nodes` lists name, status, version, and
+  age; cluster failures are translated into advice rather than HTTP statuses.
 
 ## Ideas, not yet scheduled
 

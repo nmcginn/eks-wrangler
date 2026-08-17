@@ -10,7 +10,7 @@ use clap::Parser;
 use tracing_subscriber::EnvFilter;
 
 use eks::cli::{Cli, Command, GlobalArgs};
-use eks::commands::contexts;
+use eks::commands::{self, contexts, nodes};
 use eks::kubeconfig::KubeConfig;
 use eks::ui::{self, App};
 
@@ -37,6 +37,14 @@ fn run(cli: Cli) -> Result<()> {
         Command::Dashboard => dashboard(&config, cli.global.context.as_deref()),
         Command::Contexts { quiet } => {
             print_line(&contexts::list(&config, quiet));
+            Ok(())
+        }
+        Command::Nodes => {
+            // The only command so far that needs a runtime; it builds one for
+            // itself so the filesystem-only commands stay as cheap as they are.
+            let output =
+                commands::block_on(nodes::list(&config, &paths, cli.global.context.as_deref()))?;
+            print_line(&output);
             Ok(())
         }
         Command::Use { name } => {
