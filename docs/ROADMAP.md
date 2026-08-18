@@ -38,7 +38,7 @@ cluster.
   tested pure function; percentages use `theme::Severity` thresholds; a node
   running no pods reads as `0%` rather than as an error.
 
-- [ ] **`eks pods` listing.**
+- [x] **`eks pods` listing.**
   Pods for a namespace (or `--all-namespaces`) with status, ready count,
   restarts, age, and node.
   *Acceptance:* phase derivation matches `kubectl` for the awkward cases —
@@ -48,6 +48,30 @@ cluster.
   Live CPU/memory usage for nodes and pods where `metrics.k8s.io` is available.
   *Acceptance:* absent metrics-server degrades to showing requests with a note,
   never an error; the API call is behind a trait so it can be faked in tests.
+
+### Follow-ups from the pod listing
+
+- [ ] **Label and field selectors for `eks pods`.**
+  `-l app=api` is the first thing anyone reaches for after seeing a pod list,
+  and the second is "only the ones that are not Running".
+  *Acceptance:* the selector is passed to the API server rather than filtered
+  client-side; an unparseable selector is rejected with the offending text
+  quoted, before any request is made.
+
+- [ ] **How long ago the last restart was.**
+  `kubectl` shows `9 (5m ago)`, taking the newest `lastState.terminated
+  .finishedAt` across the containers. A restart count with no recency behind it
+  cannot distinguish a pod that crashed nine times last Tuesday from one
+  crashing now, which is the whole question.
+  *Acceptance:* the timestamp chosen is a pure function over the container
+  statuses, following `kubectl`'s rule that only sidecar restarts survive
+  initialisation; a pod that has never restarted shows the bare count.
+
+- [ ] **A `--wide` mode for `eks pods`.**
+  Pod IP, and the nominated node for a preempting pod — the two columns
+  `kubectl -o wide` adds that answer questions the current table raises.
+  *Acceptance:* the column set is a pure function over the flag, tested both
+  ways; the default table is unchanged to the byte.
 
 ### Follow-ups from the capacity columns
 
@@ -78,15 +102,18 @@ cluster.
 
 - [ ] **Paginate the pod listing.**
   `eks nodes` now fetches every pod in the cluster in one request to total the
-  requests. On a large cluster that is the biggest response the tool asks for,
-  and it shares the paging problem the node listing has.
+  requests, and `eks pods -A` does the same to list them. On a large cluster
+  that is the biggest response the tool asks for, and it shares the paging
+  problem the node listing has.
   *Acceptance:* pages with the same tested continue-token function the node
   listing uses; the two listings still run concurrently.
 
 - [ ] **Severity colour in the CLI table.**
   `Requested::severity` classifies each percentage on the shared thresholds, and
   the CLI table then prints it in plain text. A node at 97% deserves to look
-  like it, at least when stdout is a terminal.
+  like it, at least when stdout is a terminal. `PodRow::severity` is now in the
+  same position — a `CrashLoopBackOff` reads exactly like a `Running` — so one
+  change should light up both tables.
   *Acceptance:* colour is suppressed when stdout is not a TTY and when `NO_COLOR`
   is set; the decision is a pure function, tested both ways.
 
@@ -203,6 +230,13 @@ cluster.
 ---
 
 ## Done
+
+- **`eks pods` listing** (2026-08-18) — pods for one namespace or for every
+  namespace, with `kubectl`'s own `STATUS` derivation reimplemented as a pure
+  function in `k8s::pods::row`: the backwards walk over app containers, sidecar
+  handling, `Init:<n>/<total>` progress, `Terminating`, and a pod on a lost node
+  reading `Unknown`. Asking for one namespace and all of them at once is an
+  error rather than one flag quietly winning.
 
 - **Pod requests per node, and utilisation percentages** (2026-08-18) —
   `k8s::pods` totals the effective requests of the pods on each node, following

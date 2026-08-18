@@ -95,6 +95,14 @@ pub enum Command {
     #[command(visible_alias = "no")]
     Nodes,
 
+    /// List the pods of a namespace, or of every namespace.
+    #[command(visible_alias = "po")]
+    Pods {
+        /// List pods in every namespace, adding a NAMESPACE column.
+        #[arg(long, short = 'A')]
+        all_namespaces: bool,
+    },
+
     /// Switch the active cluster.
     Use {
         /// Context name, as shown by `eks contexts`.

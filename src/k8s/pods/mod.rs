@@ -30,6 +30,10 @@ use kube::api::{Api, ListParams};
 
 use crate::k8s::quantity::Quantity;
 
+pub mod row;
+
+pub use row::{PodRow, render};
+
 /// Pods that have finished linger in the API server until something collects
 /// them, and they hold nothing on the node. Excluding them server-side keeps a
 /// cluster full of completed Jobs from being paid for over the wire; the same
@@ -44,6 +48,48 @@ pub async fn fetch(client: Client) -> Result<Vec<Pod>, kube::Error> {
     let api: Api<Pod> = Api::all(client);
     let params = ListParams::default().fields(LIVE_PODS);
     Ok(api.list(&params).await?.items)
+}
+
+/// Which pods a listing is about.
+///
+/// The two cases are not interchangeable at the API level — one namespace is a
+/// different endpoint from all of them — and they are not interchangeable to a
+/// reader either, since only the cluster-wide listing needs a `NAMESPACE`
+/// column. Carrying the choice as a value keeps the fetch and the rendering
+/// from disagreeing about which listing this is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Scope {
+    /// One namespace, named.
+    Namespace(String),
+    /// Every namespace the user is allowed to see.
+    All,
+}
+
+impl Scope {
+    /// Whether a listing of this scope needs a `NAMESPACE` column.
+    ///
+    /// Repeating one namespace down every row of a namespaced listing is noise;
+    /// leaving it out of a cluster-wide one loses the only thing that
+    /// disambiguates two pods with the same name.
+    #[must_use]
+    pub fn needs_namespace_column(&self) -> bool {
+        matches!(self, Self::All)
+    }
+}
+
+/// Ask the API server for the pods in `scope`, finished ones included.
+///
+/// Deliberately unlike [`fetch`]: that one exists to total what is *booked* on
+/// a node, so it filters the terminal phases out server-side. A person reading
+/// `eks pods` wants to see the `Completed` Job that ran an hour ago and the
+/// `Evicted` pod that explains their morning, so nothing is filtered here.
+pub async fn fetch_scope(client: Client, scope: &Scope) -> Result<Vec<Pod>, kube::Error> {
+    let api: Api<Pod> = match scope {
+        Scope::Namespace(name) => Api::namespaced(client, name),
+        Scope::All => Api::all(client),
+    };
+
+    Ok(api.list(&ListParams::default()).await?.items)
 }
 
 /// CPU and memory asked for, as a pair, so the two are never added up in
@@ -487,5 +533,11 @@ mod tests {
     #[test]
     fn no_pods_at_all_is_an_empty_map_rather_than_an_error() {
         assert!(by_node(&[]).is_empty());
+    }
+
+    #[test]
+    fn only_a_cluster_wide_scope_needs_a_namespace_column() {
+        assert!(Scope::All.needs_namespace_column());
+        assert!(!Scope::Namespace("payments".to_owned()).needs_namespace_column());
     }
 }

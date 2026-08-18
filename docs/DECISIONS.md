@@ -180,3 +180,50 @@ in hand would be a worse answer than an honest partial one. `-` and `0 (0%)` are
 kept visibly different for the same reason: "we could not find out" and "nothing
 is running here" are different facts, and a shared rendering would quietly turn
 one into the other.
+
+### 17. `eks pods` reimplements `kubectl`'s STATUS derivation, faithfully
+
+The word in `kubectl`'s `STATUS` column is not a field. `pod.status.phase` only
+ever holds `Pending`, `Running`, `Succeeded`, `Failed`, or `Unknown`, and none of
+those is what a person is looking for — `CrashLoopBackOff`, `Init:0/2`,
+`Terminating`, `Evicted` and `Completed` are all derived from the container
+statuses underneath by a specific, order-dependent walk.
+
+We copy that walk rather than invent a clearer one. People read a `STATUS`
+column by habit, and a tool that says something subtly different from the
+`kubectl` next to it makes them stop and check — which costs more than any
+improvement in wording would save. The parts that look like bugs are kept on
+purpose and each carries a test: the app containers are walked *backwards* so
+the first container in the spec is the one named; a started sidecar is skipped
+by the init walk but still counts towards the ready fraction; a plain init
+container's restarts are dropped from the total once initialisation is over,
+while a sidecar's survive; and `Initialized` being true ends the init phase even
+when an init container is still reporting.
+
+Two places where a judgement was needed rather than copied:
+
+- **Severity.** `theme::Severity` has to come from somewhere, and the mapping
+  lists the calm words and the settling ones and treats *everything else* as a
+  failure. That way round on purpose: the set of things that can go wrong with a
+  pod grows with every Kubernetes release, and a reason this tool has never
+  heard of should arrive coloured as a problem rather than quietly as fine.
+  `1/2 Running` is a warning, not a success, for the same reason.
+- **An empty status.** A pod caught between admission and its first kubelet
+  report derives to an empty string, where `kubectl` prints nothing. We print
+  `Unknown`, because a blank cell in a table reads like a rendering bug rather
+  than a fact about the pod.
+
+### 18. `eks pods` lists finished pods; the node totals do not
+
+`k8s::pods` now has two fetches. `fetch` filters the terminal phases out
+server-side, because it exists to total what is *booked* on a node and a
+completed Job holds nothing. `fetch_scope` filters nothing, because the
+`Completed` Job that ran an hour ago and the `Evicted` pod that explains the
+morning are exactly what someone runs `eks pods` to find.
+
+`--namespace` and `--all-namespaces` are rejected together rather than one
+silently winning. kubectl lets `-A` override, which leaves a user reading a list
+they did not ask for and believing they did; a one-line error naming both flags
+costs less than that. And a `403` on `--all-namespaces` adds a sentence
+suggesting `-n <namespace>`, because access bound to a single namespace is the
+usual cause and the cluster-wide list is the only call it cannot serve.
