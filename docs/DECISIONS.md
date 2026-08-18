@@ -143,3 +143,40 @@ The node table shows `allocatable/capacity` in one cell rather than two columns.
 The gap between the two is the kubelet's reservation, which on a small EKS node
 is a surprisingly large slice, and putting the numbers next to each other is
 what makes that visible without a second column of arithmetic.
+
+### 15. Pod requests follow the scheduler, not the obvious sum
+
+`pods::effective_requests` is `max(sum of app containers and sidecars, the peak
+init container)` plus pod overhead, per resource. Every term is there because
+the scheduler reserves it, and the naive "add up every container" is wrong in
+both directions: it double-counts init containers that have already exited, and
+it misses the sandbox overhead a RuntimeClass declares.
+
+The subtle one is sidecars — init containers with `restartPolicy: Always`. They
+never exit, so they belong in the steady-state sum *and* in the footprint of
+every init container that starts after them. Order matters: an init container
+listed before a sidecar never overlaps with it. That ordering is what the
+`an_init_container_before_a_sidecar_is_not_charged_alongside_it` test pins down,
+and it is the clause most likely to be broken by a well-meaning simplification.
+
+The maximum is taken per resource rather than by picking one "largest"
+container, because a pod with a CPU-hungry init container and a memory-hungry
+one needs the peak of each.
+
+Terminating pods still count. They hold their place on the node until the
+kubelet confirms they are gone, and a draining node that reads as empty is a
+worse lie than one that reads as full for a few seconds longer than it is.
+
+### 16. A failed pod listing empties two columns rather than the command
+
+`eks nodes` now issues two listings. They are concurrent, so the command costs
+one round trip rather than two, and they are not equally fatal: a node listing
+that fails ends the command, while a pod listing that fails leaves `CPU REQ` and
+`MEM REQ` reading `-` with a footnote explaining why.
+
+The asymmetry is deliberate. Read-only roles that cover nodes but not pods in
+every namespace are common, and throwing away a node table that we already have
+in hand would be a worse answer than an honest partial one. `-` and `0 (0%)` are
+kept visibly different for the same reason: "we could not find out" and "nothing
+is running here" are different facts, and a shared rendering would quietly turn
+one into the other.

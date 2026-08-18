@@ -155,6 +155,28 @@ impl Quantity {
     }
 }
 
+impl std::ops::Add for Quantity {
+    type Output = Self;
+
+    /// Saturating rather than checked or wrapping.
+    ///
+    /// Summing the pod requests on one node cannot get near an `i128` unless
+    /// something upstream is already nonsense, and a total that pins at the
+    /// maximum is a visibly absurd number the user can act on. Wrapping would
+    /// turn it into a small, plausible lie.
+    fn add(self, other: Self) -> Self {
+        Self {
+            thousandths: self.thousandths.saturating_add(other.thousandths),
+        }
+    }
+}
+
+impl std::iter::Sum for Quantity {
+    fn sum<I: Iterator<Item = Self>>(iter: I) -> Self {
+        iter.fold(Self::default(), std::ops::Add::add)
+    }
+}
+
 /// Split a quantity into its mantissa digits (with the decimal point removed),
 /// the number of digits that followed that point, and the suffix. Returns
 /// `None` for anything that is not a number followed by a suffix.
@@ -468,6 +490,27 @@ mod tests {
         assert_eq!(used.ratio_of(total), Some(0.25));
         assert_eq!(used.ratio_of(Quantity::default()), None);
         assert_eq!(used.ratio_of(Quantity::parse("-1").unwrap()), None);
+    }
+
+    #[test]
+    fn quantities_add_and_sum_without_ever_wrapping() {
+        let hundred = Quantity::parse("100m").unwrap();
+        assert_eq!(hundred + hundred, Quantity::parse("200m").unwrap());
+        assert_eq!(
+            [hundred, hundred, hundred].into_iter().sum::<Quantity>(),
+            Quantity::parse("300m").unwrap()
+        );
+        assert_eq!(
+            std::iter::empty::<Quantity>().sum::<Quantity>(),
+            Quantity::default()
+        );
+
+        // Absurd, but it must saturate rather than wrap into a small number: a
+        // total that reads as impossibly large is a bug someone can see, and a
+        // wrapped one is a quiet lie. This is within a factor of two of the
+        // largest quantity that can be represented at all.
+        let huge = Quantity::parse("100000000000000000E").unwrap();
+        assert_eq!((huge + huge).thousandths(), i128::MAX);
     }
 
     #[test]

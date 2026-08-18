@@ -13,6 +13,7 @@ use kube::Client;
 use kube::api::{Api, ListParams};
 
 use crate::format;
+use crate::k8s::pods::Requests;
 use crate::k8s::quantity::{self, Quantity};
 use crate::theme::Severity;
 
@@ -39,6 +40,10 @@ pub struct NodeRow {
     pub cpu: Capacity,
     /// Bytes of memory the node has, and bytes pods may actually ask for.
     pub memory: Capacity,
+    /// Cores the pods already on this node have booked.
+    pub cpu_requested: Requested,
+    /// Memory the pods already on this node have booked.
+    pub memory_requested: Requested,
     pub age: String,
 }
 
@@ -93,6 +98,61 @@ impl Capacity {
     }
 }
 
+/// What the pods on a node have booked, against what the node can give them.
+///
+/// This is the number that decides whether the next pod schedules. A node can
+/// be busy at 20% CPU and still refuse work because its pods have *requested*
+/// everything it has, and a table that shows only capacity leaves the user
+/// guessing why.
+///
+/// `requested` is `None` only when the pod listing itself was unavailable —
+/// a role that can read nodes but not pods cluster-wide is common. That is a
+/// different thing from a node with nothing on it, which is a real zero, and
+/// the two must not render the same.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Requested {
+    pub requested: Option<Quantity>,
+    pub allocatable: Option<Quantity>,
+}
+
+impl Requested {
+    /// The booked fraction of allocatable, if both halves are known.
+    ///
+    /// Can exceed 1.0: allocatable is what the scheduler honours, and pods
+    /// placed before a kubelet revised its reservation downwards really can add
+    /// up to more than it. Showing `104%` is the honest answer, and it is
+    /// exactly the moment someone wants to know.
+    #[must_use]
+    pub fn ratio(self) -> Option<f64> {
+        self.requested?.ratio_of(self.allocatable?)
+    }
+
+    /// How alarming that fraction is, on the shared `theme` thresholds, so the
+    /// CLI table and the dashboard cannot disagree about what counts as hot.
+    #[must_use]
+    pub fn severity(self) -> Severity {
+        self.ratio()
+            .map_or(Severity::Unknown, Severity::from_utilisation)
+    }
+
+    /// One table cell: what is booked, and what share of the node that is.
+    ///
+    /// A node that has not reported allocatable still shows the absolute
+    /// figure — it is the percentage that is unknown, not the requests.
+    fn cell(self, show: fn(Quantity) -> String) -> String {
+        let Some(requested) = self.requested else {
+            return UNKNOWN.to_owned();
+        };
+
+        match self.ratio() {
+            // `{:.0}` rather than a cast: no truncation to reason about, and
+            // nothing to hand-roll for a value that will not fit an integer.
+            Some(ratio) => format!("{} ({:.0}%)", show(requested), ratio * 100.0),
+            None => show(requested),
+        }
+    }
+}
+
 /// Shown wherever the API server left a field empty. Matches the placeholder
 /// `eks contexts` uses for an unknown region.
 const UNKNOWN: &str = "-";
@@ -102,8 +162,12 @@ impl NodeRow {
     ///
     /// `now` is a parameter rather than a call to the clock so the age column
     /// is testable and so every row in one listing shares a single instant.
+    ///
+    /// `requested` is the total of the pods on this node — `Some(zero)` for a
+    /// node running nothing, and `None` only when the pods could not be listed
+    /// at all.
     #[must_use]
-    pub fn from_node(node: &Node, now: Timestamp) -> Self {
+    pub fn from_node(node: &Node, requested: Option<Requests>, now: Timestamp) -> Self {
         let name = node
             .metadata
             .name
@@ -112,13 +176,23 @@ impl NodeRow {
 
         let ready = ready_condition(node);
         let cordoned = node.spec.as_ref().and_then(|spec| spec.unschedulable) == Some(true);
+        let cpu = Capacity::read(node, "cpu");
+        let memory = Capacity::read(node, "memory");
 
         Self {
             name,
             status: status_text(ready, cordoned),
             severity: severity(ready, cordoned),
-            cpu: Capacity::read(node, "cpu"),
-            memory: Capacity::read(node, "memory"),
+            cpu,
+            memory,
+            cpu_requested: Requested {
+                requested: requested.map(|total| total.cpu),
+                allocatable: cpu.allocatable,
+            },
+            memory_requested: Requested {
+                requested: requested.map(|total| total.memory),
+                allocatable: memory.allocatable,
+            },
             version: node
                 .status
                 .as_ref()
@@ -177,8 +251,12 @@ fn severity(ready: Option<bool>, cordoned: bool) -> Severity {
 ///
 /// `cluster` is the human label used in the empty-list message, so a user who
 /// typed the wrong `--context` finds out from the answer.
+///
+/// `note` is appended under the table — see [`requests_unavailable`]. It is
+/// dropped when there are no nodes, where a footnote about missing request
+/// figures would only be noise on top of a bigger problem.
 #[must_use]
-pub fn render(rows: &[NodeRow], cluster: &str) -> String {
+pub fn render(rows: &[NodeRow], cluster: &str, note: Option<&str>) -> String {
     if rows.is_empty() {
         return format!(
             "{cluster} reports no nodes.\n\
@@ -194,18 +272,38 @@ pub fn render(rows: &[NodeRow], cluster: &str) -> String {
                 row.status.clone(),
                 row.version.clone(),
                 row.cpu.cell(quantity::cpu),
+                row.cpu_requested.cell(quantity::cpu),
                 row.memory.cell(quantity::memory),
+                row.memory_requested.cell(quantity::memory),
                 row.age.clone(),
             ]
         })
         .collect();
 
-    // AGE stays last because that is where every `kubectl get` puts it, and the
-    // new columns are the ones people will be scanning for.
-    format::table(
-        &["NAME", "STATUS", "VERSION", "CPU", "MEMORY", "AGE"],
+    // Each REQ column sits beside the capacity it is a share of, so the
+    // comparison is a glance rather than a scan across the row. AGE stays last
+    // because that is where every `kubectl get` puts it.
+    let table = format::table(
+        &[
+            "NAME", "STATUS", "VERSION", "CPU", "CPU REQ", "MEMORY", "MEM REQ", "AGE",
+        ],
         &cells,
-    )
+    );
+
+    match note {
+        Some(note) => format!("{table}\n\n{note}"),
+        None => table,
+    }
+}
+
+/// The footnote shown when the pods could not be listed, so the empty request
+/// columns are explained rather than mistaken for an idle cluster.
+///
+/// `explanation` is `k8s::explain`'s sentence about the underlying failure —
+/// usually that the user's role covers nodes but not pods cluster-wide.
+#[must_use]
+pub fn requests_unavailable(explanation: &str) -> String {
+    format!("CPU REQ and MEM REQ are empty because the pods could not be listed.\n{explanation}")
 }
 
 #[cfg(test)]
@@ -220,6 +318,19 @@ mod tests {
     use k8s_openapi::jiff::SignedDuration;
 
     use super::*;
+
+    /// Most tests care about a node's own fields, not its pods; this is the
+    /// "we listed the pods and found none" case, which is a real zero.
+    fn idle() -> Requests {
+        Requests::default()
+    }
+
+    fn booked(cpu: &str, memory: &str) -> Requests {
+        Requests {
+            cpu: Quantity::parse(cpu).unwrap_or_default(),
+            memory: Quantity::parse(memory).unwrap_or_default(),
+        }
+    }
 
     fn now() -> Timestamp {
         "2026-08-17T12:00:00Z".parse().unwrap()
@@ -278,7 +389,7 @@ mod tests {
 
     #[test]
     fn a_healthy_node_reads_as_ready() {
-        let row = NodeRow::from_node(&healthy_node(), now());
+        let row = NodeRow::from_node(&healthy_node(), Some(idle()), now());
 
         assert_eq!(row.name, "ip-10-0-1-9.ec2.internal");
         assert_eq!(row.status, "Ready");
@@ -289,7 +400,7 @@ mod tests {
 
     #[test]
     fn capacity_and_allocatable_are_read_as_separate_numbers() {
-        let row = NodeRow::from_node(&healthy_node(), now());
+        let row = NodeRow::from_node(&healthy_node(), Some(idle()), now());
 
         assert_eq!(row.cpu.capacity, Some(Quantity::parse("4").unwrap()));
         assert_eq!(row.cpu.allocatable, Some(Quantity::parse("3920m").unwrap()));
@@ -305,7 +416,7 @@ mod tests {
     fn the_reserved_slice_of_a_node_is_available_as_a_ratio() {
         // Not rendered yet, but it is what the dashboard's bars will divide by,
         // so it is worth pinning down now.
-        let row = NodeRow::from_node(&healthy_node(), now());
+        let row = NodeRow::from_node(&healthy_node(), Some(idle()), now());
         let ratio = row.cpu.allocatable_ratio().unwrap();
 
         assert!((ratio - 0.98).abs() < 1e-9, "{ratio}");
@@ -320,7 +431,7 @@ mod tests {
             status.allocatable = None;
         }
 
-        let row = NodeRow::from_node(&node, now());
+        let row = NodeRow::from_node(&node, Some(idle()), now());
         assert_eq!(row.cpu.cell(quantity::cpu), "-");
         assert_eq!(row.memory.cell(quantity::memory), "-");
     }
@@ -332,7 +443,7 @@ mod tests {
             status.allocatable = None;
         }
 
-        let row = NodeRow::from_node(&node, now());
+        let row = NodeRow::from_node(&node, Some(idle()), now());
         assert_eq!(row.cpu.cell(quantity::cpu), "4");
         assert_eq!(row.memory.cell(quantity::memory), "15.6Gi");
     }
@@ -346,7 +457,7 @@ mod tests {
             status.capacity = Some(quantities(&[("cpu", "four"), ("memory", "16374624Ki")]));
         }
 
-        let row = NodeRow::from_node(&node, now());
+        let row = NodeRow::from_node(&node, Some(idle()), now());
         assert_eq!(row.cpu.capacity, None);
         // Only the unreadable half is lost.
         assert_eq!(row.cpu.cell(quantity::cpu), "3920m");
@@ -359,7 +470,7 @@ mod tests {
         // kubectl still calls that NotReady, and so do we.
         for status in ["False", "Unknown"] {
             let node = with_status(&healthy_node(), vec![condition("Ready", status)]);
-            let row = NodeRow::from_node(&node, now());
+            let row = NodeRow::from_node(&node, Some(idle()), now());
 
             assert_eq!(row.status, "NotReady", "Ready={status}");
             assert_eq!(row.severity, Severity::Critical, "Ready={status}");
@@ -369,7 +480,7 @@ mod tests {
     #[test]
     fn a_node_with_no_ready_condition_is_unknown_rather_than_broken() {
         let node = with_status(&healthy_node(), vec![condition("MemoryPressure", "False")]);
-        let row = NodeRow::from_node(&node, now());
+        let row = NodeRow::from_node(&node, Some(idle()), now());
 
         assert_eq!(row.status, "Unknown");
         assert_eq!(row.severity, Severity::Unknown);
@@ -383,7 +494,7 @@ mod tests {
             ..Default::default()
         });
 
-        let row = NodeRow::from_node(&node, now());
+        let row = NodeRow::from_node(&node, Some(idle()), now());
         assert_eq!(row.status, "Ready,SchedulingDisabled");
         // Deliberately out of service is a warning, not a failure.
         assert_eq!(row.severity, Severity::Warn);
@@ -397,7 +508,7 @@ mod tests {
             ..Default::default()
         });
 
-        let row = NodeRow::from_node(&node, now());
+        let row = NodeRow::from_node(&node, Some(idle()), now());
         assert_eq!(row.status, "NotReady,SchedulingDisabled");
         assert_eq!(row.severity, Severity::Critical);
     }
@@ -406,7 +517,7 @@ mod tests {
     fn a_node_with_nothing_filled_in_still_produces_a_row() {
         // Everything under `status` is optional in the API, and a node caught
         // mid-registration really can arrive like this.
-        let row = NodeRow::from_node(&Node::default(), now());
+        let row = NodeRow::from_node(&Node::default(), Some(idle()), now());
 
         assert_eq!(row.name, "-");
         assert_eq!(row.status, "Unknown");
@@ -415,6 +526,85 @@ mod tests {
         assert_eq!(row.severity, Severity::Unknown);
         assert_eq!(row.cpu, Capacity::default());
         assert_eq!(row.memory, Capacity::default());
+        // Pods were listed and this node has none, but with no allocatable to
+        // divide by there is no percentage to show.
+        assert_eq!(row.cpu_requested.cell(quantity::cpu), "0");
+        assert_eq!(row.memory_requested.cell(quantity::memory), "0");
+        assert_eq!(row.cpu_requested.severity(), Severity::Unknown);
+    }
+
+    #[test]
+    fn requests_are_shown_against_allocatable_as_a_percentage() {
+        let row = NodeRow::from_node(&healthy_node(), Some(booked("1960m", "7762576Ki")), now());
+
+        // Half of a 3920m allocatable, and half of a 15525152Ki one.
+        assert_eq!(row.cpu_requested.cell(quantity::cpu), "1960m (50%)");
+        assert_eq!(row.memory_requested.cell(quantity::memory), "7.4Gi (50%)");
+        assert_eq!(row.cpu_requested.ratio(), Some(0.5));
+    }
+
+    #[test]
+    fn a_node_running_no_pods_reads_as_zero_rather_than_as_an_error() {
+        // The common case for a freshly scaled node group, and the one place a
+        // missing value would be easiest to mistake for a bug.
+        let row = NodeRow::from_node(&healthy_node(), Some(idle()), now());
+
+        assert_eq!(row.cpu_requested.cell(quantity::cpu), "0 (0%)");
+        assert_eq!(row.memory_requested.cell(quantity::memory), "0 (0%)");
+        assert_eq!(row.cpu_requested.severity(), Severity::Ok);
+    }
+
+    #[test]
+    fn a_failed_pod_listing_reads_differently_from_an_empty_node() {
+        // `None` means "we could not find out", which must not look like zero.
+        let row = NodeRow::from_node(&healthy_node(), None, now());
+
+        assert_eq!(row.cpu_requested.cell(quantity::cpu), "-");
+        assert_eq!(row.memory_requested.cell(quantity::memory), "-");
+        assert_eq!(row.cpu_requested.ratio(), None);
+        assert_eq!(row.cpu_requested.severity(), Severity::Unknown);
+    }
+
+    #[test]
+    fn requests_without_a_reported_allocatable_still_show_the_absolute_figure() {
+        // A node caught mid-registration knows nothing about its own capacity,
+        // but the pods already assigned to it are still worth showing.
+        let mut node = healthy_node();
+        if let Some(status) = node.status.as_mut() {
+            status.allocatable = None;
+        }
+
+        let row = NodeRow::from_node(&node, Some(booked("500m", "1Gi")), now());
+        assert_eq!(row.cpu_requested.cell(quantity::cpu), "500m");
+        assert_eq!(row.memory_requested.cell(quantity::memory), "1Gi");
+        assert_eq!(row.cpu_requested.severity(), Severity::Unknown);
+    }
+
+    #[test]
+    fn percentages_use_the_shared_severity_thresholds() {
+        // 3920m allocatable: 2940m is exactly 75%, 3528m exactly 90%.
+        let cases = [
+            ("100m", Severity::Ok),
+            ("2939m", Severity::Ok),
+            ("2940m", Severity::Warn),
+            ("3527m", Severity::Warn),
+            ("3528m", Severity::Critical),
+        ];
+
+        for (requested, expected) in cases {
+            let row = NodeRow::from_node(&healthy_node(), Some(booked(requested, "0")), now());
+            assert_eq!(row.cpu_requested.severity(), expected, "{requested}");
+        }
+    }
+
+    #[test]
+    fn a_node_booked_past_its_allocatable_says_so_rather_than_capping() {
+        // Pods placed before the kubelet revised its reservation really can add
+        // up to more than allocatable, and that is the moment to say so.
+        let row = NodeRow::from_node(&healthy_node(), Some(booked("4312m", "0")), now());
+
+        assert_eq!(row.cpu_requested.cell(quantity::cpu), "4312m (110%)");
+        assert_eq!(row.cpu_requested.severity(), Severity::Critical);
     }
 
     #[test]
@@ -425,21 +615,48 @@ mod tests {
         let second = with_status(&second, vec![condition("Ready", "False")]);
 
         let rows = [
-            NodeRow::from_node(&healthy_node(), now()),
-            NodeRow::from_node(&second, now()),
+            NodeRow::from_node(&healthy_node(), Some(booked("1500m", "6Gi")), now()),
+            // The second node is idle, which must read as a real zero.
+            NodeRow::from_node(&second, Some(idle()), now()),
         ];
 
         assert_eq!(
-            render(&rows, "prod (us-east-1)"),
-            "NAME                         STATUS    VERSION              CPU      MEMORY         AGE\n\
-             ip-10-0-1-9.ec2.internal     Ready     v1.33.1-eks-1a2b3c4  3920m/4  14.8Gi/15.6Gi  2d2h\n\
-             ip-10-0-11-200.ec2.internal  NotReady  v1.33.1-eks-1a2b3c4  3920m/4  14.8Gi/15.6Gi  60m"
+            render(&rows, "prod (us-east-1)", None),
+            "NAME                         STATUS    VERSION              CPU      CPU REQ      MEMORY         MEM REQ    AGE\n\
+             ip-10-0-1-9.ec2.internal     Ready     v1.33.1-eks-1a2b3c4  3920m/4  1500m (38%)  14.8Gi/15.6Gi  6Gi (41%)  2d2h\n\
+             ip-10-0-11-200.ec2.internal  NotReady  v1.33.1-eks-1a2b3c4  3920m/4  0 (0%)       14.8Gi/15.6Gi  0 (0%)     60m"
         );
     }
 
     #[test]
+    fn a_footnote_explains_empty_request_columns() {
+        let rows = [NodeRow::from_node(&healthy_node(), None, now())];
+        let note = requests_unavailable("prod (us-east-1) will not let you list this resource.");
+
+        let output = render(&rows, "prod (us-east-1)", Some(&note));
+        let (table, footnote) = output
+            .split_once("\n\n")
+            .expect("a blank line before the note");
+
+        // The table is unchanged by the note; the note is what carries the news.
+        assert_eq!(table, render(&rows, "prod (us-east-1)", None));
+        assert!(footnote.contains("CPU REQ"), "{footnote}");
+        assert!(footnote.contains("will not let you list"), "{footnote}");
+    }
+
+    #[test]
+    fn a_cluster_with_no_nodes_skips_the_footnote() {
+        // There is a bigger problem than a missing column to explain.
+        let note = requests_unavailable("nope");
+        let message = render(&[], "prod (us-east-1)", Some(&note));
+
+        assert!(!message.contains("CPU REQ"), "{message}");
+        assert!(message.contains("node groups"), "{message}");
+    }
+
+    #[test]
     fn an_empty_cluster_explains_itself_instead_of_printing_a_bare_header() {
-        let message = render(&[], "prod (us-east-1)");
+        let message = render(&[], "prod (us-east-1)", None);
 
         assert!(message.contains("prod (us-east-1)"), "{message}");
         assert!(message.contains("node groups"), "{message}");
