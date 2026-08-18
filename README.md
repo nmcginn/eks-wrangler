@@ -1,5 +1,8 @@
 # eks
 
+[![Release build](https://github.com/nmcginn/eks-wrangler/actions/workflows/release.yml/badge.svg)](https://github.com/nmcginn/eks-wrangler/actions/workflows/release.yml)
+[![CI](https://github.com/nmcginn/eks-wrangler/actions/workflows/ci.yml/badge.svg)](https://github.com/nmcginn/eks-wrangler/actions/workflows/ci.yml)
+
 A fast, keyboard-driven explorer for AWS EKS clusters.
 
 Browsing a cluster should feel like browsing a filesystem — immediate, obvious,
