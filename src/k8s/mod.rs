@@ -11,6 +11,7 @@
 //! actually asks for data.
 
 pub mod client;
+pub mod metrics;
 pub mod nodes;
 pub mod pods;
 pub mod quantity;

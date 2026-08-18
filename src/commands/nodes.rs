@@ -7,6 +7,7 @@ use k8s_openapi::jiff::Timestamp;
 
 use crate::cluster::ClusterView;
 use crate::commands::contexts;
+use crate::k8s::metrics::{self as k8s_metrics};
 use crate::k8s::{self, nodes as k8s_nodes, pods as k8s_pods};
 use crate::kubeconfig::KubeConfig;
 
@@ -25,9 +26,13 @@ pub async fn list(
 
     let client = k8s::connect(paths, &target).await?;
 
-    // Concurrently, not in sequence: the two listings are independent, and the
-    // command should cost one round trip's worth of waiting rather than two.
-    let (nodes, pods) = tokio::join!(k8s_nodes::fetch(client.clone()), k8s_pods::fetch(client));
+    // Concurrently, not in sequence: the three requests are independent, and the
+    // command should cost one round trip's worth of waiting rather than three.
+    let (nodes, pods, usage) = tokio::join!(
+        k8s_nodes::fetch(client.clone()),
+        k8s_pods::fetch(client.clone()),
+        k8s_metrics::usage_by_node(&client),
+    );
 
     let nodes = nodes.map_err(|error| {
         // The raw error is worth having when debugging, but it is not what the
@@ -36,15 +41,31 @@ pub async fn list(
         anyhow!(k8s::explain(&error, &label))
     })?;
 
-    // A read-only role that grants nodes but not pods across every namespace is
-    // common enough that losing the whole table to it would be the wrong trade.
-    // The request columns go empty and a footnote says why.
-    let (requests, note) = match pods {
-        Ok(pods) => (Some(k8s_pods::by_node(&pods)), None),
+    // Only the node listing is fatal. The other two each cost the user some
+    // columns and earn a footnote, because a partial answer beats no answer:
+    // a read-only role that grants nodes but not pods across every namespace is
+    // common, and metrics-server is an add-on EKS does not install for you.
+    let mut footnotes = Vec::new();
+
+    let requests = match pods {
+        Ok(pods) => Some(k8s_pods::by_node(&pods)),
         Err(error) => {
             tracing::debug!(%error, "listing pods failed");
-            let note = k8s_nodes::requests_unavailable(&k8s::explain(&error, &label));
-            (None, Some(note))
+            footnotes.push(k8s_nodes::requests_unavailable(&k8s::explain(
+                &error, &label,
+            )));
+            None
+        }
+    };
+
+    let usage = match usage {
+        Ok(usage) => Some(usage),
+        Err(error) => {
+            tracing::debug!(%error, "reading node metrics failed");
+            footnotes.push(k8s_nodes::usage_unavailable(&k8s_metrics::explain(
+                &error, &label,
+            )));
+            None
         }
     };
 
@@ -64,14 +85,24 @@ pub async fn list(
                     .copied()
                     .unwrap_or_default()
             });
-            k8s_nodes::NodeRow::from_node(node, requested, now)
+            // Unlike the requests, an absent node here is *not* a zero: it is a
+            // node metrics-server has not sampled yet, and drawing it as idle
+            // would be an invention. `None` reads as `-`.
+            let used = usage.as_ref().and_then(|samples| {
+                node.metadata
+                    .name
+                    .as_deref()
+                    .and_then(|name| samples.get(name))
+                    .copied()
+            });
+            k8s_nodes::NodeRow::from_node(node, requested, used, now)
         })
         .collect();
     // The API server happens to return nodes in name order today; sorting makes
     // that a promise rather than an accident.
     rows.sort_by(|a, b| a.name.cmp(&b.name));
 
-    Ok(k8s_nodes::render(&rows, &label, note.as_deref()))
+    Ok(k8s_nodes::render(&rows, &label, &footnotes))
 }
 
 /// Work out which cluster to talk to, before any network call happens.
