@@ -83,6 +83,16 @@ storefront   checkout-6f7c8d9-pl4mn   0/1    Completed          0         2d   i
 `status.phase` — none of `CrashLoopBackOff`, `Init:1/2`, `Terminating`, or
 `Completed` exists in the API, and they are the ones worth reading.
 
+Narrow the listing with `-l` (labels) and `--field-selector` (fields), the same
+selectors `kubectl` takes. The filtering happens on the API server, and a
+selector that will not parse is rejected before anything connects, with the part
+that is wrong quoted back:
+
+```sh
+eks pods -l app=api,tier notin (canary)     # by label
+eks pods --field-selector status.phase!=Running   # only the ones that are not Running
+```
+
 Credentials come from the kubeconfig context itself, so whatever works for
 `kubectl` works here. When they have expired, `eks` says so and tells you how to
 refresh them instead of printing an HTTP status code.
@@ -93,6 +103,9 @@ refresh them instead of printing an HTTP status code.
 | --- | --- |
 | `-c, --context <NAME>` | Use a specific context for this invocation |
 | `-n, --namespace <NS>` | Scope resources to a namespace |
+| `-A, --all-namespaces` | List pods across every namespace (`eks pods`) |
+| `-l, --selector <SEL>` | Filter pods by label selector (`eks pods`) |
+| `--field-selector <SEL>` | Filter pods by field selector (`eks pods`) |
 | `--kubeconfig <PATH>` | Override the kubeconfig search path |
 | `-v, --verbose` | Increase log verbosity (repeatable) |
 

@@ -47,13 +47,19 @@ fn run(cli: Cli) -> Result<()> {
             print_line(&output);
             Ok(())
         }
-        Command::Pods { all_namespaces } => {
+        Command::Pods {
+            all_namespaces,
+            selector,
+            field_selector,
+        } => {
             let output = commands::block_on(pods::list(
                 &config,
                 &paths,
                 cli.global.context.as_deref(),
                 cli.global.namespace.as_deref(),
                 all_namespaces,
+                selector.as_deref(),
+                field_selector.as_deref(),
             ))?;
             print_line(&output);
             Ok(())

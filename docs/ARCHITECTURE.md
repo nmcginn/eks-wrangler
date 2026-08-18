@@ -11,7 +11,7 @@ src/
   cluster.rs           Turning kubeconfig entries into human-facing views.
   format.rs            Ages and aligned tables — pure string formatting.
   theme.rs             The entire colour palette and severity thresholds.
-  k8s/                 The Kubernetes client, quantities, nodes, and pods.
+  k8s/                 The Kubernetes client, quantities, selectors, nodes, and pods.
   commands/            One module per user-facing command.
   ui/                  The interactive dashboard.
 ```
@@ -84,6 +84,13 @@ derived from the container statuses underneath, by an order-dependent walk with
 a dozen special cases. `pods::row` reimplements that walk as a pure function over
 a `Pod` and an explicit `now`, so each case is a fixture — including the ones
 nobody can arrange on demand, like a pod on a node that stopped answering.
+
+Selectors take the same shape in reverse: `k8s::selector` parses the label and
+field selectors a user types (`app=api`, `status.phase!=Running`) into a
+canonical string, rejecting a malformed one — with the offending text quoted —
+before `eks pods` connects. It is another pure parser with no Kubernetes types
+in its signature, so the whole grammar is a fixture table; the command layer's
+`selectors_for` is where that validation is wired ahead of any request.
 
 Resource quantities get their own hop: the API server reports capacity as
 strings in a small grammar (`3920m`, `7134420Ki`, `1e3`), and `k8s::quantity`

@@ -227,3 +227,41 @@ they did not ask for and believing they did; a one-line error naming both flags
 costs less than that. And a `403` on `--all-namespaces` adds a sentence
 suggesting `-n <namespace>`, because access bound to a single namespace is the
 usual cause and the cluster-wide list is the only call it cannot serve.
+
+### 19. Selectors are parsed here, not handed to the API server raw
+
+`eks pods -l` and `--field-selector` could each be a one-line pass-through:
+take the string, call `ListParams::labels`, let the API server judge it. We
+parse and validate them ourselves in `k8s::selector` first, for the same reason
+`k8s::quantity` reimplements the quantity grammar rather than trusting a parse
+downstream.
+
+A selector is a request, not a guarantee. A malformed one comes back as a `400`
+whose body talks about parse offsets in a string the user cannot see, arriving
+*after* the credential helper has run and a round trip has happened. Validating
+before connecting turns that into an instant, local error that quotes the part
+that is wrong — `"env in"` is missing its value list — which is the whole
+acceptance criterion for the task and, more to the point, the difference between
+a typo you fix in a second and one you debug against a cluster.
+
+Parsing also lets us emit a *canonical* form: `==` folded to `=`, whitespace
+normalised, so `app == api` and `app=api` reach the wire identically. The parser
+is a pure function with no Kubernetes types in its signature, so the two
+grammars — label selectors with set membership and existence, field selectors
+with equality only — are covered by a fixture table rather than by provoking a
+cluster.
+
+Two smaller calls:
+
+- **kube's `Selector` type is not reused.** `kube::core::Selector` models a
+  parsed selector but has no parser from the string form a user types, and its
+  `Display` sorts and de-duplicates set values. We keep our own tiny
+  representation so `env in (prod, staging)` round-trips in the order it was
+  written, which makes a canonicalised selector recognisable rather than
+  reshuffled.
+- **A blank selector is absent, not empty.** `-l ''` folds to `None` rather than
+  being sent as an empty label selector, because an empty selector string is a
+  thing some servers treat differently from no selector at all, and "filter by
+  nothing" is what the user meant. An empty *filtered* listing says which
+  selector emptied it, so a live namespace a filter cleared does not read like an
+  empty one.
