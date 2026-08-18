@@ -49,7 +49,7 @@ cluster.
   *Acceptance:* absent metrics-server degrades to showing requests with a note,
   never an error; the API call is behind a trait so it can be faked in tests.
 
-- [ ] **metrics-server integration for pods.**
+- [x] **metrics-server integration for pods.**
   The other half of the task above, which was two PRs' worth. `eks pods` should
   gain `CPU` and `MEMORY` columns from `metrics.k8s.io/v1beta1/pods`, which is a
   namespaced listing summing per-container usage — a different shape from the
@@ -90,6 +90,15 @@ cluster.
   ways; the default table is unchanged to the byte.
 
 ### Follow-ups from the usage columns
+
+- [ ] **Usage against what the pod asked for.**
+  `eks pods` now shows what a pod is burning, and the node table shows every
+  figure as a share of something. A pod's `CPU`/`MEMORY` has no denominator, and
+  the one that answers "is this limit wrong?" is the pod's own request — the
+  number that decides whether it is throttled or about to be OOM-killed.
+  *Acceptance:* the request comes from the existing `effective_requests`, so the
+  two commands cannot disagree; a pod with no request shows the bare figure
+  rather than a percentage of zero.
 
 - [ ] **Usage against capacity for the dashboard's bars.**
   `nodes::Share` divides usage by *allocatable*, which is the right denominator
@@ -138,9 +147,10 @@ cluster.
 
 - [ ] **Paginate the pod listing.**
   `eks nodes` now fetches every pod in the cluster in one request to total the
-  requests, and `eks pods -A` does the same to list them. On a large cluster
-  that is the biggest response the tool asks for, and it shares the paging
-  problem the node listing has.
+  requests, and `eks pods -A` does the same to list them — twice over now, since
+  the metrics listing beside it is unpaged too. On a large cluster that is the
+  biggest response the tool asks for, and it shares the paging problem the node
+  listing has.
   *Acceptance:* pages with the same tested continue-token function the node
   listing uses; the two listings still run concurrently.
 

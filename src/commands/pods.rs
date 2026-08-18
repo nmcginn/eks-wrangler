@@ -7,6 +7,7 @@ use k8s_openapi::jiff::Timestamp;
 
 use crate::cluster::ClusterView;
 use crate::commands::nodes::target_cluster;
+use crate::k8s::metrics::{self as k8s_metrics};
 use crate::k8s::pods::{PodRow, Scope, Selectors};
 use crate::k8s::{self, pods as k8s_pods, selector};
 use crate::kubeconfig::KubeConfig;
@@ -36,28 +37,64 @@ pub async fn list(
     let selectors = selectors_for(label_selector, field_selector)?;
 
     let client = k8s::connect(paths, &target).await?;
-    let pods = k8s_pods::fetch_scope(client, &scope, &selectors)
-        .await
-        .map_err(|error| {
-            // The raw error is worth having when debugging, but it is not what
-            // the user needs to read; `-vv` brings it back.
-            tracing::debug!(%error, "listing pods failed");
-            let explanation = k8s::explain(&error, &label);
-            anyhow!(match k8s::Failure::of(&error) {
-                k8s::Failure::Forbidden => denied(&explanation, &scope),
-                _ => explanation,
-            })
-        })?;
+
+    // Concurrently, not in sequence: the two requests are independent, and the
+    // command should cost one round trip's worth of waiting rather than two.
+    let (pods, usage) = tokio::join!(
+        k8s_pods::fetch_scope(client.clone(), &scope, &selectors),
+        k8s_metrics::usage_by_pod(&client, &scope, &selectors),
+    );
+
+    let pods = pods.map_err(|error| {
+        // The raw error is worth having when debugging, but it is not what
+        // the user needs to read; `-vv` brings it back.
+        tracing::debug!(%error, "listing pods failed");
+        let explanation = k8s::explain(&error, &label);
+        anyhow!(match k8s::Failure::of(&error) {
+            k8s::Failure::Forbidden => denied(&explanation, &scope),
+            _ => explanation,
+        })
+    })?;
+
+    // Only the pod listing is fatal. Missing usage costs the user two columns
+    // and earns a footnote, because metrics-server is an add-on EKS does not
+    // install for you and a partial answer beats no answer.
+    let mut notes = Vec::new();
+    let usage = match usage {
+        Ok(usage) => Some(usage),
+        Err(error) => {
+            tracing::debug!(%error, "reading pod metrics failed");
+            notes.push(k8s_pods::usage_unavailable(&k8s_metrics::explain(
+                &error, &label,
+            )));
+            None
+        }
+    };
 
     // One instant for every row, so a slow listing cannot show two pods created
     // together with different ages.
     let now = Timestamp::now();
-    let mut rows: Vec<PodRow> = pods.iter().map(|pod| PodRow::from_pod(pod, now)).collect();
+    let mut rows: Vec<PodRow> = pods
+        .iter()
+        .map(|pod| {
+            // The join is by namespace and name, which is what makes the
+            // usage follow the selectors: only pods the API server already
+            // returned get a row, so only they can be given a figure.
+            let used = usage.as_ref().and_then(|samples| {
+                let namespace = pod.metadata.namespace.as_deref()?;
+                let name = pod.metadata.name.as_deref()?;
+                samples
+                    .get(&(namespace.to_owned(), name.to_owned()))
+                    .copied()
+            });
+            PodRow::from_pod(pod, used, now)
+        })
+        .collect();
     // Namespace first, then name: the order the NAMESPACE column implies, and
     // the one `kubectl get pods -A` uses.
     rows.sort_by(|a, b| (&a.namespace, &a.name).cmp(&(&b.namespace, &b.name)));
 
-    Ok(k8s_pods::render(&rows, &label, &scope, &selectors))
+    Ok(k8s_pods::render(&rows, &label, &scope, &selectors, &notes))
 }
 
 /// Validate the label and field selectors, before any network call.
