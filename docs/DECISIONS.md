@@ -327,3 +327,49 @@ Usage that cannot be read stays `None` rather than folding to zero, unlike a
 missing container request — which really is zero, because a container that asked
 for nothing has asked for nothing. A node with no usage reading is a node we have
 not heard from, and drawing that as an idle machine would be an invention.
+
+### 23. A pod's usage is all of its containers or none of them
+
+`metrics.k8s.io` reports node usage as one map and pod usage as a *list* of
+per-container maps, so `metrics::pod_usage` has to add the containers up. The
+decision is what to do when one of them cannot be read — absent, or a figure
+that will not parse.
+
+We give up on the whole pod for that resource. The alternative, summing the
+containers that did report, produces a number that is smaller than the truth and
+completely indistinguishable on screen from a correct one: `250m` beside a pod
+whose sidecar was not counted looks exactly like `250m`. A `-` is a worse-looking
+cell and a better answer, because it is the only one that cannot mislead. The
+resources are decided independently, so a pod missing a CPU reading still shows
+its memory.
+
+A pod with *no* containers in the sample is unknown for the same reason it is not
+zero elsewhere (decision 22): that is what metrics-server sends for a pod it has
+registered but not yet scraped, and a fresh pod drawn as idle is exactly the
+wrong answer during an incident.
+
+### 24. The pod metrics listing takes the label selector but not the field one
+
+`eks pods -l app=api` narrows the metrics request too — the aggregation layer
+filters on labels like any other API server, and on a large cluster that is worth
+the payload. `--field-selector` is deliberately not passed on: metrics-server
+does not implement field filtering, and the fields people select on
+(`status.phase`, `spec.nodeName`) are not on a `PodMetrics` in the first place.
+Sending one would ask a server to filter on something it cannot see.
+
+The columns still follow both selectors, because usage is *joined* onto the pod
+rows by namespace and name rather than being a listing in its own right. Only
+pods the API server already returned — after both selectors — have a row that a
+figure can land on. Extra samples in the response simply have nowhere to go.
+
+That join is keyed on namespace *and* name, not name alone: `kube-system/coredns`
+and `payments/coredns` are ordinary, and `-A` puts them in one table.
+
+### 25. Live usage is not fatal to `eks pods`
+
+Same rule as the node table (decision 21), for the same reason: metrics-server is
+an add-on EKS does not install for you, so its absence is the default rather than
+an error. The pod listing is the fatal request; a failed metrics request costs
+`CPU` and `MEMORY` and earns a footnote saying what to install. The two requests
+go out together in a `tokio::join!`, so the columns cost one round trip's worth of
+waiting rather than a second one.

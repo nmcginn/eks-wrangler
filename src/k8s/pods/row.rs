@@ -31,7 +31,9 @@ use k8s_openapi::api::core::v1::{
 use k8s_openapi::jiff::Timestamp;
 
 use crate::format;
+use crate::k8s::metrics::Usage;
 use crate::k8s::pods::is_sidecar;
+use crate::k8s::quantity::{self, Quantity};
 use crate::theme::Severity;
 
 /// Shown wherever the API server left a field empty, as elsewhere in the tool.
@@ -55,6 +57,14 @@ pub struct PodRow {
     pub severity: Severity,
     pub restarts: i32,
     pub age: String,
+    /// Cores the pod is actually burning, from metrics-server.
+    ///
+    /// `None` where there is no metrics-server, where it has not sampled this
+    /// pod yet, or where a container's figure would not parse — never a zero,
+    /// which would draw an idle pod. See `metrics::pod_usage`.
+    pub cpu_used: Option<Quantity>,
+    /// Memory the pod is actually holding, from metrics-server.
+    pub memory_used: Option<Quantity>,
     /// The node the pod landed on, or `-` while it is still unscheduled.
     pub node: String,
 }
@@ -64,8 +74,13 @@ impl PodRow {
     ///
     /// `now` is a parameter rather than a call to the clock so the age column
     /// is testable and so every row in one listing shares a single instant.
+    ///
+    /// `used` is what metrics-server last sampled for this pod, already summed
+    /// across its containers. `None` covers every reason there is no figure —
+    /// no metrics-server, or a pod it has not reached — and all of them render
+    /// the same way, because to a reader they mean the same thing.
     #[must_use]
-    pub fn from_pod(pod: &Pod, now: Timestamp) -> Self {
+    pub fn from_pod(pod: &Pod, used: Option<Usage>, now: Timestamp) -> Self {
         let derived = derive(pod);
 
         Self {
@@ -87,6 +102,8 @@ impl PodRow {
                 || UNKNOWN.to_owned(),
                 |created| format::human_duration(now.duration_since(created.0)),
             ),
+            cpu_used: used.and_then(|usage| usage.cpu),
+            memory_used: used.and_then(|usage| usage.memory),
             node: pod
                 .spec
                 .as_ref()
@@ -403,27 +420,53 @@ fn is_init_progress(initialising: bool, reason: &str) -> bool {
         })
 }
 
+/// Whether a listing has live usage worth two columns.
+///
+/// Same rule as the node table: a cluster with no metrics-server — the default
+/// on EKS, where it is not installed for you — gains no empty columns, and the
+/// footnote carries the news instead. `any` rather than `all`, so one pod the
+/// sampler has not reached does not cost everyone else their figures.
+fn shows_usage(rows: &[PodRow]) -> bool {
+    rows.iter()
+        .any(|row| row.cpu_used.is_some() || row.memory_used.is_some())
+}
+
+/// One usage cell: the figure, or `-` where there is not one.
+///
+/// No percentage, unlike the node table's: a pod has no allocatable of its own
+/// to be a share of. What it *asked* for would be the honest denominator, and
+/// that is a column of its own rather than something to smuggle in here.
+fn usage_cell(amount: Option<Quantity>, show: fn(Quantity) -> String) -> String {
+    amount.map_or_else(|| UNKNOWN.to_owned(), show)
+}
+
 /// Render the `eks pods` table.
 ///
 /// `cluster` is the human label used in the empty-list message, so a user who
 /// typed the wrong `--context` or the wrong namespace finds out from the answer
 /// rather than from a bare header.
+///
+/// `notes` are appended under the table — see [`usage_unavailable`]. They are
+/// dropped when there are no pods, where a footnote about missing columns would
+/// only be noise on top of a bigger problem.
 #[must_use]
 pub fn render(
     rows: &[PodRow],
     cluster: &str,
     scope: &super::Scope,
     selectors: &super::Selectors,
+    notes: &[String],
 ) -> String {
     if rows.is_empty() {
         return empty(cluster, scope, selectors);
     }
 
     let namespaced = scope.needs_namespace_column();
+    let usage = shows_usage(rows);
     let cells: Vec<Vec<String>> = rows
         .iter()
         .map(|row| {
-            let mut cells = Vec::with_capacity(7);
+            let mut cells = Vec::with_capacity(9);
             if namespaced {
                 cells.push(row.namespace.clone());
             }
@@ -432,19 +475,50 @@ pub fn render(
                 row.ready.clone(),
                 row.status.clone(),
                 row.restarts.to_string(),
-                row.age.clone(),
-                row.node.clone(),
             ]);
+            if usage {
+                cells.push(usage_cell(row.cpu_used, quantity::cpu));
+                cells.push(usage_cell(row.memory_used, quantity::memory));
+            }
+            cells.extend([row.age.clone(), row.node.clone()]);
             cells
         })
         .collect();
 
-    let mut headers = vec!["NAME", "READY", "STATUS", "RESTARTS", "AGE", "NODE"];
+    // CPU and MEMORY sit with STATUS and RESTARTS, the other columns about how
+    // the pod is doing, rather than at the end: a pod that is unhappy and one
+    // that is burning a core are usually the same investigation. AGE and NODE
+    // stay last, where every `kubectl get pods` leaves them.
+    let mut headers = vec!["NAME", "READY", "STATUS", "RESTARTS"];
+    if usage {
+        headers.extend(["CPU", "MEMORY"]);
+    }
+    headers.extend(["AGE", "NODE"]);
     if namespaced {
         headers.insert(0, "NAMESPACE");
     }
 
-    format::table(&headers, &cells)
+    let table = format::table(&headers, &cells);
+
+    if notes.is_empty() {
+        table
+    } else {
+        format!("{table}\n\n{}", notes.join("\n\n"))
+    }
+}
+
+/// The footnote shown when there is no live usage to put in a column.
+///
+/// The columns are absent rather than empty in this case, so the note has to
+/// say what is missing — otherwise a perfectly ordinary table silently answers
+/// a question the user thought they had asked. Worded like the node table's for
+/// the same reason it looks the same: it is the same failure.
+///
+/// `explanation` is `k8s::metrics::explain`'s sentence, which for the usual
+/// cause says what to install.
+#[must_use]
+pub fn usage_unavailable(explanation: &str) -> String {
+    format!("CPU and MEMORY are not shown because live usage could not be read.\n{explanation}")
 }
 
 /// What to say instead of an empty table.
@@ -605,7 +679,7 @@ mod tests {
 
     #[test]
     fn a_healthy_pod_reads_as_running_and_fully_ready() {
-        let row = PodRow::from_pod(&healthy(), now());
+        let row = PodRow::from_pod(&healthy(), None, now());
 
         assert_eq!(row.namespace, "payments");
         assert_eq!(row.name, "api-7c9f");
@@ -638,7 +712,7 @@ mod tests {
             },
         );
 
-        let row = PodRow::from_pod(&pod, now());
+        let row = PodRow::from_pod(&pod, None, now());
         assert_eq!(row.status, "CrashLoopBackOff");
         assert_eq!(row.ready, "0/1");
         assert_eq!(row.restarts, 7);
@@ -650,7 +724,7 @@ mod tests {
         let mut terminating = healthy();
         terminating.metadata.deletion_timestamp = Some(ago(1));
 
-        let row = PodRow::from_pod(&terminating, now());
+        let row = PodRow::from_pod(&terminating, None, now());
         assert_eq!(row.status, "Terminating");
         // Deliberate and temporary — worth noticing during a drain, not alarming.
         assert_eq!(row.severity, Severity::Warn);
@@ -678,7 +752,7 @@ mod tests {
         );
         finished.metadata.deletion_timestamp = Some(ago(1));
 
-        assert_eq!(PodRow::from_pod(&finished, now()).status, "Completed");
+        assert_eq!(PodRow::from_pod(&finished, None, now()).status, "Completed");
     }
 
     #[test]
@@ -691,7 +765,7 @@ mod tests {
             status.reason = Some(NODE_LOST.to_owned());
         }
 
-        let row = PodRow::from_pod(&lost, now());
+        let row = PodRow::from_pod(&lost, None, now());
         assert_eq!(row.status, "Unknown");
         assert_eq!(row.severity, Severity::Unknown);
     }
@@ -716,7 +790,7 @@ mod tests {
             },
         );
 
-        let row = PodRow::from_pod(&pod, now());
+        let row = PodRow::from_pod(&pod, None, now());
         // `PodInitializing` is the kubelet saying "not started yet", so the
         // progress count is the news, not the reason.
         assert_eq!(row.status, "Init:0/2");
@@ -747,7 +821,7 @@ mod tests {
             },
         );
 
-        assert_eq!(PodRow::from_pod(&pod, now()).status, "Init:1/3");
+        assert_eq!(PodRow::from_pod(&pod, None, now()).status, "Init:1/3");
     }
 
     #[test]
@@ -773,7 +847,7 @@ mod tests {
                 },
             );
 
-            let row = PodRow::from_pod(&pod, now());
+            let row = PodRow::from_pod(&pod, None, now());
             assert_eq!(row.status, expected);
             // A named failure is a failure, unlike bare `Init:n/total`.
             assert_eq!(row.severity, Severity::Critical, "{expected}");
@@ -806,7 +880,7 @@ mod tests {
             },
         );
 
-        assert_eq!(PodRow::from_pod(&pod, now()).status, "Signal:9");
+        assert_eq!(PodRow::from_pod(&pod, None, now()).status, "Signal:9");
     }
 
     #[test]
@@ -828,7 +902,7 @@ mod tests {
             },
         );
 
-        let row = PodRow::from_pod(&pod, now());
+        let row = PodRow::from_pod(&pod, None, now());
         assert_eq!(row.status, "Completed");
         assert_eq!(row.ready, "0/1");
         // A job that did its work is good news, not a warning.
@@ -856,7 +930,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        assert_eq!(PodRow::from_pod(&not_ready, now()).status, "NotReady");
+        assert_eq!(PodRow::from_pod(&not_ready, None, now()).status, "NotReady");
 
         let ready = pod(
             spec,
@@ -867,7 +941,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        assert_eq!(PodRow::from_pod(&ready, now()).status, "Running");
+        assert_eq!(PodRow::from_pod(&ready, None, now()).status, "Running");
     }
 
     #[test]
@@ -896,7 +970,7 @@ mod tests {
             },
         );
 
-        let row = PodRow::from_pod(&pod, now());
+        let row = PodRow::from_pod(&pod, None, now());
         assert_eq!(row.status, "Running");
         // Two of two: the app container and the sidecar.
         assert_eq!(row.ready, "2/2");
@@ -927,7 +1001,7 @@ mod tests {
         );
 
         assert_eq!(
-            PodRow::from_pod(&pod, now()).status,
+            PodRow::from_pod(&pod, None, now()).status,
             "CreateContainerConfigError"
         );
     }
@@ -955,7 +1029,7 @@ mod tests {
             },
         );
 
-        let row = PodRow::from_pod(&pod, now());
+        let row = PodRow::from_pod(&pod, None, now());
         // The crashing sidecar is still what is wrong, and still what is named.
         assert_eq!(row.status, "Init:CrashLoopBackOff");
         // But the app container is up, and one of two is honest.
@@ -984,7 +1058,7 @@ mod tests {
             },
         );
 
-        let row = PodRow::from_pod(&pod, now());
+        let row = PodRow::from_pod(&pod, None, now());
         assert_eq!(row.status, "SchedulingGated");
         assert_eq!(row.severity, Severity::Warn);
     }
@@ -1004,7 +1078,7 @@ mod tests {
             },
         );
 
-        let row = PodRow::from_pod(&pod, now());
+        let row = PodRow::from_pod(&pod, None, now());
         assert_eq!(row.status, "Evicted");
         assert_eq!(row.severity, Severity::Critical);
     }
@@ -1023,7 +1097,7 @@ mod tests {
             },
         );
 
-        let row = PodRow::from_pod(&pod, now());
+        let row = PodRow::from_pod(&pod, None, now());
         assert_eq!(row.node, "-");
         assert_eq!(row.status, "Pending");
         assert_eq!(row.ready, "0/1");
@@ -1034,7 +1108,7 @@ mod tests {
     fn a_pod_with_nothing_filled_in_still_produces_a_row() {
         // Every field under `status` is optional, and a pod caught between
         // admission and its first kubelet report really can arrive like this.
-        let row = PodRow::from_pod(&Pod::default(), now());
+        let row = PodRow::from_pod(&Pod::default(), None, now());
 
         assert_eq!(row.namespace, "-");
         assert_eq!(row.name, "-");
@@ -1064,7 +1138,7 @@ mod tests {
             },
         );
 
-        let row = PodRow::from_pod(&pod, now());
+        let row = PodRow::from_pod(&pod, None, now());
         assert_eq!(row.ready, "1/2");
         assert_eq!(row.status, "Running");
         assert_eq!(row.severity, Severity::Warn);
@@ -1091,8 +1165,8 @@ mod tests {
         other.metadata.creation_timestamp = Some(ago(3));
 
         vec![
-            PodRow::from_pod(&healthy(), now()),
-            PodRow::from_pod(&other, now()),
+            PodRow::from_pod(&healthy(), None, now()),
+            PodRow::from_pod(&other, None, now()),
         ]
     }
 
@@ -1103,6 +1177,7 @@ mod tests {
             "prod (us-east-1)",
             &Scope::Namespace("payments".to_owned()),
             &unfiltered(),
+            &[],
         );
 
         assert_eq!(
@@ -1117,7 +1192,7 @@ mod tests {
     fn a_cluster_wide_listing_leads_with_the_namespace() {
         // Without it, two pods called `api-7c9f` in different namespaces are
         // indistinguishable.
-        let rendered = render(&rows(), "prod (us-east-1)", &Scope::All, &unfiltered());
+        let rendered = render(&rows(), "prod (us-east-1)", &Scope::All, &unfiltered(), &[]);
 
         assert_eq!(
             rendered,
@@ -1134,6 +1209,7 @@ mod tests {
             "prod (us-east-1)",
             &Scope::Namespace("payments".to_owned()),
             &unfiltered(),
+            &[],
         );
 
         assert!(message.contains("prod (us-east-1)"), "{message}");
@@ -1144,7 +1220,7 @@ mod tests {
 
     #[test]
     fn an_empty_cluster_wide_listing_suggests_checking_the_cluster() {
-        let message = render(&[], "prod (us-east-1)", &Scope::All, &unfiltered());
+        let message = render(&[], "prod (us-east-1)", &Scope::All, &unfiltered(), &[]);
 
         assert!(message.contains("prod (us-east-1)"), "{message}");
         assert!(message.contains("eks contexts"), "{message}");
@@ -1164,6 +1240,7 @@ mod tests {
             "prod (us-east-1)",
             &Scope::Namespace("payments".to_owned()),
             &filtered,
+            &[],
         );
 
         assert!(message.contains("prod (us-east-1)"), "{message}");
@@ -1178,12 +1255,204 @@ mod tests {
             label: Some("app=api".to_owned()),
             field: Some("status.phase!=Running".to_owned()),
         };
-        let message = render(&[], "prod (us-east-1)", &Scope::All, &filtered);
+        let message = render(&[], "prod (us-east-1)", &Scope::All, &filtered, &[]);
 
         assert!(message.contains("label selector `app=api`"), "{message}");
         assert!(
             message.contains("field selector `status.phase!=Running`"),
             "{message}"
         );
+    }
+
+    /// A `Usage` as metrics-server would have summed it for one pod.
+    fn used(cpu: &str, memory: &str) -> Usage {
+        Usage {
+            cpu: Quantity::parse(cpu).ok(),
+            memory: Quantity::parse(memory).ok(),
+        }
+    }
+
+    /// The same two rows as [`rows`], with live usage on both.
+    fn sampled_rows() -> Vec<PodRow> {
+        let mut other = healthy();
+        other.metadata.name = Some("checkout-5d4b".to_owned());
+        other.metadata.namespace = Some("storefront".to_owned());
+        other.metadata.creation_timestamp = Some(ago(3));
+
+        vec![
+            PodRow::from_pod(&healthy(), Some(used("250m", "512Mi")), now()),
+            PodRow::from_pod(&other, Some(used("1200m", "3Gi")), now()),
+        ]
+    }
+
+    #[test]
+    fn a_sampled_pod_carries_its_usage_onto_the_row() {
+        let row = PodRow::from_pod(&healthy(), Some(used("250m", "512Mi")), now());
+
+        assert_eq!(row.cpu_used, Some(Quantity::parse("250m").unwrap()));
+        assert_eq!(row.memory_used, Some(Quantity::parse("512Mi").unwrap()));
+    }
+
+    #[test]
+    fn a_pod_with_no_sample_has_no_usage_rather_than_zero() {
+        // The whole reason these are `Option`: a pod nothing was sampled for
+        // must not read as a pod doing nothing.
+        let row = PodRow::from_pod(&healthy(), None, now());
+
+        assert_eq!(row.cpu_used, None);
+        assert_eq!(row.memory_used, None);
+
+        // Half a sample is the same story for the half that is missing.
+        let half = PodRow::from_pod(
+            &healthy(),
+            Some(Usage {
+                cpu: Quantity::parse("250m").ok(),
+                memory: None,
+            }),
+            now(),
+        );
+        assert_eq!(half.cpu_used, Some(Quantity::parse("250m").unwrap()));
+        assert_eq!(half.memory_used, None);
+    }
+
+    #[test]
+    fn usage_columns_sit_between_the_restarts_and_the_age() {
+        let rendered = render(
+            &sampled_rows(),
+            "prod (us-east-1)",
+            &Scope::Namespace("payments".to_owned()),
+            &unfiltered(),
+            &[],
+        );
+
+        assert_eq!(
+            rendered,
+            "NAME           READY  STATUS   RESTARTS  CPU    MEMORY  AGE  NODE\n\
+             api-7c9f       1/1    Running  0         250m   512Mi   90m  ip-10-0-1-9.ec2.internal\n\
+             checkout-5d4b  1/1    Running  0         1200m  3Gi     3m   ip-10-0-1-9.ec2.internal"
+        );
+    }
+
+    #[test]
+    fn a_cluster_wide_listing_keeps_the_namespace_first_with_usage_too() {
+        let rendered = render(
+            &sampled_rows(),
+            "prod (us-east-1)",
+            &Scope::All,
+            &unfiltered(),
+            &[],
+        );
+
+        assert!(
+            rendered.starts_with("NAMESPACE   NAME           READY  STATUS   RESTARTS  CPU"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn a_cluster_with_no_metrics_server_gains_no_empty_columns() {
+        // Two blank columns on every EKS cluster that has not installed the
+        // add-on would be a worse table than the one we have today.
+        let rendered = render(
+            &rows(),
+            "prod (us-east-1)",
+            &Scope::Namespace("payments".to_owned()),
+            &unfiltered(),
+            &[],
+        );
+
+        assert!(!rendered.contains("CPU"), "{rendered}");
+        assert!(!rendered.contains("MEMORY"), "{rendered}");
+    }
+
+    #[test]
+    fn one_unsampled_pod_does_not_cost_the_others_their_columns() {
+        // A pod started seconds ago has not been scraped yet; that is a `-` in
+        // its own row, not a reason to hide everyone else's figures.
+        let mut some = sampled_rows();
+        some[1].cpu_used = None;
+        some[1].memory_used = None;
+
+        let rendered = render(
+            &some,
+            "prod (us-east-1)",
+            &Scope::Namespace("payments".to_owned()),
+            &unfiltered(),
+            &[],
+        );
+
+        assert!(rendered.contains("CPU"), "{rendered}");
+        // The column narrows to the one figure left in it; what matters is that
+        // the unsampled row reads `-` in both halves rather than `0`.
+        assert!(
+            rendered.contains("checkout-5d4b  1/1    Running  0         -     -"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn half_a_sample_shows_the_half_it_has() {
+        let mut half = sampled_rows();
+        half[0].memory_used = None;
+
+        let rendered = render(
+            &half,
+            "prod (us-east-1)",
+            &Scope::Namespace("payments".to_owned()),
+            &unfiltered(),
+            &[],
+        );
+
+        assert!(
+            rendered.contains("api-7c9f       1/1    Running  0         250m   -  "),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn a_footnote_is_appended_under_the_table() {
+        let rendered = render(
+            &rows(),
+            "prod (us-east-1)",
+            &Scope::Namespace("payments".to_owned()),
+            &unfiltered(),
+            &[usage_unavailable(
+                "prod (us-east-1) has no metrics.k8s.io API.",
+            )],
+        );
+
+        assert!(rendered.contains("api-7c9f"), "{rendered}");
+        assert!(
+            rendered.contains("\n\nCPU and MEMORY are not shown"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("no metrics.k8s.io API"), "{rendered}");
+    }
+
+    #[test]
+    fn a_footnote_is_dropped_when_there_are_no_pods_to_annotate() {
+        // "Two columns are missing" is noise on top of "there is nothing here",
+        // and the empty-listing message is the one worth reading.
+        let message = render(
+            &[],
+            "prod (us-east-1)",
+            &Scope::Namespace("payments".to_owned()),
+            &unfiltered(),
+            &[usage_unavailable(
+                "prod (us-east-1) has no metrics.k8s.io API.",
+            )],
+        );
+
+        assert!(!message.contains("CPU and MEMORY"), "{message}");
+        assert!(message.contains("no pods in namespace"), "{message}");
+    }
+
+    #[test]
+    fn the_usage_footnote_says_what_is_missing_and_why() {
+        let note = usage_unavailable("prod (us-east-1) has no metrics.k8s.io API.");
+
+        assert!(note.contains("CPU and MEMORY"), "{note}");
+        assert!(note.contains("not shown"), "{note}");
+        assert!(note.contains("no metrics.k8s.io API"), "{note}");
     }
 }

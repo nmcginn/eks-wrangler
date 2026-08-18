@@ -32,7 +32,7 @@ use crate::k8s::quantity::Quantity;
 
 pub mod row;
 
-pub use row::{PodRow, render};
+pub use row::{PodRow, render, usage_unavailable};
 
 /// Pods that have finished linger in the API server until something collects
 /// them, and they hold nothing on the node. Excluding them server-side keeps a

@@ -109,6 +109,15 @@ in one shape, because they answer different questions against the same
 denominator and neither should be able to disagree with the other about what
 counts as hot.
 
+The pod half of that API is the same idea in a different shape. `PodMetrics` is
+namespaced, so the listing follows `--namespace`/`--all-namespaces` like the pod
+listing beside it, and it reports per *container* rather than per object, so
+`metrics::pod_usage` sums the containers — all of them or none, since a partial
+sum reads on screen exactly like a complete one. Usage is joined onto the rows by
+namespace and name in the command layer, which is also what makes the columns
+follow the selectors: only pods the API server already returned have a row to be
+given a figure.
+
 Resource quantities get their own hop: the API server reports capacity as
 strings in a small grammar (`3920m`, `7134420Ki`, `1e3`), and `k8s::quantity`
 turns those into numbers before anything formats or divides them. It is a pure
