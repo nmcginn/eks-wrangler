@@ -265,3 +265,65 @@ Two smaller calls:
   nothing" is what the user meant. An empty *filtered* listing says which
   selector emptied it, so a live namespace a filter cleared does not read like an
   empty one.
+
+### 20. `NodeMetrics` is hand-written, and the fetch sits behind a trait
+
+`metrics.k8s.io` is not part of Kubernetes. It is an aggregated API served by
+metrics-server, an optional add-on that EKS does not install for you, and
+`k8s-openapi` only generates the core API — so there is no `NodeMetrics` type to
+import. We write one: a serde struct plus a `kube::Resource` impl whose group,
+version, and plural are the whole content of the decision, because they are what
+put `/apis/metrics.k8s.io/v1beta1/nodes` on the wire. Get them wrong and every
+cluster looks like it has no metrics-server, which is why there is a test that
+asserts the URL rather than trusting the four strings to be read carefully.
+
+Only `metadata` and `usage` are modelled. `serde` ignores the rest by default, so
+a newer metrics-server adding a field cannot break a listing.
+
+Fetching goes behind a `Source` trait. Not for indirection's sake — there is
+exactly one real implementation, on `Client` — but because the answers worth
+testing are ones a cluster will not give on demand: no metrics-server at all, a
+node the sampler has not reached, a reading that will not parse. A fake source
+makes each of those a fixture. The trait returns `impl Future + Send` rather than
+using `async fn`, so the future can go into the `tokio::join!` beside the node
+and pod listings.
+
+### 21. Absent usage costs two columns, not two columns of dashes
+
+A failed *pod* listing leaves `CPU REQ` and `MEM REQ` reading `-` (decision 16).
+A missing metrics API drops `CPU USE` and `MEM USE` from the table entirely.
+
+The asymmetry is about which case is normal. A pod listing failing is unusual —
+a specific RBAC shape — so the columns stay and say they could not be filled.
+metrics-server being absent is the *default* on a fresh EKS cluster, and a
+default that permanently adds two dead columns to everyone's node table is a tax
+on the common case to explain the uncommon one. The columns appear when there is
+something to put in them, and a footnote naming what to install carries the news
+otherwise.
+
+The columns are all-or-nothing across a listing, not per row: one node the
+sampler has not reached yet reads as `-` beside its neighbours rather than
+collapsing the columns for everybody. So the decision is `any`, and it is a pure
+function over the rows.
+
+### 22. Usage and requests share one type, and one denominator
+
+`nodes::Share` — what was `Requested` — now carries both what the pods on a node
+have booked and what the node is actually burning. One type rather than two
+near-identical ones, because the thing that would drift if they were separate is
+the *classification*: `Severity::from_utilisation` deciding that 90% is alarming
+has to mean the same thing in both columns or the table teaches the user nothing.
+
+Both divide by **allocatable**, not capacity. For requests that is simply
+correct — allocatable is what the scheduler hands out. For usage it is a choice:
+a container can and does burn into the kubelet's reservation, so usage can read
+above 100%, and it is measured against a number that is not a hard ceiling. It is
+still the right denominator here, because the two columns sit side by side and a
+reader comparing 80% booked against 40% used is comparing fractions of the same
+thing. A utilisation *bar* asks a different question and wants capacity
+underneath it; that is on the roadmap rather than smuggled in here.
+
+Usage that cannot be read stays `None` rather than folding to zero, unlike a
+missing container request — which really is zero, because a container that asked
+for nothing has asked for nothing. A node with no usage reading is a node we have
+not heard from, and drawing that as an idle machine would be an invention.

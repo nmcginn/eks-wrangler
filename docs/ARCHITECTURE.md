@@ -11,7 +11,8 @@ src/
   cluster.rs           Turning kubeconfig entries into human-facing views.
   format.rs            Ages and aligned tables — pure string formatting.
   theme.rs             The entire colour palette and severity thresholds.
-  k8s/                 The Kubernetes client, quantities, selectors, nodes, and pods.
+  k8s/                 The Kubernetes client, quantities, selectors, nodes,
+                       pods, and metrics.
   commands/            One module per user-facing command.
   ui/                  The interactive dashboard.
 ```
@@ -54,17 +55,20 @@ Live cluster data enters as a second pipeline, joined to the first by the
 selected context:
 
 ```
-ClusterView ──► k8s::connect ──► Client ──┬─► nodes::fetch ─┐
- (choose)         (build)                 │     (I/O)       ├─► NodeRow ──► table
-                                          └─► pods::fetch ──┘  (present)  (render)
+                                          ┌─► nodes::fetch ────┐
+ClusterView ──► k8s::connect ──► Client ──┼─► pods::fetch ─────┼─► NodeRow ──► table
+ (choose)         (build)                 └─► metrics::usage ──┘  (present)  (render)
                                                 (I/O)
 ```
 
-The two listings are issued concurrently — `eks nodes` should cost one round
-trip's wait, not two — and they fail independently. A node listing that fails
-ends the command; a pod listing that fails only empties the request columns and
-adds a footnote saying why, because a role that grants nodes but not pods across
-every namespace is a normal thing to have.
+The three requests are issued concurrently — `eks nodes` should cost one round
+trip's wait, not three — and they fail independently. A node listing that fails
+ends the command. The other two only cost columns: a failed pod listing empties
+the request columns, and an absent metrics API drops the usage columns
+altogether, each adding a footnote saying why. Both failures are ordinary rather
+than exceptional. A role that grants nodes but not pods across every namespace
+is a normal thing to have, and metrics-server is an add-on that EKS does not
+install for you, so on a fresh cluster there is simply nothing to show.
 
 `NodeRow::from_node` takes an explicit `now`, so ages are computed rather than
 observed and every row in a listing shares one instant.
@@ -91,6 +95,19 @@ canonical string, rejecting a malformed one — with the offending text quoted �
 before `eks pods` connects. It is another pure parser with no Kubernetes types
 in its signature, so the whole grammar is a fixture table; the command layer's
 `selectors_for` is where that validation is wired ahead of any request.
+
+Live usage is a fourth computation on that pipeline, and the one that needed a
+type the API does not give us. `metrics.k8s.io` is an aggregated API served by an
+optional add-on, so `k8s-openapi` — which only generates the core API — has no
+`NodeMetrics`. `k8s::metrics` hand-writes it: a serde struct plus a
+`kube::Resource` impl whose group, version, and plural are what put
+`/apis/metrics.k8s.io/v1beta1/nodes` on the wire. Fetching sits behind the
+`Source` trait, so the paths worth testing — no metrics-server at all, a node the
+sampler has not reached, a reading that will not parse — are fixtures rather than
+a cluster somebody has to break. `nodes::Share` then carries requests and usage
+in one shape, because they answer different questions against the same
+denominator and neither should be able to disagree with the other about what
+counts as hot.
 
 Resource quantities get their own hop: the API server reports capacity as
 strings in a small grammar (`3920m`, `7134420Ki`, `1e3`), and `k8s::quantity`
@@ -131,6 +148,13 @@ Errors from the cluster get one extra step: `k8s::client::explain` turns a
 `kube::Error` into a sentence naming the cluster and what to do next, and the
 raw error goes to `tracing::debug` instead of the user's terminal. It is a pure
 function over a classified failure, so each message is asserted on in a test.
+
+`k8s::metrics::explain` is the one place that wraps it. Two failures dominate the
+metrics endpoint and a core-API caller never sees either — a `404` because
+nobody registered the API group, and a `503` because metrics-server is up but has
+not finished its first scrape — and both have concrete advice behind them.
+Everything else falls straight through to the shared explanation rather than
+growing a second vocabulary for an expired SSO session.
 
 `unwrap`, `expect`, and `panic!` are denied by lint in library code. Ask what
 should happen instead and return a `Result` saying so.

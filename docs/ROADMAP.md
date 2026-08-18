@@ -44,10 +44,19 @@ cluster.
   *Acceptance:* phase derivation matches `kubectl` for the awkward cases —
   `CrashLoopBackOff`, `Terminating`, `Init:0/2`, `Completed`; each has a test.
 
-- [ ] **metrics-server integration.**
-  Live CPU/memory usage for nodes and pods where `metrics.k8s.io` is available.
+- [x] **metrics-server integration for nodes.**
+  Live CPU/memory usage per node where `metrics.k8s.io` is available.
   *Acceptance:* absent metrics-server degrades to showing requests with a note,
   never an error; the API call is behind a trait so it can be faked in tests.
+
+- [ ] **metrics-server integration for pods.**
+  The other half of the task above, which was two PRs' worth. `eks pods` should
+  gain `CPU` and `MEMORY` columns from `metrics.k8s.io/v1beta1/pods`, which is a
+  namespaced listing summing per-container usage — a different shape from the
+  node one, and the reason the two split.
+  *Acceptance:* usage is summed across a pod's containers as a tested pure
+  function; the columns follow `--namespace`/`--all-namespaces` and the existing
+  selectors; a pod metrics-server has not sampled reads as unknown, not zero.
 
 ### Follow-ups from the pod listing
 
@@ -80,6 +89,25 @@ cluster.
   *Acceptance:* the column set is a pure function over the flag, tested both
   ways; the default table is unchanged to the byte.
 
+### Follow-ups from the usage columns
+
+- [ ] **Usage against capacity for the dashboard's bars.**
+  `nodes::Share` divides usage by *allocatable*, which is the right denominator
+  for "will another pod fit". A utilisation bar is asking a different question —
+  "is this machine busy" — and wants capacity underneath it, so a node at 100%
+  of allocatable does not draw as a full bar when a tenth of the machine is
+  still kubelet reserve.
+  *Acceptance:* the choice of denominator is explicit at the call site rather
+  than baked into `Share`; both readings are tested on one fixture node.
+
+- [ ] **Show the sampling window beside the usage columns.**
+  metrics-server reports a `window` — typically `20s` — over which each sample
+  was averaged, and a usage figure with no window behind it cannot be told apart
+  from an instantaneous reading. It also goes stale silently when the scraper
+  stops.
+  *Acceptance:* the age of the oldest sample in the listing is shown once, under
+  the table; a sample older than a couple of windows says so.
+
 ### Follow-ups from the capacity columns
 
 - [ ] **Extended resources in the node table.**
@@ -90,9 +118,10 @@ cluster.
   resource, so a CPU-only cluster gains no empty columns.
 
 - [ ] **A narrow mode for the node table.**
-  `eks nodes` is now eight columns and around 120 characters wide, which wraps
-  on an 80-column terminal. The request columns made this worse, and they are
-  also the ones most worth keeping when space is short.
+  `eks nodes` is now ten columns and around 140 characters wide on a cluster
+  with metrics-server, which wraps on an 80-column terminal. The request and
+  usage columns made this worse, and they are also the ones most worth keeping
+  when space is short.
   *Acceptance:* columns are dropped in a documented order to fit the terminal;
   the choice is a pure function over an available width, tested at 80, 100, and
   1 column.
@@ -116,8 +145,8 @@ cluster.
   listing uses; the two listings still run concurrently.
 
 - [ ] **Severity colour in the CLI table.**
-  `Requested::severity` classifies each percentage on the shared thresholds, and
-  the CLI table then prints it in plain text. A node at 97% deserves to look
+  `nodes::Share::severity` classifies each percentage on the shared thresholds,
+  and the CLI table then prints it in plain text. A node at 97% deserves to look
   like it, at least when stdout is a terminal. `PodRow::severity` is now in the
   same position — a `CrashLoopBackOff` reads exactly like a `Running` — so one
   change should light up both tables.
@@ -237,6 +266,15 @@ cluster.
 ---
 
 ## Done
+
+- **metrics-server integration for nodes** (2026-08-18) — `eks nodes` gained
+  `CPU USE` and `MEM USE` columns from `metrics.k8s.io/v1beta1`, beside the
+  request columns they should be read against. `k8s::metrics` hand-writes the
+  `NodeMetrics` type `k8s-openapi` does not generate and puts the fetch behind a
+  `Source` trait, so the case that matters — no metrics-server, which is every
+  fresh EKS cluster — is a fixture rather than a cluster to uninstall from. That
+  case costs two columns and a footnote naming what to install, never the table.
+  The pod half of the original task was split into its own entry above.
 
 - **Label and field selectors for `eks pods`** (2026-08-18) — `-l` and
   `--field-selector` push filtering onto the API server. `k8s::selector`

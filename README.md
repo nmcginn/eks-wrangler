@@ -55,9 +55,9 @@ cluster name:
 
 ```
 $ eks nodes --context staging
-NAME                         STATUS                       VERSION              CPU      CPU REQ      MEMORY         MEM REQ     AGE
-ip-10-0-1-9.ec2.internal     Ready                        v1.33.1-eks-1a2b3c4  3920m/4  1500m (38%)  14.8Gi/15.6Gi  6Gi (41%)   12d
-ip-10-0-11-200.ec2.internal  NotReady,SchedulingDisabled  v1.32.9-eks-9f8e7d6  3920m/4  3800m (97%)  14.8Gi/15.6Gi  15Gi (96%)  10h
+NAME                         STATUS                       VERSION              CPU      CPU REQ      CPU USE      MEMORY         MEM REQ     MEM USE      AGE
+ip-10-0-1-9.ec2.internal     Ready                        v1.33.1-eks-1a2b3c4  3920m/4  1500m (38%)  392m (10%)   14.8Gi/15.6Gi  6Gi (41%)   3.7Gi (25%)  12d
+ip-10-0-11-200.ec2.internal  NotReady,SchedulingDisabled  v1.32.9-eks-9f8e7d6  3920m/4  3800m (97%)  1200m (31%)  14.8Gi/15.6Gi  15Gi (96%)  4Gi (27%)    10h
 ```
 
 `CPU` and `MEMORY` are what the node has: allocatable — what pods may actually
@@ -65,6 +65,17 @@ ask for — over total capacity, the gap between them being what the kubelet
 reserves for itself. `CPU REQ` and `MEM REQ` are what the pods already on the
 node have booked, and what share of allocatable that is. The percentage, not the
 capacity, is what decides whether the next pod schedules.
+
+`CPU USE` and `MEM USE` are what the node is actually doing, sampled from
+metrics-server. They answer a different question from the request columns, and
+the gap between the pair is the interesting part: the second node above has
+booked 97% of its CPU and is using a third of it, which is a node full of
+over-generous requests rather than a node that is busy.
+
+Those two columns need the `metrics.k8s.io` API, which comes from
+[metrics-server](https://github.com/kubernetes-sigs/metrics-server) — an add-on
+EKS does not install for you. Without it the columns are simply absent and a note
+under the table says so; the rest of the listing is unaffected.
 
 `eks pods` lists one namespace — the context's own, unless `-n` names another —
 or every namespace with `-A`:
