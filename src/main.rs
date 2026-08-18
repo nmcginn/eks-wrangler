@@ -10,7 +10,7 @@ use clap::Parser;
 use tracing_subscriber::EnvFilter;
 
 use eks::cli::{Cli, Command, GlobalArgs};
-use eks::commands::{self, contexts, nodes};
+use eks::commands::{self, contexts, nodes, pods};
 use eks::kubeconfig::KubeConfig;
 use eks::ui::{self, App};
 
@@ -44,6 +44,17 @@ fn run(cli: Cli) -> Result<()> {
             // itself so the filesystem-only commands stay as cheap as they are.
             let output =
                 commands::block_on(nodes::list(&config, &paths, cli.global.context.as_deref()))?;
+            print_line(&output);
+            Ok(())
+        }
+        Command::Pods { all_namespaces } => {
+            let output = commands::block_on(pods::list(
+                &config,
+                &paths,
+                cli.global.context.as_deref(),
+                cli.global.namespace.as_deref(),
+                all_namespaces,
+            ))?;
             print_line(&output);
             Ok(())
         }

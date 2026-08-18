@@ -76,6 +76,15 @@ functions over `Pod` values, so the awkward parts — init containers, sidecars,
 pod overhead, a pod that has finished — are fixtures rather than a cluster you
 have to arrange.
 
+`eks pods` is a third computation on the same pipeline, and the one where the
+computation/rendering split earns the most. The `STATUS` column `kubectl` prints
+exists nowhere in the API: `status.phase` holds one of five words and none of
+them is `CrashLoopBackOff`, `Init:0/2`, `Terminating`, or `Completed`. Those are
+derived from the container statuses underneath, by an order-dependent walk with
+a dozen special cases. `pods::row` reimplements that walk as a pure function over
+a `Pod` and an explicit `now`, so each case is a fixture — including the ones
+nobody can arrange on demand, like a pod on a node that stopped answering.
+
 Resource quantities get their own hop: the API server reports capacity as
 strings in a small grammar (`3920m`, `7134420Ki`, `1e3`), and `k8s::quantity`
 turns those into numbers before anything formats or divides them. It is a pure

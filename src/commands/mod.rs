@@ -10,6 +10,7 @@ use anyhow::{Context as _, Result};
 
 pub mod contexts;
 pub mod nodes;
+pub mod pods;
 
 /// Run one async command to completion.
 ///

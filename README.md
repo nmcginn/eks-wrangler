@@ -29,6 +29,7 @@ kubeconfig — `aws eks update-kubeconfig --name <cluster>` if you do not have o
 eks                     # open the dashboard
 eks contexts            # list available clusters
 eks nodes               # list the nodes of the active cluster
+eks pods -A             # list pods across every namespace
 eks use staging         # switch cluster
 eks current             # show the active cluster
 ```
@@ -61,6 +62,23 @@ ask for — over total capacity, the gap between them being what the kubelet
 reserves for itself. `CPU REQ` and `MEM REQ` are what the pods already on the
 node have booked, and what share of allocatable that is. The percentage, not the
 capacity, is what decides whether the next pod schedules.
+
+`eks pods` lists one namespace — the context's own, unless `-n` names another —
+or every namespace with `-A`:
+
+```
+$ eks pods -A
+NAMESPACE    NAME                     READY  STATUS             RESTARTS  AGE  NODE
+kube-system  aws-node-4kd9p           2/2    Running            0         12d  ip-10-0-1-9.ec2.internal
+payments     api-7c9f6d4b8-x2vnq      1/1    Running            0         3h   ip-10-0-1-9.ec2.internal
+payments     ledger-migrate-2hq4t     0/1    Init:1/2           0         42s  ip-10-0-11-200.ec2.internal
+payments     reconcile-5d4b9-nzk8p    0/1    CrashLoopBackOff   9         26m  ip-10-0-11-200.ec2.internal
+storefront   checkout-6f7c8d9-pl4mn   0/1    Completed          0         2d   ip-10-0-1-9.ec2.internal
+```
+
+`STATUS` is the same derived word `kubectl get pods` shows, not the raw
+`status.phase` — none of `CrashLoopBackOff`, `Init:1/2`, `Terminating`, or
+`Completed` exists in the API, and they are the ones worth reading.
 
 Credentials come from the kubeconfig context itself, so whatever works for
 `kubectl` works here. When they have expired, `eks` says so and tells you how to
