@@ -83,13 +83,49 @@ impl Scope {
 /// a node, so it filters the terminal phases out server-side. A person reading
 /// `eks pods` wants to see the `Completed` Job that ran an hour ago and the
 /// `Evicted` pod that explains their morning, so nothing is filtered here.
-pub async fn fetch_scope(client: Client, scope: &Scope) -> Result<Vec<Pod>, kube::Error> {
+pub async fn fetch_scope(
+    client: Client,
+    scope: &Scope,
+    selectors: &Selectors,
+) -> Result<Vec<Pod>, kube::Error> {
     let api: Api<Pod> = match scope {
         Scope::Namespace(name) => Api::namespaced(client, name),
         Scope::All => Api::all(client),
     };
 
-    Ok(api.list(&ListParams::default()).await?.items)
+    Ok(api.list(&selectors.to_params()).await?.items)
+}
+
+/// Server-side selectors for a pod listing, already validated.
+///
+/// Carried as canonical selector strings rather than raw input so the only
+/// thing that reaches the API server is a selector [`crate::k8s::selector`] has
+/// vouched for. Both are `None` by default, which lists everything in scope.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Selectors {
+    /// A label selector, e.g. `app=api,tier notin (canary)`.
+    pub label: Option<String>,
+    /// A field selector, e.g. `status.phase!=Running`.
+    pub field: Option<String>,
+}
+
+impl Selectors {
+    /// Turn the selectors into the list parameters `kube` sends.
+    ///
+    /// A `None` leaves that selector unset — an empty string would be sent as
+    /// an empty selector, which is not quite the same thing to every server —
+    /// so the two are kept distinct all the way to the wire.
+    #[must_use]
+    pub fn to_params(&self) -> ListParams {
+        let mut params = ListParams::default();
+        if let Some(label) = &self.label {
+            params = params.labels(label);
+        }
+        if let Some(field) = &self.field {
+            params = params.fields(field);
+        }
+        params
+    }
 }
 
 /// CPU and memory asked for, as a pair, so the two are never added up in

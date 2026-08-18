@@ -101,6 +101,14 @@ pub enum Command {
         /// List pods in every namespace, adding a NAMESPACE column.
         #[arg(long, short = 'A')]
         all_namespaces: bool,
+
+        /// Select by label, e.g. `-l app=api,tier notin (canary)`.
+        #[arg(long, short = 'l', value_name = "SELECTOR")]
+        selector: Option<String>,
+
+        /// Select by field, e.g. `--field-selector status.phase!=Running`.
+        #[arg(long, value_name = "SELECTOR")]
+        field_selector: Option<String>,
     },
 
     /// Switch the active cluster.
@@ -115,7 +123,7 @@ pub enum Command {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used, clippy::expect_used)]
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
     use super::*;
     use clap::CommandFactory;
@@ -159,6 +167,47 @@ mod tests {
         let cli = parse(&["eks", "nodes", "--context", "prod"]);
         assert!(matches!(cli.command, Some(Command::Nodes)));
         assert_eq!(cli.global.context.as_deref(), Some("prod"));
+    }
+
+    #[test]
+    fn pods_accepts_label_and_field_selectors() {
+        let cli = parse(&[
+            "eks",
+            "pods",
+            "-l",
+            "app=api",
+            "--field-selector",
+            "status.phase!=Running",
+            "-A",
+        ]);
+
+        let Some(Command::Pods {
+            all_namespaces,
+            selector,
+            field_selector,
+        }) = cli.command
+        else {
+            panic!("expected a Pods command");
+        };
+
+        assert!(all_namespaces);
+        assert_eq!(selector.as_deref(), Some("app=api"));
+        assert_eq!(field_selector.as_deref(), Some("status.phase!=Running"));
+    }
+
+    #[test]
+    fn pods_selectors_default_to_absent() {
+        let Some(Command::Pods {
+            selector,
+            field_selector,
+            ..
+        }) = parse(&["eks", "pods"]).command
+        else {
+            panic!("expected a Pods command");
+        };
+
+        assert!(selector.is_none());
+        assert!(field_selector.is_none());
     }
 
     #[test]

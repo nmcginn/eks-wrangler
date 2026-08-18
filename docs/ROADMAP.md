@@ -51,12 +51,19 @@ cluster.
 
 ### Follow-ups from the pod listing
 
-- [ ] **Label and field selectors for `eks pods`.**
+- [x] **Label and field selectors for `eks pods`.**
   `-l app=api` is the first thing anyone reaches for after seeing a pod list,
   and the second is "only the ones that are not Running".
   *Acceptance:* the selector is passed to the API server rather than filtered
   client-side; an unparseable selector is rejected with the offending text
   quoted, before any request is made.
+
+- [ ] **Carry the pod selectors into the dashboard.**
+  `k8s::selector` and `k8s::pods::Selectors` now filter `eks pods`; the dashboard
+  pod views (Milestone 2) should take the same `-l`/`--field-selector` filters
+  rather than growing their own, so a selector means one thing across the tool.
+  *Acceptance:* the dashboard's pod fetch reuses `Selectors`; the parse-and-quote
+  rejection path is shared, not duplicated.
 
 - [ ] **How long ago the last restart was.**
   `kubectl` shows `9 (5m ago)`, taking the newest `lastState.terminated
@@ -230,6 +237,14 @@ cluster.
 ---
 
 ## Done
+
+- **Label and field selectors for `eks pods`** (2026-08-18) — `-l` and
+  `--field-selector` push filtering onto the API server. `k8s::selector`
+  reimplements both Kubernetes selector grammars as pure functions, so a
+  mistyped selector is rejected with the offending text quoted before anything
+  connects; an empty filtered listing names the selector rather than reading
+  like an empty namespace. Set-based membership (`in`/`notin`), existence
+  (`key`/`!key`), and `==`-folding are all covered.
 
 - **`eks pods` listing** (2026-08-18) — pods for one namespace or for every
   namespace, with `kubectl`'s own `STATUS` derivation reimplemented as a pure

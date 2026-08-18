@@ -409,9 +409,14 @@ fn is_init_progress(initialising: bool, reason: &str) -> bool {
 /// typed the wrong `--context` or the wrong namespace finds out from the answer
 /// rather than from a bare header.
 #[must_use]
-pub fn render(rows: &[PodRow], cluster: &str, scope: &super::Scope) -> String {
+pub fn render(
+    rows: &[PodRow],
+    cluster: &str,
+    scope: &super::Scope,
+    selectors: &super::Selectors,
+) -> String {
     if rows.is_empty() {
-        return empty(cluster, scope);
+        return empty(cluster, scope, selectors);
     }
 
     let namespaced = scope.needs_namespace_column();
@@ -443,7 +448,15 @@ pub fn render(rows: &[PodRow], cluster: &str, scope: &super::Scope) -> String {
 }
 
 /// What to say instead of an empty table.
-fn empty(cluster: &str, scope: &super::Scope) -> String {
+fn empty(cluster: &str, scope: &super::Scope, selectors: &super::Selectors) -> String {
+    // A filter that matches nothing must not read like an empty namespace, or
+    // the user goes looking for pods that are there but filtered out. When a
+    // selector is active it, not the scope, is the likeliest reason for a blank
+    // listing, so it leads.
+    if let Some(note) = selector_note(selectors) {
+        return format!("{cluster} has no pods matching {note}.");
+    }
+
     match scope {
         super::Scope::Namespace(name) => format!(
             "{cluster} has no pods in namespace {name:?}.\n\
@@ -456,6 +469,18 @@ fn empty(cluster: &str, scope: &super::Scope) -> String {
     }
 }
 
+/// A phrase naming the active selectors, or `None` when none are set.
+fn selector_note(selectors: &super::Selectors) -> Option<String> {
+    match (&selectors.label, &selectors.field) {
+        (Some(label), Some(field)) => Some(format!(
+            "label selector `{label}` and field selector `{field}`"
+        )),
+        (Some(label), None) => Some(format!("label selector `{label}`")),
+        (None, Some(field)) => Some(format!("field selector `{field}`")),
+        (None, None) => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
@@ -464,8 +489,14 @@ mod tests {
     use k8s_openapi::apimachinery::pkg::apis::meta::v1::{ObjectMeta, Time};
     use k8s_openapi::jiff::SignedDuration;
 
-    use super::super::Scope;
+    use super::super::{Scope, Selectors};
     use super::*;
+
+    /// Most rendering tests are not about selectors; this is the "no filter"
+    /// case they pass so the signature reads at the call site.
+    fn unfiltered() -> Selectors {
+        Selectors::default()
+    }
 
     const NODE: &str = "ip-10-0-1-9.ec2.internal";
 
@@ -1071,6 +1102,7 @@ mod tests {
             &rows(),
             "prod (us-east-1)",
             &Scope::Namespace("payments".to_owned()),
+            &unfiltered(),
         );
 
         assert_eq!(
@@ -1085,7 +1117,7 @@ mod tests {
     fn a_cluster_wide_listing_leads_with_the_namespace() {
         // Without it, two pods called `api-7c9f` in different namespaces are
         // indistinguishable.
-        let rendered = render(&rows(), "prod (us-east-1)", &Scope::All);
+        let rendered = render(&rows(), "prod (us-east-1)", &Scope::All, &unfiltered());
 
         assert_eq!(
             rendered,
@@ -1101,6 +1133,7 @@ mod tests {
             &[],
             "prod (us-east-1)",
             &Scope::Namespace("payments".to_owned()),
+            &unfiltered(),
         );
 
         assert!(message.contains("prod (us-east-1)"), "{message}");
@@ -1111,10 +1144,46 @@ mod tests {
 
     #[test]
     fn an_empty_cluster_wide_listing_suggests_checking_the_cluster() {
-        let message = render(&[], "prod (us-east-1)", &Scope::All);
+        let message = render(&[], "prod (us-east-1)", &Scope::All, &unfiltered());
 
         assert!(message.contains("prod (us-east-1)"), "{message}");
         assert!(message.contains("eks contexts"), "{message}");
         assert!(!message.contains("--all-namespaces"), "{message}");
+    }
+
+    #[test]
+    fn an_empty_filtered_listing_blames_the_selector_not_the_namespace() {
+        // A live namespace that a selector emptied must not read as an empty
+        // namespace, or the user goes hunting for pods that are there.
+        let filtered = Selectors {
+            label: Some("app=api".to_owned()),
+            field: None,
+        };
+        let message = render(
+            &[],
+            "prod (us-east-1)",
+            &Scope::Namespace("payments".to_owned()),
+            &filtered,
+        );
+
+        assert!(message.contains("prod (us-east-1)"), "{message}");
+        assert!(message.contains("label selector `app=api`"), "{message}");
+        // The scope's own advice would be a red herring here.
+        assert!(!message.contains("--all-namespaces"), "{message}");
+    }
+
+    #[test]
+    fn an_empty_filtered_listing_names_both_selectors_when_both_are_set() {
+        let filtered = Selectors {
+            label: Some("app=api".to_owned()),
+            field: Some("status.phase!=Running".to_owned()),
+        };
+        let message = render(&[], "prod (us-east-1)", &Scope::All, &filtered);
+
+        assert!(message.contains("label selector `app=api`"), "{message}");
+        assert!(
+            message.contains("field selector `status.phase!=Running`"),
+            "{message}"
+        );
     }
 }
