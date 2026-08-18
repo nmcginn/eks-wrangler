@@ -61,6 +61,13 @@ ClusterView ──► k8s::connect ──► Client ──► nodes::fetch ─�
 `NodeRow::from_node` takes an explicit `now`, so ages are computed rather than
 observed and every row in a listing shares one instant.
 
+Resource quantities get their own hop: the API server reports capacity as
+strings in a small grammar (`3920m`, `7134420Ki`, `1e3`), and `k8s::quantity`
+turns those into numbers before anything formats or divides them. It is a pure
+parser with no Kubernetes types in its signature beyond the newtype it unwraps,
+which is why the whole suffix table is covered by tests rather than by whatever
+instance types happen to be in the cluster you tried it on.
+
 Only the async commands build a Tokio runtime, and they build it themselves —
 see `commands::block_on`. `eks contexts` still starts with nothing but a file
 read. When the dashboard grows live data (see `docs/ROADMAP.md`), fetching moves

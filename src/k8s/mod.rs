@@ -12,5 +12,7 @@
 
 pub mod client;
 pub mod nodes;
+pub mod quantity;
 
 pub use client::{Failure, connect, explain};
+pub use quantity::Quantity;

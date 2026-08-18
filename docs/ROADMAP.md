@@ -24,12 +24,19 @@ cluster.
   `aws sso login`, not a raw HTTP error; node-row formatting is a pure function
   tested against fixture `Node` objects; no live-AWS test.
 
-- [ ] **Node capacity and allocatable.**
-  Show CPU and memory capacity, allocatable, and the sum of pod requests per
-  node, with utilisation percentages.
+- [x] **Quantity parsing, and node capacity and allocatable.**
+  Parse the Kubernetes resource-quantity grammar; show CPU and memory capacity
+  and allocatable per node.
   *Acceptance:* Kubernetes quantity parsing (`100m`, `1.5`, `2Gi`, `1e3`) is its
-  own tested function covering each suffix and rejecting garbage; percentages
-  use `theme::Severity` thresholds.
+  own tested function covering each suffix and rejecting garbage.
+
+- [ ] **Pod requests per node, and utilisation percentages.**
+  Sum each node's pod requests and show them against allocatable as a
+  percentage. Split out of the task above, which was two PRs' worth.
+  *Acceptance:* the effective pod request — `max(sum of containers, max of init
+  containers)` plus pod overhead, with sidecars counted in the sum — is its own
+  tested pure function; percentages use `theme::Severity` thresholds; a node
+  running no pods reads as `0%` rather than as an error.
 
 - [ ] **`eks pods` listing.**
   Pods for a namespace (or `--all-namespaces`) with status, ready count,
@@ -41,6 +48,22 @@ cluster.
   Live CPU/memory usage for nodes and pods where `metrics.k8s.io` is available.
   *Acceptance:* absent metrics-server degrades to showing requests with a note,
   never an error; the API call is behind a trait so it can be faked in tests.
+
+### Follow-ups from the capacity columns
+
+- [ ] **Extended resources in the node table.**
+  GPUs and other device-plugin resources (`nvidia.com/gpu`) are parsed correctly
+  but never shown; a node table that hides the reason a pod will not schedule is
+  doing half a job.
+  *Acceptance:* a column appears only when some node in the listing reports the
+  resource, so a CPU-only cluster gains no empty columns.
+
+- [ ] **A narrow mode for the node table.**
+  `eks nodes` is now six columns and around 90 characters wide, which wraps on
+  an 80-column terminal.
+  *Acceptance:* columns are dropped in a documented order to fit the terminal;
+  the choice is a pure function over an available width, tested at 80, 100, and
+  1 column.
 
 ### Follow-ups from the client bootstrap
 
@@ -155,6 +178,12 @@ cluster.
 ---
 
 ## Done
+
+- **Quantity parsing, and node capacity and allocatable** (2026-08-18) —
+  `k8s::quantity` parses the full resource-quantity grammar; `eks nodes` gained
+  `CPU` and `MEMORY` columns showing allocatable against capacity. The pod
+  requests and utilisation half of the original task was split into its own
+  entry above.
 
 - **Async runtime and Kubernetes client bootstrap** (2026-08-17) — `tokio`,
   `kube`, and `k8s-openapi` added; `eks nodes` lists name, status, version, and
