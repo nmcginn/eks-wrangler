@@ -373,3 +373,30 @@ an error. The pod listing is the fatal request; a failed metrics request costs
 `CPU` and `MEMORY` and earns a footnote saying what to install. The two requests
 go out together in a `tokio::join!`, so the columns cost one round trip's worth of
 waiting rather than a second one.
+
+### 26. Restart recency is carried by the count, not gathered beside it
+
+`kubectl` prints `RESTARTS` as `9 (5m ago)`, and the parenthesis is the half that
+answers the question — a count with no recency cannot tell a pod that crashed
+nine times last Tuesday from one crashing right now.
+
+The date is the newest `lastState.terminated.finishedAt`, and the interesting
+decision is *which* containers it is taken across. It is exactly the set whose
+restarts survived into the count: during initialisation, every init container
+walked; afterwards, the sidecars plus the app containers, with the plain init
+containers' history dropped. So `Init.last_restart` and `Init.sidecar_last_restart`
+shadow `Init.restarts` and `Init.sidecar_restarts` line for line, and the
+assignment that discards the init counts discards their timestamps in the same
+statement. Gathering the timestamp separately — a `max` over all the statuses —
+would be shorter and would let a finished init container date a count it is no
+longer part of, showing `3 (1m ago)` for a pod whose last real restart was
+twenty minutes back.
+
+A pod that has never restarted keeps a bare `0` rather than gaining a `(— ago)`.
+Most rows in a healthy listing are that row, and there is genuinely nothing to
+date. So is a restart with no `finishedAt`: the count is real, and inventing a
+moment for it would not be.
+
+The formatted age lives on `PodRow` rather than the `Timestamp` it came from, for
+the same reason `age` does — every row in a listing is rendered against the one
+instant handed to `PodRow::from_pod`, so rendering never reaches for a clock.

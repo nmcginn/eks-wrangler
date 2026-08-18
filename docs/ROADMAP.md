@@ -74,7 +74,7 @@ cluster.
   *Acceptance:* the dashboard's pod fetch reuses `Selectors`; the parse-and-quote
   rejection path is shared, not duplicated.
 
-- [ ] **How long ago the last restart was.**
+- [x] **How long ago the last restart was.**
   `kubectl` shows `9 (5m ago)`, taking the newest `lastState.terminated
   .finishedAt` across the containers. A restart count with no recency behind it
   cannot distinguish a pod that crashed nine times last Tuesday from one
@@ -82,6 +82,13 @@ cluster.
   *Acceptance:* the timestamp chosen is a pure function over the container
   statuses, following `kubectl`'s rule that only sidecar restarts survive
   initialisation; a pod that has never restarted shows the bare count.
+
+- [ ] **Sort the pod listing by how recently it restarted.**
+  The restart column now carries a date, and the question behind it — "what is
+  crashing *now*" — is a sort, not a scan. Alphabetical order buries the pod
+  that restarted eight seconds ago among a hundred healthy ones.
+  *Acceptance:* the ordering is a pure function over the rows; pods that have
+  never restarted sort last rather than first; the default order is unchanged.
 
 - [ ] **A `--wide` mode for `eks pods`.**
   Pod IP, and the nominated node for a preempting pod — the two columns
@@ -276,6 +283,14 @@ cluster.
 ---
 
 ## Done
+
+- **How long ago the last restart was** (2026-08-18) — `eks pods` now prints
+  `kubectl`'s `9 (5m ago)` rather than a bare `9`. The timestamp is the newest
+  `lastState.terminated.finishedAt` across exactly the containers whose restart
+  counts survived, so the two halves of the cell can never describe different
+  sets: the assignment that drops a finished init container's restarts drops its
+  date with them. A pod that has never restarted, and a restart the kubelet
+  recorded no finish time for, both keep the bare count.
 
 - **metrics-server integration for nodes** (2026-08-18) — `eks nodes` gained
   `CPU USE` and `MEM USE` columns from `metrics.k8s.io/v1beta1`, beside the
