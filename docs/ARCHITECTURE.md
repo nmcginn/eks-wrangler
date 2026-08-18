@@ -11,7 +11,7 @@ src/
   cluster.rs           Turning kubeconfig entries into human-facing views.
   format.rs            Ages and aligned tables — pure string formatting.
   theme.rs             The entire colour palette and severity thresholds.
-  k8s/                 The Kubernetes client, and translating its failures.
+  k8s/                 The Kubernetes client, quantities, nodes, and pods.
   commands/            One module per user-facing command.
   ui/                  The interactive dashboard.
 ```
@@ -54,12 +54,27 @@ Live cluster data enters as a second pipeline, joined to the first by the
 selected context:
 
 ```
-ClusterView ──► k8s::connect ──► Client ──► nodes::fetch ──► NodeRow ──► table
- (choose)         (build)                    (I/O)          (present)   (render)
+ClusterView ──► k8s::connect ──► Client ──┬─► nodes::fetch ─┐
+ (choose)         (build)                 │     (I/O)       ├─► NodeRow ──► table
+                                          └─► pods::fetch ──┘  (present)  (render)
+                                                (I/O)
 ```
+
+The two listings are issued concurrently — `eks nodes` should cost one round
+trip's wait, not two — and they fail independently. A node listing that fails
+ends the command; a pod listing that fails only empties the request columns and
+adds a footnote saying why, because a role that grants nodes but not pods across
+every namespace is a normal thing to have.
 
 `NodeRow::from_node` takes an explicit `now`, so ages are computed rather than
 observed and every row in a listing shares one instant.
+
+What a node has *booked* is a second computation on that pipeline:
+`pods::effective_requests` reduces one pod to the CPU and memory the scheduler
+reserved for it, and `pods::by_node` totals those by node. Both are pure
+functions over `Pod` values, so the awkward parts — init containers, sidecars,
+pod overhead, a pod that has finished — are fixtures rather than a cluster you
+have to arrange.
 
 Resource quantities get their own hop: the API server reports capacity as
 strings in a small grammar (`3920m`, `7134420Ki`, `1e3`), and `k8s::quantity`

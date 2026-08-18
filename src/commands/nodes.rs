@@ -7,7 +7,7 @@ use k8s_openapi::jiff::Timestamp;
 
 use crate::cluster::ClusterView;
 use crate::commands::contexts;
-use crate::k8s::{self, nodes as k8s_nodes};
+use crate::k8s::{self, nodes as k8s_nodes, pods as k8s_pods};
 use crate::kubeconfig::KubeConfig;
 
 /// Fetch and render the node table for the selected cluster.
@@ -25,25 +25,53 @@ pub async fn list(
 
     let client = k8s::connect(paths, &target).await?;
 
-    let nodes = k8s_nodes::fetch(client).await.map_err(|error| {
+    // Concurrently, not in sequence: the two listings are independent, and the
+    // command should cost one round trip's worth of waiting rather than two.
+    let (nodes, pods) = tokio::join!(k8s_nodes::fetch(client.clone()), k8s_pods::fetch(client));
+
+    let nodes = nodes.map_err(|error| {
         // The raw error is worth having when debugging, but it is not what the
         // user needs to read; `-vv` brings it back.
         tracing::debug!(%error, "listing nodes failed");
         anyhow!(k8s::explain(&error, &label))
     })?;
 
+    // A read-only role that grants nodes but not pods across every namespace is
+    // common enough that losing the whole table to it would be the wrong trade.
+    // The request columns go empty and a footnote says why.
+    let (requests, note) = match pods {
+        Ok(pods) => (Some(k8s_pods::by_node(&pods)), None),
+        Err(error) => {
+            tracing::debug!(%error, "listing pods failed");
+            let note = k8s_nodes::requests_unavailable(&k8s::explain(&error, &label));
+            (None, Some(note))
+        }
+    };
+
     // One instant for every row, so a slow listing cannot show two nodes
     // created together with different ages.
     let now = Timestamp::now();
     let mut rows: Vec<k8s_nodes::NodeRow> = nodes
         .iter()
-        .map(|node| k8s_nodes::NodeRow::from_node(node, now))
+        .map(|node| {
+            // A node absent from the totals is running nothing, which is a real
+            // zero. Only a failed pod listing leaves the figure unknown.
+            let requested = requests.as_ref().map(|totals| {
+                node.metadata
+                    .name
+                    .as_deref()
+                    .and_then(|name| totals.get(name))
+                    .copied()
+                    .unwrap_or_default()
+            });
+            k8s_nodes::NodeRow::from_node(node, requested, now)
+        })
         .collect();
     // The API server happens to return nodes in name order today; sorting makes
     // that a promise rather than an accident.
     rows.sort_by(|a, b| a.name.cmp(&b.name));
 
-    Ok(k8s_nodes::render(&rows, &label))
+    Ok(k8s_nodes::render(&rows, &label, note.as_deref()))
 }
 
 /// Work out which cluster to talk to, before any network call happens.

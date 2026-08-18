@@ -12,6 +12,7 @@
 
 pub mod client;
 pub mod nodes;
+pub mod pods;
 pub mod quantity;
 
 pub use client::{Failure, connect, explain};

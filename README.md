@@ -51,10 +51,16 @@ cluster name:
 
 ```
 $ eks nodes --context staging
-NAME                         STATUS                       VERSION              AGE
-ip-10-0-1-9.ec2.internal     Ready                        v1.33.1-eks-1a2b3c4  12d
-ip-10-0-11-200.ec2.internal  NotReady,SchedulingDisabled  v1.32.9-eks-9f8e7d6  10h
+NAME                         STATUS                       VERSION              CPU      CPU REQ      MEMORY         MEM REQ     AGE
+ip-10-0-1-9.ec2.internal     Ready                        v1.33.1-eks-1a2b3c4  3920m/4  1500m (38%)  14.8Gi/15.6Gi  6Gi (41%)   12d
+ip-10-0-11-200.ec2.internal  NotReady,SchedulingDisabled  v1.32.9-eks-9f8e7d6  3920m/4  3800m (97%)  14.8Gi/15.6Gi  15Gi (96%)  10h
 ```
+
+`CPU` and `MEMORY` are what the node has: allocatable — what pods may actually
+ask for — over total capacity, the gap between them being what the kubelet
+reserves for itself. `CPU REQ` and `MEM REQ` are what the pods already on the
+node have booked, and what share of allocatable that is. The percentage, not the
+capacity, is what decides whether the next pod schedules.
 
 Credentials come from the kubeconfig context itself, so whatever works for
 `kubectl` works here. When they have expired, `eks` says so and tells you how to

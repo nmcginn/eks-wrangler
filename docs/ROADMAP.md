@@ -30,7 +30,7 @@ cluster.
   *Acceptance:* Kubernetes quantity parsing (`100m`, `1.5`, `2Gi`, `1e3`) is its
   own tested function covering each suffix and rejecting garbage.
 
-- [ ] **Pod requests per node, and utilisation percentages.**
+- [x] **Pod requests per node, and utilisation percentages.**
   Sum each node's pod requests and show them against allocatable as a
   percentage. Split out of the task above, which was two PRs' worth.
   *Acceptance:* the effective pod request — `max(sum of containers, max of init
@@ -59,11 +59,36 @@ cluster.
   resource, so a CPU-only cluster gains no empty columns.
 
 - [ ] **A narrow mode for the node table.**
-  `eks nodes` is now six columns and around 90 characters wide, which wraps on
-  an 80-column terminal.
+  `eks nodes` is now eight columns and around 120 characters wide, which wraps
+  on an 80-column terminal. The request columns made this worse, and they are
+  also the ones most worth keeping when space is short.
   *Acceptance:* columns are dropped in a documented order to fit the terminal;
   the choice is a pure function over an available width, tested at 80, 100, and
   1 column.
+
+### Follow-ups from the request columns
+
+- [ ] **A pod count per node.**
+  The request totals are computed from a full pod listing that is then thrown
+  away; `PODS` is one more column and the number people ask for next, alongside
+  the node's `maxPods` limit, which is the *other* reason a pod will not
+  schedule.
+  *Acceptance:* the count excludes finished pods, matching the requests total it
+  sits beside; `maxPods` comes from the node's `allocatable["pods"]`.
+
+- [ ] **Paginate the pod listing.**
+  `eks nodes` now fetches every pod in the cluster in one request to total the
+  requests. On a large cluster that is the biggest response the tool asks for,
+  and it shares the paging problem the node listing has.
+  *Acceptance:* pages with the same tested continue-token function the node
+  listing uses; the two listings still run concurrently.
+
+- [ ] **Severity colour in the CLI table.**
+  `Requested::severity` classifies each percentage on the shared thresholds, and
+  the CLI table then prints it in plain text. A node at 97% deserves to look
+  like it, at least when stdout is a terminal.
+  *Acceptance:* colour is suppressed when stdout is not a TTY and when `NO_COLOR`
+  is set; the decision is a pure function, tested both ways.
 
 ### Follow-ups from the client bootstrap
 
@@ -178,6 +203,13 @@ cluster.
 ---
 
 ## Done
+
+- **Pod requests per node, and utilisation percentages** (2026-08-18) —
+  `k8s::pods` totals the effective requests of the pods on each node, following
+  the scheduler's own arithmetic for init containers, sidecars, and pod
+  overhead; `eks nodes` gained `CPU REQ` and `MEM REQ` columns showing the total
+  and its share of allocatable. The pod listing runs concurrently with the node
+  listing, and failing it costs two columns rather than the command.
 
 - **Quantity parsing, and node capacity and allocatable** (2026-08-18) —
   `k8s::quantity` parses the full resource-quantity grammar; `eks nodes` gained
