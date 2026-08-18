@@ -106,3 +106,40 @@ knows. The node fields we read — conditions, `nodeInfo`, object metadata — h
 been stable for many releases and are all optional in the generated types, so an
 older EKS control plane deserialises fine. Pin an explicit `v1_NN` feature if we
 ever reach for an API that only exists in newer releases.
+
+### 13. Quantities are integer thousandths in an `i128`
+
+`k8s-openapi` models a resource quantity as a newtype over `String`, so the
+arithmetic is ours. `k8s::quantity::Quantity` holds the value as thousandths of
+a unit — millicores for CPU, thousandths of a byte for memory — in an `i128`.
+
+Integer thousandths rather than an `f64` because a millicore is the smallest
+unit anyone schedules against, and a quantity that survives a round trip
+unchanged is far easier to reason about than one that is `3.9199999999999995`.
+`i128` because thousandths of an exbibyte overflow an `i64`, and `Ei` is in the
+grammar whether or not anyone has the hardware.
+
+The cost is that values finer than a thousandth — a `1n` extended resource —
+round to the nearest thousandth. Nothing displayed is measured that finely, and
+carrying arbitrary precision to hide a rounding nobody can see is machinery
+without a payer.
+
+Two things are deliberately strict. A capital `K` is rejected: the grammar only
+has the lowercase one, and so does `kubectl`, so accepting it would make us the
+odd tool out. And a number too large to represent is `TooLarge` rather than
+`Malformed`, because telling a user their perfectly well-formed value is not a
+quantity would send them looking for a typo that is not there.
+
+### 14. Memory is shown in binary units, unlike `kubectl`
+
+`kubectl` prints allocatable memory exactly as the node reported it —
+`7134420Ki`. Precise, and unreadable at a glance, which is the only thing a
+capacity column is for. `quantity::memory` picks the largest binary unit that
+leaves a legible number and shows one decimal: `6.8Gi`. Everything is shown in
+binary units even when the node used a decimal suffix, because a column mixing
+`1G` and `1Gi` is worse than one that is consistently approximate.
+
+The node table shows `allocatable/capacity` in one cell rather than two columns.
+The gap between the two is the kubelet's reservation, which on a small EKS node
+is a surprisingly large slice, and putting the numbers next to each other is
+what makes that visible without a second column of arithmetic.

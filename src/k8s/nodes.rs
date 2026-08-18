@@ -13,6 +13,7 @@ use kube::Client;
 use kube::api::{Api, ListParams};
 
 use crate::format;
+use crate::k8s::quantity::{self, Quantity};
 use crate::theme::Severity;
 
 /// Ask the API server for every node in the cluster.
@@ -34,7 +35,62 @@ pub struct NodeRow {
     /// call site so the CLI table and the dashboard cannot disagree about it.
     pub severity: Severity,
     pub version: String,
+    /// Cores the node has, and cores pods may actually ask for.
+    pub cpu: Capacity,
+    /// Bytes of memory the node has, and bytes pods may actually ask for.
+    pub memory: Capacity,
     pub age: String,
+}
+
+/// What a node has of one resource, and how much of it is left for pods.
+///
+/// The two are not the same number and the gap is not small: the kubelet
+/// reserves memory and CPU for itself, for the OS, and for eviction headroom,
+/// which on a 2 GiB EKS node can be a quarter of the machine. Showing capacity
+/// alone invites "why will nothing schedule on a node with free memory?", so
+/// both are shown.
+///
+/// Either half is `None` when the node has not reported it — a node still
+/// registering has no `status` at all — and the renderer says so rather than
+/// inventing a zero.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Capacity {
+    pub allocatable: Option<Quantity>,
+    pub capacity: Option<Quantity>,
+}
+
+impl Capacity {
+    /// Read one resource out of a node's `capacity` and `allocatable` maps.
+    #[must_use]
+    pub fn read(node: &Node, resource: &str) -> Self {
+        let status = node.status.as_ref();
+        Self {
+            allocatable: Quantity::lookup(status.and_then(|s| s.allocatable.as_ref()), resource),
+            capacity: Quantity::lookup(status.and_then(|s| s.capacity.as_ref()), resource),
+        }
+    }
+
+    /// The fraction of capacity the kubelet has *not* reserved, if both halves
+    /// are known. Not shown yet; the dashboard will want it.
+    #[must_use]
+    pub fn allocatable_ratio(self) -> Option<f64> {
+        self.allocatable?.ratio_of(self.capacity?)
+    }
+
+    /// One table cell: `allocatable/capacity`, formatted by `show`.
+    ///
+    /// A node reporting only one of the two prints just that number. It is
+    /// ambiguous, but it happens only mid-registration and only for a second,
+    /// and a cell that says `-/4` reads like a bug.
+    fn cell(self, show: fn(Quantity) -> String) -> String {
+        match (self.allocatable, self.capacity) {
+            (Some(allocatable), Some(capacity)) => {
+                format!("{}/{}", show(allocatable), show(capacity))
+            }
+            (Some(only), None) | (None, Some(only)) => show(only),
+            (None, None) => UNKNOWN.to_owned(),
+        }
+    }
 }
 
 /// Shown wherever the API server left a field empty. Matches the placeholder
@@ -61,6 +117,8 @@ impl NodeRow {
             name,
             status: status_text(ready, cordoned),
             severity: severity(ready, cordoned),
+            cpu: Capacity::read(node, "cpu"),
+            memory: Capacity::read(node, "memory"),
             version: node
                 .status
                 .as_ref()
@@ -135,19 +193,29 @@ pub fn render(rows: &[NodeRow], cluster: &str) -> String {
                 row.name.clone(),
                 row.status.clone(),
                 row.version.clone(),
+                row.cpu.cell(quantity::cpu),
+                row.memory.cell(quantity::memory),
                 row.age.clone(),
             ]
         })
         .collect();
 
-    format::table(&["NAME", "STATUS", "VERSION", "AGE"], &cells)
+    // AGE stays last because that is where every `kubectl get` puts it, and the
+    // new columns are the ones people will be scanning for.
+    format::table(
+        &["NAME", "STATUS", "VERSION", "CPU", "MEMORY", "AGE"],
+        &cells,
+    )
 }
 
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+    use std::collections::BTreeMap;
+
     use k8s_openapi::api::core::v1::{NodeCondition, NodeSpec, NodeStatus, NodeSystemInfo};
+    use k8s_openapi::apimachinery::pkg::api::resource::Quantity as ApiQuantity;
     use k8s_openapi::apimachinery::pkg::apis::meta::v1::Time;
     use k8s_openapi::jiff::SignedDuration;
 
@@ -173,6 +241,9 @@ mod tests {
             spec: Some(NodeSpec::default()),
             status: Some(NodeStatus {
                 conditions: Some(vec![condition("Ready", "True")]),
+                // What an m5.xlarge actually reports.
+                capacity: Some(quantities(&[("cpu", "4"), ("memory", "16374624Ki")])),
+                allocatable: Some(quantities(&[("cpu", "3920m"), ("memory", "15525152Ki")])),
                 node_info: Some(NodeSystemInfo {
                     kubelet_version: "v1.33.1-eks-1a2b3c4".to_owned(),
                     ..Default::default()
@@ -180,6 +251,13 @@ mod tests {
                 ..Default::default()
             }),
         }
+    }
+
+    fn quantities(pairs: &[(&str, &str)]) -> BTreeMap<String, ApiQuantity> {
+        pairs
+            .iter()
+            .map(|(name, value)| ((*name).to_owned(), ApiQuantity((*value).to_owned())))
+            .collect()
     }
 
     fn condition(kind: &str, status: &str) -> NodeCondition {
@@ -207,6 +285,72 @@ mod tests {
         assert_eq!(row.severity, Severity::Ok);
         assert_eq!(row.version, "v1.33.1-eks-1a2b3c4");
         assert_eq!(row.age, "2d2h");
+    }
+
+    #[test]
+    fn capacity_and_allocatable_are_read_as_separate_numbers() {
+        let row = NodeRow::from_node(&healthy_node(), now());
+
+        assert_eq!(row.cpu.capacity, Some(Quantity::parse("4").unwrap()));
+        assert_eq!(row.cpu.allocatable, Some(Quantity::parse("3920m").unwrap()));
+        assert_eq!(
+            row.memory.capacity.map(Quantity::units),
+            Some(16_767_614_976)
+        );
+        assert_eq!(row.cpu.cell(quantity::cpu), "3920m/4");
+        assert_eq!(row.memory.cell(quantity::memory), "14.8Gi/15.6Gi");
+    }
+
+    #[test]
+    fn the_reserved_slice_of_a_node_is_available_as_a_ratio() {
+        // Not rendered yet, but it is what the dashboard's bars will divide by,
+        // so it is worth pinning down now.
+        let row = NodeRow::from_node(&healthy_node(), now());
+        let ratio = row.cpu.allocatable_ratio().unwrap();
+
+        assert!((ratio - 0.98).abs() < 1e-9, "{ratio}");
+        assert_eq!(Capacity::default().allocatable_ratio(), None);
+    }
+
+    #[test]
+    fn a_node_that_has_not_reported_capacity_shows_a_placeholder() {
+        let mut node = healthy_node();
+        if let Some(status) = node.status.as_mut() {
+            status.capacity = None;
+            status.allocatable = None;
+        }
+
+        let row = NodeRow::from_node(&node, now());
+        assert_eq!(row.cpu.cell(quantity::cpu), "-");
+        assert_eq!(row.memory.cell(quantity::memory), "-");
+    }
+
+    #[test]
+    fn a_node_reporting_only_one_half_shows_the_half_it_has() {
+        let mut node = healthy_node();
+        if let Some(status) = node.status.as_mut() {
+            status.allocatable = None;
+        }
+
+        let row = NodeRow::from_node(&node, now());
+        assert_eq!(row.cpu.cell(quantity::cpu), "4");
+        assert_eq!(row.memory.cell(quantity::memory), "15.6Gi");
+    }
+
+    #[test]
+    fn a_capacity_we_cannot_parse_does_not_take_out_the_listing() {
+        // An extended resource from a broken device plugin should cost the user
+        // one cell, not the whole table.
+        let mut node = healthy_node();
+        if let Some(status) = node.status.as_mut() {
+            status.capacity = Some(quantities(&[("cpu", "four"), ("memory", "16374624Ki")]));
+        }
+
+        let row = NodeRow::from_node(&node, now());
+        assert_eq!(row.cpu.capacity, None);
+        // Only the unreadable half is lost.
+        assert_eq!(row.cpu.cell(quantity::cpu), "3920m");
+        assert_eq!(row.memory.cell(quantity::memory), "14.8Gi/15.6Gi");
     }
 
     #[test]
@@ -269,6 +413,8 @@ mod tests {
         assert_eq!(row.version, "-");
         assert_eq!(row.age, "-");
         assert_eq!(row.severity, Severity::Unknown);
+        assert_eq!(row.cpu, Capacity::default());
+        assert_eq!(row.memory, Capacity::default());
     }
 
     #[test]
@@ -285,9 +431,9 @@ mod tests {
 
         assert_eq!(
             render(&rows, "prod (us-east-1)"),
-            "NAME                         STATUS    VERSION              AGE\n\
-             ip-10-0-1-9.ec2.internal     Ready     v1.33.1-eks-1a2b3c4  2d2h\n\
-             ip-10-0-11-200.ec2.internal  NotReady  v1.33.1-eks-1a2b3c4  60m"
+            "NAME                         STATUS    VERSION              CPU      MEMORY         AGE\n\
+             ip-10-0-1-9.ec2.internal     Ready     v1.33.1-eks-1a2b3c4  3920m/4  14.8Gi/15.6Gi  2d2h\n\
+             ip-10-0-11-200.ec2.internal  NotReady  v1.33.1-eks-1a2b3c4  3920m/4  14.8Gi/15.6Gi  60m"
         );
     }
 
