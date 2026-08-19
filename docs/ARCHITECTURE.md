@@ -80,6 +80,11 @@ functions over `Pod` values, so the awkward parts — init containers, sidecars,
 pod overhead, a pod that has finished — are fixtures rather than a cluster you
 have to arrange.
 
+`effective_requests` has two callers, deliberately: `pods::by_node` totals it per
+node for `eks nodes`, and `PodRow::from_pod` keeps it per pod as the denominator
+`eks pods` shows live usage against. One function rather than two sums is what
+stops the two commands from disagreeing about what a single pod booked.
+
 `eks pods` is a third computation on the same pipeline, and the one where the
 computation/rendering split earns the most. The `STATUS` column `kubectl` prints
 exists nowhere in the API: `status.phase` holds one of five words and none of
@@ -115,15 +120,21 @@ others are the "sort by … instead" advice — and a `cause`, which is that
 listing's own map from an ordering to the footnote that would already have
 explained an empty column. What is *not* shared is the keys: `k8s::nodes::order` ranks by the share of
 allocatable a node's figures represent, where `k8s::pods::order` ranks by the
-figure itself, since a pod's usage has no denominator in its table. `NodeRow`
+figure itself. That was once for want of a denominator; now that a pod's usage
+has one, it is a choice — a node's denominator is the machine, so 95% of a small
+one is comparable to 30% of a large one, while a pod's is whatever a manifest
+asked for, and 400% of a 10m request is 40m of anybody's cluster. `NodeRow`
 gained a `created_at` beside its rendered `age` for the same reason `PodRow` has
 one — two nodes can both read `3d` and be nearly a day apart.
 
 Which columns a table has is the same shape of decision, one hop later, and it is
 settled the same way: `k8s::nodes::columns` and `k8s::pods::row::columns` are
 pure functions from a listing's conditions — the scope, whether any row carries
-live usage, and `format::Width` — to a `Vec<Column>`, and each `Column` answers
-for both its heading and its cell. Two parallel lists of headers and cells is the
+live usage, whether any row shows that usage against a request, and
+`format::Width` — to a `Vec<Column>`, and each `Column` answers for both its
+heading and its cell. The pod table's usage columns carry that last condition as
+data, because it decides a heading rather than a column: `CPU/REQ` over a column
+of `262m/500m (52%)` pairs, plain `CPU` where no row has one. Two parallel lists of headers and cells is the
 alternative, and it has a failure that type-checks: a heading added under one
 condition and its cell under a subtly different one shifts every figure to the
 right of it under the wrong heading, and the table still renders. `format::Width`

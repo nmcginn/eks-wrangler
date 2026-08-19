@@ -238,6 +238,10 @@ mod tests {
             created_at: Some(minutes_ago(180)),
             cpu_used: None,
             memory_used: None,
+            // Nothing here sorts on the request, and a pod that asked for
+            // nothing is a real pod; the orderings are over what is measured.
+            cpu_requested: Quantity::default(),
+            memory_requested: Quantity::default(),
             node: "ip-10-0-1-9.ec2.internal".to_owned(),
             ip: "10.0.1.42".to_owned(),
             nominated_node: "-".to_owned(),

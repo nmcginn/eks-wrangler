@@ -112,6 +112,20 @@ pub fn human_duration(delta: SignedDuration) -> String {
     }
 }
 
+/// A ratio as a whole-number percentage: `0.6` reads `60%`.
+///
+/// One function rather than a `{:.0}` at each call site, so a node's share of
+/// its allocatable and a pod's share of its request cannot come to be rounded
+/// differently — they are the same kind of figure, printed in two tables a
+/// person reads one after the other.
+///
+/// `{:.0}` rather than a cast: no truncation to reason about, and nothing to
+/// hand-roll for a value that will not fit an integer.
+#[must_use]
+pub fn percentage(ratio: f64) -> String {
+    format!("{:.0}%", ratio * 100.0)
+}
+
 /// Render an aligned, `kubectl`-style table.
 ///
 /// Columns are as wide as their widest cell, separated by two spaces. The last
@@ -232,6 +246,30 @@ mod tests {
         assert_eq!(Width::default(), Width::Default);
         assert!(Width::Wide.is_wide());
         assert!(!Width::Default.is_wide());
+    }
+
+    #[test]
+    fn percentages_are_whole_numbers() {
+        assert_eq!(percentage(0.0), "0%");
+        assert_eq!(percentage(0.5), "50%");
+        assert_eq!(percentage(1.0), "100%");
+    }
+
+    #[test]
+    fn percentages_round_rather_than_truncate() {
+        // A figure at 2/3 of its request reads `67%`; truncating would put it
+        // at 66% and put the row a percentage point below every other tool.
+        assert_eq!(percentage(2.0 / 3.0), "67%");
+        assert_eq!(percentage(0.004), "0%");
+    }
+
+    #[test]
+    fn a_measurement_past_its_denominator_is_reported_in_full() {
+        // A node using more than its allocatable, or a pod burning four times
+        // what it asked for. Both are real, and both are the moment somebody
+        // wants the number.
+        assert_eq!(percentage(1.04), "104%");
+        assert_eq!(percentage(4.5), "450%");
     }
 
     #[test]

@@ -525,9 +525,18 @@ that appends the alphabetical tie-break.
 
 ### 34. The node orders rank by share; the pod orders rank by the figure
 
-`eks pods --sort cpu` ranks by the number in the `CPU` column, because that is
-all there is — a pod's usage has no denominator in that table. Doing the same for
-a node would answer the wrong question: the node table already shows every figure
+`eks pods --sort cpu` ranks by the figure a pod is using rather than by its share
+of what it asked for. That began as "there is nothing else" — a pod's usage had
+no denominator then — and decision 40 has since given it one, so the choice is
+now a choice, and it stands. A node's denominator is the machine, which makes
+95% of a small node genuinely comparable to 30% of a large one. A pod's
+denominator is whatever somebody typed into a manifest, so a pod at 400% of a 10m
+request is burning 40m and is nobody's problem, while one at 60% of four cores is
+eating the node. The share is a real question about that pod's own sizing, and
+it is a different question from the one `--sort cpu` is asked — which is why a
+share ordering is a roadmap entry rather than a correction to this one.
+
+Doing the same for a node would answer the wrong question: the node table already shows every figure
 as a percentage of allocatable, and a two-core node at 95% is closer to trouble
 than a sixty-four-core node burning twenty times as much at 30%. So the node
 orders rank by `Share::ratio`.
@@ -736,3 +745,60 @@ the cluster still calls it unready — every container up, an external controlle
 withholding its condition — and that is a question the table itself raises. A pod
 with no gates reads `-` rather than `0/0`, which would suggest something
 unsatisfied on nearly every row where there is nothing to satisfy.
+
+### 40. A pod's usage is shown against its request, in one cell
+
+`eks pods` printed `262m` and left it there. The figure is unreadable on its own:
+a quarter of a core is fine, throttled, or a mistake depending entirely on what
+the pod asked for, and a reader who wants to act on the number has to go and find
+that request in a manifest. The node table has never had this problem — every
+figure in it is a share of allocatable — and the pod table now says
+`262m/500m (52%)`.
+
+The denominator is the **request**, and it comes from `pods::effective_requests`
+— the same function `eks nodes` totals per node. A pod has no allocatable of its
+own, so its request is the only honest denominator available; it is also the
+number somebody would go on to change. Calling the function rather than summing
+the containers again is what keeps `eks pods` and `eks nodes` from quietly
+disagreeing about one pod: that sum is `max(containers + sidecars, peak init
+container)` plus pod overhead, and a second implementation of it would be wrong
+in a way nobody could see.
+
+It is one cell rather than a usage column and a request column beside it, and the
+two are alternatives rather than halves — a `CPU REQ` column beside a
+`262m/500m (52%)` cell would print the same number twice. The pair won because
+its halves are read together or not at all, because the pod table is already the
+wider of the two listings, and because `READY`'s `1/2` and the node table's
+`3800m/4` make `a/b` this tool's existing spelling for a part and its whole.
+
+The other design has one thing this one does not: a request column would show
+what a pod booked on a cluster with no metrics-server, which is the EKS default
+and where this cell shows nothing at all. That is a second question — "what did
+this ask for", not "how is it doing against it" — and answering it means columns
+on every listing, which is a decision about the default table's width rather than
+about a denominator. It is a roadmap entry, and the reviewer who prefers that
+design should say so there.
+
+The heading follows the cell: `CPU/REQ` over a column of pairs, and plain `CPU`
+where no row in the listing has one, so the table itself says what the percentage
+is a share of instead of a manual saying it. A `/REQ` over a column of bare
+figures would name a denominator that is not there, which is the same rule the
+usage columns already follow by being absent rather than empty.
+
+A pod that asked for nothing keeps its bare figure. `Quantity::ratio_of` declines
+a zero denominator, so "asked for nothing" and "cannot be divided" are one branch
+rather than two that could drift; a percentage of zero would be an invention, and
+the pod really did ask for nothing. This is deliberately not the treatment a
+missing *usage* reading gets — that stays `-`, because nobody measured it, and a
+request is not a measurement.
+
+Rounding moved to `format::percentage`, shared with `nodes::Share::cell`. A node's
+share of allocatable and a pod's share of its request are the same kind of figure
+printed in two tables people read one after the other, and them differing by a
+digit would be a bug nobody could explain.
+
+The share is not classified into a `Severity`, unlike the node table's. The
+thresholds would not carry: 90% of a node's allocatable is alarming, while 90% of
+a pod's own request is a well-sized pod. What "hot" means for a pod against its
+request is a decision worth making deliberately, and nothing renders colour yet,
+so this waits for the roadmap entry that lights up both tables.

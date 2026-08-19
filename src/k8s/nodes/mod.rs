@@ -187,9 +187,10 @@ impl Share {
         };
 
         match self.ratio() {
-            // `{:.0}` rather than a cast: no truncation to reason about, and
-            // nothing to hand-roll for a value that will not fit an integer.
-            Some(ratio) => format!("{} ({:.0}%)", show(amount), ratio * 100.0),
+            // Rounded by `format::percentage`, which the pod table's shares go
+            // through too, so the two tables cannot round a percentage
+            // differently.
+            Some(ratio) => format!("{} ({})", show(amount), format::percentage(ratio)),
             None => show(amount),
         }
     }
