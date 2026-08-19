@@ -6,8 +6,12 @@ highest unchecked one that fits in a single pull request.
 Each task lists acceptance criteria. A task is done when those hold, tests cover
 them, and `make check` passes. Tick the box in the same PR that implements it.
 
-If a task turns out to be larger than one PR, land the smallest useful slice,
-tick nothing, and split the remainder into new tasks here.
+If a task turns out to be larger than one PR, land the smallest **complete**
+slice — one a user meets as a finished change — tick nothing, and split the
+remainder into new tasks here. Split at a seam: a surface this PR does not
+touch, or a decision the reviewer should make first. An entry that exists only
+because the last change stopped short of the bar in `CLAUDE.md` is not a
+follow-up; it is unfinished work, and it belongs in the PR that raised it.
 
 ---
 

@@ -82,9 +82,33 @@ Each night a fresh session picks up the next task. The procedure is in
 
 ### What "one pull request" means
 
-Roughly 200–500 lines of diff. If a task turns out bigger, split it: land the
-smallest useful piece and add the remainder to the roadmap as follow-ups. A PR
-that a human can review with coffee in hand beats a PR that does more.
+One complete change, not one line count. The reviewer should be able to read it
+over coffee and see a whole thought — so the first question is "is this
+finished?", and only then "is this small?".
+
+Measure the **production** diff, not the total. Tests here run two to four times
+the length of the code they cover, and a change is never worth splitting because
+its tests are long. Aim for **200–400 lines of production change**, with the
+tests, fixtures, and docs it needs on top of that. Past that, split.
+
+Splitting is a claim, and a follow-up has to earn it. One of these must be true:
+
+- it lands on a surface this PR does not touch — another command, a dashboard
+  pane, a module that does not exist yet;
+- it turns on a decision that is the reviewer's to make, so building it now would
+  be guessing at the answer;
+- it is a night's work on its own.
+
+Finishing what you just built is none of those. If a follow-up exists only
+because the change stops short of the priorities above — a message that
+diagnoses without advising, a flag honoured by one listing and not its twin, a
+rule stated on one path and not on the mirrored one — it is not a follow-up. It
+is the rest of the task, and it ships now, even if that carries the diff past
+the number. Two thirds of a change tonight and the last third tomorrow costs the
+reviewer two readings of the same paragraph.
+
+The tell is in your own writing: when the review notes say "the cost is that…",
+what follows is usually the half you should have finished.
 
 Never leave `master` broken, never merge your own PR, and never weaken a test to
 get CI green — if a test is wrong, fix the test deliberately and say so in the PR.
