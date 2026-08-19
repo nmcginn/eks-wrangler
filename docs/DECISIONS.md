@@ -680,3 +680,59 @@ cluster where every node is `Ready`, `status` is suggested and reorders nothing.
 The alternative bar is a different question about an ordering from the one this
 module has been answering, and it is left as a roadmap entry rather than guessed
 at.
+
+### 39. `--wide` lands on both listings, and its columns are a `Column` list
+
+`kubectl -o wide` is where people already go for a pod's IP or a node's AMI, so
+`eks` spells it `--wide` and copies both column sets to the letter, including
+the headings and their order. Two departures, both deliberate:
+
+`NODE` stays in the default pod table, where `kubectl` holds it back for wide,
+because a pod listing that will not say which machine a pod is on answers half
+the question people came with. So `--wide` adds three columns around it rather
+than the four `kubectl` adds. And the node table's wide columns go on the *end*,
+after `AGE`, rather than between `VERSION` and the capacities where `kubectl`
+puts them: the default table is then the wide one with its tail cut off, and
+someone comparing the two does not have to re-find the columns they were already
+reading.
+
+The flag lands on `eks nodes` at the same time as on `eks pods`, though only the
+pod half was on the roadmap. `eks nodes --wide` failing as an unknown argument
+while its twin accepted it would read as a bug rather than as a decision, and
+the node columns raised no question the pod ones had not already settled — this
+is the rule about a flag honoured by one listing and not its twin, in `CLAUDE.md`.
+
+The two tables now build their columns as a `Vec<Column>` from a pure function
+over the listing's conditions, where before each kept parallel lists of headers
+and cells assembled under matching `if`s. That pairing has a failure mode that
+type-checks: a heading pushed under one condition and its cell under a subtly
+different one puts every figure to the right of it under the wrong heading, and
+the table still renders perfectly. A `Column` answers for both halves of itself,
+so the two cannot drift, and the whole layout becomes one value a test can
+assert on rather than a table someone has to read in a terminal.
+
+`format::Width` is a two-variant enum beside `format::table`, not a `bool`, for
+the reason `k8s::order::Direction` is one: one type shared by both listings is
+what keeps `--wide` meaning the same thing on each. It sits in `format` rather
+than in `k8s` because it decides nothing about what is fetched — every field the
+extra columns show already arrived with the nodes and pods, so `--wide` costs no
+request and cannot fail.
+
+Where `kubectl` prints `<none>`, these columns print `-`, which is what every
+other empty cell in the tool prints. Matching `kubectl` mattered for the column
+names and their order, where a reader's habits are; a second spelling of "empty"
+inside one table would cost more than the resemblance is worth.
+
+The wide columns appear whatever is in them, unlike the usage columns, which are
+dropped when no row has a figure. The conditions look alike and are not: usage
+columns arrive unasked for, so an empty pair is clutter charged to someone who
+never wanted them, while `--wide` was typed. A column of `-` under
+`NOMINATED NODE` is the answer "nothing here is being preempted", and dropping it
+would leave the user unable to tell that from a flag that did nothing.
+
+`READINESS GATES` is in the pod set even though the roadmap entry named only two
+columns. The default table cannot explain a pod whose `READY` reads `1/1` while
+the cluster still calls it unready — every container up, an external controller
+withholding its condition — and that is a question the table itself raises. A pod
+with no gates reads `-` rather than `0/0`, which would suggest something
+unsatisfied on nearly every row where there is nothing to satisfy.

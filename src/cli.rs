@@ -106,6 +106,11 @@ pub enum Command {
         /// or no reported capacity — stay at the end either way.
         #[arg(long)]
         sort_reverse: bool,
+
+        /// Add the addresses, AMI, kernel, and container runtime, as
+        /// `kubectl get nodes -o wide` does.
+        #[arg(long)]
+        wide: bool,
     },
 
     /// List the pods of a namespace, or of every namespace.
@@ -133,6 +138,11 @@ pub enum Command {
         /// or never sampled — stay at the end either way.
         #[arg(long)]
         sort_reverse: bool,
+
+        /// Add the pod IP, the nominated node, and the readiness gates, as
+        /// `kubectl get pods -o wide` does.
+        #[arg(long)]
+        wide: bool,
     },
 
     /// Switch the active cluster.
@@ -198,7 +208,10 @@ mod tests {
         // The listing people already have must not move under them because a
         // flag was added; `--sort` is opt-in for nodes exactly as it is for
         // pods.
-        let Some(Command::Nodes { sort, sort_reverse }) = parse(&["eks", "nodes"]).command else {
+        let Some(Command::Nodes {
+            sort, sort_reverse, ..
+        }) = parse(&["eks", "nodes"]).command
+        else {
             panic!("expected a Nodes command");
         };
 
@@ -426,5 +439,70 @@ mod tests {
             args.kubeconfig_paths().unwrap(),
             vec![PathBuf::from("/a/config"), PathBuf::from("/b/config")]
         );
+    }
+
+    #[test]
+    fn both_listings_default_to_the_narrow_table() {
+        // The table people already have must not grow columns because a flag
+        // was added, so `--wide` is opt-in on both.
+        let Some(Command::Nodes { wide, .. }) = parse(&["eks", "nodes"]).command else {
+            panic!("expected a Nodes command");
+        };
+        assert!(!wide);
+
+        let Some(Command::Pods { wide, .. }) = parse(&["eks", "pods"]).command else {
+            panic!("expected a Pods command");
+        };
+        assert!(!wide);
+    }
+
+    #[test]
+    fn both_listings_take_wide() {
+        // One flag, spelled the same on both tables: a `--wide` that worked on
+        // one listing and was an unknown argument on its twin would read as a
+        // bug rather than as a decision.
+        let Some(Command::Nodes { wide, .. }) = parse(&["eks", "nodes", "--wide"]).command else {
+            panic!("expected a Nodes command");
+        };
+        assert!(wide);
+
+        let Some(Command::Pods { wide, .. }) = parse(&["eks", "pods", "--wide"]).command else {
+            panic!("expected a Pods command");
+        };
+        assert!(wide);
+    }
+
+    #[test]
+    fn wide_composes_with_the_other_listing_flags() {
+        // Nothing about `--wide` is exclusive with a scope, a selector, or an
+        // ordering — they answer different questions about the same listing.
+        let Some(Command::Pods {
+            all_namespaces,
+            selector,
+            sort,
+            sort_reverse,
+            wide,
+            ..
+        }) = parse(&[
+            "eks",
+            "pods",
+            "-A",
+            "-l",
+            "app=api",
+            "--sort",
+            "cpu",
+            "--sort-reverse",
+            "--wide",
+        ])
+        .command
+        else {
+            panic!("expected a Pods command");
+        };
+
+        assert!(all_namespaces);
+        assert_eq!(selector.as_deref(), Some("app=api"));
+        assert_eq!(sort, PodOrder::Cpu);
+        assert!(sort_reverse);
+        assert!(wide);
     }
 }

@@ -185,11 +185,28 @@ cluster.
   `k8s::nodes::sort`; a key press changes the order, and another reverses it,
   without a request.
 
-- [ ] **A `--wide` mode for `eks pods`.**
+- [x] **A `--wide` mode for `eks pods`.**
   Pod IP, and the nominated node for a preempting pod — the two columns
   `kubectl -o wide` adds that answer questions the current table raises.
   *Acceptance:* the column set is a pure function over the flag, tested both
   ways; the default table is unchanged to the byte.
+  Landed on `eks nodes` in the same change, since a `--wide` that one listing
+  rejected as an unknown argument would read as a bug; and with `READINESS
+  GATES` as a third pod column, because the default table cannot explain a pod
+  whose `READY` reads `1/1` while the cluster calls it unready.
+
+- [ ] **Decide what `--wide` means in a dashboard pane.**
+  `format::Width` and the two `columns` functions are ready for a third caller,
+  and the pod and node panes will meet the same question the CLI tables did.
+  Separate because the answer may not be a wide mode at all: a pane is narrower
+  than a terminal, not wider, and a pod's IP and readiness gates may belong in a
+  detail view for the selected row rather than in five more columns nobody can
+  fit. That is the reviewer's call to make before anything is built, and it
+  needs the pane to exist first.
+  *Acceptance:* whatever it turns into, the columns come from
+  `k8s::pods::row::columns` and `k8s::nodes::columns` rather than a second list;
+  a pane that shows the extra fields at all shows them under the same headings
+  the CLI uses.
 
 ### Follow-ups from the usage columns
 
@@ -240,7 +257,10 @@ cluster.
   `eks nodes` is now ten columns and around 140 characters wide on a cluster
   with metrics-server, which wraps on an 80-column terminal. The request and
   usage columns made this worse, and they are also the ones most worth keeping
-  when space is short.
+  when space is short. `format::Width` now exists as the other end of this —
+  `--wide` is the opt-in direction — and `k8s::nodes::columns` is the one place
+  the column set is decided, so this is a third variant and a drop order rather
+  than a new mechanism.
   *Acceptance:* columns are dropped in a documented order to fit the terminal;
   the choice is a pure function over an available width, tested at 80, 100, and
   1 column.

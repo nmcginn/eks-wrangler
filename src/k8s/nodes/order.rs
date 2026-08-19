@@ -287,6 +287,11 @@ mod tests {
             memory_used: Share::default(),
             age: "3h".to_owned(),
             created_at: Some(minutes_ago(180)),
+            internal_ip: "10.0.1.9".to_owned(),
+            external_ip: "-".to_owned(),
+            os_image: "Amazon Linux 2023.9.20260714".to_owned(),
+            kernel_version: "6.1.148-172.265.amzn2023.x86_64".to_owned(),
+            container_runtime: "containerd://1.7.28".to_owned(),
         }
     }
 

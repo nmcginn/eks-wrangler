@@ -7,6 +7,7 @@ use k8s_openapi::jiff::Timestamp;
 
 use crate::cluster::ClusterView;
 use crate::commands::nodes::target_cluster;
+use crate::format::Width;
 use crate::k8s::metrics::{self as k8s_metrics};
 use crate::k8s::order::Direction;
 use crate::k8s::pods::{Order, PodRow, Scope, Selectors};
@@ -37,6 +38,9 @@ pub struct Request<'a> {
     /// `--sort-reverse`, which flips `order` without changing which rows the
     /// ordering has nothing to rank — those stay in the tail.
     pub direction: Direction,
+    /// `--wide`. Like `order`, applied to the finished rows: every column it
+    /// adds arrived with the pods, so it costs no extra request.
+    pub width: Width,
 }
 
 /// Fetch and render the pod table for the selected cluster and scope.
@@ -137,7 +141,14 @@ pub async fn list(
         |candidate| k8s_pods::ranks_any(&rows, candidate),
     ));
 
-    Ok(k8s_pods::render(&rows, &label, &scope, &selectors, &notes))
+    Ok(k8s_pods::render(
+        &rows,
+        &label,
+        &scope,
+        &selectors,
+        &notes,
+        request.width,
+    ))
 }
 
 /// Validate the label and field selectors, before any network call.

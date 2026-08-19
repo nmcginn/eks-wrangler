@@ -98,6 +98,28 @@ pub struct PodRow {
     pub memory_used: Option<Quantity>,
     /// The node the pod landed on, or `-` while it is still unscheduled.
     pub node: String,
+    /// The address the pod answers on, or `-` before the CNI has assigned one.
+    ///
+    /// Only shown under `--wide`. On EKS this is a VPC address rather than an
+    /// overlay one, so it is the address a load balancer target group holds and
+    /// the one a security-group rule has to allow — which is why it is worth a
+    /// column at all.
+    pub ip: String,
+    /// The node the scheduler has earmarked for this pod while it evicts
+    /// something to make room, or `-` — which is nearly every pod.
+    ///
+    /// Only shown under `--wide`. A `Pending` pod with a nominated node is not
+    /// stuck: preemption is under way and it has somewhere to go. That is the
+    /// opposite conclusion from the one the `STATUS` column invites on its own.
+    pub nominated_node: String,
+    /// How many of the pod's readiness gates are satisfied, as `1/2`.
+    ///
+    /// Only shown under `--wide`, and `None` for a pod with no gates, which is
+    /// nearly every pod. A gate is the one way `READY` can read `2/2` on a pod
+    /// the cluster still calls unready — every container up, and some external
+    /// controller withholding its condition — so the default table cannot
+    /// explain that row and this column can.
+    pub readiness_gates: Option<String>,
 }
 
 impl PodRow {
@@ -153,8 +175,59 @@ impl PodRow {
                 .and_then(|spec| spec.node_name.as_deref())
                 .filter(|name| !name.is_empty())
                 .map_or_else(|| UNKNOWN.to_owned(), str::to_owned),
+            ip: pod_ip(pod),
+            nominated_node: pod
+                .status
+                .as_ref()
+                .and_then(|status| status.nominated_node_name.as_deref())
+                .filter(|name| !name.is_empty())
+                .map_or_else(|| UNKNOWN.to_owned(), str::to_owned),
+            readiness_gates: readiness_gates(pod),
         }
     }
+}
+
+/// The pod's address, preferring the dual-stack list `kubectl -o wide` reads.
+///
+/// `podIPs` and `podIP` are two spellings of the same thing and the kubelet
+/// fills both, but only the list can hold the IPv6 address of a dual-stack pod,
+/// and its first entry is the one matching the pod's primary IP family. Falling
+/// back to `podIP` covers the pod whose kubelet is older than the list field.
+fn pod_ip(pod: &Pod) -> String {
+    let status = pod.status.as_ref();
+    let from_list = status
+        .and_then(|status| status.pod_ips.as_ref())
+        .and_then(|ips| ips.first())
+        .map(|entry| entry.ip.as_str());
+    let legacy = status.and_then(|status| status.pod_ip.as_deref());
+
+    from_list
+        .or(legacy)
+        .filter(|ip| !ip.is_empty())
+        .map_or_else(|| UNKNOWN.to_owned(), str::to_owned)
+}
+
+/// How many of the pod's readiness gates its conditions satisfy, as `1/2`.
+///
+/// `None` when the pod declares no gates, which reads as `-`: `0/0` would
+/// suggest something unsatisfied on the majority of rows, where in fact there
+/// is nothing to satisfy. A gate whose condition the API server has not
+/// recorded at all counts as unsatisfied, which is what the pod's own readiness
+/// does with it.
+fn readiness_gates(pod: &Pod) -> Option<String> {
+    let gates = pod.spec.as_ref()?.readiness_gates.as_deref()?;
+    if gates.is_empty() {
+        return None;
+    }
+
+    let satisfied = gates
+        .iter()
+        .filter(|gate| {
+            condition(pod.status.as_ref(), &gate.condition_type)
+                .is_some_and(|found| found.status == "True")
+        })
+        .count();
+    Some(format!("{satisfied}/{}", gates.len()))
 }
 
 /// What the container statuses add up to.
@@ -546,11 +619,123 @@ fn usage_cell(amount: Option<Quantity>, show: fn(Quantity) -> String) -> String 
     amount.map_or_else(|| UNKNOWN.to_owned(), show)
 }
 
+/// One column of the pod table.
+///
+/// The column set is a value rather than two parallel lists of headers and
+/// cells, because the two lists drifting apart is a bug that type-checks: a
+/// header added under one condition and a cell under a subtly different one
+/// puts every figure to the right of it under the wrong heading, and the table
+/// still renders. With this, each column answers for both halves of itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Column {
+    Namespace,
+    Name,
+    Ready,
+    Status,
+    Restarts,
+    Cpu,
+    Memory,
+    Age,
+    Ip,
+    Node,
+    NominatedNode,
+    ReadinessGates,
+}
+
+impl Column {
+    /// The heading, spelled as `kubectl get pods` spells it.
+    fn header(self) -> &'static str {
+        match self {
+            Self::Namespace => "NAMESPACE",
+            Self::Name => "NAME",
+            Self::Ready => "READY",
+            Self::Status => "STATUS",
+            Self::Restarts => "RESTARTS",
+            Self::Cpu => "CPU",
+            Self::Memory => "MEMORY",
+            Self::Age => "AGE",
+            Self::Ip => "IP",
+            Self::Node => "NODE",
+            Self::NominatedNode => "NOMINATED NODE",
+            Self::ReadinessGates => "READINESS GATES",
+        }
+    }
+
+    /// This column's cell for one row.
+    fn cell(self, row: &PodRow) -> String {
+        match self {
+            Self::Namespace => row.namespace.clone(),
+            Self::Name => row.name.clone(),
+            Self::Ready => row.ready.clone(),
+            Self::Status => row.status.clone(),
+            Self::Restarts => restarts_cell(row),
+            Self::Cpu => usage_cell(row.cpu_used, quantity::cpu),
+            Self::Memory => usage_cell(row.memory_used, quantity::memory),
+            Self::Age => row.age.clone(),
+            Self::Ip => row.ip.clone(),
+            Self::Node => row.node.clone(),
+            Self::NominatedNode => row.nominated_node.clone(),
+            Self::ReadinessGates => row
+                .readiness_gates
+                .clone()
+                .unwrap_or_else(|| UNKNOWN.to_owned()),
+        }
+    }
+}
+
+/// Which columns this listing gets, in order.
+///
+/// A pure function over the three things that decide it — the scope, whether
+/// any row has live usage, and `--wide` — so the whole layout is settled by a
+/// test rather than by reading a table in a terminal.
+///
+/// The two conditions are not the same kind of condition, which is why they
+/// read differently. Usage is `any`: the columns appear unasked for, so a
+/// cluster with no metrics-server must not gain two empty ones. `--wide` was
+/// asked for, so its columns appear whatever is in them — a table of `-` under
+/// `NOMINATED NODE` is the answer "nothing is being preempted", and dropping
+/// the column would leave the user unable to tell that from a flag that did
+/// nothing.
+pub(crate) fn columns(scope: &super::Scope, rows: &[PodRow], width: format::Width) -> Vec<Column> {
+    let mut columns = Vec::with_capacity(12);
+    if scope.needs_namespace_column() {
+        columns.push(Column::Namespace);
+    }
+    columns.extend([
+        Column::Name,
+        Column::Ready,
+        Column::Status,
+        Column::Restarts,
+    ]);
+    // CPU and MEMORY sit with STATUS and RESTARTS, the other columns about how
+    // the pod is doing, rather than at the end: a pod that is unhappy and one
+    // that is burning a core are usually the same investigation.
+    if shows_usage(rows) {
+        columns.extend([Column::Cpu, Column::Memory]);
+    }
+    // AGE, IP, NODE, NOMINATED NODE, READINESS GATES is `kubectl -o wide`'s own
+    // tail order, kept to the letter. NODE is in this table by default where
+    // `kubectl` holds it back for wide, so `--wide` adds the three columns
+    // around it rather than the four `kubectl` adds.
+    columns.push(Column::Age);
+    if width.is_wide() {
+        columns.push(Column::Ip);
+    }
+    columns.push(Column::Node);
+    if width.is_wide() {
+        columns.extend([Column::NominatedNode, Column::ReadinessGates]);
+    }
+    columns
+}
+
 /// Render the `eks pods` table.
 ///
 /// `cluster` is the human label used in the empty-list message, so a user who
 /// typed the wrong `--context` or the wrong namespace finds out from the answer
 /// rather than from a bare header.
+///
+/// `width` is `--wide`. It changes only which columns are printed, never what
+/// was fetched: everything the extra columns show came back with the pods.
 ///
 /// `notes` are appended under the table — see [`usage_unavailable`]. They are
 /// dropped when there are no pods, where a footnote about missing columns would
@@ -562,47 +747,18 @@ pub fn render(
     scope: &super::Scope,
     selectors: &super::Selectors,
     notes: &[String],
+    width: format::Width,
 ) -> String {
     if rows.is_empty() {
         return empty(cluster, scope, selectors);
     }
 
-    let namespaced = scope.needs_namespace_column();
-    let usage = shows_usage(rows);
+    let columns = columns(scope, rows, width);
+    let headers: Vec<&str> = columns.iter().map(|column| column.header()).collect();
     let cells: Vec<Vec<String>> = rows
         .iter()
-        .map(|row| {
-            let mut cells = Vec::with_capacity(9);
-            if namespaced {
-                cells.push(row.namespace.clone());
-            }
-            cells.extend([
-                row.name.clone(),
-                row.ready.clone(),
-                row.status.clone(),
-                restarts_cell(row),
-            ]);
-            if usage {
-                cells.push(usage_cell(row.cpu_used, quantity::cpu));
-                cells.push(usage_cell(row.memory_used, quantity::memory));
-            }
-            cells.extend([row.age.clone(), row.node.clone()]);
-            cells
-        })
+        .map(|row| columns.iter().map(|column| column.cell(row)).collect())
         .collect();
-
-    // CPU and MEMORY sit with STATUS and RESTARTS, the other columns about how
-    // the pod is doing, rather than at the end: a pod that is unhappy and one
-    // that is burning a core are usually the same investigation. AGE and NODE
-    // stay last, where every `kubectl get pods` leaves them.
-    let mut headers = vec!["NAME", "READY", "STATUS", "RESTARTS"];
-    if usage {
-        headers.extend(["CPU", "MEMORY"]);
-    }
-    headers.extend(["AGE", "NODE"]);
-    if namespaced {
-        headers.insert(0, "NAMESPACE");
-    }
 
     let table = format::table(&headers, &cells);
 
@@ -665,7 +821,11 @@ fn selector_note(selectors: &super::Selectors) -> Option<String> {
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-    use k8s_openapi::api::core::v1::{ContainerStateRunning, ContainerStateWaiting, PodSpec};
+    use crate::format::Width;
+
+    use k8s_openapi::api::core::v1::{
+        ContainerStateRunning, ContainerStateWaiting, PodIP, PodReadinessGate, PodSpec,
+    };
     use k8s_openapi::apimachinery::pkg::apis::meta::v1::{ObjectMeta, Time};
     use k8s_openapi::jiff::SignedDuration;
 
@@ -760,6 +920,12 @@ mod tests {
                 ..Default::default()
             }),
             ..Default::default()
+        }
+    }
+
+    fn gate(kind: &str) -> PodReadinessGate {
+        PodReadinessGate {
+            condition_type: kind.to_owned(),
         }
     }
 
@@ -1307,6 +1473,7 @@ mod tests {
             &Scope::Namespace("payments".to_owned()),
             &unfiltered(),
             &[],
+            Width::Default,
         );
 
         assert_eq!(
@@ -1321,7 +1488,14 @@ mod tests {
     fn a_cluster_wide_listing_leads_with_the_namespace() {
         // Without it, two pods called `api-7c9f` in different namespaces are
         // indistinguishable.
-        let rendered = render(&rows(), "prod (us-east-1)", &Scope::All, &unfiltered(), &[]);
+        let rendered = render(
+            &rows(),
+            "prod (us-east-1)",
+            &Scope::All,
+            &unfiltered(),
+            &[],
+            Width::Default,
+        );
 
         assert_eq!(
             rendered,
@@ -1339,6 +1513,7 @@ mod tests {
             &Scope::Namespace("payments".to_owned()),
             &unfiltered(),
             &[],
+            Width::Default,
         );
 
         assert!(message.contains("prod (us-east-1)"), "{message}");
@@ -1349,7 +1524,14 @@ mod tests {
 
     #[test]
     fn an_empty_cluster_wide_listing_suggests_checking_the_cluster() {
-        let message = render(&[], "prod (us-east-1)", &Scope::All, &unfiltered(), &[]);
+        let message = render(
+            &[],
+            "prod (us-east-1)",
+            &Scope::All,
+            &unfiltered(),
+            &[],
+            Width::Default,
+        );
 
         assert!(message.contains("prod (us-east-1)"), "{message}");
         assert!(message.contains("eks contexts"), "{message}");
@@ -1370,6 +1552,7 @@ mod tests {
             &Scope::Namespace("payments".to_owned()),
             &filtered,
             &[],
+            Width::Default,
         );
 
         assert!(message.contains("prod (us-east-1)"), "{message}");
@@ -1384,7 +1567,14 @@ mod tests {
             label: Some("app=api".to_owned()),
             field: Some("status.phase!=Running".to_owned()),
         };
-        let message = render(&[], "prod (us-east-1)", &Scope::All, &filtered, &[]);
+        let message = render(
+            &[],
+            "prod (us-east-1)",
+            &Scope::All,
+            &filtered,
+            &[],
+            Width::Default,
+        );
 
         assert!(message.contains("label selector `app=api`"), "{message}");
         assert!(
@@ -1657,6 +1847,7 @@ mod tests {
             &Scope::Namespace("payments".to_owned()),
             &unfiltered(),
             &[],
+            Width::Default,
         );
 
         assert_eq!(
@@ -1750,6 +1941,7 @@ mod tests {
             &Scope::Namespace("payments".to_owned()),
             &unfiltered(),
             &[],
+            Width::Default,
         );
 
         assert_eq!(
@@ -1768,6 +1960,7 @@ mod tests {
             &Scope::All,
             &unfiltered(),
             &[],
+            Width::Default,
         );
 
         assert!(
@@ -1786,6 +1979,7 @@ mod tests {
             &Scope::Namespace("payments".to_owned()),
             &unfiltered(),
             &[],
+            Width::Default,
         );
 
         assert!(!rendered.contains("CPU"), "{rendered}");
@@ -1806,6 +2000,7 @@ mod tests {
             &Scope::Namespace("payments".to_owned()),
             &unfiltered(),
             &[],
+            Width::Default,
         );
 
         assert!(rendered.contains("CPU"), "{rendered}");
@@ -1828,6 +2023,7 @@ mod tests {
             &Scope::Namespace("payments".to_owned()),
             &unfiltered(),
             &[],
+            Width::Default,
         );
 
         assert!(
@@ -1846,6 +2042,7 @@ mod tests {
             &[usage_unavailable(
                 "prod (us-east-1) has no metrics.k8s.io API.",
             )],
+            Width::Default,
         );
 
         assert!(rendered.contains("api-7c9f"), "{rendered}");
@@ -1873,6 +2070,7 @@ mod tests {
             &Scope::Namespace("payments".to_owned()),
             &unfiltered(),
             &notes,
+            Width::Default,
         );
         let paragraphs: Vec<&str> = output.split("\n\n").collect();
 
@@ -1885,6 +2083,7 @@ mod tests {
                 &Scope::Namespace("payments".to_owned()),
                 &unfiltered(),
                 &[],
+                Width::Default,
             )
         );
         assert_eq!(paragraphs[2], "Sorted by restarts.");
@@ -1915,6 +2114,7 @@ mod tests {
             &Scope::Namespace("payments".to_owned()),
             &unfiltered(),
             &notes,
+            Width::Default,
         );
         let paragraphs: Vec<&str> = output.split("\n\n").collect();
 
@@ -1967,6 +2167,7 @@ mod tests {
             &Scope::Namespace("payments".to_owned()),
             &unfiltered(),
             &[note],
+            Width::Default,
         );
 
         assert!(!message.contains("sort by"), "{message}");
@@ -1988,6 +2189,7 @@ mod tests {
             &Scope::Namespace("payments".to_owned()),
             &unfiltered(),
             &[note],
+            Width::Default,
         );
 
         assert!(!message.contains("Sorted by"), "{message}");
@@ -2006,6 +2208,7 @@ mod tests {
             &[usage_unavailable(
                 "prod (us-east-1) has no metrics.k8s.io API.",
             )],
+            Width::Default,
         );
 
         assert!(!message.contains("CPU and MEMORY"), "{message}");
@@ -2019,5 +2222,309 @@ mod tests {
         assert!(note.contains("CPU and MEMORY"), "{note}");
         assert!(note.contains("not shown"), "{note}");
         assert!(note.contains("no metrics.k8s.io API"), "{note}");
+    }
+
+    /// The healthy pod with the fields only `--wide` shows filled in.
+    fn wide_pod() -> Pod {
+        let mut pod = healthy();
+        if let Some(status) = pod.status.as_mut() {
+            status.pod_ip = Some("10.0.1.42".to_owned());
+            status.pod_ips = Some(vec![PodIP {
+                ip: "10.0.1.42".to_owned(),
+            }]);
+        }
+        pod
+    }
+
+    #[test]
+    fn the_default_pod_table_holds_the_wide_columns_back() {
+        let rows = [PodRow::from_pod(&wide_pod(), None, now())];
+
+        let table = render(
+            &rows,
+            "prod (us-east-1)",
+            &Scope::Namespace("payments".to_owned()),
+            &unfiltered(),
+            &[],
+            Width::Default,
+        );
+
+        for held_back in ["IP", "NOMINATED NODE", "READINESS GATES"] {
+            assert!(!table.contains(held_back), "{held_back} in {table}");
+        }
+    }
+
+    #[test]
+    fn wide_adds_the_address_the_nominated_node_and_the_readiness_gates() {
+        let rows = [PodRow::from_pod(&wide_pod(), None, now())];
+
+        assert_eq!(
+            render(
+                &rows,
+                "prod (us-east-1)",
+                &Scope::Namespace("payments".to_owned()),
+                &unfiltered(),
+                &[],
+                Width::Wide,
+            ),
+            "NAME      READY  STATUS   RESTARTS  AGE  IP         NODE                      NOMINATED NODE  READINESS GATES\n\
+             api-7c9f  1/1    Running  0         90m  10.0.1.42  ip-10-0-1-9.ec2.internal  -               -"
+        );
+    }
+
+    #[test]
+    fn the_wide_pod_columns_sit_where_kubectl_puts_them() {
+        // `kubectl -o wide` ends AGE, IP, NODE, NOMINATED NODE, READINESS
+        // GATES. NODE is in this table by default, so `--wide` fills in the
+        // three around it rather than appending four.
+        let rows = [PodRow::from_pod(&wide_pod(), None, now())];
+        let scope = Scope::Namespace("payments".to_owned());
+
+        let narrow = columns(&scope, &rows, Width::Default);
+        let wide = columns(&scope, &rows, Width::Wide);
+
+        assert_eq!(
+            narrow,
+            [
+                Column::Name,
+                Column::Ready,
+                Column::Status,
+                Column::Restarts,
+                Column::Age,
+                Column::Node,
+            ]
+        );
+        assert_eq!(
+            wide,
+            [
+                Column::Name,
+                Column::Ready,
+                Column::Status,
+                Column::Restarts,
+                Column::Age,
+                Column::Ip,
+                Column::Node,
+                Column::NominatedNode,
+                Column::ReadinessGates,
+            ]
+        );
+    }
+
+    #[test]
+    fn the_wide_pod_columns_compose_with_the_namespace_and_usage_ones() {
+        // Three independent conditions decide this layout, and `--wide` must
+        // disturb neither of the other two.
+        let rows = [PodRow::from_pod(
+            &wide_pod(),
+            Some(Usage {
+                cpu: Quantity::parse("250m").ok(),
+                memory: Quantity::parse("512Mi").ok(),
+            }),
+            now(),
+        )];
+
+        let headers: Vec<&str> = columns(&Scope::All, &rows, Width::Wide)
+            .iter()
+            .map(|column| column.header())
+            .collect();
+
+        assert_eq!(
+            headers,
+            [
+                "NAMESPACE",
+                "NAME",
+                "READY",
+                "STATUS",
+                "RESTARTS",
+                "CPU",
+                "MEMORY",
+                "AGE",
+                "IP",
+                "NODE",
+                "NOMINATED NODE",
+                "READINESS GATES",
+            ]
+        );
+    }
+
+    #[test]
+    fn the_wide_columns_appear_even_when_every_one_of_them_is_empty() {
+        // Deliberately unlike the usage columns, which are dropped when a
+        // cluster has nothing to put in them. Those arrive unasked for; this
+        // flag was typed, and a column of `-` is the answer "nothing here is
+        // being preempted" rather than a flag that did nothing.
+        let rows = [PodRow::from_pod(&healthy(), None, now())];
+
+        let table = render(
+            &rows,
+            "prod (us-east-1)",
+            &Scope::Namespace("payments".to_owned()),
+            &unfiltered(),
+            &[],
+            Width::Wide,
+        );
+
+        assert!(table.contains("NOMINATED NODE"), "{table}");
+        assert!(table.contains("READINESS GATES"), "{table}");
+    }
+
+    #[test]
+    fn a_pod_with_no_address_yet_reads_as_a_dash() {
+        // Scheduled but not networked: the CNI has not handed out an address.
+        assert_eq!(PodRow::from_pod(&healthy(), None, now()).ip, "-");
+
+        let mut blank = wide_pod();
+        if let Some(status) = blank.status.as_mut() {
+            status.pod_ip = Some(String::new());
+            status.pod_ips = Some(Vec::new());
+        }
+        assert_eq!(PodRow::from_pod(&blank, None, now()).ip, "-");
+    }
+
+    #[test]
+    fn a_dual_stack_pod_shows_the_first_of_its_addresses() {
+        let mut pod = wide_pod();
+        if let Some(status) = pod.status.as_mut() {
+            status.pod_ips = Some(vec![
+                PodIP {
+                    ip: "2600:1f13::42".to_owned(),
+                },
+                PodIP {
+                    ip: "10.0.1.42".to_owned(),
+                },
+            ]);
+            // The legacy field agrees with the list on a real cluster; it is
+            // set to something else here so the test can say which one is read.
+            status.pod_ip = Some("10.0.1.42".to_owned());
+        }
+
+        assert_eq!(PodRow::from_pod(&pod, None, now()).ip, "2600:1f13::42");
+    }
+
+    #[test]
+    fn a_pod_reporting_only_the_older_address_field_still_shows_one() {
+        let mut pod = wide_pod();
+        if let Some(status) = pod.status.as_mut() {
+            status.pod_ips = None;
+        }
+
+        assert_eq!(PodRow::from_pod(&pod, None, now()).ip, "10.0.1.42");
+    }
+
+    #[test]
+    fn a_pod_awaiting_preemption_names_the_node_it_is_promised() {
+        // The one case where `Pending` is not a stuck pod: the scheduler is
+        // evicting something to make room, and this is where it will land.
+        let mut pod = wide_pod();
+        if let Some(status) = pod.status.as_mut() {
+            status.phase = Some("Pending".to_owned());
+            status.nominated_node_name = Some("ip-10-0-2-7.ec2.internal".to_owned());
+        }
+
+        let row = PodRow::from_pod(&pod, None, now());
+        assert_eq!(row.nominated_node, "ip-10-0-2-7.ec2.internal");
+    }
+
+    #[test]
+    fn readiness_gates_count_only_the_conditions_that_are_true() {
+        let mut pod = wide_pod();
+        if let Some(spec) = pod.spec.as_mut() {
+            spec.readiness_gates = Some(vec![
+                gate("target-health.elbv2.k8s.aws/pod-readiness"),
+                gate("example.com/feature-flag"),
+                // Declared, but the controller has recorded nothing for it —
+                // which is exactly as unsatisfied as a False.
+                gate("example.com/never-reported"),
+            ]);
+        }
+        if let Some(status) = pod.status.as_mut() {
+            status.conditions = Some(vec![
+                condition("Ready", "True", None),
+                condition("target-health.elbv2.k8s.aws/pod-readiness", "True", None),
+                condition("example.com/feature-flag", "False", None),
+            ]);
+        }
+
+        assert_eq!(
+            PodRow::from_pod(&pod, None, now()).readiness_gates,
+            Some("1/3".to_owned())
+        );
+    }
+
+    #[test]
+    fn a_pod_with_no_readiness_gates_reads_as_a_dash_rather_than_zero_of_zero() {
+        // `0/0` on the overwhelming majority of rows would suggest something
+        // unsatisfied where there is nothing to satisfy.
+        assert_eq!(
+            PodRow::from_pod(&wide_pod(), None, now()).readiness_gates,
+            None
+        );
+
+        let mut empty = wide_pod();
+        if let Some(spec) = empty.spec.as_mut() {
+            spec.readiness_gates = Some(Vec::new());
+        }
+        assert_eq!(PodRow::from_pod(&empty, None, now()).readiness_gates, None);
+
+        let rows = [PodRow::from_pod(&empty, None, now())];
+        let table = render(
+            &rows,
+            "prod (us-east-1)",
+            &Scope::Namespace("payments".to_owned()),
+            &unfiltered(),
+            &[],
+            Width::Wide,
+        );
+        assert!(table.ends_with("-               -"), "{table}");
+    }
+
+    #[test]
+    fn a_pod_with_nothing_filled_in_still_produces_the_wide_cells() {
+        let row = PodRow::from_pod(&Pod::default(), None, now());
+
+        assert_eq!(row.ip, "-");
+        assert_eq!(row.nominated_node, "-");
+        assert_eq!(row.readiness_gates, None);
+    }
+
+    #[test]
+    fn an_empty_wide_listing_still_says_where_the_pods_went() {
+        // `--wide` changes columns, and there are no columns here to change.
+        let scope = Scope::Namespace("payments".to_owned());
+        assert_eq!(
+            render(
+                &[],
+                "prod (us-east-1)",
+                &scope,
+                &unfiltered(),
+                &[],
+                Width::Wide
+            ),
+            render(
+                &[],
+                "prod (us-east-1)",
+                &scope,
+                &unfiltered(),
+                &[],
+                Width::Default,
+            )
+        );
+    }
+
+    #[test]
+    fn a_wide_pod_table_keeps_its_footnotes() {
+        let rows = [PodRow::from_pod(&wide_pod(), None, now())];
+        let note = "Sorted by cpu.".to_owned();
+
+        let output = render(
+            &rows,
+            "prod (us-east-1)",
+            &Scope::All,
+            &unfiltered(),
+            std::slice::from_ref(&note),
+            Width::Wide,
+        );
+
+        assert!(output.ends_with(&format!("\n\n{note}")), "{output}");
     }
 }

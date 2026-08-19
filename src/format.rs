@@ -6,6 +6,45 @@
 
 use k8s_openapi::jiff::SignedDuration;
 
+/// How many of a table's columns to print.
+///
+/// Both listings hold a handful of columns back from their default table — a
+/// pod's IP, a node's kernel version — because they are noise on the question
+/// the table is usually asked and exactly what is wanted on the day it is not.
+/// `--wide` is the same flag on both, so it is one type rather than a `bool`
+/// per listing: two listings each carrying their own would sooner or later
+/// disagree about what "wide" means, which is the whole reason [`Direction`]
+/// lives in one place too.
+///
+/// [`Direction`]: crate::k8s::order::Direction
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Width {
+    /// The columns a listing shows when nobody asked for more.
+    #[default]
+    Default,
+    /// Every column the listing has.
+    Wide,
+}
+
+impl Width {
+    /// `Wide` when `--wide` was given, `Default` otherwise.
+    ///
+    /// Named for the flag, like [`Direction::reversed`], so the call site in
+    /// `main` reads as the command line does.
+    ///
+    /// [`Direction::reversed`]: crate::k8s::order::Direction::reversed
+    #[must_use]
+    pub fn widened(yes: bool) -> Self {
+        if yes { Self::Wide } else { Self::Default }
+    }
+
+    /// Whether the extra columns are shown.
+    #[must_use]
+    pub fn is_wide(self) -> bool {
+        matches!(self, Self::Wide)
+    }
+}
+
 /// Human-readable age, in `kubectl`'s style.
 ///
 /// `kubectl` shows a coarser unit as the value grows — `45s`, `5m30s`, `3h20m`,
@@ -182,6 +221,17 @@ mod tests {
         // value in the AGE column.
         assert_eq!(human_duration(seconds(-30)), "0s");
         assert_eq!(human_duration(SignedDuration::from_hours(-24 * 400)), "0s");
+    }
+
+    #[test]
+    fn a_width_is_wide_only_when_the_flag_was_given() {
+        assert_eq!(Width::widened(true), Width::Wide);
+        assert_eq!(Width::widened(false), Width::Default);
+        // The default must be the narrow table, or a listing that forgot to
+        // pass the flag through would quietly grow columns.
+        assert_eq!(Width::default(), Width::Default);
+        assert!(Width::Wide.is_wide());
+        assert!(!Width::Default.is_wide());
     }
 
     #[test]

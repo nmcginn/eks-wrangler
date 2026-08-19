@@ -11,6 +11,7 @@ use tracing_subscriber::EnvFilter;
 
 use eks::cli::{Cli, Command, GlobalArgs};
 use eks::commands::{self, contexts, nodes, pods};
+use eks::format::Width;
 use eks::k8s::order::Direction;
 use eks::kubeconfig::KubeConfig;
 use eks::ui::{self, App};
@@ -40,7 +41,11 @@ fn run(cli: Cli) -> Result<()> {
             print_line(&contexts::list(&config, quiet));
             Ok(())
         }
-        Command::Nodes { sort, sort_reverse } => {
+        Command::Nodes {
+            sort,
+            sort_reverse,
+            wide,
+        } => {
             // The only command so far that needs a runtime; it builds one for
             // itself so the filesystem-only commands stay as cheap as they are.
             let output = commands::block_on(nodes::list(
@@ -49,6 +54,7 @@ fn run(cli: Cli) -> Result<()> {
                 cli.global.context.as_deref(),
                 sort,
                 Direction::reversed(sort_reverse),
+                Width::widened(wide),
             ))?;
             print_line(&output);
             Ok(())
@@ -59,6 +65,7 @@ fn run(cli: Cli) -> Result<()> {
             field_selector,
             sort,
             sort_reverse,
+            wide,
         } => {
             let output = commands::block_on(pods::list(
                 &config,
@@ -71,6 +78,7 @@ fn run(cli: Cli) -> Result<()> {
                     field_selector: field_selector.as_deref(),
                     order: sort,
                     direction: Direction::reversed(sort_reverse),
+                    width: Width::widened(wide),
                 },
             ))?;
             print_line(&output);

@@ -119,6 +119,18 @@ figure itself, since a pod's usage has no denominator in its table. `NodeRow`
 gained a `created_at` beside its rendered `age` for the same reason `PodRow` has
 one — two nodes can both read `3d` and be nearly a day apart.
 
+Which columns a table has is the same shape of decision, one hop later, and it is
+settled the same way: `k8s::nodes::columns` and `k8s::pods::row::columns` are
+pure functions from a listing's conditions — the scope, whether any row carries
+live usage, and `format::Width` — to a `Vec<Column>`, and each `Column` answers
+for both its heading and its cell. Two parallel lists of headers and cells is the
+alternative, and it has a failure that type-checks: a heading added under one
+condition and its cell under a subtly different one shifts every figure to the
+right of it under the wrong heading, and the table still renders. `format::Width`
+sits with `format::table` rather than in `k8s`, because `--wide` decides nothing
+about what is fetched — everything the extra columns show already arrived with
+the nodes and pods.
+
 Selectors take the same shape in reverse: `k8s::selector` parses the label and
 field selectors a user types (`app=api`, `status.phase!=Running`) into a
 canonical string, rejecting a malformed one — with the offending text quoted —
