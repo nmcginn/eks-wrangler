@@ -99,7 +99,7 @@ cluster.
   runs of one command; reversing an ordering does not move the "nothing to rank
   this by" rows out of the tail, where they belong under either direction.
 
-- [ ] **Sort the node table too.**
+- [x] **Sort the node table too.**
   `eks nodes` has the same problem `eks pods` had before `--sort`: ten columns of
   numbers in alphabetical order. `k8s::pods::order` is generic in shape but not
   in type — `Rank`, `Direction`, and the reversal rule are the reusable half, and
@@ -112,18 +112,31 @@ cluster.
   `--sort cpu --sort-reverse` prints a table that looks exactly like `--sort cpu`
   to anyone who did not type it, and the tail of unranked rows makes a reversed
   listing look sorted the other way at a glance. A line under the table, beside
-  the metrics footnote, would say.
+  the metrics footnote, would say. Now wanted by both listings, and worth writing
+  once in `k8s::order` over an `Order`'s `clap::ValueEnum` name rather than twice.
   *Acceptance:* the default order says nothing, so the existing output is
   unchanged to the byte; the note is a pure function over the order and
   direction.
+
+- [ ] **An ordering that ranked nothing should say so.**
+  `eks nodes --sort cpu` on a cluster with no metrics-server sorts by a column
+  that is not in the table: every row is unranked, the alphabet decides the whole
+  listing, and the output is identical to the default. The footnote explains why
+  the columns are missing but says nothing about the sort the user actually
+  typed, so the flag reads as broken. Discovered while sorting the node table.
+  *Acceptance:* the note fires only when no row could be ranked, and names the
+  ordering; a listing where even one row ranked says nothing extra.
 
 - [ ] **Carry `--sort` into the dashboard, alongside the selectors.**
   `k8s::pods::order` is deliberately a function over rows rather than over pods,
   so the dashboard's pod views can sort the rows they already have without
   refetching — and should, rather than growing an ordering of their own. Pairs
   with the selector task above; the three flags belong to the same listing.
-  *Acceptance:* the dashboard sorts through `k8s::pods::sort`; a key press
-  changes the order, and another reverses it, without a request.
+  `k8s::nodes::order` is now the same shape, so the node pane gets this for free
+  and the two panes should share the `Direction` key that reverses them.
+  *Acceptance:* the dashboard sorts through `k8s::pods::sort` and
+  `k8s::nodes::sort`; a key press changes the order, and another reverses it,
+  without a request.
 
 - [ ] **A `--wide` mode for `eks pods`.**
   Pod IP, and the nominated node for a preempting pod — the two columns
@@ -318,6 +331,22 @@ cluster.
 ---
 
 ## Done
+
+- **Sort the node table too** (2026-08-19) — `eks nodes --sort` takes `status`,
+  `cpu`, `memory`, `cpu-requested`, `memory-requested`, and `age`, with
+  `--sort-reverse` flipping any of them. The shared half moved up to
+  `k8s::order`: `Direction`, `Rank`, and the one comparison that keeps ranked
+  rows apart from unrankable ones, so the rule that a row with nothing to rank it
+  by stays in the tail under either direction is now written down once and
+  asserted on the primitive rather than on either listing's rows. The keys did
+  not move — a node has no restart count — and they read differently on purpose:
+  a node ranks by its *share* of allocatable, because a two-core node at 95% is
+  closer to trouble than a sixty-four-core node burning twenty times as much at
+  30%, while a pod ranks by the figure, having no denominator in its table. That
+  gives node usage two kinds of blank, and `Rank`'s tiers carry them: a figure
+  with no allocatable behind it sorts ahead of no figure at all. `NodeRow` gained
+  `created_at` beside `age`, the pairing `PodRow` already had, so `age` ranks on
+  an instant rather than on a rounded string.
 
 - **More orderings for `--sort`, and a way to reverse one** (2026-08-19) —
   `--sort` gained `age`, `cpu`, and `memory`, and `--sort-reverse` flips any of

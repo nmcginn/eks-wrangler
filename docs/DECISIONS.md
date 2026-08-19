@@ -495,3 +495,52 @@ behave differently once it is, and the accepted-values list clap prints on a typ
 stops matching what the flag really takes. A separate boolean flag composes with
 every order for free, shows up in `--help` next to the one it modifies, and needs
 no parsing at all.
+
+### 33. `Direction` and `Rank` moved up to `k8s::order`; the keys did not
+
+`eks nodes --sort` needs the same two rules `eks pods --sort` already had — which
+way round an order runs, and that a row an order cannot rank stays in the tail
+under either direction — and those rules are worth exactly nothing if the two
+tables can drift apart on them. So `Direction`, `Rank`, and the comparison that
+keeps ranked and unranked rows apart now live in `k8s::order`, with the rule
+written down once in its module docs and asserted on the primitive rather than
+on one listing's rows.
+
+The keys stayed put. A node has no restart count and a pod has no allocatable
+capacity, so each listing keeps its own `Order` enum, its own `sort`, and its own
+rank functions. A shared trait over "things that can be sorted" would have bought
+nothing here: the only code it would have deduplicated is the four-line `sort`
+that appends the alphabetical tie-break.
+
+### 34. The node orders rank by share; the pod orders rank by the figure
+
+`eks pods --sort cpu` ranks by the number in the `CPU` column, because that is
+all there is — a pod's usage has no denominator in that table. Doing the same for
+a node would answer the wrong question: the node table already shows every figure
+as a percentage of allocatable, and a two-core node at 95% is closer to trouble
+than a sixty-four-core node burning twenty times as much at 30%. So the node
+orders rank by `Share::ratio`.
+
+That gives node usage a second kind of blank, and the `Rank::Unranked` tiers
+`restarts` needed are what carry it: a node with a figure but no allocatable to
+divide it by (one still registering) sorts ahead of a node with no figure at all
+(one metrics-server has not reached), and both stay behind every node that has a
+percentage. A node reporting zero allocatable is in the first tier rather than at
+the top of the listing as an infinity, because `Quantity::ratio_of` refuses to
+divide by zero.
+
+`Share::ratio` is an `f64`, and a sort key has to be `Ord`, so the key is a
+private newtype ordered by `f64::total_cmp`. That is total over every `f64` there
+is, including the ones a nonsensical reading from the API server could produce —
+a strange figure then sorts strangely instead of making the comparison
+inconsistent and the whole sort meaningless.
+
+### 35. `--sort status` puts the unknown node above the cordoned one
+
+Node health has four states and `--sort status` has to put them in some order.
+`NotReady` leads, and `Ready` is last; the argument is about the middle. A node
+whose kubelet has stopped reporting (`Unknown`, usually a node that has only just
+registered — or one that is about to be a problem) sits above a cordoned one,
+because a cordoned node is a node somebody deliberately took out of service and
+the accident belongs above the intention. Nothing is unranked under this order —
+every node has a status — so unlike the usage orders it reverses completely.
