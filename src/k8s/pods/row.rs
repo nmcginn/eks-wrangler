@@ -78,6 +78,16 @@ pub struct PodRow {
     /// that rendering still has nothing to compute.
     pub last_restart: Option<Timestamp>,
     pub age: String,
+    /// The moment the pod was created, unformatted, for
+    /// [`crate::k8s::pods::order`] to sort on.
+    ///
+    /// Carried beside `age` for the same reason `last_restart` is carried
+    /// beside `restart_age`: `2m` and `1h` do not compare as strings, and the
+    /// rounding that makes an age readable throws away exactly the precision
+    /// that separates two pods rolled out in the same minute. `None` where the
+    /// API server returned no `creationTimestamp`, which is also what makes
+    /// `age` read as `-`.
+    pub created_at: Option<Timestamp>,
     /// Cores the pod is actually burning, from metrics-server.
     ///
     /// `None` where there is no metrics-server, where it has not sampled this
@@ -103,6 +113,13 @@ impl PodRow {
     #[must_use]
     pub fn from_pod(pod: &Pod, used: Option<Usage>, now: Timestamp) -> Self {
         let derived = derive(pod);
+        // Read once and used for both cells, so the formatted age and the
+        // instant the ordering sorts on cannot describe different moments.
+        let created_at = pod
+            .metadata
+            .creation_timestamp
+            .as_ref()
+            .map(|created| created.0);
 
         Self {
             namespace: pod
@@ -123,10 +140,11 @@ impl PodRow {
                 .last_restart
                 .map(|at| format::human_duration(now.duration_since(at))),
             last_restart: derived.last_restart,
-            age: pod.metadata.creation_timestamp.as_ref().map_or_else(
+            age: created_at.map_or_else(
                 || UNKNOWN.to_owned(),
-                |created| format::human_duration(now.duration_since(created.0)),
+                |created| format::human_duration(now.duration_since(created)),
             ),
+            created_at,
             cpu_used: used.and_then(|usage| usage.cpu),
             memory_used: used.and_then(|usage| usage.memory),
             node: pod
@@ -1676,6 +1694,30 @@ mod tests {
 
         assert_eq!(row.cpu_used, Some(Quantity::parse("250m").unwrap()));
         assert_eq!(row.memory_used, Some(Quantity::parse("512Mi").unwrap()));
+    }
+
+    #[test]
+    fn the_creation_instant_agrees_with_the_age_cell() {
+        // The two are read from one field so they cannot describe different
+        // moments — the pairing `k8s::pods::order` sorts on.
+        let row = PodRow::from_pod(&healthy(), None, now());
+
+        assert_eq!(row.age, "90m");
+        assert_eq!(row.created_at, Some(now() - SignedDuration::from_mins(90)));
+    }
+
+    #[test]
+    fn a_pod_with_no_creation_timestamp_has_no_instant_either() {
+        // The API server always sets `creationTimestamp`, but a hand-written
+        // fixture or a partial object from a cache need not, and the AGE cell
+        // already falls back to `-` for it.
+        let mut undated = healthy();
+        undated.metadata.creation_timestamp = None;
+
+        let row = PodRow::from_pod(&undated, None, now());
+
+        assert_eq!(row.age, "-");
+        assert_eq!(row.created_at, None);
     }
 
     #[test]

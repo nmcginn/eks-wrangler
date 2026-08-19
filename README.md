@@ -106,16 +106,37 @@ when that API answers — no metrics-server means no empty columns, just a note
 under the table — and a pod it has not sampled yet reads `-` rather than a zero
 that would look like an idle pod.
 
-`--sort restarts` reorders the listing by that column, most recently restarted
-first. Alphabetical order is the right one for reading a namespace and the wrong
-one during an incident — the pod that restarted eight seconds ago sits wherever
-its name puts it, among ninety-nine healthy ones. Pods that have never restarted
-go to the end, and the count only breaks ties between restarts that happened at
-the same moment. The default order is unchanged.
+`--sort` reorders the listing by a column. Alphabetical order is the right one
+for reading a namespace and the wrong one during an incident — the pod that
+restarted eight seconds ago, or the one burning a core, sits wherever its name
+puts it among ninety-nine healthy ones. The orders are `name` (the default,
+unchanged), `restarts`, `age`, `cpu`, and `memory`, and every one but `name` puts
+the row you went looking for first: the newest restart, the youngest pod, the
+largest figure.
 
 ```sh
 eks pods -A --sort restarts     # what is crashing right now, across the cluster
+eks pods --sort memory          # what is closest to being OOM-killed
+eks pods -A --sort age          # what has just rolled out
 ```
+
+`--sort-reverse` flips that, for the other reading of the same column — the pod
+using the *least* CPU, or the one that has been up longest:
+
+```sh
+eks pods --sort age --sort-reverse   # what has been running since before all this
+```
+
+Pods there is nothing to rank stay at the end under either direction. A pod that
+has never restarted does not belong at the top of a restart ordering, and a pod
+metrics-server has not sampled is not the idlest pod in the namespace — it is a
+pod nobody has measured, which is a fact about the scraper rather than about the
+pod.
+
+Note that `--sort age` prints the *youngest* first, which is the opposite way
+round from `kubectl --sort-by=.metadata.creationTimestamp`. One rule across every
+order here beat matching a different tool on one of them; `--sort-reverse` gives
+you `kubectl`'s reading.
 
 Narrow the listing with `-l` (labels) and `--field-selector` (fields), the same
 selectors `kubectl` takes. The filtering happens on the API server, and a
@@ -140,7 +161,8 @@ refresh them instead of printing an HTTP status code.
 | `-A, --all-namespaces` | List pods across every namespace (`eks pods`) |
 | `-l, --selector <SEL>` | Filter pods by label selector (`eks pods`) |
 | `--field-selector <SEL>` | Filter pods by field selector (`eks pods`) |
-| `--sort <ORDER>` | Order the pod listing: `name` (default) or `restarts` |
+| `--sort <ORDER>` | Order the pod listing: `name` (default), `restarts`, `age`, `cpu`, `memory` |
+| `--sort-reverse` | Reverse `--sort`; unrankable pods stay at the end |
 | `--kubeconfig <PATH>` | Override the kubeconfig search path |
 | `-v, --verbose` | Increase log verbosity (repeatable) |
 

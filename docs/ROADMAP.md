@@ -90,7 +90,7 @@ cluster.
   *Acceptance:* the ordering is a pure function over the rows; pods that have
   never restarted sort last rather than first; the default order is unchanged.
 
-- [ ] **More orderings for `--sort`, and a way to reverse one.**
+- [x] **More orderings for `--sort`, and a way to reverse one.**
   `--sort` now exists with two values, and `age`, `cpu`, and `memory` are the
   obvious next ones — the usage columns have exactly the same problem the
   restart column had, in that the pod burning a core is wherever its name puts
@@ -99,13 +99,31 @@ cluster.
   runs of one command; reversing an ordering does not move the "nothing to rank
   this by" rows out of the tail, where they belong under either direction.
 
+- [ ] **Sort the node table too.**
+  `eks nodes` has the same problem `eks pods` had before `--sort`: ten columns of
+  numbers in alphabetical order. `k8s::pods::order` is generic in shape but not
+  in type — `Rank`, `Direction`, and the reversal rule are the reusable half, and
+  the keys are not — so this is a question of what to share rather than a copy.
+  *Acceptance:* the rule that unrankable rows stay in the tail is stated once,
+  not twice; a node with no metrics sorts last under `--sort cpu` in either
+  direction.
+
+- [ ] **Say which ordering a listing is in.**
+  `--sort cpu --sort-reverse` prints a table that looks exactly like `--sort cpu`
+  to anyone who did not type it, and the tail of unranked rows makes a reversed
+  listing look sorted the other way at a glance. A line under the table, beside
+  the metrics footnote, would say.
+  *Acceptance:* the default order says nothing, so the existing output is
+  unchanged to the byte; the note is a pure function over the order and
+  direction.
+
 - [ ] **Carry `--sort` into the dashboard, alongside the selectors.**
   `k8s::pods::order` is deliberately a function over rows rather than over pods,
   so the dashboard's pod views can sort the rows they already have without
   refetching — and should, rather than growing an ordering of their own. Pairs
-  with the selector task above; the two flags belong to the same listing.
+  with the selector task above; the three flags belong to the same listing.
   *Acceptance:* the dashboard sorts through `k8s::pods::sort`; a key press
-  changes the order without a request.
+  changes the order, and another reverses it, without a request.
 
 - [ ] **A `--wide` mode for `eks pods`.**
   Pod IP, and the nominated node for a preempting pod — the two columns
@@ -300,6 +318,19 @@ cluster.
 ---
 
 ## Done
+
+- **More orderings for `--sort`, and a way to reverse one** (2026-08-19) —
+  `--sort` gained `age`, `cpu`, and `memory`, and `--sort-reverse` flips any of
+  them. The reversal is the part with a decision in it: it flips only the rows an
+  ordering can rank, so a pod that has never restarted, or one metrics-server has
+  not sampled, stays in the tail under either direction. Reversing the whole
+  comparison would open every reversed listing on its blank rows, and "least CPU"
+  asks which pod is idle rather than which pod nobody measured. Each ordering
+  maps a row to a private `Rank` — either a key or a marker that there is nothing
+  to rank — which is also what lets `restarts` keep its two distinct kinds of
+  blank through a reversal. `PodRow` gained `created_at` beside `age`, the same
+  pairing `last_restart` has with `restart_age`, so `age` sorts on an instant
+  rather than on a rounded string.
 
 - **Sort the pod listing by how recently it restarted** (2026-08-19) — `eks pods
   --sort restarts` puts the newest crash at the top. `k8s::pods::order` is a

@@ -8,7 +8,7 @@ use k8s_openapi::jiff::Timestamp;
 use crate::cluster::ClusterView;
 use crate::commands::nodes::target_cluster;
 use crate::k8s::metrics::{self as k8s_metrics};
-use crate::k8s::pods::{Order, PodRow, Scope, Selectors};
+use crate::k8s::pods::{Direction, Order, PodRow, Scope, Selectors};
 use crate::k8s::{self, pods as k8s_pods, selector};
 use crate::kubeconfig::KubeConfig;
 
@@ -33,6 +33,9 @@ pub struct Request<'a> {
     /// `--sort`. Applied to the finished rows, so it changes nothing about what
     /// is fetched — only the order it is read in.
     pub order: Order,
+    /// `--sort-reverse`, which flips `order` without changing which rows the
+    /// ordering has nothing to rank — those stay in the tail.
+    pub direction: Direction,
 }
 
 /// Fetch and render the pod table for the selected cluster and scope.
@@ -110,7 +113,7 @@ pub async fn list(
     // Ordering lives in `k8s::pods::order` rather than here, so the default and
     // the one `--sort` asks for are decided in the same place and by the same
     // rules — and so both can be tested on rows alone.
-    k8s_pods::sort(&mut rows, request.order);
+    k8s_pods::sort(&mut rows, request.order, request.direction);
 
     Ok(k8s_pods::render(&rows, &label, &scope, &selectors, &notes))
 }

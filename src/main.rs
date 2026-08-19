@@ -11,6 +11,7 @@ use tracing_subscriber::EnvFilter;
 
 use eks::cli::{Cli, Command, GlobalArgs};
 use eks::commands::{self, contexts, nodes, pods};
+use eks::k8s::pods::Direction;
 use eks::kubeconfig::KubeConfig;
 use eks::ui::{self, App};
 
@@ -52,6 +53,7 @@ fn run(cli: Cli) -> Result<()> {
             selector,
             field_selector,
             sort,
+            sort_reverse,
         } => {
             let output = commands::block_on(pods::list(
                 &config,
@@ -63,6 +65,7 @@ fn run(cli: Cli) -> Result<()> {
                     label_selector: selector.as_deref(),
                     field_selector: field_selector.as_deref(),
                     order: sort,
+                    direction: Direction::reversed(sort_reverse),
                 },
             ))?;
             print_line(&output);

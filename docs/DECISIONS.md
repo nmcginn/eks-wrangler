@@ -450,3 +450,48 @@ Past seven, `clippy::too_many_arguments` is denied here, and the lint is right
 for the usual reason: four of the flags are `Option<&str>` and a mistake that
 swaps two of them type-checks. The struct is raw command-line text — validating
 it is still `list`'s first job, before it connects to anything.
+
+### 30. Reversing an order does not reverse its unrankable tail
+
+`--sort-reverse` flips the comparison between rows an order can rank, and leaves
+everything else where it was. A pod that has never restarted, one with no
+`creationTimestamp`, one metrics-server has not sampled — none of these move out
+of the tail when the listing is reversed.
+
+Reversing the whole comparison would be simpler and is wrong. "Least CPU" is a
+question about which pod is idle; the pod with no sample is not idle, it is
+unmeasured, and putting it first answers a question nobody asked while burying
+the one they did. The same argument holds for `restarts`, where it would open a
+reversed listing on ninety-nine healthy pods.
+
+So each order maps a row to a private `Rank`, either `By(key)` or
+`Unranked(tier)`. Only `By` is flipped; `Unranked` always sorts after `By` and
+its tiers keep their own order. The tiers exist because `restarts` has two kinds
+of blank — a restart the kubelet recorded no `finishedAt` for is a real crash
+with no moment attached, and belongs above a pod that has never restarted at all
+— and reversal must not collapse them either.
+
+The alphabetical tie-break at the end is never reversed. It exists to make every
+order total rather than to say anything, and reversing it would mean the two
+directions of one order disagreed about rows they both consider equal.
+
+### 31. `--sort age` puts the youngest pod first
+
+The opposite way round from `kubectl --sort-by=.metadata.creationTimestamp`,
+which prints oldest first. The rule this tool follows is that every order but
+`name` leads with the row the person went looking for — the newest restart, the
+largest usage figure — and during an incident the question behind `AGE` is "what
+changed", which the youngest pod answers. One rule across five orders is worth
+more than matching another tool on one of them, and `--sort-reverse` is the
+`kubectl` reading for anyone who wants it. Both the `--help` text and the README
+say so, because a sort that runs the way you did not expect is indistinguishable
+from a broken one.
+
+### 32. `--sort-reverse` rather than a `-` prefix on the order
+
+`--sort -cpu` was the other candidate. It loses: clap has to be told to allow
+hyphenated values before it will accept it, `--sort -cpu` and `--sort=-cpu`
+behave differently once it is, and the accepted-values list clap prints on a typo
+stops matching what the flag really takes. A separate boolean flag composes with
+every order for free, shows up in `--help` next to the one it modifies, and needs
+no parsing at all.
