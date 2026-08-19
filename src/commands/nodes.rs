@@ -119,11 +119,19 @@ pub async fn list(
     footnotes.extend(k8s::order::note(order, direction));
     // And immediately under it, the case where that line on its own misleads:
     // `--sort cpu` against a cluster with no metrics-server names an ordering
-    // over a column this table does not have. The listing answers the "did it
-    // rank anything" half, because the keys are its own.
+    // over a column this table does not have. Both halves the note cannot work
+    // out for itself come from the listing: which orderings these rows can be
+    // ranked by, and whether one of the footnotes above already accounts for
+    // the column that came up empty — in which case the note points at it
+    // rather than repeating the advice a paragraph later.
+    let missing = k8s_nodes::Missing {
+        requests: requests.is_none(),
+        usage: usage.is_none(),
+    };
     footnotes.extend(k8s::order::unranked_note(
         order,
-        k8s_nodes::ranks_any(&rows, order),
+        k8s_nodes::cause(order, missing),
+        |candidate| k8s_nodes::ranks_any(&rows, candidate),
     ));
 
     Ok(k8s_nodes::render(&rows, &label, &footnotes))

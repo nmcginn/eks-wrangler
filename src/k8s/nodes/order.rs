@@ -27,7 +27,7 @@ use std::cmp::{Ordering, Reverse};
 use k8s_openapi::jiff::Timestamp;
 
 use super::{NodeRow, Share};
-use crate::k8s::order::{Direction, Rank, compare};
+use crate::k8s::order::{Cause, Direction, Rank, compare};
 use crate::theme::Severity;
 
 /// The order the rows of a node listing are printed in.
@@ -116,6 +116,45 @@ fn ranked(row: &NodeRow, order: Order) -> bool {
         Order::MemoryRequested => busiest(row.memory_requested).is_ranked(),
         Order::Age => youngest(row).is_ranked(),
     }
+}
+
+/// Which of the node table's optional columns this listing could not fill in.
+///
+/// Both are failures the command has already footnoted above the table — see
+/// [`super::requests_unavailable`] and [`super::usage_unavailable`] — and both
+/// take a column out of the table that `--sort` can name. Carried as a value so
+/// [`cause`] can be a pure function, testable without a cluster to break.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Missing {
+    /// The pod listing failed, so `CPU REQ` and `MEM REQ` are empty.
+    pub requests: bool,
+    /// Live usage could not be read, so `CPU USE` and `MEM USE` are absent.
+    pub usage: bool,
+}
+
+/// Whether a footnote above the table already accounts for an ordering that
+/// ranked nothing.
+///
+/// A third exhaustive match over `Order`, beside `rank` and `ranked`, and
+/// for the same reason: an ordering added without saying which of the table's
+/// failures could explain it should fail to compile rather than quietly claim
+/// nothing above covers it.
+///
+/// The distinction is not "is this column optional" but "did *this* listing
+/// lose it". `--sort cpu` where metrics-server answered but has not sampled any
+/// node yet is [`Cause::Unexplained`]: the columns are gone, but nothing above
+/// the table has said a word about why, and the note is the only thing that
+/// will.
+#[must_use]
+pub fn cause(order: Order, missing: Missing) -> Cause {
+    Cause::explained(match order {
+        Order::Cpu | Order::Memory => missing.usage,
+        Order::CpuRequested | Order::MemoryRequested => missing.requests,
+        // Nothing the table footnotes can explain these away. A node with no
+        // name, no status, or no creation timestamp is the API server being
+        // strange, not a column this command failed to fetch.
+        Order::Name | Order::Status | Order::Age => false,
+    })
 }
 
 /// Where a row sits in status order: the node you would look at first, first.
@@ -356,6 +395,67 @@ mod tests {
 
         assert!(ranks_any(&rows, Order::Name));
         assert!(ranks_any(&rows, Order::Status));
+    }
+
+    #[test]
+    fn the_metrics_footnote_explains_the_usage_orderings_and_nothing_else() {
+        // `--sort cpu` with no metrics-server: the note above the table already
+        // names the cause and links to the fix, so the sort note points at it
+        // instead of writing the same paragraph again a line later.
+        let missing = Missing {
+            requests: false,
+            usage: true,
+        };
+
+        assert_eq!(cause(Order::Cpu, missing), Cause::Explained);
+        assert_eq!(cause(Order::Memory, missing), Cause::Explained);
+        assert_eq!(cause(Order::CpuRequested, missing), Cause::Unexplained);
+        assert_eq!(cause(Order::MemoryRequested, missing), Cause::Unexplained);
+    }
+
+    #[test]
+    fn a_failed_pod_listing_explains_the_request_orderings_and_nothing_else() {
+        // The other footnote, over the other pair of columns: a read-only role
+        // bound to one namespace cannot list pods cluster-wide, and `CPU REQ`
+        // and `MEM REQ` go empty rather than the command failing.
+        let missing = Missing {
+            requests: true,
+            usage: false,
+        };
+
+        assert_eq!(cause(Order::CpuRequested, missing), Cause::Explained);
+        assert_eq!(cause(Order::MemoryRequested, missing), Cause::Explained);
+        assert_eq!(cause(Order::Cpu, missing), Cause::Unexplained);
+        assert_eq!(cause(Order::Memory, missing), Cause::Unexplained);
+    }
+
+    #[test]
+    fn a_column_that_is_simply_empty_is_never_blamed_on_a_footnote() {
+        // metrics-server answered and the pods listed, so nothing above the
+        // table said a word — an ordering that ranked nothing here has to
+        // explain itself rather than point upwards at nothing.
+        for order in ORDERS {
+            assert_eq!(
+                cause(order, Missing::default()),
+                Cause::Unexplained,
+                "{order:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn no_footnote_ever_explains_the_orderings_that_are_not_about_a_column() {
+        // Even with both fetches failed. A node with no name, no status, or no
+        // creation timestamp is the API server being strange, and sending the
+        // user to read the metrics footnote about it would waste their time.
+        let missing = Missing {
+            requests: true,
+            usage: true,
+        };
+
+        for order in [Order::Name, Order::Status, Order::Age] {
+            assert_eq!(cause(order, missing), Cause::Unexplained, "{order:?}");
+        }
     }
 
     #[test]

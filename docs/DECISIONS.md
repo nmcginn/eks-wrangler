@@ -634,3 +634,49 @@ them is grouped by *something* even when nothing in it ranked, and "this is in
 name order" would be a guess dressed up as an explanation. It is also silent for
 the default ordering: nobody typed a flag, so there is no flag to explain, and
 the byte-for-byte promise of decision 36 holds unchanged.
+
+### 38. The "nothing ranked" note advises, and never advises twice
+
+Decision 37 stopped at the diagnosis: `Nothing here has cpu to sort by.` is
+honest, and it is not yet advice. Two things were missing, and they are
+different problems.
+
+The first is repetition. On a cluster with no metrics-server the footnote two
+paragraphs up has already named the cause and linked to metrics-server, so
+saying it again in different words would be the same paragraph twice, a line
+apart. `k8s::order::Cause` is how the listing says which it is, and the note then
+either points back — `…, for the reason above.` — or stands on its own. It is the
+listing's answer rather than `k8s::order`'s because which of a table's footnotes
+covers which column is exactly the knowledge that module does not have:
+`k8s::nodes::cause` and `k8s::pods::cause` are third exhaustive matches over
+`Order`, beside the comparison and the rankability one, so an ordering added
+without saying which failure could account for it will not compile.
+
+The wording is "for the reason above" rather than "the note above says why"
+because the paragraph *directly* above is decision 36's `Sorted by cpu.` line,
+which gives no reason at all. A reason is the one thing up there that can only be
+the failure footnote.
+
+The second is that under `--sort restarts` in a healthy namespace nothing is
+above the note at all — nothing failed, the pods simply have not crashed — so
+pointing upwards would point at nothing. What that listing is owed is the flag
+that *would* have worked, and the note can work it out: `unranked_note` takes the
+`ranks` predicate rather than a bare `ranked: bool` and asks it about every
+variant of the `Order` enum, so the suggestions come from the rows in front of
+the user. It cannot name an ordering that would have failed the same way, and it
+cannot drift as orderings are added.
+
+Two variants are left out. The default is what dropping `--sort` altogether
+gives you, so "sort by name instead" is advice to type a flag in order to get the
+listing you would have had anyway; and a variant hidden from `--help` is a flag
+value the user cannot find any other way. When that leaves nothing, the advice
+line is dropped rather than invented — on a table where no ordering ranks,
+silence says "there is nothing else here to sort by" better than a suggestion
+that would fail identically.
+
+The bar for a suggestion is *rankable*, not *tells the rows apart*, which is the
+same `any`-not-`all` rule decision 37 settled. It has a visible cost: on a
+cluster where every node is `Ready`, `status` is suggested and reorders nothing.
+The alternative bar is a different question about an ordering from the one this
+module has been answering, and it is left as a roadmap entry rather than guessed
+at.

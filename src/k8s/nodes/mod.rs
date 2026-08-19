@@ -14,7 +14,7 @@ use kube::api::{Api, ListParams};
 
 pub mod order;
 
-pub use order::{Order, ranks_any, sort};
+pub use order::{Missing, Order, cause, ranks_any, sort};
 
 use crate::format;
 use crate::k8s::metrics::Usage;
@@ -893,20 +893,66 @@ mod tests {
     fn an_ordering_that_ranked_nothing_says_so_right_under_the_sort_note() {
         // `eks nodes --sort cpu` against a cluster with no metrics-server. The
         // usage footnote explains the missing columns; without the second note
-        // nothing explains what became of the flag the user actually typed.
+        // nothing explains what became of the flag the user actually typed —
+        // and the third line is the flag that would have worked on this table.
         let rows = [NodeRow::from_node(
             &healthy_node(),
             Some(idle()),
             None,
             now(),
         )];
-        let notes = sort_notes(&rows, Order::Cpu);
+        let notes = sort_notes(&rows, Order::Cpu, no_usage());
 
         let output = render(&rows, "prod (us-east-1)", &notes);
         let paragraphs: Vec<&str> = output.split("\n\n").collect();
 
         assert_eq!(paragraphs[1], "Sorted by cpu.");
-        assert_eq!(paragraphs[2], "Nothing here has cpu to sort by.");
+        assert_eq!(
+            paragraphs[2],
+            "Nothing here has cpu to sort by, for the reason above.\n\
+             Sort by status, cpu-requested, memory-requested, or age instead."
+        );
+    }
+
+    #[test]
+    fn an_unsampled_node_the_command_did_not_footnote_explains_itself() {
+        // metrics-server answered, so no footnote above says anything, but it
+        // has not reached this node yet and the usage columns are gone all the
+        // same. Nothing else on screen accounts for it, so the note cannot lean
+        // on something above it.
+        let rows = [NodeRow::from_node(
+            &healthy_node(),
+            Some(idle()),
+            None,
+            now(),
+        )];
+        let notes = sort_notes(&rows, Order::Cpu, Missing::default());
+
+        assert_eq!(
+            notes[1],
+            "Nothing here has cpu to sort by.\n\
+             Sort by status, cpu-requested, memory-requested, or age instead."
+        );
+    }
+
+    #[test]
+    fn an_ordering_no_footnote_could_explain_never_claims_one_did() {
+        // Both fetches failed *and* the API server left out the creation
+        // timestamps. The usage and request footnotes are above the table, but
+        // neither of them is about `age`, so pointing at them would send the
+        // user to read a paragraph that does not mention the column.
+        // `Node::default()`: no creation timestamp, no allocatable, no status.
+        let rows = [NodeRow::from_node(&Node::default(), None, None, now())];
+        let missing = Missing {
+            requests: true,
+            usage: true,
+        };
+        let notes = sort_notes(&rows, Order::Age, missing);
+
+        assert_eq!(
+            notes[1],
+            "Nothing here has age to sort by.\nSort by status instead."
+        );
     }
 
     #[test]
@@ -920,7 +966,10 @@ mod tests {
             now(),
         )];
 
-        assert_eq!(sort_notes(&rows, Order::Cpu), ["Sorted by cpu."]);
+        assert_eq!(
+            sort_notes(&rows, Order::Cpu, Missing::default()),
+            ["Sorted by cpu."]
+        );
     }
 
     #[test]
@@ -934,17 +983,27 @@ mod tests {
             now(),
         )];
 
-        assert!(sort_notes(&rows, Order::default()).is_empty());
+        assert!(sort_notes(&rows, Order::default(), no_usage()).is_empty());
     }
 
-    /// The pair of notes `commands::nodes` puts under the table, in its order.
-    fn sort_notes(rows: &[NodeRow], order: Order) -> Vec<String> {
+    /// What the command reports when only the metrics read failed.
+    fn no_usage() -> Missing {
+        Missing {
+            requests: false,
+            usage: true,
+        }
+    }
+
+    /// The pair of notes `commands::nodes` puts under the table, in its order
+    /// and with the facts it hands them.
+    fn sort_notes(rows: &[NodeRow], order: Order, missing: Missing) -> Vec<String> {
         let direction = crate::k8s::order::Direction::Natural;
         let mut notes = Vec::new();
         notes.extend(crate::k8s::order::note(order, direction));
         notes.extend(crate::k8s::order::unranked_note(
             order,
-            crate::k8s::nodes::ranks_any(rows, order),
+            crate::k8s::nodes::cause(order, missing),
+            |candidate| crate::k8s::nodes::ranks_any(rows, candidate),
         ));
         notes
     }

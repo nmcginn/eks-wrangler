@@ -1892,16 +1892,20 @@ mod tests {
 
     #[test]
     fn an_ordering_that_ranked_no_pod_says_so_under_the_sort_note() {
-        // `eks pods --sort cpu` where metrics-server has sampled nothing: the
+        // `eks pods --sort cpu` where metrics-server could not be read: the
         // table has no CPU column, and `Sorted by cpu.` on its own describes a
-        // listing the alphabet arranged.
+        // listing the alphabet arranged. The footnote above already says what to
+        // install, so the note points at it and spends its own second line on
+        // the orderings that would have worked here.
         let order = crate::k8s::pods::Order::Cpu;
+        let missing = crate::k8s::pods::Missing { usage: true };
         let notes: Vec<String> =
             crate::k8s::order::note(order, crate::k8s::order::Direction::Natural)
                 .into_iter()
                 .chain(crate::k8s::order::unranked_note(
                     order,
-                    crate::k8s::pods::ranks_any(&rows(), order),
+                    crate::k8s::pods::cause(order, missing),
+                    |candidate| crate::k8s::pods::ranks_any(&rows(), candidate),
                 ))
                 .collect();
 
@@ -1915,7 +1919,34 @@ mod tests {
         let paragraphs: Vec<&str> = output.split("\n\n").collect();
 
         assert_eq!(paragraphs[1], "Sorted by cpu.");
-        assert_eq!(paragraphs[2], "Nothing here has cpu to sort by.");
+        assert_eq!(
+            paragraphs[2],
+            "Nothing here has cpu to sort by, for the reason above.\n\
+             Sort by age instead."
+        );
+    }
+
+    #[test]
+    fn a_healthy_namespace_sorted_by_restarts_is_told_what_else_to_try() {
+        // The other half of the roadmap entry behind these notes: nothing has
+        // crashed, so nothing ranked, and there is no failure above the table to
+        // point at — because nothing failed. All the note has to offer is the
+        // flag that would reorder this listing, so it had better offer it, and
+        // this listing has three of them.
+        let order = crate::k8s::pods::Order::Restarts;
+        let note = crate::k8s::order::unranked_note(
+            order,
+            crate::k8s::pods::cause(order, crate::k8s::pods::Missing::default()),
+            |candidate| crate::k8s::pods::ranks_any(&sampled_rows(), candidate),
+        );
+
+        assert_eq!(
+            note.as_deref(),
+            Some(
+                "Nothing here has restarts to sort by.\n\
+                 Sort by age, cpu, or memory instead."
+            )
+        );
     }
 
     #[test]
@@ -1923,8 +1954,12 @@ mod tests {
         // Nothing ranked, because there is nothing at all. "No pods matched" is
         // the answer; a note about the sort would be noise on top of it.
         let order = crate::k8s::pods::Order::Cpu;
-        let note = crate::k8s::order::unranked_note(order, crate::k8s::pods::ranks_any(&[], order))
-            .expect("an ordering with no rows to rank ranked nothing");
+        let note = crate::k8s::order::unranked_note(
+            order,
+            crate::k8s::pods::cause(order, crate::k8s::pods::Missing { usage: true }),
+            |candidate| crate::k8s::pods::ranks_any(&[], candidate),
+        )
+        .expect("an ordering with no rows to rank ranked nothing");
 
         let message = render(
             &[],

@@ -21,7 +21,7 @@ use std::cmp::{Ordering, Reverse};
 use k8s_openapi::jiff::Timestamp;
 
 use super::PodRow;
-use crate::k8s::order::{Direction, Rank, compare};
+use crate::k8s::order::{Cause, Direction, Rank, compare};
 use crate::k8s::quantity::Quantity;
 
 /// The order the rows of a pod listing are printed in.
@@ -102,6 +102,41 @@ fn ranked(row: &PodRow, order: Order) -> bool {
         Order::Cpu => largest(row.cpu_used).is_ranked(),
         Order::Memory => largest(row.memory_used).is_ranked(),
     }
+}
+
+/// Which of the pod table's optional columns this listing could not fill in.
+///
+/// One field rather than [`super::super::nodes::order::Missing`]'s two, because
+/// the pod table has one optional pair: everything else in it comes from the pod
+/// listing that the command fails outright without. Still a struct, so the two
+/// listings read the same way at the two call sites and so a second optional
+/// column here is a field rather than a changed signature.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Missing {
+    /// Live usage could not be read, so `CPU` and `MEMORY` are absent — see
+    /// [`super::usage_unavailable`], which is already above the table.
+    pub usage: bool,
+}
+
+/// Whether a footnote above the table already accounts for an ordering that
+/// ranked nothing.
+///
+/// A third exhaustive match over `Order`, beside `rank` and `ranked`, and
+/// for the same reason: an ordering added without saying which of the table's
+/// failures could explain it should fail to compile rather than quietly claim
+/// nothing above covers it.
+///
+/// `restarts` is the case the roadmap entry behind this was written about: a
+/// namespace where nothing has ever crashed ranks nothing under it, and there
+/// is no failure above the table to point at, because there was no failure —
+/// the pods are simply healthy. [`Cause::Unexplained`] is the honest answer, and
+/// the advice the note carries is then the whole of what it has to offer.
+#[must_use]
+pub fn cause(order: Order, missing: Missing) -> Cause {
+    Cause::explained(match order {
+        Order::Cpu | Order::Memory => missing.usage,
+        Order::Name | Order::Restarts | Order::Age => false,
+    })
 }
 
 /// Namespace, then name.
@@ -311,6 +346,40 @@ mod tests {
     #[test]
     fn every_pod_ranks_by_name() {
         assert!(ranks_any(&[row("api", 0, None)], Order::Name));
+    }
+
+    #[test]
+    fn the_metrics_footnote_explains_the_usage_orderings_and_nothing_else() {
+        // `--sort cpu` with no metrics-server: the note above the table already
+        // names the cause and links to the fix, so the sort note points at it
+        // instead of writing the same paragraph again a line later.
+        let missing = Missing { usage: true };
+
+        assert_eq!(cause(Order::Cpu, missing), Cause::Explained);
+        assert_eq!(cause(Order::Memory, missing), Cause::Explained);
+    }
+
+    #[test]
+    fn a_namespace_where_nothing_has_crashed_has_no_footnote_to_point_at() {
+        // The case the note was written for. Nothing failed — the pods are
+        // healthy — so there is nothing above the table, and `restarts` must
+        // account for itself.
+        for missing in [Missing::default(), Missing { usage: true }] {
+            assert_eq!(cause(Order::Restarts, missing), Cause::Unexplained);
+        }
+    }
+
+    #[test]
+    fn a_column_that_is_simply_empty_is_never_blamed_on_a_footnote() {
+        // metrics-server answered, so nothing above the table said a word: a
+        // listing it has not sampled yet has to explain itself.
+        for order in ORDERS {
+            assert_eq!(
+                cause(order, Missing::default()),
+                Cause::Unexplained,
+                "{order:?}"
+            );
+        }
     }
 
     #[test]
