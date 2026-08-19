@@ -96,6 +96,19 @@ pub struct PodRow {
     pub cpu_used: Option<Quantity>,
     /// Memory the pod is actually holding, from metrics-server.
     pub memory_used: Option<Quantity>,
+    /// Cores the pod asked for — the denominator `cpu_used` is shown against.
+    ///
+    /// [`crate::k8s::pods::effective_requests`]'s figure, which is the same one
+    /// `eks nodes` totals per node, rather than a second sum over the
+    /// containers: two commands disagreeing about what one pod booked would be
+    /// worse than either of them not saying.
+    ///
+    /// Zero — not `None` — where nothing in the pod set a request, because that
+    /// pod really did ask for nothing. A zero denominator has no percentage, so
+    /// the cell falls back to the bare usage figure.
+    pub cpu_requested: Quantity,
+    /// Memory the pod asked for, on the same terms as [`Self::cpu_requested`].
+    pub memory_requested: Quantity,
     /// The node the pod landed on, or `-` while it is still unscheduled.
     pub node: String,
     /// The address the pod answers on, or `-` before the CNI has assigned one.
@@ -135,6 +148,10 @@ impl PodRow {
     #[must_use]
     pub fn from_pod(pod: &Pod, used: Option<Usage>, now: Timestamp) -> Self {
         let derived = derive(pod);
+        // The scheduler's own arithmetic, not a fresh sum over the containers:
+        // `eks nodes` totals exactly this number per node, and the two commands
+        // must not be able to disagree about what one pod asked for.
+        let requested = super::effective_requests(pod);
         // Read once and used for both cells, so the formatted age and the
         // instant the ordering sorts on cannot describe different moments.
         let created_at = pod
@@ -169,6 +186,8 @@ impl PodRow {
             created_at,
             cpu_used: used.and_then(|usage| usage.cpu),
             memory_used: used.and_then(|usage| usage.memory),
+            cpu_requested: requested.cpu,
+            memory_requested: requested.memory,
             node: pod
                 .spec
                 .as_ref()
@@ -597,6 +616,21 @@ fn shows_usage(rows: &[PodRow]) -> bool {
         .any(|row| row.cpu_used.is_some() || row.memory_used.is_some())
 }
 
+/// Whether any row will show its usage against a request.
+///
+/// Asked of the rendered pair rather than of the request alone, so the heading
+/// and the cells under it cannot come apart: a pod that asked for 500m but has
+/// never been sampled shows `-`, and a `/REQ` heading over a table of those
+/// would name a denominator no row displays.
+///
+/// `pick` is the resource, as the pair the cell is built from.
+fn shows_request(rows: &[PodRow], pick: fn(&PodRow) -> (Option<Quantity>, Quantity)) -> bool {
+    rows.iter().any(|row| {
+        let (used, requested) = pick(row);
+        used.is_some_and(|used| used.ratio_of(requested).is_some())
+    })
+}
+
 /// The `RESTARTS` cell: the count, and when the newest restart happened.
 ///
 /// A bare count cannot tell a pod that crashed nine times last Tuesday from one
@@ -610,13 +644,40 @@ fn restarts_cell(row: &PodRow) -> String {
     }
 }
 
-/// One usage cell: the figure, or `-` where there is not one.
+/// One usage cell: what the pod is burning, against what it asked for.
 ///
-/// No percentage, unlike the node table's: a pod has no allocatable of its own
-/// to be a share of. What it *asked* for would be the honest denominator, and
-/// that is a column of its own rather than something to smuggle in here.
-fn usage_cell(amount: Option<Quantity>, show: fn(Quantity) -> String) -> String {
-    amount.map_or_else(|| UNKNOWN.to_owned(), show)
+/// `250m/500m (50%)`. A bare `250m` cannot be read: it is a fifth of a core,
+/// and whether that is fine, throttled, or about to be OOM-killed depends
+/// entirely on the number the pod asked for. A pod has no allocatable of its
+/// own to be a share of — the node table's denominator — so its request is the
+/// one honest denominator there is, and it is the number a reader would go on
+/// to change.
+///
+/// The pair is one cell rather than a usage column and a request column, for
+/// the reason the node table puts `1200m (32%)` in one: the two halves are read
+/// together or not at all, and the pod table is already the wider of the two
+/// listings. `READY`'s `1/2` and the node table's `CPU` cell make `a/b` this
+/// tool's spelling for a part and its whole.
+///
+/// A pod that asked for nothing keeps the bare figure. It is the honest reading
+/// — such a pod really has no denominator — and `250m/0 (∞%)` is not a cell.
+fn usage_cell(used: Option<Quantity>, requested: Quantity, show: fn(Quantity) -> String) -> String {
+    let Some(used) = used else {
+        return UNKNOWN.to_owned();
+    };
+
+    // `ratio_of` declines a zero denominator, which is exactly the pod that
+    // asked for nothing — so the two cases are one branch rather than a
+    // separate test for zero that could come to disagree with it.
+    match used.ratio_of(requested) {
+        Some(ratio) => format!(
+            "{}/{} ({})",
+            show(used),
+            show(requested),
+            format::percentage(ratio)
+        ),
+        None => show(used),
+    }
 }
 
 /// One column of the pod table.
@@ -633,8 +694,19 @@ pub(crate) enum Column {
     Ready,
     Status,
     Restarts,
-    Cpu,
-    Memory,
+    /// Live CPU usage. `against_request` is whether any row in this listing
+    /// shows it against a request, which is the difference between a column of
+    /// figures and a column of pairs — and so is the difference between two
+    /// headings.
+    Cpu {
+        against_request: bool,
+    },
+    /// Live memory usage, on the same terms as [`Self::Cpu`]. Asked
+    /// separately, because a deployment that sets a memory request and leaves
+    /// CPU unbounded is a common shape and only one of its columns is a pair.
+    Memory {
+        against_request: bool,
+    },
     Age,
     Ip,
     Node,
@@ -651,8 +723,26 @@ impl Column {
             Self::Ready => "READY",
             Self::Status => "STATUS",
             Self::Restarts => "RESTARTS",
-            Self::Cpu => "CPU",
-            Self::Memory => "MEMORY",
+            // `CPU/REQ` over a cell reading `250m/500m (50%)`: the heading is
+            // the shape of the cell under it, so what the percentage is a
+            // percentage *of* is answered in the table rather than in a manual.
+            // A listing where nothing shows a pair keeps the plain heading — a
+            // `/REQ` over a column of bare figures would promise a denominator
+            // that is not there.
+            Self::Cpu { against_request } => {
+                if against_request {
+                    "CPU/REQ"
+                } else {
+                    "CPU"
+                }
+            }
+            Self::Memory { against_request } => {
+                if against_request {
+                    "MEMORY/REQ"
+                } else {
+                    "MEMORY"
+                }
+            }
             Self::Age => "AGE",
             Self::Ip => "IP",
             Self::Node => "NODE",
@@ -669,8 +759,10 @@ impl Column {
             Self::Ready => row.ready.clone(),
             Self::Status => row.status.clone(),
             Self::Restarts => restarts_cell(row),
-            Self::Cpu => usage_cell(row.cpu_used, quantity::cpu),
-            Self::Memory => usage_cell(row.memory_used, quantity::memory),
+            Self::Cpu { .. } => usage_cell(row.cpu_used, row.cpu_requested, quantity::cpu),
+            Self::Memory { .. } => {
+                usage_cell(row.memory_used, row.memory_requested, quantity::memory)
+            }
             Self::Age => row.age.clone(),
             Self::Ip => row.ip.clone(),
             Self::Node => row.node.clone(),
@@ -711,7 +803,14 @@ pub(crate) fn columns(scope: &super::Scope, rows: &[PodRow], width: format::Widt
     // the pod is doing, rather than at the end: a pod that is unhappy and one
     // that is burning a core are usually the same investigation.
     if shows_usage(rows) {
-        columns.extend([Column::Cpu, Column::Memory]);
+        columns.extend([
+            Column::Cpu {
+                against_request: shows_request(rows, |row| (row.cpu_used, row.cpu_requested)),
+            },
+            Column::Memory {
+                against_request: shows_request(rows, |row| (row.memory_used, row.memory_requested)),
+            },
+        ]);
     }
     // AGE, IP, NODE, NOMINATED NODE, READINESS GATES is `kubectl -o wide`'s own
     // tail order, kept to the letter. NODE is in this table by default where
@@ -825,7 +924,9 @@ mod tests {
 
     use k8s_openapi::api::core::v1::{
         ContainerStateRunning, ContainerStateWaiting, PodIP, PodReadinessGate, PodSpec,
+        ResourceRequirements,
     };
+    use k8s_openapi::apimachinery::pkg::api::resource::Quantity as ApiQuantity;
     use k8s_openapi::apimachinery::pkg::apis::meta::v1::{ObjectMeta, Time};
     use k8s_openapi::jiff::SignedDuration;
 
@@ -2030,6 +2131,306 @@ mod tests {
             rendered.contains("api-7c9f       1/1    Running  0         250m   -  "),
             "{rendered}"
         );
+    }
+
+    /// The healthy pod, with its container asking for the given resources.
+    ///
+    /// Takes the entries as pairs rather than two `&str`s so a container that
+    /// sets a memory request and leaves CPU unbounded — a very common shape,
+    /// and the one that gives a listing a pair in one column and not the other
+    /// — is expressible.
+    fn asking(entries: &[(&str, &str)]) -> Pod {
+        let mut pod = healthy();
+        if let Some(spec) = pod.spec.as_mut() {
+            for container in &mut spec.containers {
+                container.resources = Some(ResourceRequirements {
+                    requests: Some(
+                        entries
+                            .iter()
+                            .map(|(name, value)| {
+                                ((*name).to_owned(), ApiQuantity((*value).to_owned()))
+                            })
+                            .collect(),
+                    ),
+                    ..Default::default()
+                });
+            }
+        }
+        pod
+    }
+
+    /// The two rows of [`sampled_rows`], each pod asking for something — the
+    /// shape nearly every real deployment has.
+    fn requesting_rows() -> Vec<PodRow> {
+        let mut other = asking(&[("cpu", "2"), ("memory", "4Gi")]);
+        other.metadata.name = Some("checkout-5d4b".to_owned());
+        other.metadata.namespace = Some("storefront".to_owned());
+        other.metadata.creation_timestamp = Some(ago(3));
+
+        vec![
+            PodRow::from_pod(
+                &asking(&[("cpu", "500m"), ("memory", "1Gi")]),
+                Some(used("250m", "512Mi")),
+                now(),
+            ),
+            PodRow::from_pod(&other, Some(used("1200m", "3Gi")), now()),
+        ]
+    }
+
+    #[test]
+    fn a_pod_carries_what_it_asked_for_onto_the_row() {
+        let row = PodRow::from_pod(
+            &asking(&[("cpu", "500m"), ("memory", "1Gi")]),
+            Some(used("250m", "512Mi")),
+            now(),
+        );
+
+        assert_eq!(row.cpu_requested, Quantity::parse("500m").unwrap());
+        assert_eq!(row.memory_requested, Quantity::parse("1Gi").unwrap());
+    }
+
+    #[test]
+    fn the_request_on_a_row_is_the_one_eks_nodes_totals() {
+        // The interesting half of `effective_requests`: an init container that
+        // dwarfs the app container decides the pod's footprint, and pod
+        // overhead is charged on top. A second sum written here would get this
+        // wrong quietly, and the two commands would disagree about one pod.
+        let mut pod = healthy();
+        if let Some(spec) = pod.spec.as_mut() {
+            spec.containers = vec![Container {
+                resources: Some(ResourceRequirements {
+                    requests: Some(
+                        [("cpu", "200m")]
+                            .into_iter()
+                            .map(|(name, value)| (name.to_owned(), ApiQuantity(value.to_owned())))
+                            .collect(),
+                    ),
+                    ..Default::default()
+                }),
+                ..container("app")
+            }];
+            spec.init_containers = Some(vec![Container {
+                resources: Some(ResourceRequirements {
+                    requests: Some(
+                        [("cpu", "1")]
+                            .into_iter()
+                            .map(|(name, value)| (name.to_owned(), ApiQuantity(value.to_owned())))
+                            .collect(),
+                    ),
+                    ..Default::default()
+                }),
+                ..container("migrate")
+            }]);
+            spec.overhead = Some(
+                [("cpu", "50m")]
+                    .into_iter()
+                    .map(|(name, value)| (name.to_owned(), ApiQuantity(value.to_owned())))
+                    .collect(),
+            );
+        }
+
+        let row = PodRow::from_pod(&pod, Some(used("250m", "512Mi")), now());
+
+        // max(200m app, 1 init) + 50m overhead, which is what `eks nodes` puts
+        // in this pod's share of its node.
+        assert_eq!(row.cpu_requested, Quantity::parse("1050m").unwrap());
+        assert_eq!(
+            row.cpu_requested,
+            crate::k8s::pods::effective_requests(&pod).cpu
+        );
+    }
+
+    #[test]
+    fn usage_is_shown_against_what_the_pod_asked_for() {
+        // 250m on its own is unreadable: a fifth of a core is fine, throttled,
+        // or a mistake depending entirely on the number beside it.
+        let rendered = render(
+            &requesting_rows(),
+            "prod (us-east-1)",
+            &Scope::Namespace("payments".to_owned()),
+            &unfiltered(),
+            &[],
+            Width::Default,
+        );
+
+        assert_eq!(
+            rendered,
+            "NAME           READY  STATUS   RESTARTS  CPU/REQ          MEMORY/REQ       AGE  NODE\n\
+             api-7c9f       1/1    Running  0         250m/500m (50%)  512Mi/1Gi (50%)  90m  ip-10-0-1-9.ec2.internal\n\
+             checkout-5d4b  1/1    Running  0         1200m/2 (60%)    3Gi/4Gi (75%)    3m   ip-10-0-1-9.ec2.internal"
+        );
+    }
+
+    #[test]
+    fn a_pod_that_asked_for_nothing_keeps_the_bare_usage_figure() {
+        // The honest reading: such a pod has no denominator, and `250m/0` is
+        // not a percentage of anything. The heading drops the `/REQ` with it,
+        // rather than promising a column of pairs that is a column of figures.
+        let rendered = render(
+            &sampled_rows(),
+            "prod (us-east-1)",
+            &Scope::Namespace("payments".to_owned()),
+            &unfiltered(),
+            &[],
+            Width::Default,
+        );
+
+        assert_eq!(
+            rendered,
+            "NAME           READY  STATUS   RESTARTS  CPU    MEMORY  AGE  NODE\n\
+             api-7c9f       1/1    Running  0         250m   512Mi   90m  ip-10-0-1-9.ec2.internal\n\
+             checkout-5d4b  1/1    Running  0         1200m  3Gi     3m   ip-10-0-1-9.ec2.internal"
+        );
+    }
+
+    #[test]
+    fn usage_past_the_request_is_reported_rather_than_capped() {
+        // The pod being throttled, or the one about to be OOM-killed. Capping
+        // at 100% would hide the only moment anybody reads this column for.
+        let row = PodRow::from_pod(
+            &asking(&[("cpu", "100m"), ("memory", "256Mi")]),
+            Some(used("450m", "1Gi")),
+            now(),
+        );
+
+        assert_eq!(
+            Column::Cpu {
+                against_request: true
+            }
+            .cell(&row),
+            "450m/100m (450%)"
+        );
+        assert_eq!(
+            Column::Memory {
+                against_request: true
+            }
+            .cell(&row),
+            "1Gi/256Mi (400%)"
+        );
+    }
+
+    #[test]
+    fn a_pod_using_nothing_reads_as_zero_of_its_request() {
+        // A real zero, unlike the `-` of a pod nobody has sampled: this one was
+        // measured and is idle, which is a fact about the pod rather than about
+        // the scraper, and the two must not render alike.
+        let row = PodRow::from_pod(
+            &asking(&[("cpu", "500m"), ("memory", "1Gi")]),
+            Some(used("0", "0")),
+            now(),
+        );
+
+        assert_eq!(
+            Column::Cpu {
+                against_request: true
+            }
+            .cell(&row),
+            "0/500m (0%)"
+        );
+    }
+
+    #[test]
+    fn an_unsampled_pod_reads_as_unknown_however_much_it_asked_for() {
+        // A request is not a measurement. Rendering `-/500m` would put a figure
+        // in a cell that has none, and `0/500m (0%)` would invent an idle pod.
+        let row = PodRow::from_pod(&asking(&[("cpu", "500m"), ("memory", "1Gi")]), None, now());
+
+        assert_eq!(
+            Column::Cpu {
+                against_request: true
+            }
+            .cell(&row),
+            "-"
+        );
+        assert_eq!(
+            Column::Memory {
+                against_request: true
+            }
+            .cell(&row),
+            "-"
+        );
+    }
+
+    #[test]
+    fn a_request_on_one_resource_pairs_that_column_alone() {
+        // Setting a memory request and leaving CPU unbounded is a common shape,
+        // and each heading answers for its own column.
+        let rows = vec![PodRow::from_pod(
+            &asking(&[("memory", "1Gi")]),
+            Some(used("250m", "512Mi")),
+            now(),
+        )];
+
+        assert_eq!(
+            columns(
+                &Scope::Namespace("payments".to_owned()),
+                &rows,
+                Width::Default
+            ),
+            vec![
+                Column::Name,
+                Column::Ready,
+                Column::Status,
+                Column::Restarts,
+                Column::Cpu {
+                    against_request: false
+                },
+                Column::Memory {
+                    against_request: true
+                },
+                Column::Age,
+                Column::Node,
+            ]
+        );
+    }
+
+    #[test]
+    fn one_pod_with_a_request_earns_the_heading_for_the_column() {
+        // `any`, like the usage columns themselves: one pod that asked for
+        // something is a pair somebody can read, and the rows around it that
+        // asked for nothing keep their bare figures under the same heading.
+        let mut rows = requesting_rows();
+        rows[1] = PodRow::from_pod(&healthy(), Some(used("1200m", "3Gi")), now());
+
+        let rendered = render(
+            &rows,
+            "prod (us-east-1)",
+            &Scope::Namespace("payments".to_owned()),
+            &unfiltered(),
+            &[],
+            Width::Default,
+        );
+
+        assert!(
+            rendered.starts_with("NAME      READY  STATUS   RESTARTS  CPU/REQ"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("250m/500m (50%)"), "{rendered}");
+        assert!(rendered.contains("1200m            3Gi"), "{rendered}");
+    }
+
+    #[test]
+    fn a_listing_nobody_sampled_promises_no_denominator() {
+        // Every pod here asked for something and none was measured, so there is
+        // no pair to head — and with no usage at all the columns are absent
+        // anyway, which the footnote above the table explains.
+        let rows = vec![PodRow::from_pod(
+            &asking(&[("cpu", "500m"), ("memory", "1Gi")]),
+            None,
+            now(),
+        )];
+
+        let rendered = render(
+            &rows,
+            "prod (us-east-1)",
+            &Scope::Namespace("payments".to_owned()),
+            &unfiltered(),
+            &[],
+            Width::Default,
+        );
+
+        assert!(!rendered.contains("CPU"), "{rendered}");
+        assert!(!rendered.contains("REQ"), "{rendered}");
     }
 
     #[test]

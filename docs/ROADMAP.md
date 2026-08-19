@@ -210,7 +210,7 @@ cluster.
 
 ### Follow-ups from the usage columns
 
-- [ ] **Usage against what the pod asked for.**
+- [x] **Usage against what the pod asked for.**
   `eks pods` now shows what a pod is burning, and the node table shows every
   figure as a share of something. A pod's `CPU`/`MEMORY` has no denominator, and
   the one that answers "is this limit wrong?" is the pod's own request — the
@@ -218,6 +218,39 @@ cluster.
   *Acceptance:* the request comes from the existing `effective_requests`, so the
   two commands cannot disagree; a pod with no request shows the bare figure
   rather than a percentage of zero.
+  Landed as one cell — `262m/500m (52%)` — with the heading following it:
+  `CPU/REQ` over a column of pairs, plain `CPU` where no row in the listing has
+  one, so the table says what the percentage is a share of.
+
+- [ ] **What a pod asked for, when nothing has measured it.**
+  A pod's request reaches the table only as the denominator of a usage figure, so
+  on a cluster with no metrics-server — the EKS default — `eks pods` still says
+  nothing about what anything booked. "What did this ask for?" is a different
+  question from "how is it doing against it?", and it is asked of pods nobody has
+  sampled: the `Pending` one, the one on a cluster with no add-ons installed.
+  Separate because it is the reviewer's call, and it is a call *between* designs
+  rather than an addition to this one: a `CPU REQ` column beside the existing
+  `262m/500m (52%)` cell would print the same number twice, so taking this means
+  either a column and a plainer usage cell — the node table's shape — or a column
+  that appears only where the usage pair does not. It also puts two more columns
+  on every listing, which is the default table's width, and that belongs with the
+  narrow-mode task rather than arriving as a side effect.
+  *Acceptance:* the figure is `effective_requests`'s, as the usage denominator
+  already is; whichever shape it takes, no listing shows one pod's request twice.
+
+- [ ] **Sort a pod listing by its share of what it asked for.**
+  `--sort cpu` ranks the figure, which is the right key for "what is eating this
+  node" and the wrong one for "whose request is wrong" — the question the new
+  percentage puts in front of the reader. A pod at 400% of a 10m request is
+  burning 40m; the ordering that finds it is not the one that finds the pod
+  burning a core. Separate because it turns on a decision the reviewer should
+  make rather than one this PR could guess: whether a share is two more `--sort`
+  values (`cpu-share`, `memory-share`), a modifier that re-reads the existing
+  ones, and whether the node orders — which already rank by share — should gain
+  the opposite reading at the same time for symmetry.
+  *Acceptance:* the unrankable tail is the pods with no request or no sample,
+  under `k8s::order`'s existing rule rather than a second one; `--sort cpu` is
+  unchanged.
 
 - [ ] **Usage against capacity for the dashboard's bars.**
   `nodes::Share` divides usage by *allocatable*, which is the right denominator
@@ -290,6 +323,11 @@ cluster.
   like it, at least when stdout is a terminal. `PodRow::severity` is now in the
   same position — a `CrashLoopBackOff` reads exactly like a `Running` — so one
   change should light up both tables.
+  The pod table's `262m/500m (52%)` is the third figure wanting this and the one
+  that needs a decision first: it carries no `Severity` deliberately, because
+  `Severity::from_utilisation`'s thresholds do not transfer — 90% of a node's
+  allocatable is alarming and 90% of a pod's own request is a well-sized pod. Say
+  what "hot" means for a pod against its request before colouring it.
   *Acceptance:* colour is suppressed when stdout is not a TTY and when `NO_COLOR`
   is set; the decision is a pure function, tested both ways.
 

@@ -91,8 +91,10 @@ eks nodes --sort age --sort-reverse  # the node that has been up longest
 The node orders rank by *share*, not by the raw figure: a two-core node at 95%
 is closer to trouble than a sixty-four-core node burning twenty times as much and
 sitting at 30%, and the node table already shows every figure as a percentage of
-what the node can give out. `eks pods --sort cpu` ranks by the figure instead,
-because a pod's usage has no denominator in that table.
+what the node can give out. `eks pods --sort cpu` ranks by the figure instead:
+a pod's percentage is a share of what it asked for, which is whatever somebody
+put in a manifest, so a pod at 400% of a 10m request is burning 40m and is not
+the row you are looking for.
 
 Nodes there is nothing to rank stay at the end under either direction, exactly as
 they do for pods: a node metrics-server has not sampled is not the idlest node in
@@ -132,12 +134,12 @@ or every namespace with `-A`:
 
 ```
 $ eks pods -A
-NAMESPACE    NAME                     READY  STATUS             RESTARTS    CPU   MEMORY  AGE  NODE
-kube-system  aws-node-4kd9p           2/2    Running            0           14m   142Mi   12d  ip-10-0-1-9.ec2.internal
-payments     api-7c9f6d4b8-x2vnq      1/1    Running            0           262m  576Mi   3h   ip-10-0-1-9.ec2.internal
-payments     ledger-migrate-2hq4t     0/1    Init:1/2           0           -     -       42s  ip-10-0-11-200.ec2.internal
-payments     reconcile-5d4b9-nzk8p    0/1    CrashLoopBackOff   9 (5m ago)  3m    18Mi    26m  ip-10-0-11-200.ec2.internal
-storefront   checkout-6f7c8d9-pl4mn   0/1    Completed          0           -     -       2d   ip-10-0-1-9.ec2.internal
+NAMESPACE    NAME                    READY  STATUS            RESTARTS    CPU/REQ          MEMORY/REQ         AGE  NODE
+kube-system  aws-node-4kd9p          2/2    Running           0           14m/25m (56%)    142Mi/256Mi (55%)  12d  ip-10-0-1-9.ec2.internal
+payments     api-7c9f6d4b8-x2vnq     1/1    Running           0           262m/500m (52%)  576Mi/1Gi (56%)    3h   ip-10-0-1-9.ec2.internal
+payments     ledger-migrate-2hq4t    0/1    Init:1/2          0           -                -                  42s  ip-10-0-11-200.ec2.internal
+payments     reconcile-5d4b9-nzk8p   0/1    CrashLoopBackOff  9 (5m ago)  3m/250m (1%)     18Mi/512Mi (4%)    26m  ip-10-0-11-200.ec2.internal
+storefront   checkout-6f7c8d9-pl4mn  0/1    Completed         0           -                -                  2d   ip-10-0-1-9.ec2.internal
 ```
 
 `STATUS` is the same derived word `kubectl get pods` shows, not the raw
@@ -150,11 +152,24 @@ since, and those are not the same problem. The time is the newest restart among
 the containers the count covers, and a pod that has never restarted keeps a
 plain `0`.
 
-`CPU` and `MEMORY` are what the pod is actually doing, summed across its
-containers from the same metrics-server the node table uses. They appear only
-when that API answers — no metrics-server means no empty columns, just a note
-under the table — and a pod it has not sampled yet reads `-` rather than a zero
-that would look like an idle pod.
+`CPU/REQ` and `MEMORY/REQ` are what the pod is actually doing, against what it
+asked for: `262m/500m (52%)` is a pod using about half its CPU request. The
+figure is summed across the pod's containers from the same metrics-server the
+node table uses, and the request is the same number `eks nodes` totals into that
+node's `CPU REQ` — the scheduler's arithmetic, not a second sum, so the two
+commands cannot disagree about one pod.
+
+The request is the only denominator a pod has. `262m` on its own cannot be read:
+a quarter of a core is fine, throttled, or a mistake depending entirely on what
+the pod asked for, and it is the request a reader would go on to change. A
+figure above 100% is shown as it is — that is the pod being throttled, or the one
+about to be OOM-killed, which is the moment anybody reads the column for.
+
+A pod that asked for nothing keeps a bare figure, and the heading drops to `CPU`
+with it: there is no denominator, and `262m/0` is not a percentage of anything.
+The columns appear only when metrics-server answers — no metrics-server means no
+empty columns, just a note under the table — and a pod it has not sampled yet
+reads `-` rather than a zero that would look like an idle pod.
 
 `--sort` reorders the listing by a column. Alphabetical order is the right one
 for reading a namespace and the wrong one during an incident — the pod that
@@ -163,6 +178,11 @@ puts it among ninety-nine healthy ones. The orders are `name` (the default,
 unchanged), `restarts`, `age`, `cpu`, and `memory`, and every one but `name` puts
 the row you went looking for first: the newest restart, the youngest pod, the
 largest figure.
+
+`cpu` and `memory` rank what a pod is *using*, not its share of what it asked
+for. A pod at 400% of a 10m request is burning 40m and is nobody's problem; one
+at 60% of four cores is eating the node. The percentage in the cell is about that
+pod's own sizing; the figure beside it is what the listing is usually opened for.
 
 ```sh
 eks pods -A --sort restarts     # what is crashing right now, across the cluster

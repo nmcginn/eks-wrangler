@@ -13,9 +13,11 @@
 //!
 //! # Sorting by a share, not by a figure
 //!
-//! `--sort cpu` on a *pod* ranks by the number in the column, because a pod's
-//! usage has no denominator in the table. On a *node* every figure is already
-//! shown as a share of what the node can give out, and that share is the
+//! `--sort cpu` on a *pod* ranks by the number in the column. A pod's usage does
+//! have a denominator now — what it asked for — but that denominator is whatever
+//! somebody typed into a manifest, so 400% of a 10m request is 40m and nobody's
+//! problem. A *node*'s denominator is the machine, every figure in that table is
+//! already shown as a share of what the node can give out, and that share is the
 //! question: a two-core node at 95% is closer to trouble than a sixty-four-core
 //! node burning twenty times as much and sitting at 30%. So the node orderings
 //! rank by percentage, and a node whose allocatable the API server has not
