@@ -51,15 +51,19 @@ fn run(cli: Cli) -> Result<()> {
             all_namespaces,
             selector,
             field_selector,
+            sort,
         } => {
             let output = commands::block_on(pods::list(
                 &config,
                 &paths,
                 cli.global.context.as_deref(),
-                cli.global.namespace.as_deref(),
-                all_namespaces,
-                selector.as_deref(),
-                field_selector.as_deref(),
+                pods::Request {
+                    namespace: cli.global.namespace.as_deref(),
+                    all_namespaces,
+                    label_selector: selector.as_deref(),
+                    field_selector: field_selector.as_deref(),
+                    order: sort,
+                },
             ))?;
             print_line(&output);
             Ok(())

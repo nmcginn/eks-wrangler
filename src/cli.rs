@@ -7,6 +7,8 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
 
+use crate::k8s::pods::Order;
+
 /// Explore and interact with AWS EKS clusters.
 #[derive(Debug, Parser)]
 #[command(
@@ -109,6 +111,11 @@ pub enum Command {
         /// Select by field, e.g. `--field-selector status.phase!=Running`.
         #[arg(long, value_name = "SELECTOR")]
         field_selector: Option<String>,
+
+        /// Order the listing: `name`, or `restarts` for most recently
+        /// restarted first.
+        #[arg(long, value_name = "ORDER", default_value = "name")]
+        sort: Order,
     },
 
     /// Switch the active cluster.
@@ -185,6 +192,7 @@ mod tests {
             all_namespaces,
             selector,
             field_selector,
+            ..
         }) = cli.command
         else {
             panic!("expected a Pods command");
@@ -193,6 +201,41 @@ mod tests {
         assert!(all_namespaces);
         assert_eq!(selector.as_deref(), Some("app=api"));
         assert_eq!(field_selector.as_deref(), Some("status.phase!=Running"));
+    }
+
+    #[test]
+    fn pods_defaults_to_the_alphabetical_order() {
+        // The listing people already know must not change under them because a
+        // flag was added; `--sort` is opt-in.
+        let Some(Command::Pods { sort, .. }) = parse(&["eks", "pods"]).command else {
+            panic!("expected a Pods command");
+        };
+
+        assert_eq!(sort, Order::Name);
+        assert_eq!(sort, Order::default());
+    }
+
+    #[test]
+    fn pods_takes_a_restart_ordering() {
+        let Some(Command::Pods { sort, .. }) =
+            parse(&["eks", "pods", "--sort", "restarts"]).command
+        else {
+            panic!("expected a Pods command");
+        };
+
+        assert_eq!(sort, Order::Restarts);
+    }
+
+    #[test]
+    fn an_unknown_sort_order_is_rejected_with_the_ones_that_exist() {
+        // clap lists the accepted values itself, which is the whole reason the
+        // flag is a value enum rather than a free string parsed later.
+        let error = Cli::try_parse_from(["eks", "pods", "--sort", "age"])
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("age"), "{error}");
+        assert!(error.contains("restarts"), "{error}");
     }
 
     #[test]

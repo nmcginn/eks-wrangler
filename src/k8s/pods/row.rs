@@ -69,6 +69,14 @@ pub struct PodRow {
     /// every row in a listing is rendered against the one instant passed to
     /// [`PodRow::from_pod`], so rendering cannot reach for a clock of its own.
     pub restart_age: Option<String>,
+    /// The same moment, unformatted, for [`crate::k8s::pods::order`] to sort on.
+    ///
+    /// Ordering needs the instant rather than the words: `2m` and `1h` do not
+    /// compare as strings, and rounding "eight seconds ago" to `8s` throws away
+    /// exactly the precision that separates two pods crashing in the same
+    /// minute. It is carried beside `restart_age` rather than replacing it so
+    /// that rendering still has nothing to compute.
+    pub last_restart: Option<Timestamp>,
     pub age: String,
     /// Cores the pod is actually burning, from metrics-server.
     ///
@@ -114,6 +122,7 @@ impl PodRow {
             restart_age: derived
                 .last_restart
                 .map(|at| format::human_duration(now.duration_since(at))),
+            last_restart: derived.last_restart,
             age: pod.metadata.creation_timestamp.as_ref().map_or_else(
                 || UNKNOWN.to_owned(),
                 |created| format::human_duration(now.duration_since(created.0)),
@@ -1402,6 +1411,63 @@ mod tests {
         assert_eq!(row.restarts, 9);
         assert_eq!(row.restart_age.as_deref(), Some("5m"));
         assert_eq!(restarts_cell(&row), "9 (5m ago)");
+    }
+
+    #[test]
+    fn the_unformatted_restart_instant_is_carried_for_sorting() {
+        // `restart_age` rounds — two pods that crashed forty seconds apart both
+        // read `5m` — so ordering needs the moment itself. It has to be the
+        // *same* moment the cell is rendered from, or the listing would be
+        // sorted by one number and read as another.
+        let pod = pod(
+            PodSpec {
+                containers: vec![container("app")],
+                ..Default::default()
+            },
+            PodStatus {
+                phase: Some("Running".to_owned()),
+                container_statuses: Some(vec![restarted(
+                    "app",
+                    waiting("CrashLoopBackOff"),
+                    9,
+                    Some(ago(5)),
+                )]),
+                ..Default::default()
+            },
+        );
+
+        let row = PodRow::from_pod(&pod, None, now());
+        assert_eq!(row.last_restart, Some(ago(5).0));
+    }
+
+    #[test]
+    fn a_pod_with_nothing_to_date_carries_no_instant_either() {
+        // Both halves of the pair go missing together: a never-restarted pod,
+        // and a restart the kubelet recorded no finishing time for.
+        let never = PodRow::from_pod(&healthy(), None, now());
+        assert_eq!(never.restarts, 0);
+        assert_eq!(never.last_restart, None);
+
+        let undated = pod(
+            PodSpec {
+                containers: vec![container("app")],
+                ..Default::default()
+            },
+            PodStatus {
+                phase: Some("Running".to_owned()),
+                container_statuses: Some(vec![restarted(
+                    "app",
+                    waiting("CrashLoopBackOff"),
+                    2,
+                    None,
+                )]),
+                ..Default::default()
+            },
+        );
+
+        let undated = PodRow::from_pod(&undated, None, now());
+        assert_eq!(undated.restarts, 2);
+        assert_eq!(undated.last_restart, None);
     }
 
     #[test]

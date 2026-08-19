@@ -400,3 +400,53 @@ moment for it would not be.
 The formatted age lives on `PodRow` rather than the `Timestamp` it came from, for
 the same reason `age` does — every row in a listing is rendered against the one
 instant handed to `PodRow::from_pod`, so rendering never reaches for a clock.
+
+### 27. Ordering is a function over rows, and the count is only the tie-break
+
+`--sort restarts` sorts `PodRow`s, not `Pod`s. That is what lets the whole
+ranking be a fixture table — the awkward cases are two `i32`s and two
+`Option<Timestamp>`s rather than container statuses arranged to produce them —
+and it is also what will let the dashboard reorder a listing it already has in
+memory without going back to the API server.
+
+The key is *when*, not *how many*. Sorting by restart count reads like the
+obvious thing and answers the wrong question: it puts the pod that failed two
+hundred times last week above the one that started crashing a minute ago, which
+during an incident is precisely backwards. The count survives as the tie-break,
+where it decides between two containers killed by the same node problem at the
+same instant.
+
+Three ranks, not two. A restart with no `lastState.terminated.finishedAt`
+(decision 26) is neither dated nor absent: the count is real, so sorting it in
+among the healthy pods would bury a genuine crash, but there is no moment to
+rank it against the dated ones, and inventing one — treating it as the epoch, or
+as now — would put a pod somewhere it has not earned. It sits between the two,
+in its own rank.
+
+Every ordering is total, ending in namespace-then-name. An ordering that is only
+*nearly* total shows up as a listing that changes shape between two runs of the
+same command against an unchanged cluster, which reads as a bug in the cluster
+rather than in the sort.
+
+`PodRow` therefore carries both `restart_age` (formatted, for rendering) and
+`last_restart` (the instant, for ordering). They are redundant on purpose:
+`restart_age` rounds, so two pods that crashed forty seconds apart both read
+`5m` and cannot be ordered by what is on screen, while rendering still must not
+reach for a clock of its own.
+
+### 28. `--sort` is a `clap::ValueEnum` on the domain type
+
+`k8s::pods::Order` derives `ValueEnum` itself rather than `cli.rs` defining a
+parallel enum and converting. The alternative is a translation table that can
+drift, guarding a boundary that is not really there: which order to print a
+listing in is a presentation choice in both directions, not a Kubernetes concept
+being adapted for the command line. Deriving it there also means clap owns the
+"that is not one of the orders" message, listing the ones that are.
+
+### 29. `eks pods`'s flags travel as a struct
+
+`commands::pods::list` takes a `Request` rather than eight positional arguments.
+Past seven, `clippy::too_many_arguments` is denied here, and the lint is right
+for the usual reason: four of the flags are `Option<&str>` and a mistake that
+swaps two of them type-checks. The struct is raw command-line text — validating
+it is still `list`'s first job, before it connects to anything.
