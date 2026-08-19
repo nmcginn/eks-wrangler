@@ -871,6 +871,38 @@ mod tests {
     }
 
     #[test]
+    fn the_sort_note_goes_under_the_table_with_the_footnotes() {
+        // The renderer has no opinion about the note beyond where notes go;
+        // this is the assertion that it lands under the table rather than
+        // anywhere in it, and that the table above it is untouched.
+        let rows = [NodeRow::from_node(&healthy_node(), None, None, now())];
+        let notes = [
+            requests_unavailable("no pods for you"),
+            crate::k8s::order::note(Order::Cpu, crate::k8s::order::Direction::Reversed)
+                .expect("a reordered listing should say so"),
+        ];
+
+        let output = render(&rows, "prod (us-east-1)", &notes);
+        let paragraphs: Vec<&str> = output.split("\n\n").collect();
+
+        assert_eq!(paragraphs[0], render(&rows, "prod (us-east-1)", &[]));
+        assert_eq!(paragraphs[2], "Sorted by cpu, reversed.");
+    }
+
+    #[test]
+    fn a_cluster_with_no_nodes_says_nothing_about_the_order_it_would_have_been_in() {
+        // `eks nodes --sort cpu` against a scaled-to-zero cluster: there is no
+        // table for the note to be about, and the empty-cluster message is the
+        // only thing worth reading.
+        let note = crate::k8s::order::note(Order::Cpu, crate::k8s::order::Direction::Natural)
+            .expect("a reordered listing should say so");
+        let message = render(&[], "prod (us-east-1)", &[note]);
+
+        assert!(!message.contains("Sorted by"), "{message}");
+        assert!(message.contains("node groups"), "{message}");
+    }
+
+    #[test]
     fn a_cluster_with_no_nodes_skips_the_footnote() {
         // There is a bigger problem than a missing column to explain.
         let note = requests_unavailable("nope");

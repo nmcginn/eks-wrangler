@@ -1857,6 +1857,62 @@ mod tests {
     }
 
     #[test]
+    fn the_sort_note_goes_under_the_table_with_the_footnotes() {
+        let notes = [
+            usage_unavailable("prod (us-east-1) has no metrics.k8s.io API."),
+            crate::k8s::order::note(
+                crate::k8s::pods::Order::Restarts,
+                crate::k8s::order::Direction::Natural,
+            )
+            .expect("a reordered listing should say so"),
+        ];
+
+        let output = render(
+            &rows(),
+            "prod (us-east-1)",
+            &Scope::Namespace("payments".to_owned()),
+            &unfiltered(),
+            &notes,
+        );
+        let paragraphs: Vec<&str> = output.split("\n\n").collect();
+
+        // The table above the notes is exactly the table without them.
+        assert_eq!(
+            paragraphs[0],
+            render(
+                &rows(),
+                "prod (us-east-1)",
+                &Scope::Namespace("payments".to_owned()),
+                &unfiltered(),
+                &[],
+            )
+        );
+        assert_eq!(paragraphs[2], "Sorted by restarts.");
+    }
+
+    #[test]
+    fn an_empty_listing_says_nothing_about_the_order_it_would_have_been_in() {
+        // `eks pods --sort restarts` in an empty namespace: there is no table
+        // for the note to describe, and "there is nothing here" is the answer.
+        let note = crate::k8s::order::note(
+            crate::k8s::pods::Order::Restarts,
+            crate::k8s::order::Direction::Natural,
+        )
+        .expect("a reordered listing should say so");
+
+        let message = render(
+            &[],
+            "prod (us-east-1)",
+            &Scope::Namespace("payments".to_owned()),
+            &unfiltered(),
+            &[note],
+        );
+
+        assert!(!message.contains("Sorted by"), "{message}");
+        assert!(message.contains("no pods in namespace"), "{message}");
+    }
+
+    #[test]
     fn a_footnote_is_dropped_when_there_are_no_pods_to_annotate() {
         // "Two columns are missing" is noise on top of "there is nothing here",
         // and the empty-listing message is the one worth reading.

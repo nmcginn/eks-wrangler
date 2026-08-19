@@ -32,8 +32,19 @@
 //!
 //! `Rank` is what keeps those two halves of a comparison apart, and `compare`
 //! is the one place the rule is written down.
+//!
+//! # Saying which way round it ran
+//!
+//! A sorted table looks exactly like an unsorted one to anyone who did not type
+//! the command, and a reversed one looks like the ordering running the other
+//! way. [`note`] is the line under the table that says, and it is generic over
+//! the `Order` enums rather than written once per listing — it needs only the
+//! name `clap` already knows the value by, so `--sort cpu-requested` and the
+//! note under the table cannot start spelling the ordering differently.
 
 use std::cmp::Ordering;
+
+use clap::ValueEnum;
 
 /// Which way round an ordering runs.
 ///
@@ -96,6 +107,45 @@ pub(crate) fn compare<T: Ord>(a: &Rank<T>, b: &Rank<T>, direction: Direction) ->
     }
 }
 
+/// A line naming the ordering a listing is in, or `None` when there is nothing
+/// worth saying.
+///
+/// Pure in both arguments and blind to the rows, so it says which ordering was
+/// *asked for* rather than what the ordering happened to do to this particular
+/// table. Whether an ordering managed to rank anything is a separate question,
+/// and a separate note.
+///
+/// Silent for a listing nobody reordered, which keeps the default output of
+/// every command exactly as it was. "Nobody reordered it" means both halves:
+/// `--sort-reverse` on its own reverses the default ordering, so it prints a
+/// table that is genuinely not the default one and says so.
+///
+/// The name is `clap`'s own — the text the user typed after `--sort` — so a
+/// renamed value cannot leave the note describing the old spelling. A value
+/// `clap` will not name is one hidden from `--help`; there is no honest thing
+/// to call it, so the note is dropped rather than guessed at.
+#[must_use]
+pub fn note<O>(order: O, direction: Direction) -> Option<String>
+where
+    // By value, and `Copy` so that it can be — the call site should read like
+    // the `sort` call it sits next to, and an `Order` is a fieldless enum.
+    O: ValueEnum + Copy + Default + PartialEq,
+{
+    if order == O::default() && direction == Direction::Natural {
+        return None;
+    }
+
+    let name = order.to_possible_value()?;
+    let name = name.get_name();
+
+    Some(match direction {
+        Direction::Natural => format!("Sorted by {name}."),
+        // Named after the flag that did it, so the line doubles as the way back
+        // to the other reading of the same column.
+        Direction::Reversed => format!("Sorted by {name}, reversed."),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
@@ -103,6 +153,19 @@ mod tests {
     use super::*;
 
     const DIRECTIONS: [Direction; 2] = [Direction::Natural, Direction::Reversed];
+
+    /// A stand-in for the real `Order` enums.
+    ///
+    /// `note` is generic, and the guarantees below are about the generic
+    /// function rather than about either listing's set of orderings — which is
+    /// also why the multi-word variant is here: it is what proves the note
+    /// spells an ordering the way the flag does.
+    #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, ValueEnum)]
+    enum TestOrder {
+        #[default]
+        Name,
+        CpuRequested,
+    }
 
     #[test]
     fn a_listing_runs_the_natural_way_round_unless_asked() {
@@ -161,6 +224,58 @@ mod tests {
                 Ordering::Equal,
                 "{direction:?}"
             );
+        }
+    }
+
+    #[test]
+    fn a_listing_nobody_reordered_says_nothing_about_its_order() {
+        // The whole reason the note is an `Option`: every existing command's
+        // output has to be unchanged to the byte for the people who never
+        // touched `--sort`.
+        assert_eq!(note(TestOrder::Name, Direction::Natural), None);
+    }
+
+    #[test]
+    fn an_ordering_names_itself_the_way_the_flag_spells_it() {
+        // `cpu-requested`, not `CpuRequested`: the note has to be the text the
+        // user would type, or it is telling them about a flag value that does
+        // not exist.
+        assert_eq!(
+            note(TestOrder::CpuRequested, Direction::Natural).as_deref(),
+            Some("Sorted by cpu-requested.")
+        );
+    }
+
+    #[test]
+    fn a_reversed_listing_says_which_way_round_it_ran() {
+        assert_eq!(
+            note(TestOrder::CpuRequested, Direction::Reversed).as_deref(),
+            Some("Sorted by cpu-requested, reversed.")
+        );
+    }
+
+    #[test]
+    fn reversing_the_default_ordering_is_still_worth_saying() {
+        // `--sort-reverse` on its own is accepted and prints Z-to-A. The order
+        // is the default one, but the listing is not the default listing, and
+        // it is the one most likely to be mistaken for it.
+        assert_eq!(
+            note(TestOrder::Name, Direction::Reversed).as_deref(),
+            Some("Sorted by name, reversed.")
+        );
+    }
+
+    #[test]
+    fn every_ordering_but_the_untouched_default_has_something_to_say() {
+        for direction in DIRECTIONS {
+            for order in [TestOrder::Name, TestOrder::CpuRequested] {
+                let quiet = order == TestOrder::default() && direction == Direction::Natural;
+                assert_eq!(
+                    note(order, direction).is_none(),
+                    quiet,
+                    "{order:?} {direction:?}"
+                );
+            }
         }
     }
 }

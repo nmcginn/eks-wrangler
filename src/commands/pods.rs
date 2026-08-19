@@ -116,6 +116,12 @@ pub async fn list(
     // rules — and so both can be tested on rows alone.
     k8s_pods::sort(&mut rows, request.order, request.direction);
 
+    // Last of the notes, under whatever went wrong, and worded and positioned
+    // exactly as `eks nodes` does it — the two tables answer "which order is
+    // this?" the same way because it is the same question. Silent unless
+    // `--sort` or `--sort-reverse` was given.
+    notes.extend(k8s::order::note(request.order, request.direction));
+
     Ok(k8s_pods::render(&rows, &label, &scope, &selectors, &notes))
 }
 
