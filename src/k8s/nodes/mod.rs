@@ -12,6 +12,10 @@ use k8s_openapi::jiff::Timestamp;
 use kube::Client;
 use kube::api::{Api, ListParams};
 
+pub mod order;
+
+pub use order::{Order, sort};
+
 use crate::format;
 use crate::k8s::metrics::Usage;
 use crate::k8s::pods::Requests;
@@ -50,6 +54,12 @@ pub struct NodeRow {
     /// Memory the node is actually holding, from metrics-server.
     pub memory_used: Share,
     pub age: String,
+    /// When the node joined, if it reported it — what `age` was rendered from.
+    ///
+    /// Carried beside the rendered string so `--sort age` ranks on an instant
+    /// rather than on a rounded, human-readable one: `3d` and `3d` are the same
+    /// text and nearly a day apart. The same pairing `PodRow` has.
+    pub created_at: Option<Timestamp>,
 }
 
 /// What a node has of one resource, and how much of it is left for pods.
@@ -230,6 +240,11 @@ impl NodeRow {
                 || UNKNOWN.to_owned(),
                 |created| format::human_duration(now.duration_since(created.0)),
             ),
+            created_at: node
+                .metadata
+                .creation_timestamp
+                .as_ref()
+                .map(|created| created.0),
         }
     }
 }
@@ -872,5 +887,29 @@ mod tests {
         assert!(message.contains("prod (us-east-1)"), "{message}");
         assert!(message.contains("node groups"), "{message}");
         assert!(!message.contains("NAME"), "{message}");
+    }
+
+    #[test]
+    fn a_row_carries_the_instant_behind_its_age_as_well_as_the_text() {
+        // `--sort age` ranks on this rather than on the rendered string: two
+        // nodes can both read `3d` and be nearly a day apart.
+        let joined = ago(50);
+        let node = healthy_node();
+
+        let row = NodeRow::from_node(&node, Some(idle()), None, now());
+
+        assert_eq!(row.created_at, Some(joined.0));
+        assert_eq!(row.age, "2d2h");
+    }
+
+    #[test]
+    fn a_node_the_api_server_gave_no_creation_time_has_no_instant_either() {
+        let mut node = healthy_node();
+        node.metadata.creation_timestamp = None;
+
+        let row = NodeRow::from_node(&node, Some(idle()), None, now());
+
+        assert_eq!(row.created_at, None);
+        assert_eq!(row.age, "-");
     }
 }

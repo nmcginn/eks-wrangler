@@ -13,9 +13,11 @@
 pub mod client;
 pub mod metrics;
 pub mod nodes;
+pub mod order;
 pub mod pods;
 pub mod quantity;
 pub mod selector;
 
 pub use client::{Failure, connect, explain};
+pub use order::Direction;
 pub use quantity::Quantity;

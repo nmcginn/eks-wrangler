@@ -96,12 +96,21 @@ instant the pod was created, each beside the rounded age its cell is rendered
 from. Sorting rows rather than pods is also what will let the dashboard reorder a
 listing it is already holding.
 
-Each order maps a row to a private `Rank`, which is either something to compare
-or a marker that this row has nothing to rank. `--sort-reverse` flips only the
-first kind, so the pods an order cannot rank stay in the tail whichever way round
-the listing runs — reversing the whole comparison would open every reversed
-listing on its blank rows. That split is why the tail tiers of `restarts` (an
-undated restart is not the same blank as no restart) survive reversal too.
+Each order maps a row to a `Rank`, which is either something to compare or a
+marker that this row has nothing to rank. `--sort-reverse` flips only the first
+kind, so the rows an order cannot rank stay in the tail whichever way round the
+listing runs — reversing the whole comparison would open every reversed listing
+on its blank rows. That split is why the tail tiers of `restarts` (an undated
+restart is not the same blank as no restart) survive reversal too.
+
+`Rank`, `Direction`, and the comparison that keeps those two halves apart live in
+`k8s::order`, one level above both listings, because `eks nodes --sort` follows
+exactly the same rules and a second copy of them would be a second chance to
+drift. What is *not* shared is the keys: `k8s::nodes::order` ranks by the share of
+allocatable a node's figures represent, where `k8s::pods::order` ranks by the
+figure itself, since a pod's usage has no denominator in its table. `NodeRow`
+gained a `created_at` beside its rendered `age` for the same reason `PodRow` has
+one — two nodes can both read `3d` and be nearly a day apart.
 
 Selectors take the same shape in reverse: `k8s::selector` parses the label and
 field selectors a user types (`app=api`, `status.phase!=Running`) into a

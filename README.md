@@ -77,6 +77,27 @@ Those two columns need the `metrics.k8s.io` API, which comes from
 EKS does not install for you. Without it the columns are simply absent and a note
 under the table says so; the rest of the listing is unaffected.
 
+`--sort` reorders the node listing too, by `name` (the default, unchanged),
+`status`, `cpu`, `memory`, `cpu-requested`, `memory-requested`, or `age`, and
+`--sort-reverse` flips any of them:
+
+```sh
+eks nodes --sort status              # the NotReady node, first
+eks nodes --sort cpu                 # the node closest to being full
+eks nodes --sort cpu-requested       # the node the scheduler will refuse next
+eks nodes --sort age --sort-reverse  # the node that has been up longest
+```
+
+The node orders rank by *share*, not by the raw figure: a two-core node at 95%
+is closer to trouble than a sixty-four-core node burning twenty times as much and
+sitting at 30%, and the node table already shows every figure as a percentage of
+what the node can give out. `eks pods --sort cpu` ranks by the figure instead,
+because a pod's usage has no denominator in that table.
+
+Nodes there is nothing to rank stay at the end under either direction, exactly as
+they do for pods: a node metrics-server has not sampled is not the idlest node in
+the cluster.
+
 `eks pods` lists one namespace — the context's own, unless `-n` names another —
 or every namespace with `-A`:
 
@@ -161,8 +182,8 @@ refresh them instead of printing an HTTP status code.
 | `-A, --all-namespaces` | List pods across every namespace (`eks pods`) |
 | `-l, --selector <SEL>` | Filter pods by label selector (`eks pods`) |
 | `--field-selector <SEL>` | Filter pods by field selector (`eks pods`) |
-| `--sort <ORDER>` | Order the pod listing: `name` (default), `restarts`, `age`, `cpu`, `memory` |
-| `--sort-reverse` | Reverse `--sort`; unrankable pods stay at the end |
+| `--sort <ORDER>` | Order the listing. Pods: `name` (default), `restarts`, `age`, `cpu`, `memory`. Nodes: `name` (default), `status`, `cpu`, `memory`, `cpu-requested`, `memory-requested`, `age` |
+| `--sort-reverse` | Reverse `--sort`; unrankable rows stay at the end |
 | `--kubeconfig <PATH>` | Override the kubeconfig search path |
 | `-v, --verbose` | Increase log verbosity (repeatable) |
 

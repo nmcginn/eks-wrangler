@@ -7,7 +7,8 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
 
-use crate::k8s::pods::Order;
+use crate::k8s::nodes::Order as NodeOrder;
+use crate::k8s::pods::Order as PodOrder;
 
 /// Explore and interact with AWS EKS clusters.
 #[derive(Debug, Parser)]
@@ -95,7 +96,17 @@ pub enum Command {
 
     /// List the nodes of a cluster.
     #[command(visible_alias = "no")]
-    Nodes,
+    Nodes {
+        /// Order the listing. Every order but `name` puts the most interesting
+        /// row first: the least healthy node, the fullest, the youngest.
+        #[arg(long, value_name = "ORDER", default_value = "name")]
+        sort: NodeOrder,
+
+        /// Reverse the order. Nodes there is nothing to rank — no live usage,
+        /// or no reported capacity — stay at the end either way.
+        #[arg(long)]
+        sort_reverse: bool,
+    },
 
     /// List the pods of a namespace, or of every namespace.
     #[command(visible_alias = "po")]
@@ -116,7 +127,7 @@ pub enum Command {
         /// interesting row first: the newest restart, the youngest pod, the
         /// largest usage figure.
         #[arg(long, value_name = "ORDER", default_value = "name")]
-        sort: Order,
+        sort: PodOrder,
 
         /// Reverse the order. Pods there is nothing to rank — never restarted,
         /// or never sampled — stay at the end either way.
@@ -174,12 +185,74 @@ mod tests {
     fn nodes_accepts_a_context_and_its_short_alias() {
         assert!(matches!(
             parse(&["eks", "no"]).command,
-            Some(Command::Nodes)
+            Some(Command::Nodes { .. })
         ));
 
         let cli = parse(&["eks", "nodes", "--context", "prod"]);
-        assert!(matches!(cli.command, Some(Command::Nodes)));
+        assert!(matches!(cli.command, Some(Command::Nodes { .. })));
         assert_eq!(cli.global.context.as_deref(), Some("prod"));
+    }
+
+    #[test]
+    fn nodes_defaults_to_the_alphabetical_order() {
+        // The listing people already have must not move under them because a
+        // flag was added; `--sort` is opt-in for nodes exactly as it is for
+        // pods.
+        let Some(Command::Nodes { sort, sort_reverse }) = parse(&["eks", "nodes"]).command else {
+            panic!("expected a Nodes command");
+        };
+
+        assert_eq!(sort, NodeOrder::Name);
+        assert_eq!(sort, NodeOrder::default());
+        assert!(!sort_reverse);
+    }
+
+    #[test]
+    fn nodes_takes_every_ordering_by_name() {
+        for (flag, expected) in [
+            ("name", NodeOrder::Name),
+            ("status", NodeOrder::Status),
+            ("cpu", NodeOrder::Cpu),
+            ("memory", NodeOrder::Memory),
+            ("cpu-requested", NodeOrder::CpuRequested),
+            ("memory-requested", NodeOrder::MemoryRequested),
+            ("age", NodeOrder::Age),
+        ] {
+            let Some(Command::Nodes { sort, .. }) =
+                parse(&["eks", "nodes", "--sort", flag]).command
+            else {
+                panic!("expected a Nodes command");
+            };
+
+            assert_eq!(sort, expected, "--sort {flag}");
+        }
+    }
+
+    #[test]
+    fn nodes_takes_a_reversal_with_or_without_an_ordering() {
+        for args in [
+            vec!["eks", "nodes", "--sort-reverse"],
+            vec!["eks", "nodes", "--sort", "cpu", "--sort-reverse"],
+        ] {
+            let Some(Command::Nodes { sort_reverse, .. }) = parse(&args).command else {
+                panic!("expected a Nodes command");
+            };
+
+            assert!(sort_reverse, "{args:?}");
+        }
+    }
+
+    #[test]
+    fn the_two_listings_do_not_share_an_ordering_vocabulary() {
+        // `restarts` is a pod ordering and means nothing for a node; a node
+        // rejecting it should say so rather than sorting by something else.
+        let error = Cli::try_parse_from(["eks", "nodes", "--sort", "restarts"])
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("restarts"), "{error}");
+        assert!(error.contains("status"), "{error}");
+        assert!(error.contains("cpu-requested"), "{error}");
     }
 
     #[test]
@@ -217,18 +290,18 @@ mod tests {
             panic!("expected a Pods command");
         };
 
-        assert_eq!(sort, Order::Name);
-        assert_eq!(sort, Order::default());
+        assert_eq!(sort, PodOrder::Name);
+        assert_eq!(sort, PodOrder::default());
     }
 
     #[test]
     fn pods_takes_every_ordering_by_name() {
         for (flag, expected) in [
-            ("name", Order::Name),
-            ("restarts", Order::Restarts),
-            ("age", Order::Age),
-            ("cpu", Order::Cpu),
-            ("memory", Order::Memory),
+            ("name", PodOrder::Name),
+            ("restarts", PodOrder::Restarts),
+            ("age", PodOrder::Age),
+            ("cpu", PodOrder::Cpu),
+            ("memory", PodOrder::Memory),
         ] {
             let Some(Command::Pods { sort, .. }) = parse(&["eks", "pods", "--sort", flag]).command
             else {

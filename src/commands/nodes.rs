@@ -8,6 +8,7 @@ use k8s_openapi::jiff::Timestamp;
 use crate::cluster::ClusterView;
 use crate::commands::contexts;
 use crate::k8s::metrics::{self as k8s_metrics};
+use crate::k8s::order::Direction;
 use crate::k8s::{self, nodes as k8s_nodes, pods as k8s_pods};
 use crate::kubeconfig::KubeConfig;
 
@@ -16,10 +17,16 @@ use crate::kubeconfig::KubeConfig;
 /// `selector` is whatever the user passed to `--context`: a full context name,
 /// or the short cluster name `eks contexts` shows. `None` means the cluster
 /// their kubeconfig already points at.
+///
+/// `order` and `direction` are `--sort` and `--sort-reverse`. They are applied
+/// to the finished rows, so they change nothing about what is fetched — only
+/// the order it is read in.
 pub async fn list(
     config: &KubeConfig,
     paths: &[PathBuf],
     selector: Option<&str>,
+    order: k8s_nodes::Order,
+    direction: Direction,
 ) -> Result<String> {
     let target = target_cluster(config, selector)?;
     let label = target.label();
@@ -98,9 +105,12 @@ pub async fn list(
             k8s_nodes::NodeRow::from_node(node, requested, used, now)
         })
         .collect();
-    // The API server happens to return nodes in name order today; sorting makes
-    // that a promise rather than an accident.
-    rows.sort_by(|a, b| a.name.cmp(&b.name));
+    // Ordering lives in `k8s::nodes::order` rather than here, so the default and
+    // the one `--sort` asks for are decided in the same place and by the same
+    // rules — and so both can be tested on rows alone. The default is still by
+    // name, which the API server happens to return today; sorting makes that a
+    // promise rather than an accident.
+    k8s_nodes::sort(&mut rows, order, direction);
 
     Ok(k8s_nodes::render(&rows, &label, &footnotes))
 }

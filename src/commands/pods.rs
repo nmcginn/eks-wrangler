@@ -8,7 +8,8 @@ use k8s_openapi::jiff::Timestamp;
 use crate::cluster::ClusterView;
 use crate::commands::nodes::target_cluster;
 use crate::k8s::metrics::{self as k8s_metrics};
-use crate::k8s::pods::{Direction, Order, PodRow, Scope, Selectors};
+use crate::k8s::order::Direction;
+use crate::k8s::pods::{Order, PodRow, Scope, Selectors};
 use crate::k8s::{self, pods as k8s_pods, selector};
 use crate::kubeconfig::KubeConfig;
 

@@ -12,26 +12,16 @@
 //! here is total: two rows only ever compare equal if they are the same pod in
 //! the same namespace, so one listing always renders the same way twice.
 //!
-//! # Which way is "first"
-//!
-//! Every ordering puts the row a person went looking for at the top: the newest
-//! restart, the largest usage figure, the youngest pod. That is deliberately not
-//! `kubectl --sort-by=.metadata.creationTimestamp`, which prints oldest first —
-//! but it is the same rule as `--sort restarts`, and one rule across four
-//! orderings beats matching a different tool on one of them.
-//!
-//! [`Direction::Reversed`] flips that, and flips only that. The rows an ordering
-//! has *nothing to rank* — a pod that has never restarted under `restarts`, one
-//! metrics-server has not sampled under `cpu` — stay in the tail under either
-//! direction, because "least CPU" means the pod using the least, not the pod
-//! whose usage is unknown. The private `Rank` type below is what keeps those
-//! two halves of a comparison apart.
+//! Which way round an ordering runs, and what happens to the rows it cannot
+//! rank, are [`crate::k8s::order`]'s rules rather than this module's — `eks
+//! nodes` follows the same ones. What lives here is the keys.
 
 use std::cmp::{Ordering, Reverse};
 
 use k8s_openapi::jiff::Timestamp;
 
 use super::PodRow;
+use crate::k8s::order::{Direction, Rank, compare};
 use crate::k8s::quantity::Quantity;
 
 /// The order the rows of a pod listing are printed in.
@@ -54,74 +44,12 @@ pub enum Order {
     Memory,
 }
 
-/// Which way round an [`Order`] runs.
-///
-/// A value rather than a `bool` parameter, because `sort(&mut rows, order,
-/// true)` at a call site says nothing about what `true` does to the listing.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum Direction {
-    /// The ordering's own direction: newest, largest, or A-to-Z first.
-    #[default]
-    Natural,
-    /// The ordering, flipped — except for the rows it has nothing to rank,
-    /// which stay in the tail. See the module docs.
-    Reversed,
-}
-
-impl Direction {
-    /// `Reversed` when the flag was given, `Natural` otherwise.
-    #[must_use]
-    pub fn reversed(yes: bool) -> Self {
-        if yes { Self::Reversed } else { Self::Natural }
-    }
-
-    /// Flip a comparison if this direction is reversed.
-    fn apply(self, ordering: Ordering) -> Ordering {
-        match self {
-            Self::Natural => ordering,
-            Self::Reversed => ordering.reverse(),
-        }
-    }
-}
-
 /// Sort a listing in place.
 pub fn sort(rows: &mut [PodRow], order: Order, direction: Direction) {
     // The alphabet is the last word under every ordering and in either
     // direction, so a listing with nothing left to separate two rows still
     // cannot shuffle between two runs of one command.
     rows.sort_by(|a, b| rank(a, b, order, direction).then_with(|| by_name(a, b)));
-}
-
-/// Where a row sits under an ordering, before the direction is applied.
-///
-/// The two cases are kept apart rather than folded into an `Option` because
-/// only the ranked half is reversible. Reversing the whole comparison would
-/// drag every blank row to the top of the listing, which is the one place a
-/// reader is certain not to want them: asking for the *least* CPU is asking
-/// which pod is idle, not which pod metrics-server has not reached.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Rank<T> {
-    /// Something to rank the row by. These are what a reversal flips.
-    By(T),
-    /// Nothing to rank the row by, in the tail tier given — a lower tier first.
-    ///
-    /// Tiers exist for `restarts`, where a restart the kubelet recorded no
-    /// finishing time for is a different kind of blank from never having
-    /// restarted: the count is real, so burying it among the healthy pods would
-    /// hide a genuine crash, but there is no moment to rank it against the
-    /// dated ones either.
-    Unranked(u8),
-}
-
-/// Compare two ranks, flipping only the part a direction is allowed to flip.
-fn compare<T: Ord>(a: &Rank<T>, b: &Rank<T>, direction: Direction) -> Ordering {
-    match (a, b) {
-        (Rank::By(a), Rank::By(b)) => direction.apply(a.cmp(b)),
-        // Ranked before unranked whichever way round the listing runs.
-        (Rank::By(_), Rank::Unranked(_)) => Ordering::Less,
-        (Rank::Unranked(_), Rank::By(_)) => Ordering::Greater,
-        (Rank::Unranked(a), Rank::Unranked(b)) => a.cmp(b),
-    }
 }
 
 /// The ordering's own comparison, before the alphabetical tie-break.
@@ -298,10 +226,10 @@ mod tests {
 
     #[test]
     fn name_order_run_naturally_is_the_default() {
+        // The direction's own defaulting is `k8s::order`'s test; this is about
+        // which ordering a pod listing opens in.
         assert_eq!(Order::default(), Order::Name);
         assert_eq!(Direction::default(), Direction::Natural);
-        assert_eq!(Direction::reversed(false), Direction::Natural);
-        assert_eq!(Direction::reversed(true), Direction::Reversed);
     }
 
     #[test]
