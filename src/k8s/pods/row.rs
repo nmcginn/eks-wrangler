@@ -15,6 +15,11 @@
 //! - A *sidecar* — an init container with `restartPolicy: Always` — is skipped
 //!   by that walk once it has started, counts towards the ready fraction, and
 //!   is the only init container whose restarts survive into the final count.
+//! - The `RESTARTS` cell carries *when* the newest surviving restart happened
+//!   — `9 (5m ago)` — taken from the newest `lastState.terminated.finishedAt`
+//!   across exactly the containers whose counts survived. The recency follows
+//!   the count rather than being gathered separately, so the two halves of the
+//!   cell can never describe different sets of containers.
 //! - The app containers are walked *backwards*, so when several are unhappy the
 //!   first one in the spec is the one named.
 //! - A pod being deleted reads `Terminating`, except on a lost node, where it
@@ -56,6 +61,14 @@ pub struct PodRow {
     /// call site so the CLI table and the dashboard cannot disagree about it.
     pub severity: Severity,
     pub restarts: i32,
+    /// How long before `now` the newest surviving restart finished, formatted
+    /// the way [`PodRow::age`] is.
+    ///
+    /// `None` for a pod that has never restarted, which reads as a bare count.
+    /// Pre-formatted rather than a `Timestamp` for the same reason `age` is:
+    /// every row in a listing is rendered against the one instant passed to
+    /// [`PodRow::from_pod`], so rendering cannot reach for a clock of its own.
+    pub restart_age: Option<String>,
     pub age: String,
     /// Cores the pod is actually burning, from metrics-server.
     ///
@@ -98,6 +111,9 @@ impl PodRow {
             severity: severity(&derived.status, derived.ready, derived.total),
             status: derived.status,
             restarts: derived.restarts,
+            restart_age: derived
+                .last_restart
+                .map(|at| format::human_duration(now.duration_since(at))),
             age: pod.metadata.creation_timestamp.as_ref().map_or_else(
                 || UNKNOWN.to_owned(),
                 |created| format::human_duration(now.duration_since(created.0)),
@@ -120,6 +136,8 @@ struct Derived {
     ready: usize,
     total: usize,
     restarts: i32,
+    /// The newest restart among the containers `restarts` counted, if any.
+    last_restart: Option<Timestamp>,
 }
 
 /// Walk a pod's containers the way `kubectl get pods` does.
@@ -142,6 +160,7 @@ fn derive(pod: &Pod) -> Derived {
     let init = init_phase(status, init_specs);
     let mut ready = init.ready;
     let mut restarts = init.restarts;
+    let mut last_restart = init.last_restart;
     if let Some(blocked) = init.reason.clone() {
         reason = blocked;
     }
@@ -155,8 +174,11 @@ fn derive(pod: &Pod) -> Derived {
         let steady = steady_state(status);
         ready += steady.ready;
         // Only a sidecar's restarts survive: a plain init container having
-        // restarted before the pod came up is history, not a live warning.
+        // restarted before the pod came up is history, not a live warning. The
+        // recency is discarded with the count it belonged to, so a finished
+        // init container cannot leave its timestamp behind on a `0`.
         restarts = init.sidecar_restarts.saturating_add(steady.restarts);
+        last_restart = newest(init.sidecar_last_restart, steady.last_restart);
         if let Some(current) = steady.reason {
             reason = current;
         }
@@ -190,6 +212,7 @@ fn derive(pod: &Pod) -> Derived {
         ready,
         total,
         restarts,
+        last_restart,
     }
 }
 
@@ -222,6 +245,11 @@ struct Init {
     ready: usize,
     restarts: i32,
     sidecar_restarts: i32,
+    /// The newest restart across every init container walked.
+    last_restart: Option<Timestamp>,
+    /// The same, restricted to the sidecars — the subset that survives once
+    /// initialisation is over.
+    sidecar_last_restart: Option<Timestamp>,
 }
 
 /// Walk the init containers in order, stopping at the first one that has not
@@ -240,11 +268,14 @@ fn init_phase(status: Option<&PodStatus>, specs: &[Container]) -> Init {
             .find(|spec| spec.name == container.name)
             .is_some_and(is_sidecar);
 
+        let restarted = last_terminated_at(container);
         init.restarts = init.restarts.saturating_add(container.restart_count);
+        init.last_restart = newest(init.last_restart, restarted);
         if sidecar {
             init.sidecar_restarts = init
                 .sidecar_restarts
                 .saturating_add(container.restart_count);
+            init.sidecar_last_restart = newest(init.sidecar_last_restart, restarted);
         }
 
         let terminated = state(container, |state| state.terminated.as_ref());
@@ -289,6 +320,8 @@ struct Steady {
     reason: Option<String>,
     ready: usize,
     restarts: i32,
+    /// The newest restart across the app containers.
+    last_restart: Option<Timestamp>,
     /// Whether anything is still up, which is what separates a finished Job
     /// from one whose sidecar never exits.
     any_running: bool,
@@ -307,6 +340,7 @@ fn steady_state(status: Option<&PodStatus>) -> Steady {
         .rev()
     {
         steady.restarts = steady.restarts.saturating_add(container.restart_count);
+        steady.last_restart = newest(steady.last_restart, last_terminated_at(container));
 
         let waiting = state(container, |state| state.waiting.as_ref())
             .and_then(|waiting| waiting.reason.as_deref())
@@ -360,6 +394,38 @@ fn exit_reason(terminated: &ContainerStateTerminated) -> String {
             Some(signal) if signal != 0 => format!("Signal:{signal}"),
             _ => format!("ExitCode:{}", terminated.exit_code),
         },
+    }
+}
+
+/// When a container's *previous* run ended, if it had one.
+///
+/// This is what makes a restart count recent or historical. `lastState` is only
+/// populated once the kubelet has restarted a container, so its absence is the
+/// ordinary case rather than missing data — and `finishedAt` can still be unset
+/// on a container killed before it was ever seen to stop, which reads the same
+/// way: no recency to show.
+fn last_terminated_at(container: &ContainerStatus) -> Option<Timestamp> {
+    Some(
+        container
+            .last_state
+            .as_ref()?
+            .terminated
+            .as_ref()?
+            .finished_at
+            .as_ref()?
+            .0,
+    )
+}
+
+/// The later of two moments, tolerating either being absent.
+///
+/// A fold rather than a `max` over an iterator because the two sides are
+/// gathered in different places — the init walk stops early, and the app walk
+/// runs backwards.
+fn newest(current: Option<Timestamp>, candidate: Option<Timestamp>) -> Option<Timestamp> {
+    match (current, candidate) {
+        (Some(current), Some(candidate)) => Some(current.max(candidate)),
+        (current, candidate) => current.or(candidate),
     }
 }
 
@@ -431,6 +497,19 @@ fn shows_usage(rows: &[PodRow]) -> bool {
         .any(|row| row.cpu_used.is_some() || row.memory_used.is_some())
 }
 
+/// The `RESTARTS` cell: the count, and when the newest restart happened.
+///
+/// A bare count cannot tell a pod that crashed nine times last Tuesday from one
+/// crashing right now, which is the only question anyone asks of the column. A
+/// pod that has never restarted keeps the bare count — `0 (— ago)` would be
+/// noise on every healthy row, which is most of them.
+fn restarts_cell(row: &PodRow) -> String {
+    match &row.restart_age {
+        Some(age) => format!("{} ({age} ago)", row.restarts),
+        None => row.restarts.to_string(),
+    }
+}
+
 /// One usage cell: the figure, or `-` where there is not one.
 ///
 /// No percentage, unlike the node table's: a pod has no allocatable of its own
@@ -474,7 +553,7 @@ pub fn render(
                 row.name.clone(),
                 row.ready.clone(),
                 row.status.clone(),
-                row.restarts.to_string(),
+                restarts_cell(row),
             ]);
             if usage {
                 cells.push(usage_cell(row.cpu_used, quantity::cpu));
@@ -603,6 +682,29 @@ mod tests {
             restart_count: restarts,
             state: Some(state),
             ..Default::default()
+        }
+    }
+
+    /// A container status carrying the wreckage of a previous run — what the
+    /// kubelet leaves behind after it restarts a container, and the only place
+    /// the recency of a restart is recorded.
+    fn restarted(
+        name: &str,
+        state: ContainerState,
+        restarts: i32,
+        finished: Option<Time>,
+    ) -> ContainerStatus {
+        ContainerStatus {
+            last_state: Some(ContainerState {
+                terminated: Some(ContainerStateTerminated {
+                    reason: Some("Error".to_owned()),
+                    exit_code: 1,
+                    finished_at: finished,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..status(name, state, false, restarts)
         }
     }
 
@@ -1261,6 +1363,223 @@ mod tests {
         assert!(
             message.contains("field selector `status.phase!=Running`"),
             "{message}"
+        );
+    }
+
+    #[test]
+    fn a_pod_that_has_never_restarted_shows_a_bare_count() {
+        // Most rows in a healthy listing. `0 (— ago)` on every one of them
+        // would be noise, and there is genuinely nothing to date.
+        let row = PodRow::from_pod(&healthy(), None, now());
+
+        assert_eq!(row.restarts, 0);
+        assert_eq!(row.restart_age, None);
+        assert_eq!(restarts_cell(&row), "0");
+    }
+
+    #[test]
+    fn a_restarted_container_says_how_long_ago_it_happened() {
+        // The distinction the column exists to make: nine crashes last Tuesday
+        // and nine crashes in the last five minutes are not the same incident.
+        let pod = pod(
+            PodSpec {
+                containers: vec![container("app")],
+                ..Default::default()
+            },
+            PodStatus {
+                phase: Some("Running".to_owned()),
+                container_statuses: Some(vec![restarted(
+                    "app",
+                    waiting("CrashLoopBackOff"),
+                    9,
+                    Some(ago(5)),
+                )]),
+                ..Default::default()
+            },
+        );
+
+        let row = PodRow::from_pod(&pod, None, now());
+        assert_eq!(row.restarts, 9);
+        assert_eq!(row.restart_age.as_deref(), Some("5m"));
+        assert_eq!(restarts_cell(&row), "9 (5m ago)");
+    }
+
+    #[test]
+    fn the_newest_restart_across_the_containers_is_the_one_dated() {
+        // One container settled hours ago and another is still going; the
+        // recent one is the news, whichever order the statuses arrive in.
+        let pod = pod(
+            PodSpec {
+                containers: vec![container("app"), container("exporter")],
+                ..Default::default()
+            },
+            PodStatus {
+                phase: Some("Running".to_owned()),
+                container_statuses: Some(vec![
+                    restarted("app", waiting("CrashLoopBackOff"), 4, Some(ago(240))),
+                    restarted("exporter", running(), 2, Some(ago(2))),
+                ]),
+                ..Default::default()
+            },
+        );
+
+        let row = PodRow::from_pod(&pod, None, now());
+        assert_eq!(row.restarts, 6);
+        assert_eq!(row.restart_age.as_deref(), Some("2m"));
+    }
+
+    #[test]
+    fn a_finished_init_containers_restart_time_is_forgotten_with_its_count() {
+        // The rule that makes this worth a test: once initialisation is over,
+        // only a sidecar's restarts survive — so only a sidecar's timestamp may
+        // survive with them. A plain init container leaving its date behind
+        // would date a count it is no longer part of.
+        let mut proxy = restarted("proxy", running(), 3, Some(ago(20)));
+        proxy.started = Some(true);
+        proxy.ready = true;
+
+        let pod = pod(
+            PodSpec {
+                containers: vec![container("app")],
+                init_containers: Some(vec![sidecar("proxy"), container("migrate")]),
+                ..Default::default()
+            },
+            PodStatus {
+                phase: Some("Running".to_owned()),
+                conditions: Some(vec![condition("Ready", "True", None)]),
+                init_container_statuses: Some(vec![
+                    proxy,
+                    // Restarted far more recently, and entirely irrelevant.
+                    restarted("migrate", terminated(Some("Completed"), 0), 5, Some(ago(1))),
+                ]),
+                container_statuses: Some(vec![status("app", running(), true, 0)]),
+                ..Default::default()
+            },
+        );
+
+        let row = PodRow::from_pod(&pod, None, now());
+        assert_eq!(row.restarts, 3);
+        assert_eq!(row.restart_age.as_deref(), Some("20m"));
+    }
+
+    #[test]
+    fn while_initialising_the_init_containers_own_restart_time_is_shown() {
+        // Before the pod comes up the init restarts are the count, so they are
+        // also the recency — a pod stuck retrying its migration should say how
+        // long ago the last attempt died.
+        let pod = pod(
+            PodSpec {
+                containers: vec![container("app")],
+                init_containers: Some(vec![container("migrate"), container("seed")]),
+                ..Default::default()
+            },
+            PodStatus {
+                phase: Some("Pending".to_owned()),
+                init_container_statuses: Some(vec![restarted(
+                    "migrate",
+                    waiting("CrashLoopBackOff"),
+                    3,
+                    Some(ago(45)),
+                )]),
+                ..Default::default()
+            },
+        );
+
+        let row = PodRow::from_pod(&pod, None, now());
+        assert_eq!(row.status, "Init:CrashLoopBackOff");
+        assert_eq!(row.restarts, 3);
+        assert_eq!(row.restart_age.as_deref(), Some("45m"));
+    }
+
+    #[test]
+    fn a_previous_run_with_no_finish_time_leaves_the_count_undated() {
+        // A container killed before anything observed it stopping. The count is
+        // still real; inventing a date for it would not be.
+        let pod = pod(
+            PodSpec {
+                containers: vec![container("app")],
+                ..Default::default()
+            },
+            PodStatus {
+                phase: Some("Running".to_owned()),
+                container_statuses: Some(vec![restarted(
+                    "app",
+                    waiting("CrashLoopBackOff"),
+                    2,
+                    None,
+                )]),
+                ..Default::default()
+            },
+        );
+
+        let row = PodRow::from_pod(&pod, None, now());
+        assert_eq!(row.restarts, 2);
+        assert_eq!(row.restart_age, None);
+        assert_eq!(restarts_cell(&row), "2");
+    }
+
+    #[test]
+    fn a_restart_dated_in_the_future_reads_as_just_now_rather_than_negatively() {
+        // Clock skew between the node and here, which is not the user's problem
+        // and certainly not worth a `-3m`.
+        let skewed = Time(now() + SignedDuration::from_mins(3));
+        let pod = pod(
+            PodSpec {
+                containers: vec![container("app")],
+                ..Default::default()
+            },
+            PodStatus {
+                phase: Some("Running".to_owned()),
+                container_statuses: Some(vec![restarted(
+                    "app",
+                    waiting("CrashLoopBackOff"),
+                    1,
+                    Some(skewed),
+                )]),
+                ..Default::default()
+            },
+        );
+
+        assert_eq!(
+            restarts_cell(&PodRow::from_pod(&pod, None, now())),
+            "1 (0s ago)"
+        );
+    }
+
+    #[test]
+    fn the_restarts_column_widens_to_fit_the_recency_without_moving_the_others() {
+        // The cell grows from `0` to `9 (5m ago)`; the table has to stay a
+        // table, and AGE and NODE have to stay where `kubectl` leaves them.
+        let mut crashing = healthy();
+        crashing.metadata.name = Some("checkout-5d4b".to_owned());
+        crashing.status = Some(PodStatus {
+            phase: Some("Running".to_owned()),
+            container_statuses: Some(vec![restarted(
+                "app",
+                waiting("CrashLoopBackOff"),
+                9,
+                Some(ago(5)),
+            )]),
+            ..Default::default()
+        });
+
+        let rows = vec![
+            PodRow::from_pod(&healthy(), None, now()),
+            PodRow::from_pod(&crashing, None, now()),
+        ];
+        let rendered = render(
+            &rows,
+            "prod (us-east-1)",
+            &Scope::Namespace("payments".to_owned()),
+            &unfiltered(),
+            &[],
+        );
+
+        assert_eq!(
+            rendered,
+            "NAME           READY  STATUS            RESTARTS    AGE  NODE\n\
+             api-7c9f       1/1    Running           0           90m  ip-10-0-1-9.ec2.internal\n\
+             checkout-5d4b  0/1    CrashLoopBackOff  9 (5m ago)  90m  ip-10-0-1-9.ec2.internal"
         );
     }
 

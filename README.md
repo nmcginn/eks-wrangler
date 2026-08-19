@@ -82,17 +82,23 @@ or every namespace with `-A`:
 
 ```
 $ eks pods -A
-NAMESPACE    NAME                     READY  STATUS             RESTARTS  CPU   MEMORY  AGE  NODE
-kube-system  aws-node-4kd9p           2/2    Running            0         14m   142Mi   12d  ip-10-0-1-9.ec2.internal
-payments     api-7c9f6d4b8-x2vnq      1/1    Running            0         262m  576Mi   3h   ip-10-0-1-9.ec2.internal
-payments     ledger-migrate-2hq4t     0/1    Init:1/2           0         -     -       42s  ip-10-0-11-200.ec2.internal
-payments     reconcile-5d4b9-nzk8p    0/1    CrashLoopBackOff   9         3m    18Mi    26m  ip-10-0-11-200.ec2.internal
-storefront   checkout-6f7c8d9-pl4mn   0/1    Completed          0         -     -       2d   ip-10-0-1-9.ec2.internal
+NAMESPACE    NAME                     READY  STATUS             RESTARTS    CPU   MEMORY  AGE  NODE
+kube-system  aws-node-4kd9p           2/2    Running            0           14m   142Mi   12d  ip-10-0-1-9.ec2.internal
+payments     api-7c9f6d4b8-x2vnq      1/1    Running            0           262m  576Mi   3h   ip-10-0-1-9.ec2.internal
+payments     ledger-migrate-2hq4t     0/1    Init:1/2           0           -     -       42s  ip-10-0-11-200.ec2.internal
+payments     reconcile-5d4b9-nzk8p    0/1    CrashLoopBackOff   9 (5m ago)  3m    18Mi    26m  ip-10-0-11-200.ec2.internal
+storefront   checkout-6f7c8d9-pl4mn   0/1    Completed          0           -     -       2d   ip-10-0-1-9.ec2.internal
 ```
 
 `STATUS` is the same derived word `kubectl get pods` shows, not the raw
 `status.phase` — none of `CrashLoopBackOff`, `Init:1/2`, `Terminating`, or
 `Completed` exists in the API, and they are the ones worth reading.
+
+`RESTARTS` says when, not just how many. `9 (5m ago)` is a pod crashing now;
+`9` on its own is a pod that crashed nine times last Tuesday and has been fine
+since, and those are not the same problem. The time is the newest restart among
+the containers the count covers, and a pod that has never restarted keeps a
+plain `0`.
 
 `CPU` and `MEMORY` are what the pod is actually doing, summed across its
 containers from the same metrics-server the node table uses. They appear only
