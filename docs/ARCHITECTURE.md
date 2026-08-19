@@ -103,10 +103,17 @@ listing runs — reversing the whole comparison would open every reversed listin
 on its blank rows. That split is why the tail tiers of `restarts` (an undated
 restart is not the same blank as no restart) survive reversal too.
 
-`Rank`, `Direction`, and the comparison that keeps those two halves apart live in
-`k8s::order`, one level above both listings, because `eks nodes --sort` follows
-exactly the same rules and a second copy of them would be a second chance to
-drift. What is *not* shared is the keys: `k8s::nodes::order` ranks by the share of
+`Rank`, `Direction`, the comparison that keeps those two halves apart, and the
+two notes under a reordered table all live in `k8s::order`, one level above both
+listings, because `eks nodes --sort` follows exactly the same rules and a second
+copy of them would be a second chance to drift. The notes are generic over the
+`Order` enums and take their spelling from `clap::ValueEnum`, so an ordering is
+always called what the flag calls it. What they cannot know is the rows, so each
+listing hands in the two facts they turn on: a `ranks_any` predicate — asked
+about every ordering, not just the one that failed, since the answers for the
+others are the "sort by … instead" advice — and a `cause`, which is that
+listing's own map from an ordering to the footnote that would already have
+explained an empty column. What is *not* shared is the keys: `k8s::nodes::order` ranks by the share of
 allocatable a node's figures represent, where `k8s::pods::order` ranks by the
 figure itself, since a pod's usage has no denominator in its table. `NodeRow`
 gained a `created_at` beside its rendered `age` for the same reason `PodRow` has

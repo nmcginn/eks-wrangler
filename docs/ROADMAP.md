@@ -141,7 +141,7 @@ cluster.
   *Acceptance:* the note fires only when no row could be ranked, and names the
   ordering; a listing where even one row ranked says nothing extra.
 
-- [ ] **Point the "nothing ranked" note at what would fix it.**
+- [x] **Point the "nothing ranked" note at what would fix it.**
   `Nothing here has cpu to sort by.` now sits under the table, and on a cluster
   with no metrics-server the footnote above it already says what to install — but
   the two are separate paragraphs that never refer to each other, and under
@@ -151,13 +151,28 @@ cluster.
   sentence per ordering; a listing where the fixable cause is already explained
   above does not explain it twice.
 
+- [ ] **Suggest orderings that tell the rows apart, not merely rank them.**
+  The advice under an unranked listing suggests every ordering that can rank a
+  row, which is the `any`-not-`all` rule the rest of `--sort` follows. On a
+  cluster where every node is `Ready`, that suggests `status`, and `--sort
+  status` there reorders nothing — the user is sent to a second listing in the
+  same order as the first. Separate because the fix turns on a decision the
+  reviewer should make rather than one this PR could guess: whether "the rows
+  differ under this ordering" is the right bar for a *suggestion* when "one row
+  ranked" is deliberately the bar everywhere else, and whether an ordering that
+  puts every row in one group is really saying nothing — "everything here is
+  Ready" is an answer too.
+
 - [ ] **Carry the "nothing ranked" note into the dashboard's panes.**
   Pairs with the sort-note task above, and has the same shape: a pane that takes
   `--sort` can sort by a column its cluster does not populate, and the pane's
   header is the place to say so rather than a footnote under a scrolling list.
   Discovered while writing the CLI note.
-  *Acceptance:* the pane asks `k8s::nodes::ranks_any`/`k8s::pods::ranks_any` and
-  words the answer through `k8s::order::unranked_note`, not a second wording.
+  *Acceptance:* the pane words the answer through `k8s::order::unranked_note`,
+  not a second wording, handing it the same two facts the CLI does — a `ranks`
+  predicate over its own rows and a `k8s::nodes::cause`/`k8s::pods::cause`. The
+  `Cause::Explained` half needs a decision the CLI did not have to make, since a
+  pane has nowhere obvious for "the reason above" to point.
 
 - [ ] **Carry `--sort` into the dashboard, alongside the selectors.**
   `k8s::pods::order` is deliberately a function over rows rather than over pods,
@@ -196,13 +211,21 @@ cluster.
   *Acceptance:* the choice of denominator is explicit at the call site rather
   than baked into `Share`; both readings are tested on one fixture node.
 
-- [ ] **Show the sampling window beside the usage columns.**
+- [ ] **Show the sampling window beside the usage columns, and say when there
+  was no sample.**
   metrics-server reports a `window` — typically `20s` — over which each sample
   was averaged, and a usage figure with no window behind it cannot be told apart
   from an instantaneous reading. It also goes stale silently when the scraper
-  stops.
+  stops. The same silence covers the case where `metrics.k8s.io` answers with an
+  empty list — metrics-server registered but not yet scraping — where the usage
+  columns simply vanish and no footnote is printed, because the footnote is
+  written on the error path and there was no error. Noticed while deciding what
+  `k8s::nodes::cause` should call that case: `--sort cpu` now says something
+  about it, and a table nobody sorted still says nothing.
   *Acceptance:* the age of the oldest sample in the listing is shown once, under
-  the table; a sample older than a couple of windows says so.
+  the table; a sample older than a couple of windows says so; an empty sample set
+  earns the same footnote a failed read does, worded for "not scraping yet"
+  rather than "not installed".
 
 ### Follow-ups from the capacity columns
 
@@ -363,6 +386,23 @@ cluster.
 ---
 
 ## Done
+
+- **Point the "nothing ranked" note at what would fix it** (2026-08-19) — the
+  note now advises as well as diagnoses. Where a footnote above the table has
+  already named the cause and linked to the fix, it points back at it —
+  `Nothing here has cpu to sort by, for the reason above.` — rather than writing
+  the same paragraph again a line later; `k8s::nodes::cause` and
+  `k8s::pods::cause` are what decide, because which of a table's footnotes covers
+  which column is exactly the knowledge `k8s::order` does not have. Where nothing
+  is above it — `--sort restarts` in a namespace where nothing has crashed, which
+  is not a failure at all — the diagnosis stands alone. Either way a second line
+  says what to type instead: `Sort by age, cpu, or memory instead.`, worked out
+  by asking the listing's own `ranks_any` about every variant of its `Order`
+  enum, so the advice comes from the rows in front of the user and cannot name an
+  ordering that would have failed the same way. The default ordering and any
+  variant hidden from `--help` are left out — one is what typing no flag gives
+  you, the other is a flag value nobody can find — and when that leaves nothing,
+  the advice line is dropped rather than invented.
 
 - **An ordering that ranked nothing should say so** (2026-08-19) — `eks nodes
   --sort cpu` on a cluster with no metrics-server now prints `Nothing here has

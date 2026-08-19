@@ -124,10 +124,17 @@ pub async fn list(
     // And under it, the case where that line on its own misleads: an ordering
     // that ranked no row at all — `--sort cpu` with no metrics-server, `--sort
     // restarts` where nothing has ever crashed — describes a listing the
-    // alphabet arranged. Again worded once, in `k8s::order`, for both tables.
+    // alphabet arranged. Again worded once, in `k8s::order`, for both tables,
+    // with the listing supplying the two things the wording turns on: what
+    // these rows could be sorted by instead, and whether the note above already
+    // explains the empty column.
+    let missing = k8s_pods::Missing {
+        usage: usage.is_none(),
+    };
     notes.extend(k8s::order::unranked_note(
         request.order,
-        k8s_pods::ranks_any(&rows, request.order),
+        k8s_pods::cause(request.order, missing),
+        |candidate| k8s_pods::ranks_any(&rows, candidate),
     ));
 
     Ok(k8s_pods::render(&rows, &label, &scope, &selectors, &notes))
