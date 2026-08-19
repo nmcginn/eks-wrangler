@@ -8,33 +8,50 @@ use k8s_openapi::jiff::Timestamp;
 use crate::cluster::ClusterView;
 use crate::commands::nodes::target_cluster;
 use crate::k8s::metrics::{self as k8s_metrics};
-use crate::k8s::pods::{PodRow, Scope, Selectors};
+use crate::k8s::pods::{Order, PodRow, Scope, Selectors};
 use crate::k8s::{self, pods as k8s_pods, selector};
 use crate::kubeconfig::KubeConfig;
+
+/// What the user asked `eks pods` for, as it came off the command line.
+///
+/// A struct rather than five more parameters: the flags describe one request,
+/// and a row of same-typed positional arguments is how a `--namespace` quietly
+/// ends up in the `--field-selector` slot. Everything here is still raw text —
+/// validating it is [`list`]'s first job, before it connects to anything.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Request<'a> {
+    /// `--namespace`. Without one, the context's own namespace is used, which
+    /// is what a bare `kubectl get pods` would do.
+    pub namespace: Option<&'a str>,
+    /// `--all-namespaces`, which contradicts `namespace` rather than
+    /// overriding it.
+    pub all_namespaces: bool,
+    /// `-l`, unparsed.
+    pub label_selector: Option<&'a str>,
+    /// `--field-selector`, unparsed.
+    pub field_selector: Option<&'a str>,
+    /// `--sort`. Applied to the finished rows, so it changes nothing about what
+    /// is fetched — only the order it is read in.
+    pub order: Order,
+}
 
 /// Fetch and render the pod table for the selected cluster and scope.
 ///
 /// `context` is whatever the user passed to `--context`, resolved exactly as
-/// `eks nodes` resolves it. `namespace` is `--namespace` when they gave one;
-/// without it the context's own namespace is used, which is what a bare
-/// `kubectl get pods` would do. `label_selector` and `field_selector` are the
-/// raw `-l` and `--field-selector` strings, validated here before connecting.
+/// `eks nodes` resolves it; `request` is the rest of the flags.
 pub async fn list(
     config: &KubeConfig,
     paths: &[PathBuf],
     context: Option<&str>,
-    namespace: Option<&str>,
-    all_namespaces: bool,
-    label_selector: Option<&str>,
-    field_selector: Option<&str>,
+    request: Request<'_>,
 ) -> Result<String> {
     let target = target_cluster(config, context)?;
     let label = target.label();
     // Resolved before connecting: a contradictory pair of flags, or a selector
     // the user mistyped, should be rejected instantly, not after a credential
     // helper has run and a request has gone out.
-    let scope = scope_for(&target, namespace, all_namespaces)?;
-    let selectors = selectors_for(label_selector, field_selector)?;
+    let scope = scope_for(&target, request.namespace, request.all_namespaces)?;
+    let selectors = selectors_for(request.label_selector, request.field_selector)?;
 
     let client = k8s::connect(paths, &target).await?;
 
@@ -90,9 +107,10 @@ pub async fn list(
             PodRow::from_pod(pod, used, now)
         })
         .collect();
-    // Namespace first, then name: the order the NAMESPACE column implies, and
-    // the one `kubectl get pods -A` uses.
-    rows.sort_by(|a, b| (&a.namespace, &a.name).cmp(&(&b.namespace, &b.name)));
+    // Ordering lives in `k8s::pods::order` rather than here, so the default and
+    // the one `--sort` asks for are decided in the same place and by the same
+    // rules — and so both can be tested on rows alone.
+    k8s_pods::sort(&mut rows, request.order);
 
     Ok(k8s_pods::render(&rows, &label, &scope, &selectors, &notes))
 }

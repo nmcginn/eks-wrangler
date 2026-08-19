@@ -83,12 +83,29 @@ cluster.
   statuses, following `kubectl`'s rule that only sidecar restarts survive
   initialisation; a pod that has never restarted shows the bare count.
 
-- [ ] **Sort the pod listing by how recently it restarted.**
+- [x] **Sort the pod listing by how recently it restarted.**
   The restart column now carries a date, and the question behind it — "what is
   crashing *now*" — is a sort, not a scan. Alphabetical order buries the pod
   that restarted eight seconds ago among a hundred healthy ones.
   *Acceptance:* the ordering is a pure function over the rows; pods that have
   never restarted sort last rather than first; the default order is unchanged.
+
+- [ ] **More orderings for `--sort`, and a way to reverse one.**
+  `--sort` now exists with two values, and `age`, `cpu`, and `memory` are the
+  obvious next ones — the usage columns have exactly the same problem the
+  restart column had, in that the pod burning a core is wherever its name puts
+  it. A `--sort-reverse`, or a `-` prefix, would be the other half.
+  *Acceptance:* each ordering is total, so a listing never shuffles between two
+  runs of one command; reversing an ordering does not move the "nothing to rank
+  this by" rows out of the tail, where they belong under either direction.
+
+- [ ] **Carry `--sort` into the dashboard, alongside the selectors.**
+  `k8s::pods::order` is deliberately a function over rows rather than over pods,
+  so the dashboard's pod views can sort the rows they already have without
+  refetching — and should, rather than growing an ordering of their own. Pairs
+  with the selector task above; the two flags belong to the same listing.
+  *Acceptance:* the dashboard sorts through `k8s::pods::sort`; a key press
+  changes the order without a request.
 
 - [ ] **A `--wide` mode for `eks pods`.**
   Pod IP, and the nominated node for a preempting pod — the two columns
@@ -283,6 +300,17 @@ cluster.
 ---
 
 ## Done
+
+- **Sort the pod listing by how recently it restarted** (2026-08-19) — `eks pods
+  --sort restarts` puts the newest crash at the top. `k8s::pods::order` is a
+  pure function over `PodRow`s with no clock and no cluster in its signature,
+  which is what makes the awkward rankings fixtures: a restart the kubelet
+  recorded no `finishedAt` for sorts between the dated restarts and the pods
+  that have never restarted, because the count is real but there is no moment to
+  rank it by. The count is only ever the tie-break — sorting by *how many* would
+  put a pod that failed two hundred times last week above one that started
+  crashing a minute ago. Every ordering is total, so one listing cannot render
+  two ways.
 
 - **How long ago the last restart was** (2026-08-18) — `eks pods` now prints
   `kubectl`'s `9 (5m ago)` rather than a bare `9`. The timestamp is the newest

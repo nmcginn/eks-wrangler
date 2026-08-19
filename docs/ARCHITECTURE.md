@@ -89,6 +89,12 @@ a dozen special cases. `pods::row` reimplements that walk as a pure function ove
 a `Pod` and an explicit `now`, so each case is a fixture — including the ones
 nobody can arrange on demand, like a pod on a node that stopped answering.
 
+Ordering is the last hop on that pipeline and the one furthest from the cluster:
+`k8s::pods::order` sorts finished `PodRow`s, so `--sort restarts` needs neither a
+clock nor a request — `PodRow` already carries the instant each restart finished,
+beside the rounded age the cell is rendered from. Sorting rows rather than pods
+is also what will let the dashboard reorder a listing it is already holding.
+
 Selectors take the same shape in reverse: `k8s::selector` parses the label and
 field selectors a user types (`app=api`, `status.phase!=Running`) into a
 canonical string, rejecting a malformed one — with the offending text quoted —

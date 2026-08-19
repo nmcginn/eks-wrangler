@@ -30,8 +30,10 @@ use kube::api::{Api, ListParams};
 
 use crate::k8s::quantity::Quantity;
 
+pub mod order;
 pub mod row;
 
+pub use order::{Order, sort};
 pub use row::{PodRow, render, usage_unavailable};
 
 /// Pods that have finished linger in the API server until something collects
