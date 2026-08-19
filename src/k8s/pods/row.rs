@@ -1891,6 +1891,53 @@ mod tests {
     }
 
     #[test]
+    fn an_ordering_that_ranked_no_pod_says_so_under_the_sort_note() {
+        // `eks pods --sort cpu` where metrics-server has sampled nothing: the
+        // table has no CPU column, and `Sorted by cpu.` on its own describes a
+        // listing the alphabet arranged.
+        let order = crate::k8s::pods::Order::Cpu;
+        let notes: Vec<String> =
+            crate::k8s::order::note(order, crate::k8s::order::Direction::Natural)
+                .into_iter()
+                .chain(crate::k8s::order::unranked_note(
+                    order,
+                    crate::k8s::pods::ranks_any(&rows(), order),
+                ))
+                .collect();
+
+        let output = render(
+            &rows(),
+            "prod (us-east-1)",
+            &Scope::Namespace("payments".to_owned()),
+            &unfiltered(),
+            &notes,
+        );
+        let paragraphs: Vec<&str> = output.split("\n\n").collect();
+
+        assert_eq!(paragraphs[1], "Sorted by cpu.");
+        assert_eq!(paragraphs[2], "Nothing here has cpu to sort by.");
+    }
+
+    #[test]
+    fn an_empty_listing_says_nothing_about_an_ordering_that_ranked_nothing() {
+        // Nothing ranked, because there is nothing at all. "No pods matched" is
+        // the answer; a note about the sort would be noise on top of it.
+        let order = crate::k8s::pods::Order::Cpu;
+        let note = crate::k8s::order::unranked_note(order, crate::k8s::pods::ranks_any(&[], order))
+            .expect("an ordering with no rows to rank ranked nothing");
+
+        let message = render(
+            &[],
+            "prod (us-east-1)",
+            &Scope::Namespace("payments".to_owned()),
+            &unfiltered(),
+            &[note],
+        );
+
+        assert!(!message.contains("sort by"), "{message}");
+    }
+
+    #[test]
     fn an_empty_listing_says_nothing_about_the_order_it_would_have_been_in() {
         // `eks pods --sort restarts` in an empty namespace: there is no table
         // for the note to describe, and "there is nothing here" is the answer.

@@ -41,6 +41,13 @@
 //! the `Order` enums rather than written once per listing — it needs only the
 //! name `clap` already knows the value by, so `--sort cpu-requested` and the
 //! note under the table cannot start spelling the ordering differently.
+//!
+//! [`unranked_note`] is the second half of that, for the listing where the
+//! ordering ranked nothing at all: `--sort cpu` on a cluster with no
+//! metrics-server sorts by a column that is not in the table, and `Sorted by
+//! cpu.` on its own then describes rows the alphabet arranged. Both notes are
+//! blind to the rows on purpose — the keys are the part of an ordering this
+//! module does not know — so the listing hands in the one fact each needs.
 
 use std::cmp::Ordering;
 
@@ -96,6 +103,18 @@ pub(crate) enum Rank<T> {
     Unranked(u8),
 }
 
+impl<T> Rank<T> {
+    /// Whether the ordering found something to rank this row by.
+    ///
+    /// Which tail tier an unranked row landed in is not the question here: the
+    /// note under the table is about an ordering that ranked *nothing*, and a
+    /// listing sorted entirely into its tail tiers is still one the flag did
+    /// not order.
+    pub(crate) fn is_ranked(&self) -> bool {
+        matches!(self, Self::By(_))
+    }
+}
+
 /// Compare two ranks, flipping only the part a direction is allowed to flip.
 pub(crate) fn compare<T: Ord>(a: &Rank<T>, b: &Rank<T>, direction: Direction) -> Ordering {
     match (a, b) {
@@ -144,6 +163,45 @@ where
         // to the other reading of the same column.
         Direction::Reversed => format!("Sorted by {name}, reversed."),
     })
+}
+
+/// A line saying an ordering found nothing at all to rank, or `None` when it
+/// ranked something.
+///
+/// `ranked` is the one fact this module cannot work out for itself: whether any
+/// row in the listing carried the figure the ordering sorts on.
+/// [`crate::k8s::nodes::ranks_any`] and [`crate::k8s::pods::ranks_any`] answer
+/// it, as pure functions over the finished rows.
+///
+/// `eks nodes --sort cpu` against a cluster with no metrics-server is the case
+/// this exists for. There is no `CPU USE` column, every row is unranked, and the
+/// alphabet decides the whole listing — and [`note`] then prints `Sorted by
+/// cpu.` underneath, naming an ordering that did nothing. The footnote beside it
+/// explains why the columns are missing but says nothing about the flag the user
+/// actually typed, so `--sort` reads as broken rather than as inapplicable.
+///
+/// Silent when the user asked for no ordering, so a command nobody passed
+/// `--sort` to prints what it always printed. The direction is not a parameter:
+/// reversing an ordering that ranked nothing is still an ordering that ranked
+/// nothing, and the fact worth reporting is the same either way.
+///
+/// It deliberately stops short of saying what order the rows came out in
+/// instead. Unranked rows keep their tail tiers, and a listing split across two
+/// of them is grouped by something even when nothing in it ranked, so "this is
+/// in name order" would be a guess dressed as an explanation.
+#[must_use]
+pub fn unranked_note<O>(order: O, ranked: bool) -> Option<String>
+where
+    O: ValueEnum + Copy + Default + PartialEq,
+{
+    if ranked || order == O::default() {
+        return None;
+    }
+
+    // `clap`'s name again, for the same reason [`note`] uses it: the two lines
+    // sit one under the other, and they must call the ordering the same thing.
+    let name = order.to_possible_value()?;
+    Some(format!("Nothing here has {} to sort by.", name.get_name()))
 }
 
 #[cfg(test)]
@@ -225,6 +283,53 @@ mod tests {
                 "{direction:?}"
             );
         }
+    }
+
+    #[test]
+    fn a_rank_says_whether_it_ranked_anything() {
+        assert!(Rank::By(1).is_ranked());
+        assert!(!Rank::<i32>::Unranked(0).is_ranked());
+        // Both tail tiers are the same answer to this question: an ordering
+        // that put every row in a tier ordered none of them.
+        assert!(!Rank::<i32>::Unranked(1).is_ranked());
+    }
+
+    #[test]
+    fn an_ordering_that_ranked_nothing_says_so() {
+        // `eks nodes --sort cpu` with no metrics-server: the `Sorted by cpu.`
+        // line above this one is about a column the table does not have.
+        assert_eq!(
+            unranked_note(TestOrder::CpuRequested, false).as_deref(),
+            Some("Nothing here has cpu-requested to sort by.")
+        );
+    }
+
+    #[test]
+    fn an_ordering_that_ranked_one_row_says_nothing_extra() {
+        // One ranked row puts the row somebody went looking for at an end of
+        // the table, which is the whole job. Saying anything here would be
+        // noise under a listing that worked.
+        assert_eq!(unranked_note(TestOrder::CpuRequested, true), None);
+    }
+
+    #[test]
+    fn the_default_ordering_stays_silent_even_when_it_ranks_nothing() {
+        // Nobody typed a flag, so there is no flag to explain — and the default
+        // output of every command has to stay unchanged to the byte.
+        assert_eq!(unranked_note(TestOrder::Name, false), None);
+    }
+
+    #[test]
+    fn the_two_notes_call_an_ordering_the_same_thing() {
+        // They print one under the other. An ordering spelled two ways across
+        // two adjacent lines reads as two different orderings.
+        let named = note(TestOrder::CpuRequested, Direction::Reversed)
+            .expect("a reordered listing should say so");
+        let unranked = unranked_note(TestOrder::CpuRequested, false)
+            .expect("an ordering that ranked nothing should say so");
+
+        assert!(named.contains("cpu-requested"), "{named}");
+        assert!(unranked.contains("cpu-requested"), "{unranked}");
     }
 
     #[test]
