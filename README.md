@@ -98,6 +98,10 @@ Nodes there is nothing to rank stay at the end under either direction, exactly a
 they do for pods: a node metrics-server has not sampled is not the idlest node in
 the cluster.
 
+A reordered listing says which order it is in, on a line under the table beside
+the metrics note — `Sorted by cpu, reversed.` A listing nobody reordered says
+nothing, so the default output is exactly what it always was.
+
 `eks pods` lists one namespace — the context's own, unless `-n` names another —
 or every namespace with `-A`:
 
@@ -154,6 +158,12 @@ metrics-server has not sampled is not the idlest pod in the namespace — it is 
 pod nobody has measured, which is a fact about the scraper rather than about the
 pod.
 
+A reordered listing says so under the table — `Sorted by restarts.`, or
+`Sorted by age, reversed.` — because a sorted table and an unsorted one look
+alike to anyone who did not type the command, and the unrankable tail makes a
+reversed listing look like the ordering running the other way. A plain
+`eks pods` says nothing, and prints what it always did.
+
 Note that `--sort age` prints the *youngest* first, which is the opposite way
 round from `kubectl --sort-by=.metadata.creationTimestamp`. One rule across every
 order here beat matching a different tool on one of them; `--sort-reverse` gives
@@ -183,7 +193,7 @@ refresh them instead of printing an HTTP status code.
 | `-l, --selector <SEL>` | Filter pods by label selector (`eks pods`) |
 | `--field-selector <SEL>` | Filter pods by field selector (`eks pods`) |
 | `--sort <ORDER>` | Order the listing. Pods: `name` (default), `restarts`, `age`, `cpu`, `memory`. Nodes: `name` (default), `status`, `cpu`, `memory`, `cpu-requested`, `memory-requested`, `age` |
-| `--sort-reverse` | Reverse `--sort`; unrankable rows stay at the end |
+| `--sort-reverse` | Reverse `--sort`; unrankable rows stay at the end. Either flag adds a line under the table naming the order |
 | `--kubeconfig <PATH>` | Override the kubeconfig search path |
 | `-v, --verbose` | Increase log verbosity (repeatable) |
 

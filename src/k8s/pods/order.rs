@@ -748,4 +748,43 @@ mod tests {
             .collect();
         assert_eq!(printed, ["idle", "hungry", "unsampled"]);
     }
+
+    #[test]
+    fn every_ordering_names_itself_under_the_table() {
+        // As for `eks nodes`: the note lives in `k8s::order`, but the names in
+        // it are this enum's, and a renamed variant must not be able to change
+        // the note without a test noticing.
+        for direction in DIRECTIONS {
+            for order in ORDERS {
+                let note = crate::k8s::order::note(order, direction);
+
+                if order == Order::default() && direction == Direction::Natural {
+                    assert_eq!(note, None, "{order:?} {direction:?}");
+                    continue;
+                }
+
+                let note = note.expect("a reordered listing should say so");
+                assert!(note.starts_with("Sorted by "), "{note}");
+                assert_eq!(
+                    note.contains("reversed"),
+                    direction == Direction::Reversed,
+                    "{note}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_pod_and_node_tables_word_a_shared_ordering_identically() {
+        // `cpu` means the same thing to a reader of either table, so it has to
+        // read the same under both. The two enums are separate types and
+        // nothing but this test stops them drifting apart.
+        for direction in DIRECTIONS {
+            assert_eq!(
+                crate::k8s::order::note(Order::Cpu, direction),
+                crate::k8s::order::note(crate::k8s::nodes::Order::Cpu, direction),
+                "{direction:?}"
+            );
+        }
+    }
 }

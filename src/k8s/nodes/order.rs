@@ -596,4 +596,40 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn every_ordering_names_itself_under_the_table() {
+        // The note is `k8s::order`'s, but the names it prints are this enum's,
+        // and they are what the user typed after `--sort`. Asserting it here
+        // means renaming a variant cannot quietly change what the note says
+        // without a test noticing.
+        for direction in DIRECTIONS {
+            for order in ORDERS {
+                let note = crate::k8s::order::note(order, direction);
+
+                if order == Order::default() && direction == Direction::Natural {
+                    assert_eq!(note, None, "{order:?} {direction:?}");
+                    continue;
+                }
+
+                let note = note.expect("a reordered listing should say so");
+                assert!(note.starts_with("Sorted by "), "{note}");
+                assert_eq!(
+                    note.contains("reversed"),
+                    direction == Direction::Reversed,
+                    "{note}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_multi_word_ordering_is_named_the_way_the_flag_spells_it() {
+        // `cpu-requested`, not `CpuRequested` — the note has to echo a value
+        // `--sort` would actually accept.
+        assert_eq!(
+            crate::k8s::order::note(Order::CpuRequested, Direction::Natural).as_deref(),
+            Some("Sorted by cpu-requested.")
+        );
+    }
 }

@@ -108,7 +108,7 @@ cluster.
   not twice; a node with no metrics sorts last under `--sort cpu` in either
   direction.
 
-- [ ] **Say which ordering a listing is in.**
+- [x] **Say which ordering a listing is in.**
   `--sort cpu --sort-reverse` prints a table that looks exactly like `--sort cpu`
   to anyone who did not type it, and the tail of unranked rows makes a reversed
   listing look sorted the other way at a glance. A line under the table, beside
@@ -118,12 +118,22 @@ cluster.
   unchanged to the byte; the note is a pure function over the order and
   direction.
 
+- [ ] **Carry the sort note into the dashboard's panes.**
+  The note now sits in the footnote list of both CLI tables, and the dashboard
+  panes will want the same line once they take `--sort` — but a pane has a title
+  bar the CLI table does not, and a footnote under a scrolling list is a worse
+  place for it than the header. Discovered while writing the CLI note.
+  *Acceptance:* the note comes from `k8s::order::note`, not a second wording;
+  the default order is as silent in a pane as it is on the command line.
+
 - [ ] **An ordering that ranked nothing should say so.**
   `eks nodes --sort cpu` on a cluster with no metrics-server sorts by a column
-  that is not in the table: every row is unranked, the alphabet decides the whole
-  listing, and the output is identical to the default. The footnote explains why
-  the columns are missing but says nothing about the sort the user actually
-  typed, so the flag reads as broken. Discovered while sorting the node table.
+  that is not in the table: every row is unranked, and the alphabet decides the
+  whole listing. The table now says `Sorted by cpu.` under it, which makes this
+  *worse* rather than better — it names an ordering that did nothing, over rows
+  the alphabet put in that order. The footnote beside it explains why the columns
+  are missing but says nothing about the sort the user actually typed, so the
+  flag still reads as broken. Discovered while sorting the node table.
   *Acceptance:* the note fires only when no row could be ranked, and names the
   ordering; a listing where even one row ranked says nothing extra.
 
@@ -331,6 +341,22 @@ cluster.
 ---
 
 ## Done
+
+- **Say which ordering a listing is in** (2026-08-19) — a reordered listing now
+  carries a line under the table naming its order: `Sorted by cpu, reversed.`
+  `k8s::order::note` is one function over both listings' `Order` enums rather
+  than a wording per table, and it takes the name from
+  `clap::ValueEnum::to_possible_value`, so the note is the text the user typed
+  after `--sort` — `cpu-requested`, never `CpuRequested` — and a renamed value
+  cannot leave the note describing the old spelling. It is silent for the
+  default order in its natural direction, which is what keeps every existing
+  command's output unchanged to the byte; `--sort-reverse` on its own is *not*
+  that case, because it reverses the default order and prints a Z-to-A listing
+  that is the easiest of all to mistake for the default one. Joining the
+  existing footnote list rather than growing a mechanism of its own also settles
+  two questions for free: it sits under the notes about what went wrong, and it
+  disappears on an empty listing, where "there is nothing here" is the only
+  thing worth reading.
 
 - **Sort the node table too** (2026-08-19) — `eks nodes --sort` takes `status`,
   `cpu`, `memory`, `cpu-requested`, `memory-requested`, and `age`, with

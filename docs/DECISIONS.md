@@ -544,3 +544,41 @@ registered — or one that is about to be a problem) sits above a cordoned one,
 because a cordoned node is a node somebody deliberately took out of service and
 the accident belongs above the intention. Nothing is unranked under this order —
 every node has a status — so unlike the usage orders it reverses completely.
+
+### 36. A reordered listing names its order; the default one stays silent
+
+`eks nodes --sort cpu` and `eks nodes` print the same columns, the same widths
+and the same rows, and to anyone who did not type the command they are the same
+table. `--sort cpu --sort-reverse` is worse: the unrankable tail stays at the
+bottom under either direction, so a reversed listing looks like the ordering
+running the other way with a few odd rows at the end. So a reordered listing now
+carries a line under the table saying which order it is in.
+
+It is silent for the default order in its natural direction, which is what keeps
+every existing command's output unchanged to the byte — a promise worth more than
+the note, since it is what lets anyone paste `eks nodes` into a script or a
+ticket without the tool having an opinion about it. Both halves matter:
+`--sort-reverse` on its own reverses the *default* order and prints Z-to-A, which
+is not the default listing and is the one most easily mistaken for it, so it
+speaks.
+
+`k8s::order::note` is generic over the two `Order` enums rather than written once
+per listing, taking the name from `clap::ValueEnum::to_possible_value`. That is
+the text the user typed after `--sort`, so the note cannot start spelling an
+ordering differently from the flag that produced it — `cpu-requested`, never
+`CpuRequested`. A variant `clap` will not name is one hidden from `--help`; there
+is nothing honest to call it, so the note is dropped rather than guessed at.
+
+It is a *note*, not a header: it joins the existing footnote list that carries
+"no metrics-server" and "could not list pods", which means it lands under the
+table, after the notes about what went wrong — a table nobody could fill in is
+more urgent than the order it came out in — and it disappears entirely on an
+empty listing, where the renderer already drops footnotes because "there is
+nothing here" is the only thing worth reading.
+
+What the note deliberately does not say is whether the ordering actually ranked
+anything. `eks nodes --sort cpu` on a cluster with no metrics-server sorts by a
+column that is not in the table, and every row lands in the tail. That is a
+second, sharper thing to say, it depends on the rows rather than on the flags,
+and it is its own roadmap entry.
+

@@ -112,6 +112,12 @@ pub async fn list(
     // promise rather than an accident.
     k8s_nodes::sort(&mut rows, order, direction);
 
+    // Last of the footnotes, under whatever went wrong: a table nobody could
+    // fill in is more urgent news than the order it came out in. The note is
+    // silent unless `--sort` or `--sort-reverse` was given, so a plain
+    // `eks nodes` prints exactly what it printed before.
+    footnotes.extend(k8s::order::note(order, direction));
+
     Ok(k8s_nodes::render(&rows, &label, &footnotes))
 }
 
