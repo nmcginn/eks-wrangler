@@ -239,6 +239,9 @@ mod tests {
             cpu_used: None,
             memory_used: None,
             node: "ip-10-0-1-9.ec2.internal".to_owned(),
+            ip: "10.0.1.42".to_owned(),
+            nominated_node: "-".to_owned(),
+            readiness_gates: None,
         }
     }
 
@@ -887,6 +890,7 @@ mod tests {
             &super::super::Scope::Namespace("payments".to_owned()),
             &super::super::Selectors::default(),
             &[],
+            crate::format::Width::Default,
         );
 
         let printed: Vec<&str> = table
@@ -921,6 +925,7 @@ mod tests {
             &super::super::Scope::Namespace("payments".to_owned()),
             &super::super::Selectors::default(),
             &[],
+            crate::format::Width::Default,
         );
 
         let printed: Vec<&str> = table

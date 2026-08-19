@@ -7,6 +7,7 @@ use k8s_openapi::jiff::Timestamp;
 
 use crate::cluster::ClusterView;
 use crate::commands::contexts;
+use crate::format::Width;
 use crate::k8s::metrics::{self as k8s_metrics};
 use crate::k8s::order::Direction;
 use crate::k8s::{self, nodes as k8s_nodes, pods as k8s_pods};
@@ -20,13 +21,15 @@ use crate::kubeconfig::KubeConfig;
 ///
 /// `order` and `direction` are `--sort` and `--sort-reverse`. They are applied
 /// to the finished rows, so they change nothing about what is fetched — only
-/// the order it is read in.
+/// the order it is read in. `width` is `--wide`, and is the same again: every
+/// column it adds arrived with the nodes, so it costs no extra request.
 pub async fn list(
     config: &KubeConfig,
     paths: &[PathBuf],
     selector: Option<&str>,
     order: k8s_nodes::Order,
     direction: Direction,
+    width: Width,
 ) -> Result<String> {
     let target = target_cluster(config, selector)?;
     let label = target.label();
@@ -134,7 +137,7 @@ pub async fn list(
         |candidate| k8s_nodes::ranks_any(&rows, candidate),
     ));
 
-    Ok(k8s_nodes::render(&rows, &label, &footnotes))
+    Ok(k8s_nodes::render(&rows, &label, &footnotes, width))
 }
 
 /// Work out which cluster to talk to, before any network call happens.

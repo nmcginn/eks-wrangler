@@ -107,6 +107,26 @@ metrics-server, where there is no `CPU USE` column to sort by — a second line
 says so: `Nothing here has cpu to sort by.` Without it the line above names an
 ordering that did nothing, over rows the alphabet put in that order.
 
+`--wide` adds the columns `kubectl get nodes -o wide` adds, on the end of the
+table rather than in the middle of it, so the default listing is the same one
+with its tail cut off:
+
+```
+$ eks nodes --wide
+NAME                         STATUS    VERSION              CPU      CPU REQ      MEMORY         MEM REQ     AGE  INTERNAL-IP  EXTERNAL-IP  OS-IMAGE                      KERNEL-VERSION                   CONTAINER-RUNTIME
+ip-10-0-1-9.ec2.internal     Ready     v1.33.1-eks-1a2b3c4  3920m/4  1500m (38%)  14.8Gi/15.6Gi  6Gi (41%)   12d  10.0.1.9     -            Amazon Linux 2023.9.20260714  6.1.148-172.265.amzn2023.x86_64  containerd://1.7.28
+ip-10-0-11-200.ec2.internal  NotReady  v1.32.9-eks-9f8e7d6  3920m/4  3800m (97%)  14.8Gi/15.6Gi  15Gi (96%)  10h  10.0.11.200  -            Amazon Linux 2023.6.20251201  6.1.134-152.225.amzn2023.x86_64  containerd://1.7.25
+```
+
+`INTERNAL-IP` is the address in a target group and in a security-group rule, and
+the one that finds the instance in the EC2 console — none of which the node name
+will do. `OS-IMAGE` is the column that says a node group is a release behind the
+rest of the cluster. A node in a private subnet has no `EXTERNAL-IP`, and a `-`
+there is the healthy answer.
+
+Nothing extra is fetched for any of it: every one of those fields came back with
+the nodes, so `--wide` costs no request.
+
 `eks pods` lists one namespace — the context's own, unless `-n` names another —
 or every namespace with `-A`:
 
@@ -189,6 +209,31 @@ eks pods -l app=api,tier notin (canary)     # by label
 eks pods --field-selector status.phase!=Running   # only the ones that are not Running
 ```
 
+`--wide` adds the three columns `kubectl get pods -o wide` has that this table
+does not — `NODE` is here by default — in `kubectl`'s own order:
+
+```
+$ eks pods --wide
+NAME                   READY  STATUS            RESTARTS    AGE  IP          NODE                         NOMINATED NODE               READINESS GATES
+api-7c9f6d4b8-x2vnq    1/1    Running           0           3h   10.0.1.42   ip-10-0-1-9.ec2.internal     -                            1/1
+ledger-migrate-2hq4t   0/1    Pending           0           42s  -           -                            ip-10-0-11-200.ec2.internal  -
+reconcile-5d4b9-nzk8p  0/1    CrashLoopBackOff  9 (5m ago)  26m  10.0.11.87  ip-10-0-11-200.ec2.internal  -                            -
+```
+
+`IP` is the pod's VPC address on EKS, so it is what a target group holds and what
+a security-group rule has to allow. `NOMINATED NODE` is the one case where a
+`Pending` pod is not stuck — the scheduler is evicting something to make room,
+and that is where the pod will land. `READINESS GATES` is the only way `READY`
+can read `1/1` on a pod the cluster still calls unready: every container up, and
+an external controller withholding its condition. A pod with no gates reads `-`
+rather than `0/0`, which would suggest something unsatisfied where there is
+nothing to satisfy.
+
+Unlike the usage columns, the wide ones appear whatever is in them. You asked for
+them; a column of `-` under `NOMINATED NODE` is the answer "nothing here is being
+preempted", and dropping it would leave you unable to tell that from a flag that
+did nothing.
+
 Credentials come from the kubeconfig context itself, so whatever works for
 `kubectl` works here. When they have expired, `eks` says so and tells you how to
 refresh them instead of printing an HTTP status code.
@@ -204,6 +249,7 @@ refresh them instead of printing an HTTP status code.
 | `--field-selector <SEL>` | Filter pods by field selector (`eks pods`) |
 | `--sort <ORDER>` | Order the listing. Pods: `name` (default), `restarts`, `age`, `cpu`, `memory`. Nodes: `name` (default), `status`, `cpu`, `memory`, `cpu-requested`, `memory-requested`, `age` |
 | `--sort-reverse` | Reverse `--sort`; unrankable rows stay at the end. Either flag adds a line under the table naming the order |
+| `--wide` | Add the extra columns `kubectl -o wide` shows. Pods: `IP`, `NOMINATED NODE`, `READINESS GATES`. Nodes: `INTERNAL-IP`, `EXTERNAL-IP`, `OS-IMAGE`, `KERNEL-VERSION`, `CONTAINER-RUNTIME` |
 | `--kubeconfig <PATH>` | Override the kubeconfig search path |
 | `-v, --verbose` | Increase log verbosity (repeatable) |
 
