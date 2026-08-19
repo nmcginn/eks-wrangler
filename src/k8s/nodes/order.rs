@@ -84,6 +84,40 @@ fn rank(a: &NodeRow, b: &NodeRow, order: Order, direction: Direction) -> Orderin
     }
 }
 
+/// Whether an ordering has anything at all to rank in these rows.
+///
+/// The question behind the note under the table: `eks nodes --sort cpu` on a
+/// cluster with no metrics-server ranks nothing, and the alphabet decides the
+/// whole listing. See [`crate::k8s::order::unranked_note`].
+///
+/// `any` rather than `all`, matching the rule the usage columns already follow:
+/// one node the sampler has not reached is not a listing the ordering failed to
+/// order. It is the row a person went looking for that has to be findable, and
+/// one ranked row puts it at an end of the table.
+#[must_use]
+pub fn ranks_any(rows: &[NodeRow], order: Order) -> bool {
+    rows.iter().any(|row| ranked(row, order))
+}
+
+/// Whether one row carries what an ordering sorts on.
+///
+/// A second exhaustive match over `Order` beside [`rank`], on purpose: adding an
+/// ordering without saying what makes a row rankable under it should fail to
+/// compile rather than quietly claim every listing in that order ranked nothing.
+fn ranked(row: &NodeRow, order: Order) -> bool {
+    match order {
+        // Every node has both, `NodeRow::from_node` substituting a placeholder
+        // for a node the API server somehow did not name, so these two can never
+        // come up empty-handed.
+        Order::Name | Order::Status => true,
+        Order::Cpu => busiest(row.cpu_used).is_ranked(),
+        Order::Memory => busiest(row.memory_used).is_ranked(),
+        Order::CpuRequested => busiest(row.cpu_requested).is_ranked(),
+        Order::MemoryRequested => busiest(row.memory_requested).is_ranked(),
+        Order::Age => youngest(row).is_ranked(),
+    }
+}
+
 /// Where a row sits in status order: the node you would look at first, first.
 ///
 /// Every node has a status, so nothing is unranked here. The order within it is
@@ -263,6 +297,74 @@ mod tests {
         let mut rows = rows.to_vec();
         sort(&mut rows, order, direction);
         rows.iter().map(|row| row.name.clone()).collect()
+    }
+
+    #[test]
+    fn a_cluster_with_no_metrics_ranks_nothing_under_cpu() {
+        // The case the note under the table exists for: no metrics-server, so
+        // no `CPU USE` column, and `--sort cpu` leaves the alphabet in charge.
+        let rows = [burning("a", None, Some("4")), burning("b", None, Some("4"))];
+
+        assert!(!ranks_any(&rows, Order::Cpu));
+    }
+
+    #[test]
+    fn one_sampled_node_is_enough_for_cpu_to_have_ranked_something() {
+        // A half-scraped cluster is not a listing the ordering failed to order:
+        // the busiest node it knows about is at the top, where it belongs.
+        let rows = [
+            burning("a", None, Some("4")),
+            burning("b", Some("3"), Some("4")),
+        ];
+
+        assert!(ranks_any(&rows, Order::Cpu));
+    }
+
+    #[test]
+    fn a_figure_with_no_allocatable_behind_it_ranks_nothing() {
+        // Node orderings rank by share, so a reading with nothing to divide it
+        // by is unranked — a different tail tier from no reading at all, but
+        // the same answer to "did this ordering order anything".
+        let rows = [burning("a", Some("3"), None)];
+
+        assert!(!ranks_any(&rows, Order::Cpu));
+    }
+
+    #[test]
+    fn a_listing_with_no_pod_totals_ranks_nothing_under_the_booked_orderings() {
+        // The pod listing failed, so `CPU REQ` and `MEM REQ` are empty columns.
+        let rows = [booked("a", None), booked("b", None)];
+
+        assert!(!ranks_any(&rows, Order::CpuRequested));
+        assert!(ranks_any(&[booked("a", Some("1"))], Order::CpuRequested));
+    }
+
+    #[test]
+    fn nodes_with_no_creation_timestamp_rank_nothing_under_age() {
+        assert!(!ranks_any(&[aged("a", None)], Order::Age));
+        assert!(ranks_any(
+            &[aged("a", None), aged("b", Some(5))],
+            Order::Age
+        ));
+    }
+
+    #[test]
+    fn every_node_ranks_by_name_and_by_status() {
+        // Both keys are always present — a node the API server did not name
+        // gets a placeholder — so these two orderings can never come up empty.
+        let rows = [row("a"), unhealthy("b", Severity::Unknown)];
+
+        assert!(ranks_any(&rows, Order::Name));
+        assert!(ranks_any(&rows, Order::Status));
+    }
+
+    #[test]
+    fn an_empty_listing_ranks_nothing_under_any_ordering() {
+        // True but never printed: `render` drops every note when there are no
+        // rows, because "this cluster reports no nodes" is the whole answer.
+        for order in ORDERS {
+            assert!(!ranks_any(&[], order), "{order:?}");
+        }
     }
 
     #[test]

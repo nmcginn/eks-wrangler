@@ -102,6 +102,11 @@ A reordered listing says which order it is in, on a line under the table beside
 the metrics note — `Sorted by cpu, reversed.` A listing nobody reordered says
 nothing, so the default output is exactly what it always was.
 
+When an ordering ranks *nothing* — `--sort cpu` on a cluster with no
+metrics-server, where there is no `CPU USE` column to sort by — a second line
+says so: `Nothing here has cpu to sort by.` Without it the line above names an
+ordering that did nothing, over rows the alphabet put in that order.
+
 `eks pods` lists one namespace — the context's own, unless `-n` names another —
 or every namespace with `-A`:
 
@@ -163,6 +168,11 @@ A reordered listing says so under the table — `Sorted by restarts.`, or
 alike to anyone who did not type the command, and the unrankable tail makes a
 reversed listing look like the ordering running the other way. A plain
 `eks pods` says nothing, and prints what it always did.
+
+If the ordering ranked no row at all — `--sort restarts` in a namespace where
+nothing has ever crashed, `--sort cpu` with no metrics-server — a second line
+says `Nothing here has restarts to sort by.` One ranked row is enough to silence
+it: the row you went looking for is then at an end of the table, which is the job.
 
 Note that `--sort age` prints the *youngest* first, which is the opposite way
 round from `kubectl --sort-by=.metadata.creationTimestamp`. One rule across every

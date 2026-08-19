@@ -69,6 +69,41 @@ fn rank(a: &PodRow, b: &PodRow, order: Order, direction: Direction) -> Ordering 
     }
 }
 
+/// Whether an ordering has anything at all to rank in these rows.
+///
+/// The question behind the note under the table: `eks pods --sort cpu` where
+/// metrics-server has sampled nothing ranks nothing, and the alphabet decides
+/// the whole listing. See [`crate::k8s::order::unranked_note`].
+///
+/// `any` rather than `all`: one unsampled pod is not a listing the ordering
+/// failed to order, and one ranked row puts the pod a person went looking for at
+/// an end of the table.
+#[must_use]
+pub fn ranks_any(rows: &[PodRow], order: Order) -> bool {
+    rows.iter().any(|row| ranked(row, order))
+}
+
+/// Whether one row carries what an ordering sorts on.
+///
+/// A second exhaustive match over `Order` beside [`rank`], on purpose: adding an
+/// ordering without saying what makes a row rankable under it should fail to
+/// compile rather than quietly claim every listing in that order ranked nothing.
+fn ranked(row: &PodRow, order: Order) -> bool {
+    match order {
+        // Every pod has a namespace and a name.
+        Order::Name => true,
+        // Not `recency(row).is_ranked()` alone. Under this ordering the restart
+        // count is a key as well as a tie-break, so a pod that has restarted
+        // without the kubelet recording a `finishedAt` is one this ordering
+        // still lifted clear of the healthy rows. Calling that "nothing to sort
+        // by" would say so over a listing with a crashing pod near the top.
+        Order::Restarts => recency(row).is_ranked() || row.restarts > 0,
+        Order::Age => youngest(row).is_ranked(),
+        Order::Cpu => largest(row.cpu_used).is_ranked(),
+        Order::Memory => largest(row.memory_used).is_ranked(),
+    }
+}
+
 /// Namespace, then name.
 ///
 /// Namespace leads because that is what the `NAMESPACE` column implies about
@@ -207,6 +242,84 @@ mod tests {
         let mut rows = rows.to_vec();
         sort(&mut rows, order, direction);
         rows.iter().map(|row| row.name.clone()).collect()
+    }
+
+    #[test]
+    fn a_listing_where_nothing_has_ever_restarted_ranks_nothing_under_restarts() {
+        // The good-news case, and still worth saying: `--sort restarts` on a
+        // healthy namespace prints an alphabetical table, and without a note it
+        // looks exactly like a flag that was ignored.
+        let rows = [row("api", 0, None), row("worker", 0, None)];
+
+        assert!(!ranks_any(&rows, Order::Restarts));
+    }
+
+    #[test]
+    fn a_restart_with_no_finishing_time_is_still_something_to_sort_by() {
+        // Unranked under `recency` — there is no moment to rank it against the
+        // dated restarts — but the count is real, and the ordering has already
+        // lifted this pod clear of the healthy rows. Claiming there was nothing
+        // to sort by would say so over a listing with a crashing pod near the
+        // top of it.
+        let rows = [row("api", 3, None), row("worker", 0, None)];
+
+        assert!(ranks_any(&rows, Order::Restarts));
+        assert_eq!(
+            sorted(&rows, Order::Restarts, Direction::Natural),
+            ["api", "worker"]
+        );
+    }
+
+    #[test]
+    fn one_restarted_pod_is_enough_for_restarts_to_have_ranked_something() {
+        let rows = [row("api", 9, Some(5)), row("worker", 0, None)];
+
+        assert!(ranks_any(&rows, Order::Restarts));
+    }
+
+    #[test]
+    fn an_unsampled_listing_ranks_nothing_under_the_usage_orderings() {
+        // No metrics-server, so no `CPU`/`MEMORY` columns to sort by.
+        let rows = [using("api", None, None), using("worker", None, None)];
+
+        assert!(!ranks_any(&rows, Order::Cpu));
+        assert!(!ranks_any(&rows, Order::Memory));
+    }
+
+    #[test]
+    fn one_sampled_pod_is_enough_for_the_usage_orderings_to_have_ranked() {
+        let rows = [
+            using("api", Some("250m"), None),
+            using("worker", None, None),
+        ];
+
+        assert!(ranks_any(&rows, Order::Cpu));
+        // Sampled for CPU and not for memory is a real shape: the two columns
+        // are asked about separately, and so are the two orderings.
+        assert!(!ranks_any(&rows, Order::Memory));
+    }
+
+    #[test]
+    fn pods_with_no_creation_timestamp_rank_nothing_under_age() {
+        assert!(!ranks_any(&[aged("api", None)], Order::Age));
+        assert!(ranks_any(
+            &[aged("api", None), aged("worker", Some(5))],
+            Order::Age
+        ));
+    }
+
+    #[test]
+    fn every_pod_ranks_by_name() {
+        assert!(ranks_any(&[row("api", 0, None)], Order::Name));
+    }
+
+    #[test]
+    fn an_empty_listing_ranks_nothing_under_any_ordering() {
+        // True but never printed: `render` drops every note when there are no
+        // rows, because "nothing matched" is the whole answer.
+        for order in ORDERS {
+            assert!(!ranks_any(&[], order), "{order:?}");
+        }
     }
 
     #[test]

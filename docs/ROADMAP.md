@@ -126,7 +126,7 @@ cluster.
   *Acceptance:* the note comes from `k8s::order::note`, not a second wording;
   the default order is as silent in a pane as it is on the command line.
 
-- [ ] **An ordering that ranked nothing should say so.**
+- [x] **An ordering that ranked nothing should say so.**
   `eks nodes --sort cpu` on a cluster with no metrics-server sorts by a column
   that is not in the table: every row is unranked, and the alphabet decides the
   whole listing. The table now says `Sorted by cpu.` under it, which makes this
@@ -136,6 +136,24 @@ cluster.
   flag still reads as broken. Discovered while sorting the node table.
   *Acceptance:* the note fires only when no row could be ranked, and names the
   ordering; a listing where even one row ranked says nothing extra.
+
+- [ ] **Point the "nothing ranked" note at what would fix it.**
+  `Nothing here has cpu to sort by.` now sits under the table, and on a cluster
+  with no metrics-server the footnote above it already says what to install — but
+  the two are separate paragraphs that never refer to each other, and under
+  `--sort restarts` in a healthy namespace there is nothing above it at all. The
+  note is honest and it is not yet advice. Discovered while writing it.
+  *Acceptance:* the wording is still one function over the `Order` name, not a
+  sentence per ordering; a listing where the fixable cause is already explained
+  above does not explain it twice.
+
+- [ ] **Carry the "nothing ranked" note into the dashboard's panes.**
+  Pairs with the sort-note task above, and has the same shape: a pane that takes
+  `--sort` can sort by a column its cluster does not populate, and the pane's
+  header is the place to say so rather than a footnote under a scrolling list.
+  Discovered while writing the CLI note.
+  *Acceptance:* the pane asks `k8s::nodes::ranks_any`/`k8s::pods::ranks_any` and
+  words the answer through `k8s::order::unranked_note`, not a second wording.
 
 - [ ] **Carry `--sort` into the dashboard, alongside the selectors.**
   `k8s::pods::order` is deliberately a function over rows rather than over pods,
@@ -341,6 +359,28 @@ cluster.
 ---
 
 ## Done
+
+- **An ordering that ranked nothing should say so** (2026-08-19) — `eks nodes
+  --sort cpu` on a cluster with no metrics-server now prints `Nothing here has
+  cpu to sort by.` under the line naming the ordering, instead of leaving
+  `Sorted by cpu.` to describe a listing the alphabet arranged. The split
+  `k8s::order` already anticipated holds: `note` says which ordering was asked
+  for and stays blind to the rows, and `unranked_note` is the separate answer to
+  the separate question, taking the one fact the module cannot work out for
+  itself — whether any row carried the key — from each listing's new
+  `ranks_any`. `any` rather than `all`, matching the rule the usage columns
+  already follow: one unsampled row is not a listing the ordering failed to
+  order, because one ranked row puts the row somebody went looking for at an end
+  of the table. Rankability is a second exhaustive `match` over `Order` beside
+  the comparison, so an ordering added without saying what makes a row rankable
+  under it fails to compile rather than quietly claiming every such listing
+  ranked nothing — and the pod `restarts` arm is the reason the two matches are
+  not one: a restart the kubelet recorded no `finishedAt` for is `Unranked`
+  under `recency` but is still something this ordering sorted on, because the
+  count is a key there as well as a tie-break. The note stops short of naming
+  the order the rows came out in instead: unranked rows keep their tail tiers,
+  so a listing can be grouped by something even when nothing in it ranked, and
+  "this is in name order" would be a guess.
 
 - **Say which ordering a listing is in** (2026-08-19) — a reordered listing now
   carries a line under the table naming its order: `Sorted by cpu, reversed.`

@@ -121,6 +121,14 @@ pub async fn list(
     // this?" the same way because it is the same question. Silent unless
     // `--sort` or `--sort-reverse` was given.
     notes.extend(k8s::order::note(request.order, request.direction));
+    // And under it, the case where that line on its own misleads: an ordering
+    // that ranked no row at all — `--sort cpu` with no metrics-server, `--sort
+    // restarts` where nothing has ever crashed — describes a listing the
+    // alphabet arranged. Again worded once, in `k8s::order`, for both tables.
+    notes.extend(k8s::order::unranked_note(
+        request.order,
+        k8s_pods::ranks_any(&rows, request.order),
+    ));
 
     Ok(k8s_pods::render(&rows, &label, &scope, &selectors, &notes))
 }

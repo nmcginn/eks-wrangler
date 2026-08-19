@@ -582,3 +582,44 @@ column that is not in the table, and every row lands in the tail. That is a
 second, sharper thing to say, it depends on the rows rather than on the flags,
 and it is its own roadmap entry.
 
+
+### 37. "Nothing ranked" is a second note, computed by the listing
+
+Decision 36 ends by naming the gap it left: the note says which ordering was
+*asked for*, and says nothing about whether that ordering managed to rank a
+single row. `eks nodes --sort cpu` on a cluster with no metrics-server is the
+case — no `CPU USE` column, every row in the tail, the alphabet deciding the
+whole listing — and `Sorted by cpu.` underneath makes it worse rather than
+better, because it names an ordering over rows it did not arrange. The footnote
+above explains the missing columns and says nothing about the flag the user
+typed, so `--sort` reads as broken.
+
+So there is a second line, `Nothing here has cpu to sort by.`, and it is a
+second function rather than a third argument to `note`. The two questions have
+different inputs: which order was asked for is a fact about the flags, and
+whether it ranked anything is a fact about the rows. Keeping them apart is what
+lets `note` stay pure in the flags alone and testable without a fixture row.
+
+The rows half is `k8s::nodes::ranks_any` and `k8s::pods::ranks_any`, because the
+keys are the part of an ordering `k8s::order` deliberately does not know. Both
+are `any`, not `all`, following the rule the usage columns already use: one
+unsampled row is not a listing the ordering failed to order, and one ranked row
+is enough to put the row somebody went looking for at an end of the table.
+
+Rankability is a second exhaustive `match` over `Order`, sitting beside the
+comparison rather than being derived from it. Two matches are a drift risk, and
+exhaustiveness is the answer — adding an ordering without saying what makes a
+row rankable under it will not compile. They are also not the same function:
+under the pod `restarts` order, a restart the kubelet recorded no `finishedAt`
+for is `Rank::Unranked` — there is no moment to rank it against the dated ones —
+but the count is a key under that ordering as well as a tie-break, so the
+ordering did lift that pod clear of the healthy rows. Deriving rankability
+mechanically from `Rank` would print "nothing here has restarts to sort by" over
+a listing with a crashing pod near the top of it.
+
+The note stops at the diagnosis and does not name the order the rows came out in
+instead. Unranked rows keep their tail tiers, so a listing split across two of
+them is grouped by *something* even when nothing in it ranked, and "this is in
+name order" would be a guess dressed up as an explanation. It is also silent for
+the default ordering: nobody typed a flag, so there is no flag to explain, and
+the byte-for-byte promise of decision 36 holds unchanged.

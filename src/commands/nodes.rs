@@ -117,6 +117,14 @@ pub async fn list(
     // silent unless `--sort` or `--sort-reverse` was given, so a plain
     // `eks nodes` prints exactly what it printed before.
     footnotes.extend(k8s::order::note(order, direction));
+    // And immediately under it, the case where that line on its own misleads:
+    // `--sort cpu` against a cluster with no metrics-server names an ordering
+    // over a column this table does not have. The listing answers the "did it
+    // rank anything" half, because the keys are its own.
+    footnotes.extend(k8s::order::unranked_note(
+        order,
+        k8s_nodes::ranks_any(&rows, order),
+    ));
 
     Ok(k8s_nodes::render(&rows, &label, &footnotes))
 }

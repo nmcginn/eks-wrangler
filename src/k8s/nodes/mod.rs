@@ -14,7 +14,7 @@ use kube::api::{Api, ListParams};
 
 pub mod order;
 
-pub use order::{Order, sort};
+pub use order::{Order, ranks_any, sort};
 
 use crate::format;
 use crate::k8s::metrics::Usage;
@@ -887,6 +887,66 @@ mod tests {
 
         assert_eq!(paragraphs[0], render(&rows, "prod (us-east-1)", &[]));
         assert_eq!(paragraphs[2], "Sorted by cpu, reversed.");
+    }
+
+    #[test]
+    fn an_ordering_that_ranked_nothing_says_so_right_under_the_sort_note() {
+        // `eks nodes --sort cpu` against a cluster with no metrics-server. The
+        // usage footnote explains the missing columns; without the second note
+        // nothing explains what became of the flag the user actually typed.
+        let rows = [NodeRow::from_node(
+            &healthy_node(),
+            Some(idle()),
+            None,
+            now(),
+        )];
+        let notes = sort_notes(&rows, Order::Cpu);
+
+        let output = render(&rows, "prod (us-east-1)", &notes);
+        let paragraphs: Vec<&str> = output.split("\n\n").collect();
+
+        assert_eq!(paragraphs[1], "Sorted by cpu.");
+        assert_eq!(paragraphs[2], "Nothing here has cpu to sort by.");
+    }
+
+    #[test]
+    fn a_listing_the_ordering_did_rank_gets_only_the_line_naming_it() {
+        // One sampled node is enough: the busiest node the cluster knows about
+        // is at the top, so there is nothing to apologise for.
+        let rows = [NodeRow::from_node(
+            &healthy_node(),
+            Some(idle()),
+            Some(used("392m", "1552515Ki")),
+            now(),
+        )];
+
+        assert_eq!(sort_notes(&rows, Order::Cpu), ["Sorted by cpu."]);
+    }
+
+    #[test]
+    fn the_default_listing_carries_neither_note() {
+        // The guarantee that keeps `eks nodes` unchanged to the byte for
+        // everyone who has never typed `--sort`.
+        let rows = [NodeRow::from_node(
+            &healthy_node(),
+            Some(idle()),
+            None,
+            now(),
+        )];
+
+        assert!(sort_notes(&rows, Order::default()).is_empty());
+    }
+
+    /// The pair of notes `commands::nodes` puts under the table, in its order.
+    fn sort_notes(rows: &[NodeRow], order: Order) -> Vec<String> {
+        let direction = crate::k8s::order::Direction::Natural;
+        let mut notes = Vec::new();
+        notes.extend(crate::k8s::order::note(order, direction));
+        notes.extend(crate::k8s::order::unranked_note(
+            order,
+            crate::k8s::nodes::ranks_any(rows, order),
+        ));
+        notes
     }
 
     #[test]
