@@ -58,10 +58,21 @@ with the same API.
 
 ### 8. One reviewable pull request per night
 
-Work lands as a nightly PR sized for a human to review over coffee — roughly
-200–500 lines. The constraint is the point: it forces tasks to be split into
-independently valuable pieces, keeps `master` releasable, and keeps a human in
-the loop on every change. See `CLAUDE.md`.
+Work lands as a nightly PR sized for a human to review over coffee. The
+constraint is the point: it forces tasks to be split into independently valuable
+pieces, keeps `master` releasable, and keeps a human in the loop on every change.
+See `CLAUDE.md`.
+
+*Amended after #15.* The size was stated as 200–500 lines of diff, which measured
+the wrong thing. Tests here run two to four times the length of the code they
+cover, so a 500-line ceiling on the *total* left barely a hundred lines for the
+change itself, and the loop began splitting on the line count rather than at a
+seam. #15 is the example: it landed a note saying an ordering had ranked nothing
+and deferred *pointing that note at the fix* to a second PR — one thought cut in
+half, and half of it below the bar priority 3 sets for error messages. The budget
+is now 200–400 lines of production change with tests on top, and a slice has to
+be complete before it is asked to be small. Deferral needs a seam to happen at:
+an untouched surface, an open design question, or a night's work of its own.
 
 ### 9. The async runtime is built per command, not around `main`
 
