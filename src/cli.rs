@@ -112,10 +112,16 @@ pub enum Command {
         #[arg(long, value_name = "SELECTOR")]
         field_selector: Option<String>,
 
-        /// Order the listing: `name`, or `restarts` for most recently
-        /// restarted first.
+        /// Order the listing. Every order but `name` puts the most
+        /// interesting row first: the newest restart, the youngest pod, the
+        /// largest usage figure.
         #[arg(long, value_name = "ORDER", default_value = "name")]
         sort: Order,
+
+        /// Reverse the order. Pods there is nothing to rank — never restarted,
+        /// or never sampled — stay at the end either way.
+        #[arg(long)]
+        sort_reverse: bool,
     },
 
     /// Switch the active cluster.
@@ -216,26 +222,64 @@ mod tests {
     }
 
     #[test]
-    fn pods_takes_a_restart_ordering() {
-        let Some(Command::Pods { sort, .. }) =
-            parse(&["eks", "pods", "--sort", "restarts"]).command
-        else {
-            panic!("expected a Pods command");
-        };
+    fn pods_takes_every_ordering_by_name() {
+        for (flag, expected) in [
+            ("name", Order::Name),
+            ("restarts", Order::Restarts),
+            ("age", Order::Age),
+            ("cpu", Order::Cpu),
+            ("memory", Order::Memory),
+        ] {
+            let Some(Command::Pods { sort, .. }) = parse(&["eks", "pods", "--sort", flag]).command
+            else {
+                panic!("expected a Pods command");
+            };
 
-        assert_eq!(sort, Order::Restarts);
+            assert_eq!(sort, expected, "--sort {flag}");
+        }
     }
 
     #[test]
     fn an_unknown_sort_order_is_rejected_with_the_ones_that_exist() {
         // clap lists the accepted values itself, which is the whole reason the
         // flag is a value enum rather than a free string parsed later.
-        let error = Cli::try_parse_from(["eks", "pods", "--sort", "age"])
+        //
+        // `node` rather than `age`, which this test used before `age` became a
+        // real ordering. The assertion is about the rejection listing what is
+        // accepted, so any word the flag does not take will do.
+        let error = Cli::try_parse_from(["eks", "pods", "--sort", "node"])
             .unwrap_err()
             .to_string();
 
-        assert!(error.contains("age"), "{error}");
+        assert!(error.contains("node"), "{error}");
         assert!(error.contains("restarts"), "{error}");
+        assert!(error.contains("memory"), "{error}");
+    }
+
+    #[test]
+    fn the_listing_runs_the_natural_way_round_unless_asked() {
+        // Another flag that must not move the listing people already have.
+        let Some(Command::Pods { sort_reverse, .. }) = parse(&["eks", "pods"]).command else {
+            panic!("expected a Pods command");
+        };
+
+        assert!(!sort_reverse);
+    }
+
+    #[test]
+    fn pods_takes_a_reversal_with_or_without_an_ordering() {
+        // `--sort-reverse` on its own reverses the default, which is a sensible
+        // thing to type and not an error.
+        for args in [
+            vec!["eks", "pods", "--sort-reverse"],
+            vec!["eks", "pods", "--sort", "cpu", "--sort-reverse"],
+        ] {
+            let Some(Command::Pods { sort_reverse, .. }) = parse(&args).command else {
+                panic!("expected a Pods command");
+            };
+
+            assert!(sort_reverse, "{args:?}");
+        }
     }
 
     #[test]

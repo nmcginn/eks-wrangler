@@ -90,10 +90,18 @@ a `Pod` and an explicit `now`, so each case is a fixture — including the ones
 nobody can arrange on demand, like a pod on a node that stopped answering.
 
 Ordering is the last hop on that pipeline and the one furthest from the cluster:
-`k8s::pods::order` sorts finished `PodRow`s, so `--sort restarts` needs neither a
-clock nor a request — `PodRow` already carries the instant each restart finished,
-beside the rounded age the cell is rendered from. Sorting rows rather than pods
-is also what will let the dashboard reorder a listing it is already holding.
+`k8s::pods::order` sorts finished `PodRow`s, so `--sort` needs neither a clock nor
+a request — `PodRow` already carries the instant each restart finished and the
+instant the pod was created, each beside the rounded age its cell is rendered
+from. Sorting rows rather than pods is also what will let the dashboard reorder a
+listing it is already holding.
+
+Each order maps a row to a private `Rank`, which is either something to compare
+or a marker that this row has nothing to rank. `--sort-reverse` flips only the
+first kind, so the pods an order cannot rank stay in the tail whichever way round
+the listing runs — reversing the whole comparison would open every reversed
+listing on its blank rows. That split is why the tail tiers of `restarts` (an
+undated restart is not the same blank as no restart) survive reversal too.
 
 Selectors take the same shape in reverse: `k8s::selector` parses the label and
 field selectors a user types (`app=api`, `status.phase!=Running`) into a
