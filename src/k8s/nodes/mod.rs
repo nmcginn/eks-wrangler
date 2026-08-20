@@ -615,12 +615,20 @@ fn device_names(rows: &[NodeRow]) -> BTreeSet<&str> {
 /// Which columns this listing gets, in order.
 ///
 /// A pure function over the three things that decide it — whether any row has
-/// live usage, which extended resources the listing reports, and `--wide` — so
-/// the layout is settled by a test rather than by reading a table in a
+/// live usage, which extended resources the listing reports, and the [`Width`]
+/// — so the layout is settled by a test rather than by reading a table in a
 /// terminal. The conditions differ in the same way the pod table's do: the
 /// usage and device columns appear unasked for and so are dropped when a
 /// cluster has nothing to put in them, while `--wide` columns were asked for
 /// and appear whatever is in them.
+///
+/// [`Width::Narrow`] then drops columns from that starting set until the row
+/// fits its target — see [`DROP_ORDER`]. `Wide` is not narrowed: the user
+/// typed `--wide` for the extra columns, not for a table that stays away from
+/// them.
+///
+/// [`Width`]: format::Width
+/// [`Width::Narrow`]: format::Width::Narrow
 pub(crate) fn columns(rows: &[NodeRow], width: format::Width) -> Vec<Column<'_>> {
     // Each REQ and USE column sits beside the capacity it is a share of, so the
     // comparison a person actually wants — booked against burnt — is a glance
@@ -646,20 +654,121 @@ pub(crate) fn columns(rows: &[NodeRow], width: format::Width) -> Vec<Column<'_>>
     // last of the default columns, where every `kubectl get` puts it.
     columns.extend(device_names(rows).into_iter().map(Column::Device));
     columns.push(Column::Age);
-    // `kubectl get nodes -o wide`'s own tail, in its order. It goes after AGE
-    // rather than after VERSION, where `kubectl` puts it, so that the default
-    // table is the same table with the tail cut off — a user comparing a wide
-    // listing against a plain one should not have to re-find the columns.
-    if width.is_wide() {
-        columns.extend([
-            Column::InternalIp,
-            Column::ExternalIp,
-            Column::OsImage,
-            Column::KernelVersion,
-            Column::ContainerRuntime,
-        ]);
+    match width {
+        format::Width::Default => columns,
+        // `kubectl get nodes -o wide`'s own tail, in its order. It goes after
+        // AGE rather than after VERSION, where `kubectl` puts it, so that the
+        // default table is the same table with the tail cut off — a user
+        // comparing a wide listing against a plain one should not have to
+        // re-find the columns.
+        format::Width::Wide => {
+            columns.extend([
+                Column::InternalIp,
+                Column::ExternalIp,
+                Column::OsImage,
+                Column::KernelVersion,
+                Column::ContainerRuntime,
+            ]);
+            columns
+        }
+        format::Width::Narrow(target) => narrow_to_fit(columns, rows, target),
+    }
+}
+
+/// The order columns get dropped in when [`Width::Narrow`] cannot fit them all.
+///
+/// A list of predicates rather than a single ranking, because some columns want
+/// to leave together: `CPU REQ` and `MEM REQ` are placed to be read as one
+/// answer to "what is booked on this machine", and dropping one but not the
+/// other makes the remaining half read as noise. Partner columns — `CPU REQ`
+/// and `CPU USE` alongside `CPU` — also drop before their base, so a request
+/// or usage figure is never left in the table without the capacity it is a
+/// share of.
+///
+/// The steps:
+///
+/// 1. `VERSION` — the same string on every node in a node group, easy to get
+///    from `kubectl` on the day it matters.
+/// 2. `AGE` — a standard column but rarely the one people came for.
+/// 3. `CPU REQ` and `MEM REQ` — dropping the pair leaves capacity and usage
+///    side-by-side, which is the "how busy is this machine" question.
+/// 4. `CPU USE` and `MEM USE` — the pair the tool exists for, so late.
+/// 5. `CPU` and `MEMORY` — the machine's own specs, dropped before the device
+///    columns rather than after them: a device column only exists because
+///    somebody installed the plugin that surfaces it, and a GPU cluster
+///    surviving a narrow terminal with `GPU` intact and `CPU` gone is the
+///    right trade — every listing has `CPU`, and only the interesting one has
+///    the card.
+/// 6. Every device column, together — a GPU cluster wants them all or none,
+///    and the alphabet is a bad rule for "which card is important". On a
+///    cluster with no devices this step is a no-op and the next runs in the
+///    same pass.
+/// 7. `STATUS` — the last thing to go before `NAME` is alone.
+///
+/// `NAME` never drops. A row we cannot fit at all is still a row with a name;
+/// the terminal wraps it, and dropping the name would leave a row that no
+/// listing can be about.
+///
+/// [`Width::Narrow`]: format::Width::Narrow
+const DROP_ORDER: &[fn(&Column<'_>) -> bool] = &[
+    |c| matches!(c, Column::Version),
+    |c| matches!(c, Column::Age),
+    |c| matches!(c, Column::CpuRequested | Column::MemoryRequested),
+    |c| matches!(c, Column::CpuUsed | Column::MemoryUsed),
+    |c| matches!(c, Column::Cpu | Column::Memory),
+    |c| matches!(c, Column::Device(_)),
+    |c| matches!(c, Column::Status),
+];
+
+/// Drop columns from `columns` in [`DROP_ORDER`] until the row fits `target`.
+///
+/// Stops as soon as the row fits: on a wide-enough terminal a `Narrow(target)`
+/// returns exactly what `Default` does, byte for byte. When even one column
+/// cannot fit — a `--width 1`, or a very narrow terminal on a cluster with
+/// long node names — the last step leaves only `NAME` and the row prints
+/// wider than the target, which is the terminal's problem to wrap rather than
+/// ours to solve by dropping the name too.
+fn narrow_to_fit<'a>(
+    mut columns: Vec<Column<'a>>,
+    rows: &[NodeRow],
+    target: u16,
+) -> Vec<Column<'a>> {
+    let target = usize::from(target);
+    for step in DROP_ORDER {
+        if row_width(&columns, rows) <= target {
+            return columns;
+        }
+        columns.retain(|column| !step(column));
     }
     columns
+}
+
+/// How wide the table's row will be when rendered.
+///
+/// Mirrors [`crate::format::table`]'s arithmetic: each column is as wide as
+/// its widest cell or its header, separated by two spaces, with the trailing
+/// pad on the last column trimmed. Kept beside [`narrow_to_fit`] rather than
+/// exposed from `format` because the drop rule is the only caller — the
+/// renderer measures its own columns from the strings it is about to print,
+/// and a second computation shared between the two would be a second chance
+/// for the two to disagree.
+fn row_width(columns: &[Column<'_>], rows: &[NodeRow]) -> usize {
+    if columns.is_empty() {
+        return 0;
+    }
+    let widths: usize = columns
+        .iter()
+        .map(|column| {
+            let header = column.header().chars().count();
+            let widest_cell = rows
+                .iter()
+                .map(|row| column.cell(row).chars().count())
+                .max()
+                .unwrap_or(0);
+            header.max(widest_cell)
+        })
+        .sum();
+    widths + 2 * (columns.len() - 1)
 }
 
 /// Render the `eks nodes` table.
@@ -2258,5 +2367,171 @@ mod tests {
             requests_unavailable(std::slice::from_ref(&row), "why"),
             "CPU REQ and MEM REQ are empty because the pods could not be listed.\nwhy"
         );
+    }
+
+    // --- Narrow mode --------------------------------------------------------
+
+    /// One default-shape row: healthy, booked, no metrics-server. The width
+    /// tests want a fixture whose row width is predictable rather than the
+    /// widest cluster we can build, so a single node is enough.
+    fn one_booked_row() -> Vec<NodeRow> {
+        vec![NodeRow::from_node(
+            &healthy_node(),
+            Some(&booked("1500m", "6Gi")),
+            None,
+            now(),
+        )]
+    }
+
+    fn headings_at(rows: &[NodeRow], target: u16) -> Vec<String> {
+        columns(rows, Width::Narrow(target))
+            .iter()
+            .map(|column| column.header())
+            .collect()
+    }
+
+    #[test]
+    fn a_wide_enough_narrow_is_the_default_table_byte_for_byte() {
+        // A resize that leaves the row still fitting must not shuffle it —
+        // narrowing is subtraction, and subtracting nothing changes nothing.
+        // 200 cols is roomier than any table this file produces.
+        let rows = one_booked_row();
+        assert_eq!(
+            columns(&rows, Width::Narrow(200)),
+            columns(&rows, Width::Default)
+        );
+        assert_eq!(
+            render(&rows, "prod (us-east-1)", &[], Width::Narrow(200)),
+            render(&rows, "prod (us-east-1)", &[], Width::Default),
+        );
+    }
+
+    #[test]
+    fn a_narrow_terminal_drops_version_first() {
+        // The default row is 107 chars for the fixture — `NAME(24) STATUS(6)
+        // VERSION(19) CPU(7) CPU REQ(11) MEMORY(13) MEM REQ(9) AGE(4)` with
+        // seven two-space separators — and dropping just `VERSION` gets it to
+        // 86. `kubectl` prints VERSION too, so a person on a narrow terminal
+        // asking for it has somewhere to go; it is the right first thing to
+        // let go.
+        assert_eq!(
+            headings_at(&one_booked_row(), 100),
+            [
+                "NAME", "STATUS", "CPU", "CPU REQ", "MEMORY", "MEM REQ", "AGE"
+            ],
+        );
+    }
+
+    #[test]
+    fn eighty_columns_still_keep_the_requests_beside_the_capacities() {
+        // 80 cols is the width every laptop lid narrows to under a docked
+        // browser: `VERSION` and `AGE` both leave, and the pair columns
+        // survive the drop that matters — the request beside the capacity it
+        // is a share of. AGE is the standard column but not the one a person
+        // narrowing a listing came for.
+        let rows = one_booked_row();
+        assert_eq!(
+            headings_at(&rows, 80),
+            ["NAME", "STATUS", "CPU", "CPU REQ", "MEMORY", "MEM REQ"],
+        );
+        assert!(
+            row_width(&columns(&rows, Width::Narrow(80)), &rows) <= 80,
+            "the reported columns must actually fit 80"
+        );
+    }
+
+    #[test]
+    fn a_row_narrower_than_the_name_still_prints_the_name() {
+        // At `--width 1` — the acceptance-test extreme — every column but NAME
+        // is dropped, and NAME stays even though the row is still wider than
+        // one character. The alternative — dropping NAME too — is a row a
+        // person cannot read at all.
+        assert_eq!(headings_at(&one_booked_row(), 1), ["NAME"]);
+    }
+
+    #[test]
+    fn the_pair_columns_leave_together_rather_than_singly() {
+        // `CPU REQ` next to `MEMORY` without `MEM REQ` reads as noise — the
+        // eye pairs it with the wrong number — so the two go together, and
+        // the same for the USE pair and for CPU + MEMORY themselves.
+        let rows = one_booked_row();
+
+        // 70 cols forces a drop past just VERSION; both REQ columns leave.
+        let cols = headings_at(&rows, 70);
+        assert!(!cols.contains(&"CPU REQ".to_owned()), "{cols:?}");
+        assert!(!cols.contains(&"MEM REQ".to_owned()), "{cols:?}");
+
+        // A width small enough to lose CPU also loses MEMORY, never one alone.
+        let cols = headings_at(&rows, 30);
+        assert!(!cols.contains(&"CPU".to_owned()), "{cols:?}");
+        assert!(!cols.contains(&"MEMORY".to_owned()), "{cols:?}");
+    }
+
+    #[test]
+    fn a_gpu_column_outlasts_the_cpu_column_on_a_narrow_terminal() {
+        // The device columns are what a person on a GPU cluster came for, so
+        // they drop after `CPU` and `MEMORY` do — the interesting column
+        // stays as long as it can. On a general cluster this step is a
+        // no-op, so the tests without devices see the CPU pair drop as
+        // step 5 straight into STATUS being the last thing left.
+        let rows = [NodeRow::from_node(
+            &gpu_node(),
+            Some(&booked_device("nvidia.com/gpu", "1")),
+            None,
+            now(),
+        )];
+
+        // At 60 cols VERSION, AGE, both REQ columns, and CPU + MEMORY have
+        // all left, but `NVIDIA.COM/GPU` is still there beside NAME and
+        // STATUS — the card count is what the reader typed `eks nodes` to
+        // see, so it survives the drop that removes the resources every
+        // cluster has anyway.
+        let cols = headings_at(&rows, 60);
+        assert!(cols.contains(&"NVIDIA.COM/GPU".to_owned()), "{cols:?}");
+        assert!(!cols.contains(&"CPU".to_owned()), "{cols:?}");
+        assert!(!cols.contains(&"MEMORY".to_owned()), "{cols:?}");
+        assert!(cols.contains(&"NAME".to_owned()));
+        assert!(cols.contains(&"STATUS".to_owned()));
+    }
+
+    #[test]
+    fn wide_beats_narrow_when_both_could_apply() {
+        // `--wide` was explicit; the terminal is not. A row that widened when
+        // asked to and then narrowed itself would be a flag that meant
+        // nothing. The type gate is in `Width::for_terminal`, and this
+        // asserts the listing agrees: `Width::Wide` is the wide set, not a
+        // dropped one.
+        let rows = one_booked_row();
+        let wide = columns(&rows, Width::Wide);
+        assert!(wide.iter().any(|c| matches!(c, Column::InternalIp)));
+        assert!(wide.iter().any(|c| matches!(c, Column::KernelVersion)));
+    }
+
+    #[test]
+    fn a_metrics_server_row_drops_the_use_pair_before_the_base_pair() {
+        // The USE columns come off before CPU and MEMORY themselves, so a row
+        // with metrics never lands in "CPU is gone but CPU USE is still here"
+        // — the partner without its base would read as a percentage of
+        // nothing.
+        let rows = [NodeRow::from_node(
+            &healthy_node(),
+            Some(&booked("1500m", "6Gi")),
+            Some(used("392m", "1552515Ki")),
+            now(),
+        )];
+
+        // A width tight enough that CPU is gone: the USE columns are already
+        // gone too. Loop rather than pick one width, because the fixture's
+        // exact widths shift when the sample values do and the invariant is
+        // the ordering, not a specific number.
+        for target in [1_u16, 20, 40, 60] {
+            let cols = headings_at(&rows, target);
+            let has_cpu = cols.iter().any(|c| c == "CPU");
+            let has_cpu_use = cols.iter().any(|c| c == "CPU USE");
+            let has_mem = cols.iter().any(|c| c == "MEMORY");
+            let has_mem_use = cols.iter().any(|c| c == "MEM USE");
+            assert!(!has_cpu_use || has_cpu, "{target}: {cols:?}");
+            assert!(!has_mem_use || has_mem, "{target}: {cols:?}");
+        }
     }
 }

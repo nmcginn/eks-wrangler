@@ -1001,3 +1001,52 @@ listing has a row that is more current than its neighbours. So the table is
 rendered without it and each line is prefixed afterwards, header included. That
 keeps the gutter's two characters a fact about this listing rather than a
 feature of every table.
+
+### 46. `Width::Narrow` carries a target width, and the drop rule is the listing's
+
+`eks nodes` at ten columns and around 140 characters wide wraps on the terminal
+every laptop lid narrows to under a docked browser, which is where the request
+and usage columns land — the ones most worth keeping. The other end of `--wide`
+was always going to be a third `Width` variant rather than a listing-specific
+flag; the type already existed as one place both tables agreed on how much to
+show.
+
+`Width::Narrow(u16)` carries the target width, not "narrow yes/no". Deciding
+"which columns fit" from a hidden ambient terminal size would put the answer
+somewhere a test could not name it, and the acceptance criterion for this task
+was a pure function over an available width. So the ioctl lives in one
+`stdout_terminal_cols` function in `main.rs` and the arithmetic lives in
+`k8s::nodes::narrow_to_fit`, which two tests hit at 80, 100, and 1 column with
+no terminal in sight.
+
+`--wide` beats `Narrow` at the type gate: `Width::for_terminal(true, _)`
+returns `Wide`. A `--wide` that widened when asked to and then narrowed itself
+would be a flag that meant nothing on the terminals it exists for. A pipe is
+not a "narrow terminal": `Width::for_terminal(false, None)` returns `Default`,
+so `eks nodes | grep foo` is unchanged to the byte and no script parsing the
+output breaks. Pods is passed the same width value for consistency; the pod
+table has no drop rule yet, and `is_wide()` reads `false` on a `Narrow`
+variant, so the pod table lands on its default columns rather than losing
+some in a way this PR did not design.
+
+The drop order for `k8s::nodes` is a `DROP_ORDER` list of predicates, in this
+sequence: `VERSION`, `AGE`, the `REQ` pair, the `USE` pair, `CPU` and
+`MEMORY`, every device column, `STATUS`. Two rules shaped it:
+
+- **Partner columns leave before their base.** `CPU REQ` is a percentage of a
+  capacity, and dropping the capacity while keeping the percentage leaves a
+  figure of nothing. So `REQ` and `USE` drop before `CPU` and `MEMORY`, and
+  the pair columns drop together — an eye reading `CPU REQ` next to `MEMORY`
+  with no `MEM REQ` pairs the wrong numbers.
+- **The interesting column outlasts the ordinary one.** A device column only
+  exists because somebody installed the plugin that surfaces it; every
+  cluster has `CPU` and `MEMORY`, and only the GPU cluster has `NVIDIA.COM/GPU`.
+  So devices drop after `CPU` and `MEMORY` rather than before them. On a
+  general cluster this step is a no-op. On a GPU cluster with a very narrow
+  terminal, the row keeps the card count and loses `CPU`, which is the right
+  trade — the user typed `eks nodes` for the card, not for the ordinary
+  columns that were going to show up anyway.
+
+`NAME` never drops. A row we cannot fit at all is still a row with a name; the
+terminal wraps it, and dropping the name would leave a listing that has no
+answer for "which node is this".

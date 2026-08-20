@@ -144,7 +144,12 @@ condition and its cell under a subtly different one shifts every figure to the
 right of it under the wrong heading, and the table still renders. `format::Width`
 sits with `format::table` rather than in `k8s`, because `--wide` decides nothing
 about what is fetched — everything the extra columns show already arrived with
-the nodes and pods. `format::list` sits beside it for the same reason: writing a
+the nodes and pods. Its `Narrow(u16)` variant is the other end of `--wide`:
+the same one type carries "widen" and "fit this many characters" so both
+listings agree on what the flag means, and each is free to decide its own drop
+order. The node table's lives in `k8s::nodes::DROP_ORDER`; the terminal-size
+lookup lives in one function in `main.rs`, so the arithmetic that picks
+columns has no ioctl to fake in a test. `format::list` sits beside it for the same reason: writing a
 set of names out as prose, serial comma and all, is a rule that belongs in one
 place whether the sentence around it is offering orderings to sort by or naming
 the columns a failed pod listing emptied.
