@@ -130,7 +130,11 @@ fn ranked(row: &NodeRow, order: Order) -> bool {
 pub struct Missing {
     /// The pod listing failed, so `CPU REQ` and `MEM REQ` are empty.
     pub requests: bool,
-    /// Live usage could not be read, so `CPU USE` and `MEM USE` are absent.
+    /// There is no live usage in the table, so `CPU USE` and `MEM USE` are
+    /// absent — either because the read failed, or because it succeeded and
+    /// nothing here had been sampled. Both now put a footnote above the table
+    /// (see [`super::usage_unavailable`] and [`super::usage_unsampled`]), which
+    /// is what this field is really asking about.
     pub usage: bool,
 }
 
@@ -143,10 +147,10 @@ pub struct Missing {
 /// nothing above covers it.
 ///
 /// The distinction is not "is this column optional" but "did *this* listing
-/// lose it". `--sort cpu` where metrics-server answered but has not sampled any
-/// node yet is [`Cause::Unexplained`]: the columns are gone, but nothing above
-/// the table has said a word about why, and the note is the only thing that
-/// will.
+/// lose it". `--sort cpu` where the `CPU USE` column is present and every figure
+/// in it lacks an allocatable to be a share of is [`Cause::Unexplained`]: the
+/// ordering ranked nothing, the column is right there in the table, and no
+/// footnote above is about it.
 #[must_use]
 pub fn cause(order: Order, missing: Missing) -> Cause {
     Cause::explained(match order {
@@ -438,9 +442,12 @@ mod tests {
 
     #[test]
     fn a_column_that_is_simply_empty_is_never_blamed_on_a_footnote() {
-        // metrics-server answered and the pods listed, so nothing above the
-        // table said a word — an ordering that ranked nothing here has to
-        // explain itself rather than point upwards at nothing.
+        // Nothing above the table said a word — which, now that a listing with
+        // no usage at all earns a footnote of its own, is the listing whose
+        // usage columns are *present* and cannot be ranked anyway: a node
+        // metrics-server sampled whose allocatable the API server has not
+        // reported leaves `--sort cpu` with no share to rank and nothing above
+        // to point at.
         for order in ORDERS {
             assert_eq!(
                 cause(order, Missing::default()),

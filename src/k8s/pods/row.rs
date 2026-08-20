@@ -611,7 +611,12 @@ fn is_init_progress(initialising: bool, reason: &str) -> bool {
 /// on EKS, where it is not installed for you — gains no empty columns, and the
 /// footnote carries the news instead. `any` rather than `all`, so one pod the
 /// sampler has not reached does not cost everyone else their figures.
-fn shows_usage(rows: &[PodRow]) -> bool {
+///
+/// Public for the reason [`crate::k8s::nodes::shows_usage`] is: the command
+/// layer owes the reader a footnote when the columns are gone, and the rows are
+/// what decide whether they are.
+#[must_use]
+pub fn shows_usage(rows: &[PodRow]) -> bool {
     rows.iter()
         .any(|row| row.cpu_used.is_some() || row.memory_used.is_some())
 }
@@ -880,6 +885,24 @@ pub fn render(
 #[must_use]
 pub fn usage_unavailable(explanation: &str) -> String {
     format!("CPU and MEMORY are not shown because live usage could not be read.\n{explanation}")
+}
+
+/// The footnote shown when the metrics read succeeded and had nothing in it.
+///
+/// The pod half of [`crate::k8s::nodes::usage_unsampled`], and there for the
+/// same reason: the columns vanish exactly as they do when the read fails, and
+/// a successful request that quietly costs two columns leaves the user unable
+/// to tell a cluster with no metrics-server from one whose metrics-server has
+/// not reached these pods yet.
+///
+/// The headings are named without the `/REQ` suffix a listing with requests
+/// behind it gets, because a listing with no usage never shows that heading —
+/// the denominator is only printed where there is a figure to divide.
+#[must_use]
+pub fn usage_unsampled(explanation: &str) -> String {
+    format!(
+        "CPU and MEMORY are not shown because nothing here has been sampled yet.\n{explanation}"
+    )
 }
 
 /// What to say instead of an empty table.
@@ -2452,6 +2475,63 @@ mod tests {
             "{rendered}"
         );
         assert!(rendered.contains("no metrics.k8s.io API"), "{rendered}");
+    }
+
+    #[test]
+    fn an_unsampled_namespace_is_told_apart_from_a_cluster_with_no_metrics_server() {
+        // Same two missing columns, opposite advice. `eks pods` meets this more
+        // often than `eks nodes` does, because a namespace whose pods have only
+        // just been created is scraped a moment after they start.
+        let rendered = render(
+            &rows(),
+            "prod (us-east-1)",
+            &Scope::Namespace("payments".to_owned()),
+            &unfiltered(),
+            &[usage_unsampled(&crate::k8s::metrics::unsampled(
+                "prod (us-east-1)",
+            ))],
+            Width::Default,
+        );
+
+        assert!(rendered.contains("api-7c9f"), "{rendered}");
+        assert!(
+            rendered.contains(
+                "\n\nCPU and MEMORY are not shown because nothing here has been sampled yet."
+            ),
+            "{rendered}"
+        );
+        assert!(rendered.contains("kube-system"), "{rendered}");
+        assert!(
+            !rendered.contains("github.com/kubernetes-sigs/metrics-server"),
+            "advice to install what is already installed: {rendered}"
+        );
+    }
+
+    #[test]
+    fn a_sampled_listing_says_how_old_its_figures_are() {
+        // The same line `eks nodes` prints, in the same words, because it is a
+        // fact about metrics-server rather than about either table.
+        let sample = crate::k8s::metrics::Sample {
+            usage: crate::k8s::metrics::Usage::default(),
+            taken_at: Some(now() - SignedDuration::from_secs(12)),
+            window: Some(SignedDuration::from_secs(20)),
+        };
+        let freshness = crate::k8s::metrics::freshness(&[sample], now())
+            .expect("a stamped sample dates the listing");
+
+        let rendered = render(
+            &rows(),
+            "prod (us-east-1)",
+            &Scope::Namespace("payments".to_owned()),
+            &unfiltered(),
+            &[crate::k8s::metrics::freshness_note(freshness)],
+            Width::Default,
+        );
+
+        assert!(
+            rendered.ends_with("\n\nUsage is up to 12s old, averaged over 20s."),
+            "{rendered}"
+        );
     }
 
     #[test]

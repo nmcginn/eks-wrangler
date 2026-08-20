@@ -113,8 +113,10 @@ fn ranked(row: &PodRow, order: Order) -> bool {
 /// column here is a field rather than a changed signature.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Missing {
-    /// Live usage could not be read, so `CPU` and `MEMORY` are absent — see
-    /// [`super::usage_unavailable`], which is already above the table.
+    /// There is no live usage in the table, so `CPU` and `MEMORY` are absent —
+    /// either because the read failed, or because it succeeded and nothing here
+    /// had been sampled. Both put a footnote above the table: see
+    /// [`super::usage_unavailable`] and [`super::usage_unsampled`].
     pub usage: bool,
 }
 
@@ -378,8 +380,11 @@ mod tests {
 
     #[test]
     fn a_column_that_is_simply_empty_is_never_blamed_on_a_footnote() {
-        // metrics-server answered, so nothing above the table said a word: a
-        // listing it has not sampled yet has to explain itself.
+        // Nothing above the table said a word — which, now that a listing with
+        // no usage at all earns a footnote of its own, is the listing whose
+        // usage columns are *present* and half filled in: metrics-server
+        // reporting memory for these pods and no cpu it could read leaves
+        // `--sort cpu` with nothing to rank and nothing to point at.
         for order in ORDERS {
             assert_eq!(
                 cause(order, Missing::default()),

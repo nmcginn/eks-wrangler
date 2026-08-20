@@ -34,7 +34,7 @@ pub mod order;
 pub mod row;
 
 pub use order::{Missing, Order, cause, ranks_any, sort};
-pub use row::{PodRow, render, usage_unavailable};
+pub use row::{PodRow, render, shows_usage, usage_unavailable, usage_unsampled};
 
 /// Pods that have finished linger in the API server until something collects
 /// them, and they hold nothing on the node. Excluding them server-side keeps a

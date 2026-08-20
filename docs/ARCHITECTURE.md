@@ -70,6 +70,10 @@ than exceptional. A role that grants nodes but not pods across every namespace
 is a normal thing to have, and metrics-server is an add-on that EKS does not
 install for you, so on a fresh cluster there is simply nothing to show.
 
+The metrics request has a third outcome that is neither of those: it succeeds and
+carries nothing. That costs the same two columns a failure does, so it earns a
+footnote of its own rather than the silence a successful request used to buy.
+
 `NodeRow::from_node` takes an explicit `now`, so ages are computed rather than
 observed and every row in a listing shares one instant.
 
@@ -171,6 +175,18 @@ namespace and name in the command layer, which is also what makes the columns
 follow the selectors: only pods the API server already returned have a row to be
 given a figure.
 
+A sample is more than its figures. metrics-server stamps each one with when it
+was taken and the window it was averaged over, and `metrics::Sample` carries both
+through the join so a table can be dated from the samples that actually reached
+it rather than from whatever the endpoint returned. `metrics::freshness` reduces
+those to the age of the oldest sample and the longest window — a pure function
+over samples and one instant, so staleness is a fixture rather than a wait — and
+`metrics::Outcome` is the three-way answer the command layer needs afterwards:
+the columns are shown and want dating, the read failed, or the read answered with
+nothing and the table owes an explanation nobody was giving it. Which of the
+three a listing is in is asked of the rendered rows, not of the reply, so the
+footnote and the columns cannot disagree.
+
 Resource quantities get their own hop: the API server reports capacity as
 strings in a small grammar (`3920m`, `7134420Ki`, `1e3`), and `k8s::quantity`
 turns those into numbers before anything formats or divides them. It is a pure
@@ -217,6 +233,11 @@ nobody registered the API group, and a `503` because metrics-server is up but ha
 not finished its first scrape — and both have concrete advice behind them.
 Everything else falls straight through to the shared explanation rather than
 growing a second vocabulary for an expired SSO session.
+
+`k8s::metrics::unsampled` sits beside it and is deliberately not one of its
+branches: no request failed, so there is no `kube::Error` to explain. It is the
+sentence for a reply that arrived empty, and it says metrics-server is installed
+precisely because the footnote it replaces would have said the opposite.
 
 `unwrap`, `expect`, and `panic!` are denied by lint in library code. Ask what
 should happen instead and return a `Result` saying so.

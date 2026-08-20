@@ -80,11 +80,34 @@ pub async fn list(
     };
 
     // One instant for every row, so a slow listing cannot show two nodes
-    // created together with different ages.
+    // created together with different ages — and so the freshness note below is
+    // measured from the same instant the `AGE` column is.
     let now = Timestamp::now();
-    let mut rows: Vec<k8s_nodes::NodeRow> = nodes
+
+    // The join is done before the rows are built rather than inside them,
+    // because the samples are wanted twice: once for the figures, and once to
+    // date the table. Collecting them here means the note describes exactly the
+    // samples that reached the listing, not every sample the endpoint returned.
+    let samples: Vec<Option<k8s_metrics::Sample>> = nodes
         .iter()
         .map(|node| {
+            // Unlike the requests below, an absent node here is *not* a zero: it
+            // is a node metrics-server has not sampled yet, and drawing it as
+            // idle would be an invention. `None` reads as `-`.
+            usage.as_ref().and_then(|samples| {
+                node.metadata
+                    .name
+                    .as_deref()
+                    .and_then(|name| samples.get(name))
+                    .copied()
+            })
+        })
+        .collect();
+
+    let mut rows: Vec<k8s_nodes::NodeRow> = nodes
+        .iter()
+        .zip(&samples)
+        .map(|(node, sample)| {
             // A node absent from the totals is running nothing, which is a real
             // zero. Only a failed pod listing leaves the figure unknown.
             let requested = requests.as_ref().map(|totals| {
@@ -95,17 +118,7 @@ pub async fn list(
                     .copied()
                     .unwrap_or_default()
             });
-            // Unlike the requests, an absent node here is *not* a zero: it is a
-            // node metrics-server has not sampled yet, and drawing it as idle
-            // would be an invention. `None` reads as `-`.
-            let used = usage.as_ref().and_then(|samples| {
-                node.metadata
-                    .name
-                    .as_deref()
-                    .and_then(|name| samples.get(name))
-                    .copied()
-            });
-            k8s_nodes::NodeRow::from_node(node, requested, used, now)
+            k8s_nodes::NodeRow::from_node(node, requested, sample.map(|s| s.usage), now)
         })
         .collect();
     // Ordering lives in `k8s::nodes::order` rather than here, so the default and
@@ -114,6 +127,25 @@ pub async fn list(
     // name, which the API server happens to return today; sorting makes that a
     // promise rather than an accident.
     k8s_nodes::sort(&mut rows, order, direction);
+
+    // What became of the usage columns, asked of the rows rather than of the
+    // request: a read that succeeded and returned nothing costs exactly the
+    // columns a failed one does, and the two want opposite advice. Where the
+    // columns did survive, they want a date instead — metrics-server going quiet
+    // does not fail this request, so without one a stale figure and a fresh one
+    // are the same table.
+    let usage_columns = k8s_metrics::Outcome::of(usage.as_ref(), k8s_nodes::shows_usage(&rows));
+    match usage_columns {
+        k8s_metrics::Outcome::Shown => footnotes.extend(
+            k8s_metrics::freshness(samples.iter().flatten(), now).map(k8s_metrics::freshness_note),
+        ),
+        k8s_metrics::Outcome::Unsampled => {
+            footnotes.push(k8s_nodes::usage_unsampled(&k8s_metrics::unsampled(&label)));
+        }
+        // Already footnoted above, where the error was caught and could still be
+        // explained.
+        k8s_metrics::Outcome::Unreadable => {}
+    }
 
     // Last of the footnotes, under whatever went wrong: a table nobody could
     // fill in is more urgent news than the order it came out in. The note is
@@ -129,7 +161,10 @@ pub async fn list(
     // rather than repeating the advice a paragraph later.
     let missing = k8s_nodes::Missing {
         requests: requests.is_none(),
-        usage: usage.is_none(),
+        // The columns being gone, rather than the read having failed: both
+        // reasons for their absence now have a footnote above for the note to
+        // point back at.
+        usage: usage_columns.is_missing(),
     };
     footnotes.extend(k8s::order::unranked_note(
         order,
