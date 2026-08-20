@@ -97,28 +97,58 @@ pub async fn list(
     };
 
     // One instant for every row, so a slow listing cannot show two pods created
-    // together with different ages.
+    // together with different ages — and so the freshness note below is measured
+    // from the same instant the `AGE` column is.
     let now = Timestamp::now();
-    let mut rows: Vec<PodRow> = pods
+
+    // The join is done before the rows are built rather than inside them,
+    // because the samples are wanted twice: once for the figures, and once to
+    // date the table. It matters more here than on the node table, where the two
+    // listings cover the same set: the metrics endpoint is asked for a whole
+    // namespace, so a `--field-selector` can leave samples behind that no row
+    // shows, and dating the table from those would put an age under a listing
+    // they are not in.
+    let samples: Vec<Option<k8s_metrics::Sample>> = pods
         .iter()
         .map(|pod| {
             // The join is by namespace and name, which is what makes the
             // usage follow the selectors: only pods the API server already
             // returned get a row, so only they can be given a figure.
-            let used = usage.as_ref().and_then(|samples| {
+            usage.as_ref().and_then(|samples| {
                 let namespace = pod.metadata.namespace.as_deref()?;
                 let name = pod.metadata.name.as_deref()?;
                 samples
                     .get(&(namespace.to_owned(), name.to_owned()))
                     .copied()
-            });
-            PodRow::from_pod(pod, used, now)
+            })
         })
+        .collect();
+
+    let mut rows: Vec<PodRow> = pods
+        .iter()
+        .zip(&samples)
+        .map(|(pod, sample)| PodRow::from_pod(pod, sample.map(|s| s.usage), now))
         .collect();
     // Ordering lives in `k8s::pods::order` rather than here, so the default and
     // the one `--sort` asks for are decided in the same place and by the same
     // rules — and so both can be tested on rows alone.
     k8s_pods::sort(&mut rows, request.order, request.direction);
+
+    // What became of the usage columns, decided and worded exactly as
+    // `commands::nodes` decides and words it: the two tables read the same
+    // metrics-server, and a person moving between them should not have to work
+    // out whether two different sentences mean the same thing.
+    let usage_columns = k8s_metrics::Outcome::of(usage.as_ref(), k8s_pods::shows_usage(&rows));
+    match usage_columns {
+        k8s_metrics::Outcome::Shown => notes.extend(
+            k8s_metrics::freshness(samples.iter().flatten(), now).map(k8s_metrics::freshness_note),
+        ),
+        k8s_metrics::Outcome::Unsampled => {
+            notes.push(k8s_pods::usage_unsampled(&k8s_metrics::unsampled(&label)));
+        }
+        // Already noted above, where the error was caught.
+        k8s_metrics::Outcome::Unreadable => {}
+    }
 
     // Last of the notes, under whatever went wrong, and worded and positioned
     // exactly as `eks nodes` does it — the two tables answer "which order is
@@ -133,7 +163,9 @@ pub async fn list(
     // these rows could be sorted by instead, and whether the note above already
     // explains the empty column.
     let missing = k8s_pods::Missing {
-        usage: usage.is_none(),
+        // The columns being gone, rather than the read having failed: both
+        // reasons for their absence now have a note above to point back at.
+        usage: usage_columns.is_missing(),
     };
     notes.extend(k8s::order::unranked_note(
         request.order,

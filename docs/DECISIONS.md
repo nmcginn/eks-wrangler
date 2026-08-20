@@ -802,3 +802,58 @@ thresholds would not carry: 90% of a node's allocatable is alarming, while 90% o
 a pod's own request is a well-sized pod. What "hot" means for a pod against its
 request is a decision worth making deliberately, and nothing renders colour yet,
 so this waits for the roadmap entry that lights up both tables.
+
+### 41. A usage figure is shown with its age, and an empty sample set says so
+
+The usage columns had two states on screen and three in reality. metrics-server
+missing produced a footnote saying what to install; metrics-server answering
+produced the columns. metrics-server answering *with nothing* — a fresh install,
+a node that joined a minute ago, a namespace whose pods have only just started —
+produced neither: the columns vanished exactly as they do when it is absent, and
+nothing was printed, because the footnote was written on the error path and there
+was no error. From the reader's chair that is indistinguishable from the missing
+case, and the advice for the two is opposite. `metrics::Outcome` makes the third
+case a value rather than a gap, and `usage_unsampled` gives it the footnote it
+was owed.
+
+Which of the three a listing is in is asked of the **rendered rows**, not of the
+reply. `eks pods --field-selector spec.nodeName=…` narrows the rows but not the
+metrics request — metrics-server does not implement field filtering — so a reply
+can be full of readings for pods the table does not contain. Asking the reply
+would call that listing sampled while showing no figures at all.
+
+The other half is that a figure which *is* shown carries no date. A number with
+nothing beside it cannot be told from an instantaneous reading, and — the reason
+this matters — metrics-server going quiet does not fail the request that asks it
+for a sample. The same table keeps rendering, with figures that are minutes old
+and look exactly like fresh ones. So every table with usage in it now ends with
+`Usage is up to 12s old, averaged over 20s.`
+
+The age is the **oldest** sample in the listing. The note is a guarantee about
+the whole table and is only as good as its worst row; "up to" is what makes that
+readable. The window is the **longest** any sample reported, since samples that
+disagree mean two scrapers or one being reconfigured, and the slower of them
+decides how long "up to date" lasts.
+
+Stale is more than two windows. metrics-server publishes about one reading per
+window, so one window of lag is what a working scraper looks like and two means a
+scrape did not happen. A listing whose window we could not read is never accused:
+without a window there is no scale to judge an age against, and "your figures are
+stale" is not a sentence to print on a guess. A window of `0s` is treated the same
+way, since it would call a listing taken half a second ago stale.
+
+`metav1.Duration` reaches the wire as a Go duration string — `20.04s`, `1m0s`,
+`500ms` — which is not anything `jiff` parses, so `metrics::parse_duration` is a
+small grammar of its own. Integer arithmetic throughout: `20.04s` is exact in
+nanoseconds and is not exact in binary floating point, and this value is compared
+against another duration rather than merely printed. The unit table is ordered
+longest-spelling-first, because `ms` read as `m` turns half a second into half an
+hour and would call every listing fresh forever. Anything outside the grammar is
+`None` rather than a guess — a wrong window either accuses a healthy cluster or
+excuses a scraper that has stopped.
+
+One consequence worth naming: `Missing::usage`, which decides whether the
+"nothing ranked" note points at a footnote above or explains itself, now means
+"the columns are gone" rather than "the read failed". Both ways of losing them
+leave a footnote for it to point at, so the old reading would have printed the
+same advice twice, a paragraph apart — the thing decision 38 exists to prevent.

@@ -261,7 +261,7 @@ cluster.
   *Acceptance:* the choice of denominator is explicit at the call site rather
   than baked into `Share`; both readings are tested on one fixture node.
 
-- [ ] **Show the sampling window beside the usage columns, and say when there
+- [x] **Show the sampling window beside the usage columns, and say when there
   was no sample.**
   metrics-server reports a `window` — typically `20s` — over which each sample
   was averaged, and a usage figure with no window behind it cannot be told apart
@@ -276,6 +276,38 @@ cluster.
   the table; a sample older than a couple of windows says so; an empty sample set
   earns the same footnote a failed read does, worded for "not scraping yet"
   rather than "not installed".
+  Landed on both listings, in one wording, as `Usage is up to 12s old, averaged
+  over 20s.` — the age is the oldest sample so the line covers every row, and the
+  window is the longest any sample reported. Past two windows it says the figures
+  are stale and names the pod to look at. `metrics::Sample` carries the two
+  stamps through the join, so the note dates the samples that reached the table
+  rather than the ones the endpoint returned; `metrics::Outcome` makes "answered
+  with nothing" the third case it always was.
+
+- [ ] **A row whose sample is old, rather than a listing that is.**
+  The freshness note is one line about the whole table, and it takes its age from
+  the oldest sample in it — so a single node whose kubelet stopped reporting
+  makes a listing of otherwise-current figures read as stale, and the reader has
+  no way to tell which row dragged it. Discovered while writing the note, and
+  separate because the fix is a shape this PR could only have guessed at: an age
+  per row is a column, and the pod table is already the wider of the two
+  listings, so it belongs with the narrow-mode decision rather than arriving
+  ahead of it; a marker on the stale rows instead is the other design, and it
+  needs `Severity` colour to exist before it reads as anything.
+  *Acceptance:* whichever shape it takes, the staleness rule stays
+  `Freshness::is_stale`'s rather than a second reading of "a couple of windows";
+  a listing where every sample is current gains nothing.
+
+- [ ] **Carry the freshness and unsampled notes into the dashboard's panes.**
+  The third of the notes that will want a pane's header rather than a footnote
+  under a scrolling list, and it pairs with the two sort-note entries above. A
+  pane refreshing in the background makes it matter more than it does on the
+  command line, where a listing is as old as the moment you typed it: a pane
+  whose figures stopped moving looks exactly like a pane on an idle cluster.
+  *Acceptance:* the pane words both through `k8s::metrics::freshness_note` and
+  `k8s::metrics::unsampled`, not a second wording, and asks
+  `k8s::metrics::Outcome::of` which of the three cases it is in rather than
+  testing the request result itself.
 
 ### Follow-ups from the capacity columns
 

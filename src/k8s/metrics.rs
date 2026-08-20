@@ -37,12 +37,14 @@ use std::collections::BTreeMap;
 use std::future::Future;
 
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity as ApiQuantity;
-use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
+use k8s_openapi::apimachinery::pkg::apis::meta::v1::{ObjectMeta, Time};
+use k8s_openapi::jiff::{SignedDuration, Timestamp};
 use k8s_openapi::{ClusterResourceScope, NamespaceResourceScope};
 use kube::api::{Api, ListParams};
 use kube::{Client, Resource};
 use serde::Deserialize;
 
+use crate::format;
 use crate::k8s::client;
 use crate::k8s::pods::{Scope, Selectors};
 use crate::k8s::quantity::Quantity;
@@ -56,6 +58,16 @@ use crate::k8s::quantity::Quantity;
 pub struct NodeMetrics {
     #[serde(default)]
     pub metadata: ObjectMeta,
+    /// When the reading was taken — the *end* of the window below, so a fresh
+    /// sample is a few seconds old rather than zero seconds old.
+    #[serde(default)]
+    pub timestamp: Option<Time>,
+    /// How long the reading was averaged over, as Go's `time.Duration` prints
+    /// it: `20.04s`, `1m0s`. Kept as text here and parsed when the sample is
+    /// indexed, so a spelling we do not understand costs the freshness note
+    /// rather than the whole sample.
+    #[serde(default)]
+    pub window: Option<String>,
     /// `cpu` and `memory`, in the usual resource-quantity grammar.
     #[serde(default)]
     pub usage: BTreeMap<String, ApiQuantity>,
@@ -118,6 +130,316 @@ impl Usage {
     }
 }
 
+/// One reading, with the two facts that say how much to trust it.
+///
+/// A usage figure on its own cannot be told apart from an instantaneous one,
+/// and it cannot be told apart from a stale one either — which matters because
+/// metrics-server going quiet does not fail the request that asks it for a
+/// sample. The same table keeps rendering, with figures that are minutes old
+/// and look exactly like fresh ones. [`taken_at`](Self::taken_at) and
+/// [`window`](Self::window) are what [`freshness`] dates a listing from.
+///
+/// Both are optional because both are the sampler's word rather than ours. A
+/// reading whose timestamp is missing or unreadable is still a reading, so it
+/// keeps its figures and loses only its place in the note.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Sample {
+    /// What the node or pod was using.
+    pub usage: Usage,
+    /// When the reading was taken.
+    pub taken_at: Option<Timestamp>,
+    /// How long it was averaged over.
+    pub window: Option<SignedDuration>,
+}
+
+impl Sample {
+    /// Build a sample from one metrics item's usage and its two stamps.
+    fn new(usage: Usage, timestamp: Option<&Time>, window: Option<&str>) -> Self {
+        Self {
+            usage,
+            taken_at: timestamp.map(|at| at.0),
+            window: window.and_then(parse_duration),
+        }
+    }
+}
+
+/// Go's duration units, in nanoseconds, longest spelling first.
+///
+/// The order is the whole correctness of [`parse_duration`]: read `ms` as `m`
+/// and a 500-millisecond window becomes eight hours, which would call every
+/// listing fresh forever.
+const UNITS: [(&str, i64); 8] = [
+    ("ns", 1),
+    ("us", 1_000),
+    // Go emits the micro sign; some encoders emit the Greek letter instead, and
+    // the two are different characters that look identical.
+    ("\u{b5}s", 1_000),
+    ("\u{3bc}s", 1_000),
+    ("ms", 1_000_000),
+    ("s", 1_000_000_000),
+    ("m", 60_000_000_000),
+    ("h", 3_600_000_000_000),
+];
+
+/// Parse a Go duration string, which is how a `metav1.Duration` reaches the wire.
+///
+/// metrics-server reports its averaging window as `20.04s`, `1m0s`, `500ms` —
+/// `time.Duration`'s own formatting, a run of `<number><unit>` pairs rather than
+/// anything ISO-8601 that `jiff` would take directly.
+///
+/// Anything that is not that grammar is `None` rather than a guess: the window
+/// decides whether a listing is called stale, and a window read wrongly would
+/// either accuse a healthy cluster or excuse a scraper that has stopped.
+///
+/// Integer arithmetic throughout, deliberately. `20.04s` is exact in nanoseconds
+/// and is not exact in binary floating point, and this value is compared against
+/// another duration rather than merely printed.
+fn parse_duration(text: &str) -> Option<SignedDuration> {
+    let (negative, body) = match text.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, text.strip_prefix('+').unwrap_or(text)),
+    };
+
+    // Go prints a zero duration as `0s`, and accepts a bare `0`. Take both.
+    if body == "0" {
+        return Some(SignedDuration::ZERO);
+    }
+
+    let mut nanos: i64 = 0;
+    let mut rest = body;
+    while !rest.is_empty() {
+        // Digits and `.` are ASCII, so this byte index is always a char
+        // boundary, including when the unit that follows is a micro sign.
+        let end = rest
+            .find(|c: char| !c.is_ascii_digit() && c != '.')
+            .unwrap_or(rest.len());
+        let (number, tail) = rest.split_at(end);
+        let (scale, remainder) = UNITS
+            .iter()
+            .find_map(|(unit, scale)| tail.strip_prefix(unit).map(|rest| (*scale, rest)))?;
+        nanos = nanos.checked_add(scaled(number, scale)?)?;
+        rest = remainder;
+    }
+
+    // An empty `body` never entered the loop, so it lands here as a zero it is
+    // not; reject it alongside the arithmetic that overflowed.
+    if body.is_empty() {
+        return None;
+    }
+
+    let nanos = if negative {
+        nanos.checked_neg()?
+    } else {
+        nanos
+    };
+    Some(SignedDuration::from_nanos(nanos))
+}
+
+/// One `<number><unit>` pair, in nanoseconds.
+///
+/// The fractional part is walked a digit at a time rather than parsed, so that
+/// the multiplication is by a power of ten this function has already reduced —
+/// no rounding, and a window written to more precision than a nanosecond is
+/// truncated exactly as Go truncates it rather than overflowing.
+fn scaled(number: &str, scale: i64) -> Option<i64> {
+    let (whole, fraction) = number.split_once('.').unwrap_or((number, ""));
+    if whole.is_empty() && fraction.is_empty() {
+        return None;
+    }
+
+    // Go reads `.5s`, where the whole part is absent rather than zero.
+    let mut nanos = if whole.is_empty() {
+        0
+    } else {
+        whole.parse::<i64>().ok()?.checked_mul(scale)?
+    };
+
+    let mut place = scale;
+    for digit in fraction.chars() {
+        place /= 10;
+        if place == 0 {
+            break;
+        }
+        nanos = nanos.checked_add(i64::from(digit.to_digit(10)?).checked_mul(place)?)?;
+    }
+    Some(nanos)
+}
+
+/// How old the usage figures in one listing are.
+///
+/// Computed from the samples that actually reached a row, so a listing narrowed
+/// by a selector is dated by what it shows rather than by whatever the metrics
+/// endpoint happened to return.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Freshness {
+    /// How long ago the *oldest* sample in the listing was taken, so that every
+    /// figure in the table is at most this old. The oldest rather than the
+    /// newest because the note is a guarantee about the whole table, and a
+    /// guarantee is only as good as its worst row.
+    pub age: SignedDuration,
+    /// The longest window any of those samples was averaged over, when any of
+    /// them said.
+    pub window: Option<SignedDuration>,
+}
+
+impl Freshness {
+    /// Whether these figures describe the past rather than the present.
+    ///
+    /// A couple of windows is the bar. metrics-server publishes a new reading
+    /// about once per window, so a listing one window behind is ordinary and one
+    /// two windows behind has missed a scrape — which is what a stopped scraper
+    /// looks like from here, since the request that asks for the sample keeps
+    /// succeeding.
+    ///
+    /// A listing whose window we could not read is never accused. Without one
+    /// there is no scale to judge an age against, and "your figures are stale"
+    /// is not a sentence to print on a guess.
+    #[must_use]
+    pub fn is_stale(self) -> bool {
+        self.window
+            .filter(|window| *window > SignedDuration::ZERO)
+            .and_then(|window| window.checked_mul(2))
+            .is_some_and(|couple| self.age > couple)
+    }
+}
+
+/// Date a listing from the samples that reached it.
+///
+/// `None` when nothing was sampled, or when no sample carried a timestamp we
+/// could read. A note that cannot say how old the figures are is worse than no
+/// note at all: the reader would take the missing half for freshness.
+///
+/// Clock skew — a sample stamped in the future — reads as an age of zero rather
+/// than as a negative one, which is what [`format::human_duration`] already does
+/// with a node created in the future.
+#[must_use]
+pub fn freshness<'a>(
+    samples: impl IntoIterator<Item = &'a Sample>,
+    now: Timestamp,
+) -> Option<Freshness> {
+    let mut oldest: Option<Timestamp> = None;
+    let mut window: Option<SignedDuration> = None;
+
+    for sample in samples {
+        if let Some(at) = sample.taken_at {
+            oldest = Some(oldest.map_or(at, |current| current.min(at)));
+        }
+        // The longest, so a listing whose samples disagree is described by the
+        // slowest of them — the one that decides how long "up to date" is.
+        if let Some(seen) = sample.window {
+            window = Some(window.map_or(seen, |current| current.max(seen)));
+        }
+    }
+
+    Some(Freshness {
+        age: now.duration_since(oldest?).max(SignedDuration::ZERO),
+        window,
+    })
+}
+
+/// The line under a table saying how old its usage figures are, and whether that
+/// is a problem.
+///
+/// One wording for both listings, because it is a fact about the sample rather
+/// than about the columns: `eks nodes` and `eks pods` read the same
+/// metrics-server, and a person reading one after the other should not have to
+/// work out whether two differently worded lines mean the same thing.
+#[must_use]
+pub fn freshness_note(freshness: Freshness) -> String {
+    let age = format::human_duration(freshness.age);
+
+    let Some(window) = freshness.window else {
+        // Honest about the half we have. Naming no window also keeps the line
+        // from implying a staleness judgement that `is_stale` refused to make.
+        return format!("Usage is up to {age} old.");
+    };
+    let window = format::human_duration(window);
+
+    if freshness.is_stale() {
+        format!(
+            "Usage is up to {age} old, averaged over {window} \u{2014} more than two sampling windows, so these figures are stale.\n\
+             metrics-server can stop scraping without failing this request; check its pod in kube-system."
+        )
+    } else {
+        format!("Usage is up to {age} old, averaged over {window}.")
+    }
+}
+
+/// What became of a listing's usage columns.
+///
+/// Three outcomes rather than two, which is the whole of this task: until now
+/// the command asked only whether the metrics read had failed, and a read that
+/// *succeeded* with nothing in it took the columns away just as thoroughly while
+/// saying nothing at all. From the reader's chair that third case is
+/// indistinguishable from a cluster with no metrics-server, and the advice for
+/// the two is opposite — one says install it, the other says wait for it.
+///
+/// A value rather than a pair of `bool`s at the call site, for the reason
+/// [`crate::k8s::order::Cause`] is one: the branch decides which sentence a user
+/// reads, and it should be legible where it is taken.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Outcome {
+    /// Figures reached the table. They want dating — see [`freshness_note`].
+    Shown,
+    /// The read answered, and nothing in this listing had been sampled. Nothing
+    /// has been said about it yet, so this is the case that owes a footnote —
+    /// see [`unsampled`].
+    Unsampled,
+    /// The read failed. Already footnoted where the error was caught, with the
+    /// explanation only that branch has — see [`explain`].
+    Unreadable,
+}
+
+impl Outcome {
+    /// Read from the two things the command layer knows: whether the metrics
+    /// request answered, and whether any figure from it reached the rendered
+    /// rows.
+    ///
+    /// The second half is asked of the rows rather than of the reply, so the
+    /// footnote and the columns cannot disagree: a reply full of samples for
+    /// pods that a `--field-selector` kept out of the table is, to this listing,
+    /// no samples at all.
+    #[must_use]
+    pub fn of<T>(read: Option<&T>, shown: bool) -> Self {
+        match (read, shown) {
+            // A read that never answered cannot have put a figure on screen, so
+            // the second half has nothing to add.
+            (None, _) => Self::Unreadable,
+            (Some(_), true) => Self::Shown,
+            (Some(_), false) => Self::Unsampled,
+        }
+    }
+
+    /// Whether the table lost its usage columns, whichever way it lost them.
+    ///
+    /// Both losing outcomes now leave a footnote above the table, which is what
+    /// `k8s::nodes::Missing` and `k8s::pods::Missing` are really asking about
+    /// when they decide whether the "nothing ranked" note can point upwards
+    /// instead of repeating the advice.
+    #[must_use]
+    pub fn is_missing(self) -> bool {
+        !matches!(self, Self::Shown)
+    }
+}
+
+/// The sentence for a metrics read that answered, and answered with nothing.
+///
+/// Every branch of [`explain`] is a failure; this is not one. The aggregation
+/// layer is registered, the request succeeded, and the reply held no reading for
+/// anything in this listing. On screen that is indistinguishable from a cluster
+/// with no metrics-server — the usage columns are simply not there — so it earns
+/// the same footnote, worded for a scraper that has not got here yet rather than
+/// one that was never installed.
+///
+/// `cluster` is a human label such as `prod (us-east-1)`, not an ARN.
+#[must_use]
+pub fn unsampled(cluster: &str) -> String {
+    format!(
+        "metrics-server answered for {cluster}, so it is installed \u{2014} it has simply not got to anything in this listing.\n\
+         A fresh install, or a node that has only just joined, takes a scrape interval or two to appear; if it stays empty, check the metrics-server pod in kube-system."
+    )
+}
+
 /// One pod's sampled usage, as `metrics.k8s.io/v1beta1` reports it.
 ///
 /// Unlike [`NodeMetrics`] this has no `usage` of its own: metrics-server
@@ -128,6 +450,14 @@ impl Usage {
 pub struct PodMetrics {
     #[serde(default)]
     pub metadata: ObjectMeta,
+    /// When the reading was taken. See [`NodeMetrics::timestamp`]; the pod half
+    /// of the API stamps the pod, not each container, so one pod is one sample
+    /// however many containers it has.
+    #[serde(default)]
+    pub timestamp: Option<Time>,
+    /// How long it was averaged over. See [`NodeMetrics::window`].
+    #[serde(default)]
+    pub window: Option<String>,
     #[serde(default)]
     pub containers: Vec<ContainerMetrics>,
 }
@@ -221,17 +551,22 @@ fn sum_containers(containers: &[ContainerMetrics], resource: &str) -> Option<Qua
 /// could be joined onto, and putting it on the wrong one would be worse than
 /// the `-` the renderer already has for a pod nothing was sampled for.
 #[must_use]
-pub fn by_pod(metrics: &[PodMetrics]) -> BTreeMap<PodKey, Usage> {
+pub fn by_pod(metrics: &[PodMetrics]) -> BTreeMap<PodKey, Sample> {
     metrics
         .iter()
-        .filter_map(|sample| {
-            let namespace = sample
+        .filter_map(|item| {
+            let namespace = item
                 .metadata
                 .namespace
                 .as_deref()
                 .filter(|ns| !ns.is_empty())?;
-            let name = sample.metadata.name.as_deref().filter(|n| !n.is_empty())?;
-            Some(((namespace.to_owned(), name.to_owned()), pod_usage(sample)))
+            let name = item.metadata.name.as_deref().filter(|n| !n.is_empty())?;
+            let sample = Sample::new(
+                pod_usage(item),
+                item.timestamp.as_ref(),
+                item.window.as_deref(),
+            );
+            Some(((namespace.to_owned(), name.to_owned()), sample))
         })
         .collect()
 }
@@ -305,7 +640,7 @@ impl Source for Client {
 ///
 /// Generic over [`Source`] so the command layer's happy path and its
 /// degraded one are both reachable from a test without a cluster.
-pub async fn usage_by_node<S: Source>(source: &S) -> Result<BTreeMap<String, Usage>, kube::Error> {
+pub async fn usage_by_node<S: Source>(source: &S) -> Result<BTreeMap<String, Sample>, kube::Error> {
     Ok(by_node(&source.node_usage().await?))
 }
 
@@ -317,7 +652,7 @@ pub async fn usage_by_pod<S: Source>(
     source: &S,
     scope: &Scope,
     selectors: &Selectors,
-) -> Result<BTreeMap<PodKey, Usage>, kube::Error> {
+) -> Result<BTreeMap<PodKey, Sample>, kube::Error> {
     Ok(by_pod(&source.pod_usage(scope, selectors).await?))
 }
 
@@ -327,12 +662,17 @@ pub async fn usage_by_pod<S: Source>(
 /// and guessing would be worse than the `-` the caller already renders for a
 /// node the sampler has not reached.
 #[must_use]
-pub fn by_node(metrics: &[NodeMetrics]) -> BTreeMap<String, Usage> {
+pub fn by_node(metrics: &[NodeMetrics]) -> BTreeMap<String, Sample> {
     metrics
         .iter()
-        .filter_map(|sample| {
-            let name = sample.metadata.name.as_deref().filter(|n| !n.is_empty())?;
-            Some((name.to_owned(), Usage::read(&sample.usage)))
+        .filter_map(|item| {
+            let name = item.metadata.name.as_deref().filter(|n| !n.is_empty())?;
+            let sample = Sample::new(
+                Usage::read(&item.usage),
+                item.timestamp.as_ref(),
+                item.window.as_deref(),
+            );
+            Some((name.to_owned(), sample))
         })
         .collect()
 }
@@ -380,12 +720,27 @@ mod tests {
         kube::Error::Api(Status::failure(message, "Failure").with_code(code).boxed())
     }
 
+    /// The instant every fixture here is dated against.
+    fn now() -> Timestamp {
+        "2026-08-17T12:00:00Z"
+            .parse()
+            .expect("a literal RFC 3339 timestamp")
+    }
+
+    fn seconds_ago(seconds: i64) -> Time {
+        Time(now() - SignedDuration::from_secs(seconds))
+    }
+
+    /// Stamped as metrics-server stamps a reading it took a moment ago, since
+    /// that is what almost every sample the tool sees looks like.
     fn sample(name: &str, cpu: &str, memory: &str) -> NodeMetrics {
         NodeMetrics {
             metadata: ObjectMeta {
                 name: Some(name.to_owned()),
                 ..Default::default()
             },
+            timestamp: Some(seconds_ago(8)),
+            window: Some("20.04s".to_owned()),
             usage: [("cpu", cpu), ("memory", memory)]
                 .into_iter()
                 .map(|(key, value)| (key.to_owned(), ApiQuantity(value.to_owned())))
@@ -400,7 +755,18 @@ mod tests {
                 name: Some(name.to_owned()),
                 ..Default::default()
             },
+            timestamp: Some(seconds_ago(8)),
+            window: Some("20.04s".to_owned()),
             containers,
+        }
+    }
+
+    /// A sample carrying nothing but its stamps, for dating a listing.
+    fn stamped(taken_at: Option<Timestamp>, window: Option<&str>) -> Sample {
+        Sample {
+            usage: Usage::default(),
+            taken_at,
+            window: window.and_then(parse_duration),
         }
     }
 
@@ -504,9 +870,12 @@ mod tests {
         ]);
 
         assert_eq!(index.len(), 2);
-        assert_eq!(index["node-a"].cpu, Some(Quantity::parse("412m").unwrap()));
         assert_eq!(
-            index["node-b"].memory,
+            index["node-a"].usage.cpu,
+            Some(Quantity::parse("412m").unwrap())
+        );
+        assert_eq!(
+            index["node-b"].usage.memory,
             Some(Quantity::parse("8Gi").unwrap())
         );
     }
@@ -528,7 +897,7 @@ mod tests {
         let mut broken = sample("node-a", "lots", "3925716Ki");
         broken.usage.remove("memory");
 
-        let usage = by_node(&[broken])["node-a"];
+        let usage = by_node(&[broken])["node-a"].usage;
         assert_eq!(usage.cpu, None);
         assert_eq!(usage.memory, None);
     }
@@ -543,7 +912,10 @@ mod tests {
         let source = Fake::nodes(Ok(vec![sample("node-a", "412m", "3925716Ki")]));
         let index = usage_by_node(&source).await.unwrap();
 
-        assert_eq!(index["node-a"].cpu, Some(Quantity::parse("412m").unwrap()));
+        assert_eq!(
+            index["node-a"].usage.cpu,
+            Some(Quantity::parse("412m").unwrap())
+        );
     }
 
     #[tokio::test]
@@ -712,11 +1084,15 @@ mod tests {
 
         assert_eq!(index.len(), 2);
         assert_eq!(
-            index[&("kube-system".to_owned(), "coredns".to_owned())].cpu,
+            index[&("kube-system".to_owned(), "coredns".to_owned())]
+                .usage
+                .cpu,
             Some(Quantity::parse("5m").unwrap())
         );
         assert_eq!(
-            index[&("payments".to_owned(), "coredns".to_owned())].cpu,
+            index[&("payments".to_owned(), "coredns".to_owned())]
+                .usage
+                .cpu,
             Some(Quantity::parse("9m").unwrap())
         );
     }
@@ -772,7 +1148,9 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            index[&("payments".to_owned(), "api-7c9f".to_owned())].cpu,
+            index[&("payments".to_owned(), "api-7c9f".to_owned())]
+                .usage
+                .cpu,
             Some(Quantity::parse("250m").unwrap())
         );
     }
@@ -787,5 +1165,429 @@ mod tests {
             .expect_err("a 404 is not a usage listing");
 
         assert!(explain(&error, "prod (us-east-1)").contains("metrics-server"));
+    }
+
+    // --- The averaging window, off the wire -------------------------------
+
+    #[test]
+    fn the_window_metrics_server_actually_sends_is_read_to_the_nanosecond() {
+        // `20.04s` is what a default metrics-server reports, and it is not
+        // representable in binary floating point — which is why this is parsed
+        // with integers rather than through an `f64`.
+        assert_eq!(
+            parse_duration("20.04s"),
+            Some(SignedDuration::from_nanos(20_040_000_000))
+        );
+    }
+
+    #[test]
+    fn every_unit_go_prints_a_duration_in_is_understood() {
+        // Both spellings of the micro sign: Go emits U+00B5, and encoders that
+        // normalise emit the visually identical Greek U+03BC.
+        let cases = [
+            ("1ns", SignedDuration::from_nanos(1)),
+            ("1us", SignedDuration::from_nanos(1_000)),
+            ("1\u{b5}s", SignedDuration::from_nanos(1_000)),
+            ("1\u{3bc}s", SignedDuration::from_nanos(1_000)),
+            ("1ms", SignedDuration::from_nanos(1_000_000)),
+            ("1s", SignedDuration::from_secs(1)),
+            ("1m", SignedDuration::from_secs(60)),
+            ("1h", SignedDuration::from_secs(3_600)),
+        ];
+
+        for (text, expected) in cases {
+            assert_eq!(parse_duration(text), Some(expected), "{text}");
+        }
+    }
+
+    #[test]
+    fn a_unit_is_never_read_as_a_shorter_one_it_ends_with() {
+        // The bug this ordering exists to prevent: `ms` read as `m` turns half a
+        // second into half an hour, and every listing then looks fresh forever.
+        assert_eq!(
+            parse_duration("500ms"),
+            Some(SignedDuration::from_millis(500))
+        );
+        assert_eq!(
+            parse_duration("500ns"),
+            Some(SignedDuration::from_nanos(500))
+        );
+    }
+
+    #[test]
+    fn a_compound_duration_adds_its_parts_up() {
+        // How Go prints anything over a minute, which is what a metrics-server
+        // configured with a slower resolution reports.
+        assert_eq!(parse_duration("1m0s"), Some(SignedDuration::from_secs(60)));
+        assert_eq!(parse_duration("1m30s"), Some(SignedDuration::from_secs(90)));
+        assert_eq!(
+            parse_duration("1h2m3s"),
+            Some(SignedDuration::from_secs(3_723))
+        );
+        assert_eq!(
+            parse_duration("2m0.5s"),
+            Some(SignedDuration::from_millis(120_500))
+        );
+    }
+
+    #[test]
+    fn a_leading_dot_is_the_zero_go_lets_you_leave_out() {
+        assert_eq!(
+            parse_duration(".5s"),
+            Some(SignedDuration::from_millis(500))
+        );
+    }
+
+    #[test]
+    fn a_zero_window_is_read_rather_than_rejected() {
+        // Go writes zero as `0s` and accepts a bare `0`. Reading it is not the
+        // same as trusting it — see the staleness test below, which refuses to
+        // judge an age against a window of nothing.
+        assert_eq!(parse_duration("0"), Some(SignedDuration::ZERO));
+        assert_eq!(parse_duration("0s"), Some(SignedDuration::ZERO));
+    }
+
+    #[test]
+    fn a_signed_duration_keeps_its_sign() {
+        assert_eq!(parse_duration("-20s"), Some(-SignedDuration::from_secs(20)));
+        assert_eq!(parse_duration("+20s"), Some(SignedDuration::from_secs(20)));
+    }
+
+    #[test]
+    fn precision_finer_than_a_nanosecond_is_dropped_rather_than_refused() {
+        // Go truncates here too. Refusing the whole window over a digit nothing
+        // can represent would cost the note for no gain.
+        assert_eq!(
+            parse_duration("1.9999999999s"),
+            Some(SignedDuration::from_nanos(1_999_999_999))
+        );
+    }
+
+    #[test]
+    fn a_window_that_is_not_a_duration_is_no_window_rather_than_a_guess() {
+        // Every one of these would otherwise become a number, and a wrong window
+        // either accuses a healthy cluster of staleness or excuses a scraper
+        // that has stopped.
+        for text in [
+            "",       // absent
+            "20",     // a bare number: Go requires the unit
+            "s",      // a bare unit
+            "twenty", // prose
+            "1x",     // a unit we do not know
+            "1.2.3s", // two decimal points
+            "1s2",    // a trailing number with nothing to scale it
+            "-",      // a sign and nothing else
+            "PT20S",  // ISO 8601, which this is deliberately not
+        ] {
+            assert_eq!(parse_duration(text), None, "{text:?}");
+        }
+    }
+
+    #[test]
+    fn a_duration_too_large_to_count_in_nanoseconds_is_refused_not_wrapped() {
+        // Overflow reads as "we could not tell", which costs the note. Wrapping
+        // would read as a plausible small window and quietly change the verdict.
+        assert_eq!(parse_duration("9223372036854775807h"), None);
+        assert_eq!(parse_duration("9999999999999999999999s"), None);
+    }
+
+    #[test]
+    fn a_sample_carries_the_stamps_it_arrived_with() {
+        let index = by_node(&[sample("node-a", "412m", "3925716Ki")]);
+
+        assert_eq!(
+            index["node-a"].taken_at,
+            Some(now() - SignedDuration::from_secs(8))
+        );
+        assert_eq!(
+            index["node-a"].window,
+            Some(SignedDuration::from_nanos(20_040_000_000))
+        );
+    }
+
+    #[test]
+    fn a_pod_sample_carries_the_stamps_it_arrived_with() {
+        // The pod half stamps the pod, not each container, so a pod with three
+        // containers is still one sample with one age.
+        let index = by_pod(&[pod_sample(
+            "payments",
+            "api-7c9f",
+            vec![container("app", "250m", "512Mi")],
+        )]);
+
+        let sample = index[&("payments".to_owned(), "api-7c9f".to_owned())];
+        assert_eq!(sample.taken_at, Some(now() - SignedDuration::from_secs(8)));
+        assert_eq!(
+            sample.window,
+            Some(SignedDuration::from_nanos(20_040_000_000))
+        );
+    }
+
+    #[test]
+    fn a_sample_with_unreadable_stamps_keeps_its_figures() {
+        // The stamps are the sampler's word, and losing them costs the note
+        // rather than the reading — a figure with no date is still a figure.
+        let mut odd = sample("node-a", "412m", "3925716Ki");
+        odd.timestamp = None;
+        odd.window = Some("whenever".to_owned());
+
+        let read = by_node(&[odd])["node-a"];
+
+        assert_eq!(read.usage.cpu, Some(Quantity::parse("412m").unwrap()));
+        assert_eq!(read.taken_at, None);
+        assert_eq!(read.window, None);
+    }
+
+    // --- Dating a listing --------------------------------------------------
+
+    #[test]
+    fn a_listing_is_dated_by_its_oldest_sample() {
+        // The note is a guarantee about the whole table, so it is only as good
+        // as the worst row: "up to 5m old" must cover the 5m one.
+        let samples = [
+            stamped(Some(now() - SignedDuration::from_secs(10)), Some("20s")),
+            stamped(Some(now() - SignedDuration::from_secs(300)), Some("20s")),
+            stamped(Some(now() - SignedDuration::from_secs(45)), Some("20s")),
+        ];
+
+        let freshness = freshness(&samples, now()).expect("a stamped listing can be dated");
+
+        assert_eq!(freshness.age, SignedDuration::from_secs(300));
+    }
+
+    #[test]
+    fn the_window_reported_is_the_longest_any_sample_gave() {
+        // Disagreeing windows mean two scrapers, or one being reconfigured. The
+        // slower of them is what decides how long "up to date" lasts.
+        let samples = [
+            stamped(Some(now()), Some("20s")),
+            stamped(Some(now()), Some("1m0s")),
+        ];
+
+        let freshness = freshness(&samples, now()).expect("a stamped listing can be dated");
+
+        assert_eq!(freshness.window, Some(SignedDuration::from_secs(60)));
+    }
+
+    #[test]
+    fn a_listing_nothing_stamped_cannot_be_dated_and_says_nothing() {
+        // Half a note is worse than none: "averaged over 20s" with no age beside
+        // it would read as a claim that the figures are current.
+        let samples = [stamped(None, Some("20s")), stamped(None, None)];
+
+        assert_eq!(freshness(&samples, now()), None);
+    }
+
+    #[test]
+    fn an_empty_listing_has_no_freshness_to_report() {
+        assert_eq!(freshness(&[], now()), None);
+    }
+
+    #[test]
+    fn one_stamped_sample_dates_a_listing_the_rest_of_which_is_undated() {
+        // `any` rather than `all`, matching the rule the usage columns
+        // themselves follow: one unstamped row does not cost everyone the note.
+        let samples = [
+            stamped(None, None),
+            stamped(Some(now() - SignedDuration::from_secs(30)), Some("20s")),
+        ];
+
+        let freshness = freshness(&samples, now()).expect("one stamp is enough");
+
+        assert_eq!(freshness.age, SignedDuration::from_secs(30));
+    }
+
+    #[test]
+    fn a_sample_stamped_in_the_future_reads_as_no_age_rather_than_a_negative_one() {
+        // Clock skew between the API server and here. `human_duration` already
+        // treats a node created in the future the same way.
+        let samples = [stamped(
+            Some(now() + SignedDuration::from_secs(30)),
+            Some("20s"),
+        )];
+
+        let freshness = freshness(&samples, now()).expect("a stamped listing can be dated");
+
+        assert_eq!(freshness.age, SignedDuration::ZERO);
+        assert!(!freshness.is_stale());
+    }
+
+    // --- Staleness ---------------------------------------------------------
+
+    #[test]
+    fn a_listing_within_a_couple_of_windows_is_not_stale() {
+        // One window of lag is what a working scraper looks like.
+        for seconds in [0, 20, 39, 40] {
+            let samples = [stamped(
+                Some(now() - SignedDuration::from_secs(seconds)),
+                Some("20s"),
+            )];
+            let freshness = freshness(&samples, now()).expect("a stamped listing can be dated");
+
+            assert!(!freshness.is_stale(), "{seconds}s");
+        }
+    }
+
+    #[test]
+    fn a_listing_older_than_a_couple_of_windows_is_stale() {
+        // Two windows behind means a scrape did not happen, which is what a
+        // stopped metrics-server looks like from here: the request still
+        // succeeds, and the figures stop moving.
+        for seconds in [41, 300, 86_400] {
+            let samples = [stamped(
+                Some(now() - SignedDuration::from_secs(seconds)),
+                Some("20s"),
+            )];
+            let freshness = freshness(&samples, now()).expect("a stamped listing can be dated");
+
+            assert!(freshness.is_stale(), "{seconds}s");
+        }
+    }
+
+    #[test]
+    fn a_listing_with_no_window_is_never_accused_of_being_stale() {
+        // Without a window there is no scale to judge an age against, and
+        // "your figures are stale" is not a sentence to print on a guess.
+        let samples = [stamped(
+            Some(now() - SignedDuration::from_secs(86_400)),
+            None,
+        )];
+
+        let freshness = freshness(&samples, now()).expect("a stamped listing can be dated");
+
+        assert!(!freshness.is_stale());
+    }
+
+    #[test]
+    fn a_window_of_zero_is_no_scale_to_judge_staleness_by_either() {
+        // `0s` would make every listing older than an instant stale, including
+        // the one taken half a second ago.
+        let samples = [stamped(
+            Some(now() - SignedDuration::from_secs(1)),
+            Some("0s"),
+        )];
+
+        let freshness = freshness(&samples, now()).expect("a stamped listing can be dated");
+
+        assert!(!freshness.is_stale());
+    }
+
+    // --- What the table says -----------------------------------------------
+
+    #[test]
+    fn the_freshness_note_gives_the_age_and_the_window_it_covers() {
+        let samples = [stamped(
+            Some(now() - SignedDuration::from_secs(14)),
+            Some("20.04s"),
+        )];
+        let freshness = freshness(&samples, now()).expect("a stamped listing can be dated");
+
+        assert_eq!(
+            freshness_note(freshness),
+            "Usage is up to 14s old, averaged over 20s."
+        );
+    }
+
+    #[test]
+    fn a_stale_listing_says_so_and_says_what_to_go_and_look_at() {
+        // The diagnosis on its own would leave the reader with a number and no
+        // next command; the second line is the point of the first.
+        let samples = [stamped(
+            Some(now() - SignedDuration::from_secs(370)),
+            Some("20s"),
+        )];
+        let freshness = freshness(&samples, now()).expect("a stamped listing can be dated");
+
+        let note = freshness_note(freshness);
+
+        assert!(note.contains("6m10s"), "{note}");
+        assert!(note.contains("stale"), "{note}");
+        assert!(note.contains("kube-system"), "{note}");
+    }
+
+    #[test]
+    fn a_listing_with_no_window_dates_itself_without_claiming_one() {
+        let samples = [stamped(Some(now() - SignedDuration::from_secs(14)), None)];
+        let freshness = freshness(&samples, now()).expect("a stamped listing can be dated");
+
+        assert_eq!(freshness_note(freshness), "Usage is up to 14s old.");
+    }
+
+    #[test]
+    fn a_fresh_listing_never_reads_as_a_warning() {
+        // This line is under every table on a healthy cluster, so it has to be
+        // a fact and not an alarm.
+        let samples = [stamped(
+            Some(now() - SignedDuration::from_secs(8)),
+            Some("20s"),
+        )];
+        let freshness = freshness(&samples, now()).expect("a stamped listing can be dated");
+
+        let note = freshness_note(freshness);
+
+        assert!(!note.contains("stale"), "{note}");
+        assert!(!note.contains("kube-system"), "{note}");
+        assert_eq!(note.lines().count(), 1, "{note}");
+    }
+
+    #[test]
+    fn an_unsampled_listing_says_metrics_server_is_there_rather_than_missing() {
+        // The whole difference from the 404 footnote beside it: telling the user
+        // to install something they already have sends them the wrong way.
+        let message = unsampled("prod (us-east-1)");
+
+        assert!(message.contains("prod (us-east-1)"), "{message}");
+        assert!(message.contains("installed"), "{message}");
+        assert!(message.contains("kube-system"), "{message}");
+        assert!(
+            !message.contains("github.com/kubernetes-sigs/metrics-server"),
+            "advice to install what is already installed: {message}"
+        );
+    }
+
+    // --- Which of the three cases a listing is in --------------------------
+
+    #[test]
+    fn usage_that_reached_the_rows_is_shown_and_wants_dating() {
+        let read = by_node(&[sample("node-a", "412m", "3925716Ki")]);
+
+        assert_eq!(Outcome::of(Some(&read), true), Outcome::Shown);
+        assert!(!Outcome::of(Some(&read), true).is_missing());
+    }
+
+    #[test]
+    fn a_read_that_answered_with_nothing_is_told_apart_from_one_that_failed() {
+        // The case this task exists for. Both lose the columns; only one of them
+        // means metrics-server is missing.
+        let empty = by_node(&[]);
+
+        assert_eq!(Outcome::of(Some(&empty), false), Outcome::Unsampled);
+        assert_eq!(
+            Outcome::of(None::<&BTreeMap<String, Sample>>, false),
+            Outcome::Unreadable
+        );
+    }
+
+    #[test]
+    fn both_ways_of_losing_the_columns_count_as_missing() {
+        // Which is what the "nothing ranked" note asks, since both now leave a
+        // footnote above the table for it to point at.
+        assert!(Outcome::Unsampled.is_missing());
+        assert!(Outcome::Unreadable.is_missing());
+    }
+
+    #[test]
+    fn samples_that_no_row_shows_are_not_samples_this_listing_has() {
+        // `eks pods --field-selector spec.nodeName=...` narrows the rows but not
+        // the metrics request, so the reply can be full of readings for pods the
+        // table does not contain. Dating the table from those would put an age
+        // under a listing they are not in.
+        let read = by_pod(&[pod_sample(
+            "payments",
+            "elsewhere",
+            vec![container("app", "250m", "512Mi")],
+        )]);
+
+        assert_eq!(Outcome::of(Some(&read), false), Outcome::Unsampled);
     }
 }

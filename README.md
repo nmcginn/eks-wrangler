@@ -58,6 +58,8 @@ $ eks nodes --context staging
 NAME                         STATUS                       VERSION              CPU      CPU REQ      CPU USE      MEMORY         MEM REQ     MEM USE      AGE
 ip-10-0-1-9.ec2.internal     Ready                        v1.33.1-eks-1a2b3c4  3920m/4  1500m (38%)  392m (10%)   14.8Gi/15.6Gi  6Gi (41%)   3.7Gi (25%)  12d
 ip-10-0-11-200.ec2.internal  NotReady,SchedulingDisabled  v1.32.9-eks-9f8e7d6  3920m/4  3800m (97%)  1200m (31%)  14.8Gi/15.6Gi  15Gi (96%)  4Gi (27%)    10h
+
+Usage is up to 12s old, averaged over 20s.
 ```
 
 `CPU` and `MEMORY` are what the node has: allocatable — what pods may actually
@@ -76,6 +78,31 @@ Those two columns need the `metrics.k8s.io` API, which comes from
 [metrics-server](https://github.com/kubernetes-sigs/metrics-server) — an add-on
 EKS does not install for you. Without it the columns are simply absent and a note
 under the table says so; the rest of the listing is unaffected.
+
+There is a third case between those two, and it used to be silent: metrics-server
+installed, answering, and with nothing to say yet — a fresh install, or a node
+that joined a moment ago. The columns vanish exactly as they do when it is
+missing, so the note says which of the two it is, because the advice is opposite:
+
+```
+CPU USE and MEM USE are not shown because nothing here has been sampled yet.
+metrics-server answered for staging (eu-west-1), so it is installed — it has simply not got to anything in this listing.
+A fresh install, or a node that has only just joined, takes a scrape interval or two to appear; if it stays empty, check the metrics-server pod in kube-system.
+```
+
+Where the columns *are* there, the line under the table says how old they are:
+`Usage is up to 12s old, averaged over 20s.` A usage figure with nothing beside
+it cannot be told from an instantaneous reading, and metrics-server going quiet
+does not fail the request that asks it for a sample — the same table keeps
+rendering, with figures that are minutes old and look exactly like fresh ones.
+The age is the oldest sample in the listing, so it covers every row. Past a
+couple of sampling windows the line says the figures are stale and where to
+look:
+
+```
+Usage is up to 6m10s old, averaged over 20s — more than two sampling windows, so these figures are stale.
+metrics-server can stop scraping without failing this request; check its pod in kube-system.
+```
 
 `--sort` reorders the node listing too, by `name` (the default, unchanged),
 `status`, `cpu`, `memory`, `cpu-requested`, `memory-requested`, or `age`, and
@@ -170,6 +197,14 @@ with it: there is no denominator, and `262m/0` is not a percentage of anything.
 The columns appear only when metrics-server answers — no metrics-server means no
 empty columns, just a note under the table — and a pod it has not sampled yet
 reads `-` rather than a zero that would look like an idle pod.
+
+The same three notes the node table carries appear here, worded the same way,
+because they are facts about metrics-server rather than about either table:
+`Usage is up to 12s old, averaged over 20s.` under a listing that has figures,
+the staleness warning past a couple of sampling windows, and — where
+metrics-server answered with nothing for these pods, which happens to a namespace
+whose pods have only just started — a note saying it is installed and has not got
+here yet, rather than the one telling you to install it.
 
 `--sort` reorders the listing by a column. Alphabetical order is the right one
 for reading a namespace and the wrong one during an incident — the pod that

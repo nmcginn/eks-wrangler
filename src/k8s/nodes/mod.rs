@@ -360,7 +360,14 @@ fn severity(ready: Option<bool>, cordoned: bool) -> Severity {
 /// carries the news instead. One node the sampler has not reached yet is not
 /// enough to drop the columns for everyone else, so this is `any` rather than
 /// `all`.
-fn shows_usage(rows: &[NodeRow]) -> bool {
+///
+/// Public because the command layer asks the same question for a second reason:
+/// a table with no usage columns owes the reader a footnote saying why, and
+/// which footnote that is depends on whether the read failed or merely came back
+/// empty. Asking the rows rather than the request keeps the note and the columns
+/// from disagreeing.
+#[must_use]
+pub fn shows_usage(rows: &[NodeRow]) -> bool {
     rows.iter()
         .any(|row| row.cpu_used.amount.is_some() || row.memory_used.amount.is_some())
 }
@@ -540,6 +547,24 @@ pub fn requests_unavailable(explanation: &str) -> String {
 pub fn usage_unavailable(explanation: &str) -> String {
     format!(
         "CPU USE and MEM USE are not shown because live usage could not be read.\n{explanation}"
+    )
+}
+
+/// The footnote shown when the metrics read succeeded and had nothing in it.
+///
+/// The columns vanish exactly as they do when the read fails, and until now
+/// nothing was printed about it — because the footnote above is written on the
+/// error path and there was no error. A table that quietly drops two columns
+/// after a successful request is the worst of the three cases: the user cannot
+/// tell it apart from a cluster with no metrics-server, and the advice for the
+/// two is different.
+///
+/// `explanation` is [`crate::k8s::metrics::unsampled`]'s sentence, which says
+/// metrics-server is installed and what waiting on it looks like.
+#[must_use]
+pub fn usage_unsampled(explanation: &str) -> String {
+    format!(
+        "CPU USE and MEM USE are not shown because nothing here has been sampled yet.\n{explanation}"
     )
 }
 
@@ -993,6 +1018,65 @@ mod tests {
     }
 
     #[test]
+    fn a_footnote_tells_an_unsampled_cluster_from_one_with_no_metrics_server() {
+        // Same two missing columns, opposite advice: this cluster has
+        // metrics-server, so telling the user to install it would send them off
+        // to fix something that is not broken.
+        let rows = [NodeRow::from_node(
+            &healthy_node(),
+            Some(idle()),
+            None,
+            now(),
+        )];
+        let note = usage_unsampled(&crate::k8s::metrics::unsampled("prod (us-east-1)"));
+
+        let output = render(&rows, "prod (us-east-1)", &[note], Width::Default);
+        let (table, footnote) = output
+            .split_once("\n\n")
+            .expect("a blank line before the note");
+
+        assert_eq!(
+            table,
+            render(&rows, "prod (us-east-1)", &[], Width::Default)
+        );
+        assert!(footnote.contains("CPU USE"), "{footnote}");
+        assert!(footnote.contains("MEM USE"), "{footnote}");
+        assert!(footnote.contains("sampled"), "{footnote}");
+        assert!(
+            !footnote.contains("could not be read"),
+            "the failed-read wording on a read that succeeded: {footnote}"
+        );
+    }
+
+    #[test]
+    fn a_sampled_listing_says_how_old_its_figures_are() {
+        // The line that goes under every healthy table: a usage column with
+        // nothing beside it cannot be told from an instantaneous reading, and
+        // metrics-server going quiet never fails the request that asks it.
+        let rows = [NodeRow::from_node(
+            &healthy_node(),
+            Some(idle()),
+            Some(used("392m", "1552515Ki")),
+            now(),
+        )];
+        let sample = crate::k8s::metrics::Sample {
+            usage: used("392m", "1552515Ki"),
+            taken_at: Some(now() - SignedDuration::from_secs(12)),
+            window: Some(SignedDuration::from_secs(20)),
+        };
+        let freshness = crate::k8s::metrics::freshness(&[sample], now())
+            .expect("a stamped sample dates the listing");
+        let note = crate::k8s::metrics::freshness_note(freshness);
+
+        let output = render(&rows, "prod (us-east-1)", &[note], Width::Default);
+
+        assert!(
+            output.ends_with("\n\nUsage is up to 12s old, averaged over 20s."),
+            "{output}"
+        );
+    }
+
+    #[test]
     fn two_footnotes_are_kept_apart_rather_than_run_together() {
         // A role that can read neither pods nor metrics gets both notes, and
         // they must not read as one paragraph.
@@ -1077,22 +1161,62 @@ mod tests {
     }
 
     #[test]
-    fn an_unsampled_node_the_command_did_not_footnote_explains_itself() {
-        // metrics-server answered, so no footnote above says anything, but it
-        // has not reached this node yet and the usage columns are gone all the
-        // same. Nothing else on screen accounts for it, so the note cannot lean
-        // on something above it.
+    fn a_column_that_is_in_the_table_and_ranks_nothing_explains_itself() {
+        // metrics-server answered and this node was sampled, so the `CPU USE`
+        // column is right there — but the API server has not said what the node
+        // can give out, so there is no share to rank by. Nothing above the table
+        // is about that, so the note cannot lean on something above it.
+        //
+        // The listing where nothing at all was sampled no longer reaches this
+        // branch: it now earns a footnote of its own, and `commands::nodes`
+        // reports it as `Missing { usage: true }` so the note points upwards.
+        let mut sampled_but_undescribed = healthy_node();
+        if let Some(status) = sampled_but_undescribed.status.as_mut() {
+            status.allocatable = None;
+        }
+        let rows = [NodeRow::from_node(
+            &sampled_but_undescribed,
+            Some(idle()),
+            Some(used("392m", "1552515Ki")),
+            now(),
+        )];
+
+        assert!(shows_usage(&rows), "the columns should be in the table");
+
+        let notes = sort_notes(&rows, Order::Cpu, Missing::default());
+
+        // The booked orderings rank by share too, so removing the denominator
+        // takes them with it — which is exactly why the advice is computed from
+        // the rows rather than listed out by hand.
+        assert_eq!(
+            notes[1],
+            "Nothing here has cpu to sort by.\nSort by status or age instead."
+        );
+    }
+
+    #[test]
+    fn a_listing_nothing_sampled_points_at_the_footnote_that_now_explains_it() {
+        // The other half of the pair above, and what changed: metrics-server
+        // answered with nothing, the columns are gone, and there is now a
+        // footnote saying so — so the note points at it rather than restating
+        // the advice a paragraph later.
         let rows = [NodeRow::from_node(
             &healthy_node(),
             Some(idle()),
             None,
             now(),
         )];
-        let notes = sort_notes(&rows, Order::Cpu, Missing::default());
+
+        assert!(
+            !shows_usage(&rows),
+            "there is nothing to put in the columns"
+        );
+
+        let notes = sort_notes(&rows, Order::Cpu, no_usage());
 
         assert_eq!(
             notes[1],
-            "Nothing here has cpu to sort by.\n\
+            "Nothing here has cpu to sort by, for the reason above.\n\
              Sort by status, cpu-requested, memory-requested, or age instead."
         );
     }
