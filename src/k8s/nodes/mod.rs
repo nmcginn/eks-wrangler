@@ -7,6 +7,9 @@
 //! server never filled in — is a test rather than a cluster you have to break
 //! on purpose.
 
+use std::cmp::Reverse;
+use std::collections::{BTreeMap, BTreeSet};
+
 use k8s_openapi::api::core::v1::{Node, NodeSystemInfo};
 use k8s_openapi::jiff::Timestamp;
 use kube::Client;
@@ -20,6 +23,7 @@ use crate::format;
 use crate::k8s::metrics::Usage;
 use crate::k8s::pods::Requests;
 use crate::k8s::quantity::{self, Quantity};
+use crate::k8s::resource;
 use crate::theme::Severity;
 
 /// Ask the API server for every node in the cluster.
@@ -82,6 +86,97 @@ pub struct NodeRow {
     ///
     /// Only shown under `--wide`.
     pub container_runtime: String,
+    /// The extended resources this node advertises — GPUs, and anything else a
+    /// device plugin or an administrator put on it — keyed by their
+    /// fully-qualified name.
+    ///
+    /// Empty for the overwhelming majority of nodes, and a column each for the
+    /// rest. A node that reports none of a resource another node in the listing
+    /// does is simply absent from this map rather than carrying a zero: it has
+    /// no GPUs, which is a different fact from having zero of them free.
+    pub devices: BTreeMap<String, Device>,
+}
+
+/// One extended resource on one node: how many of them it will hand out, and
+/// how many the pods already there have booked.
+///
+/// The reason this is not a third [`Share`] is the denominator question a
+/// device asks and CPU does not. A node's CPU column shows allocatable over
+/// capacity because the gap between them is the kubelet's own reservation, on
+/// every node, always. A device's gap is not routine — it is a device the
+/// kubelet has and will not schedule onto, usually one its plugin marked
+/// unhealthy — so it belongs in a sentence under the table rather than in a
+/// pair of numbers a reader has to notice are different.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Device {
+    /// What the node has of it, and how many of those it will hand out.
+    pub capacity: Capacity,
+    /// What the pods already on this node have booked, or `None` when the pods
+    /// could not be listed at all.
+    ///
+    /// Never `None` for a device nobody asked for: that is a real zero, and a
+    /// node with four idle GPUs must not read like a node whose pod listing
+    /// failed.
+    pub booked: Option<Quantity>,
+}
+
+impl Device {
+    /// What is booked, against what the scheduler will hand out.
+    ///
+    /// The same shape and the same denominator the CPU and memory columns use,
+    /// so a percentage means one thing across a row and the dashboard can take
+    /// a bar's width from it without inventing a second rule.
+    #[must_use]
+    pub fn share(self) -> Share {
+        Share {
+            amount: self.booked,
+            allocatable: self.capacity.allocatable,
+        }
+    }
+
+    /// `(offered, held)` when the node has more of this device than it will
+    /// hand out, and `None` when it offers everything it has.
+    ///
+    /// The cell shows what can be handed out, because that is the number that
+    /// decides whether the next pod fits — which leaves the difference
+    /// invisible, and the difference is exactly why a GPU pod that should fit
+    /// is sitting `Pending`. See [`devices_withheld`], which says so.
+    #[must_use]
+    pub fn withheld(self) -> Option<(Quantity, Quantity)> {
+        let allocatable = self.capacity.allocatable?;
+        let capacity = self.capacity.capacity?;
+        (allocatable < capacity).then_some((allocatable, capacity))
+    }
+
+    /// One table cell: what is booked, out of what the node will hand out.
+    ///
+    /// `2/4 (50%)`, which is the pod table's usage cell rather than either of
+    /// this table's two. Neither of those fits: `Capacity`'s pair would print
+    /// allocatable over capacity, which for a device is the same number twice
+    /// on every healthy node, and `Share`'s `2 (50%)` hides the total — and for
+    /// a device the total is the fact people came for. "This node has eight
+    /// A100s" is not something to work back out of a percentage.
+    fn cell(self) -> String {
+        let booked = self
+            .booked
+            .map_or_else(|| UNKNOWN.to_owned(), quantity::count);
+
+        let Some(allocatable) = self.capacity.allocatable else {
+            // Reported under `capacity` and not under `allocatable`, which
+            // happens for a moment while a node registers. There is nothing for
+            // the figure to be a share of, so it stands alone.
+            return booked;
+        };
+
+        let total = quantity::count(allocatable);
+        match self.share().ratio() {
+            Some(ratio) => format!("{booked}/{total} ({})", format::percentage(ratio)),
+            // No ratio means either no booked figure or a node offering none of
+            // a device it reports; `-/4` and `0/0` are both better than a
+            // percentage of nothing.
+            None => format!("{booked}/{total}"),
+        }
+    }
 }
 
 /// What a node has of one resource, and how much of it is left for pods.
@@ -217,7 +312,7 @@ impl NodeRow {
     #[must_use]
     pub fn from_node(
         node: &Node,
-        requested: Option<Requests>,
+        requested: Option<&Requests>,
         used: Option<Usage>,
         now: Timestamp,
     ) -> Self {
@@ -276,8 +371,47 @@ impl NodeRow {
             os_image: system_field(info, |info| &info.os_image),
             kernel_version: system_field(info, |info| &info.kernel_version),
             container_runtime: system_field(info, |info| &info.container_runtime_version),
+            devices: devices(node, requested),
         }
     }
+}
+
+/// The extended resources one node advertises, and what is booked of each.
+///
+/// The names are the union of the node's `capacity` and `allocatable` maps, not
+/// either one alone: a node that reports a device under one and not the other
+/// is mid-registration or mid-failure, and that is the state this column exists
+/// to make visible rather than one to drop a node's device for.
+///
+/// Which names count is [`crate::k8s::resource::is_extended`]'s answer, so
+/// `cpu`, `memory`, `pods`, and the `hugepages-*` entries beside them never
+/// arrive here — they either have a column already or want one with a heading
+/// of their own.
+fn devices(node: &Node, requested: Option<&Requests>) -> BTreeMap<String, Device> {
+    let status = node.status.as_ref();
+    let names: BTreeSet<&str> = [
+        status.and_then(|status| status.capacity.as_ref()),
+        status.and_then(|status| status.allocatable.as_ref()),
+    ]
+    .into_iter()
+    .flatten()
+    .flat_map(|map| map.keys().map(String::as_str))
+    .filter(|name| resource::is_extended(name))
+    .collect();
+
+    names
+        .into_iter()
+        .map(|name| {
+            let device = Device {
+                capacity: Capacity::read(node, name),
+                // A device absent from the pod total is one nobody asked for,
+                // which is a real zero. Only a failed pod listing — `None` all
+                // the way from the command layer — leaves it unknown.
+                booked: requested.map(|total| total.extended(name)),
+            };
+            (name.to_owned(), device)
+        })
+        .collect()
 }
 
 /// One of a node's reported addresses, by type, or `-` if it has none of it.
@@ -379,7 +513,7 @@ pub fn shows_usage(rows: &[NodeRow]) -> bool {
 /// and its cell under a subtly different one shifts every figure to the right
 /// of it under the wrong heading, and the table still renders.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Column {
+pub(crate) enum Column<'a> {
     Name,
     Status,
     Version,
@@ -389,6 +523,12 @@ pub(crate) enum Column {
     Memory,
     MemoryRequested,
     MemoryUsed,
+    /// One extended resource, by its fully-qualified name.
+    ///
+    /// The only column whose identity is not known until the nodes arrive, so
+    /// it borrows the name from the rows it was computed from rather than
+    /// owning a copy per column.
+    Device(&'a str),
     Age,
     InternalIp,
     ExternalIp,
@@ -397,26 +537,31 @@ pub(crate) enum Column {
     ContainerRuntime,
 }
 
-impl Column {
+impl Column<'_> {
     /// The heading. The wide ones are spelled as `kubectl get nodes -o wide`
     /// spells them, hyphens and all, so the two tables can be read together.
-    fn header(self) -> &'static str {
+    ///
+    /// A `String` rather than a `&'static str` because a device column is
+    /// headed by a name the cluster invented; every other column pays one small
+    /// allocation per table for it.
+    fn header(self) -> String {
         match self {
-            Self::Name => "NAME",
-            Self::Status => "STATUS",
-            Self::Version => "VERSION",
-            Self::Cpu => "CPU",
-            Self::CpuRequested => "CPU REQ",
-            Self::CpuUsed => "CPU USE",
-            Self::Memory => "MEMORY",
-            Self::MemoryRequested => "MEM REQ",
-            Self::MemoryUsed => "MEM USE",
-            Self::Age => "AGE",
-            Self::InternalIp => "INTERNAL-IP",
-            Self::ExternalIp => "EXTERNAL-IP",
-            Self::OsImage => "OS-IMAGE",
-            Self::KernelVersion => "KERNEL-VERSION",
-            Self::ContainerRuntime => "CONTAINER-RUNTIME",
+            Self::Name => "NAME".to_owned(),
+            Self::Status => "STATUS".to_owned(),
+            Self::Version => "VERSION".to_owned(),
+            Self::Cpu => "CPU".to_owned(),
+            Self::CpuRequested => "CPU REQ".to_owned(),
+            Self::CpuUsed => "CPU USE".to_owned(),
+            Self::Memory => "MEMORY".to_owned(),
+            Self::MemoryRequested => "MEM REQ".to_owned(),
+            Self::MemoryUsed => "MEM USE".to_owned(),
+            Self::Device(name) => resource::heading(name),
+            Self::Age => "AGE".to_owned(),
+            Self::InternalIp => "INTERNAL-IP".to_owned(),
+            Self::ExternalIp => "EXTERNAL-IP".to_owned(),
+            Self::OsImage => "OS-IMAGE".to_owned(),
+            Self::KernelVersion => "KERNEL-VERSION".to_owned(),
+            Self::ContainerRuntime => "CONTAINER-RUNTIME".to_owned(),
         }
     }
 
@@ -432,6 +577,14 @@ impl Column {
             Self::Memory => row.memory.cell(quantity::memory),
             Self::MemoryRequested => row.memory_requested.cell(quantity::memory),
             Self::MemoryUsed => row.memory_used.cell(quantity::memory),
+            // A node that does not report this device at all reads `-`. It is
+            // not a node with none free; it is a node with no such hardware,
+            // and the two want different reactions from whoever is looking for
+            // somewhere to put a GPU pod.
+            Self::Device(name) => row
+                .devices
+                .get(name)
+                .map_or_else(|| UNKNOWN.to_owned(), |device| device.cell()),
             Self::Age => row.age.clone(),
             Self::InternalIp => row.internal_ip.clone(),
             Self::ExternalIp => row.external_ip.clone(),
@@ -442,15 +595,29 @@ impl Column {
     }
 }
 
+/// Every extended resource some node in this listing reports, in name order.
+///
+/// A union across the rows rather than the first node's list, and `any` rather
+/// than `all` for the same reason the usage columns are: a cluster with one GPU
+/// node group and three CPU ones must still get the column, and the nodes
+/// without the hardware read `-`. Name order so two runs of one command cannot
+/// put the columns in a different order.
+fn device_names(rows: &[NodeRow]) -> BTreeSet<&str> {
+    rows.iter()
+        .flat_map(|row| row.devices.keys().map(String::as_str))
+        .collect()
+}
+
 /// Which columns this listing gets, in order.
 ///
-/// A pure function over the two things that decide it — whether any row has
-/// live usage, and `--wide` — so the layout is settled by a test rather than by
-/// reading a table in a terminal. The two conditions differ in the same way the
-/// pod table's do: usage columns appear unasked for and so are dropped when a
+/// A pure function over the three things that decide it — whether any row has
+/// live usage, which extended resources the listing reports, and `--wide` — so
+/// the layout is settled by a test rather than by reading a table in a
+/// terminal. The conditions differ in the same way the pod table's do: the
+/// usage and device columns appear unasked for and so are dropped when a
 /// cluster has nothing to put in them, while `--wide` columns were asked for
 /// and appear whatever is in them.
-pub(crate) fn columns(rows: &[NodeRow], width: format::Width) -> Vec<Column> {
+pub(crate) fn columns(rows: &[NodeRow], width: format::Width) -> Vec<Column<'_>> {
     // Each REQ and USE column sits beside the capacity it is a share of, so the
     // comparison a person actually wants — booked against burnt — is a glance
     // rather than a scan across the row. AGE stays last of the default columns
@@ -470,6 +637,10 @@ pub(crate) fn columns(rows: &[NodeRow], width: format::Width) -> Vec<Column> {
     if usage {
         columns.push(Column::MemoryUsed);
     }
+    // Devices sit after the resources every node has and before AGE, so the
+    // block of "what this machine can give out" stays together and AGE stays
+    // last of the default columns, where every `kubectl get` puts it.
+    columns.extend(device_names(rows).into_iter().map(Column::Device));
     columns.push(Column::Age);
     // `kubectl get nodes -o wide`'s own tail, in its order. It goes after AGE
     // rather than after VERSION, where `kubectl` puts it, so that the default
@@ -509,7 +680,8 @@ pub fn render(rows: &[NodeRow], cluster: &str, notes: &[String], width: format::
     }
 
     let columns = columns(rows, width);
-    let headers: Vec<&str> = columns.iter().map(|column| column.header()).collect();
+    let headings: Vec<String> = columns.iter().map(|column| column.header()).collect();
+    let headers: Vec<&str> = headings.iter().map(String::as_str).collect();
     let cells: Vec<Vec<String>> = rows
         .iter()
         .map(|row| columns.iter().map(|column| column.cell(row)).collect())
@@ -529,9 +701,86 @@ pub fn render(rows: &[NodeRow], cluster: &str, notes: &[String], width: format::
 ///
 /// `explanation` is `k8s::explain`'s sentence about the underlying failure —
 /// usually that the user's role covers nodes but not pods cluster-wide.
+///
+/// The columns it names come from the rows rather than from a constant, because
+/// a device column has a booked figure in it too and it goes the same way. It
+/// says "the booked half" of those because the rest of the cell survives: the
+/// device count came back with the nodes, and only the numerator is missing.
 #[must_use]
-pub fn requests_unavailable(explanation: &str) -> String {
-    format!("CPU REQ and MEM REQ are empty because the pods could not be listed.\n{explanation}")
+pub fn requests_unavailable(rows: &[NodeRow], explanation: &str) -> String {
+    let devices: Vec<String> = device_names(rows)
+        .into_iter()
+        .map(resource::heading)
+        .collect();
+
+    let columns = match format::list(&devices, "and") {
+        Some(devices) => format!("CPU REQ, MEM REQ, and the booked half of {devices} are empty"),
+        None => "CPU REQ and MEM REQ are empty".to_owned(),
+    };
+
+    format!("{columns} because the pods could not be listed.\n{explanation}")
+}
+
+/// The footnote for nodes holding back devices they report.
+///
+/// A device column shows what the scheduler will hand out, which is the number
+/// that decides whether the next pod fits. When a node's capacity is larger
+/// than that, the difference is hardware the kubelet has and will not schedule
+/// onto — usually a device its plugin marked unhealthy — and nothing in the
+/// table shows it. That absence is precisely the case this whole column was
+/// added for: a GPU pod sitting `Pending` on a cluster whose GPU node looks,
+/// from the table, half empty.
+///
+/// `None` when every node offers everything it has, which is the ordinary case
+/// and earns no line.
+#[must_use]
+pub fn devices_withheld(rows: &[NodeRow]) -> Option<String> {
+    let mut withheld: Vec<(&str, &str, Quantity, Quantity)> = rows
+        .iter()
+        .flat_map(|row| {
+            row.devices.iter().filter_map(move |(name, device)| {
+                let (offered, held) = device.withheld()?;
+                Some((row.name.as_str(), name.as_str(), offered, held))
+            })
+        })
+        .collect();
+
+    // Widest gap first, then by node and resource name, so the node this names
+    // is the one worth looking at — and is the same one on every run, whatever
+    // order `--sort` put the table in.
+    withheld.sort_by_key(|&(node, name, offered, held)| {
+        (
+            Reverse(held.thousandths() - offered.thousandths()),
+            node,
+            name,
+        )
+    });
+    let &(node, name, offered, held) = withheld.first()?;
+
+    let (offered, held) = (quantity::count(offered), quantity::count(held));
+
+    // Counted by node rather than by device, because the thing to go and look
+    // at is a machine: one node with two sick device plugins is one visit.
+    let nodes: BTreeSet<&str> = withheld.iter().map(|&(node, ..)| node).collect();
+    // Two sentences rather than one clause slotted into either, because a
+    // subordinate clause that has to read as both a whole sentence and a noun
+    // phrase ends up doing neither well.
+    let summary = if nodes.len() == 1 {
+        format!("{node} offers {offered} of the {held} {name} it reports.")
+    } else {
+        format!(
+            "{} nodes offer fewer devices than they report, including {node}, \
+             which offers {offered} of the {held} {name} it has.",
+            nodes.len()
+        )
+    };
+
+    Some(format!(
+        "{summary}\n\
+         A device a node has but will not offer is usually one its plugin marked unhealthy; \
+         check the device-plugin pods there, because a pod asking for the missing one will \
+         stay Pending."
+    ))
 }
 
 /// The footnote shown when there is no live usage to put in a column.
@@ -595,6 +844,7 @@ mod tests {
         Requests {
             cpu: Quantity::parse(cpu).unwrap_or_default(),
             memory: Quantity::parse(memory).unwrap_or_default(),
+            ..Requests::default()
         }
     }
 
@@ -662,7 +912,7 @@ mod tests {
 
     #[test]
     fn a_healthy_node_reads_as_ready() {
-        let row = NodeRow::from_node(&healthy_node(), Some(idle()), None, now());
+        let row = NodeRow::from_node(&healthy_node(), Some(&idle()), None, now());
 
         assert_eq!(row.name, "ip-10-0-1-9.ec2.internal");
         assert_eq!(row.status, "Ready");
@@ -673,7 +923,7 @@ mod tests {
 
     #[test]
     fn capacity_and_allocatable_are_read_as_separate_numbers() {
-        let row = NodeRow::from_node(&healthy_node(), Some(idle()), None, now());
+        let row = NodeRow::from_node(&healthy_node(), Some(&idle()), None, now());
 
         assert_eq!(row.cpu.capacity, Some(Quantity::parse("4").unwrap()));
         assert_eq!(row.cpu.allocatable, Some(Quantity::parse("3920m").unwrap()));
@@ -689,7 +939,7 @@ mod tests {
     fn the_reserved_slice_of_a_node_is_available_as_a_ratio() {
         // Not rendered yet, but it is what the dashboard's bars will divide by,
         // so it is worth pinning down now.
-        let row = NodeRow::from_node(&healthy_node(), Some(idle()), None, now());
+        let row = NodeRow::from_node(&healthy_node(), Some(&idle()), None, now());
         let ratio = row.cpu.allocatable_ratio().unwrap();
 
         assert!((ratio - 0.98).abs() < 1e-9, "{ratio}");
@@ -704,7 +954,7 @@ mod tests {
             status.allocatable = None;
         }
 
-        let row = NodeRow::from_node(&node, Some(idle()), None, now());
+        let row = NodeRow::from_node(&node, Some(&idle()), None, now());
         assert_eq!(row.cpu.cell(quantity::cpu), "-");
         assert_eq!(row.memory.cell(quantity::memory), "-");
     }
@@ -716,7 +966,7 @@ mod tests {
             status.allocatable = None;
         }
 
-        let row = NodeRow::from_node(&node, Some(idle()), None, now());
+        let row = NodeRow::from_node(&node, Some(&idle()), None, now());
         assert_eq!(row.cpu.cell(quantity::cpu), "4");
         assert_eq!(row.memory.cell(quantity::memory), "15.6Gi");
     }
@@ -730,7 +980,7 @@ mod tests {
             status.capacity = Some(quantities(&[("cpu", "four"), ("memory", "16374624Ki")]));
         }
 
-        let row = NodeRow::from_node(&node, Some(idle()), None, now());
+        let row = NodeRow::from_node(&node, Some(&idle()), None, now());
         assert_eq!(row.cpu.capacity, None);
         // Only the unreadable half is lost.
         assert_eq!(row.cpu.cell(quantity::cpu), "3920m");
@@ -743,7 +993,7 @@ mod tests {
         // kubectl still calls that NotReady, and so do we.
         for status in ["False", "Unknown"] {
             let node = with_status(&healthy_node(), vec![condition("Ready", status)]);
-            let row = NodeRow::from_node(&node, Some(idle()), None, now());
+            let row = NodeRow::from_node(&node, Some(&idle()), None, now());
 
             assert_eq!(row.status, "NotReady", "Ready={status}");
             assert_eq!(row.severity, Severity::Critical, "Ready={status}");
@@ -753,7 +1003,7 @@ mod tests {
     #[test]
     fn a_node_with_no_ready_condition_is_unknown_rather_than_broken() {
         let node = with_status(&healthy_node(), vec![condition("MemoryPressure", "False")]);
-        let row = NodeRow::from_node(&node, Some(idle()), None, now());
+        let row = NodeRow::from_node(&node, Some(&idle()), None, now());
 
         assert_eq!(row.status, "Unknown");
         assert_eq!(row.severity, Severity::Unknown);
@@ -767,7 +1017,7 @@ mod tests {
             ..Default::default()
         });
 
-        let row = NodeRow::from_node(&node, Some(idle()), None, now());
+        let row = NodeRow::from_node(&node, Some(&idle()), None, now());
         assert_eq!(row.status, "Ready,SchedulingDisabled");
         // Deliberately out of service is a warning, not a failure.
         assert_eq!(row.severity, Severity::Warn);
@@ -781,7 +1031,7 @@ mod tests {
             ..Default::default()
         });
 
-        let row = NodeRow::from_node(&node, Some(idle()), None, now());
+        let row = NodeRow::from_node(&node, Some(&idle()), None, now());
         assert_eq!(row.status, "NotReady,SchedulingDisabled");
         assert_eq!(row.severity, Severity::Critical);
     }
@@ -790,7 +1040,7 @@ mod tests {
     fn a_node_with_nothing_filled_in_still_produces_a_row() {
         // Everything under `status` is optional in the API, and a node caught
         // mid-registration really can arrive like this.
-        let row = NodeRow::from_node(&Node::default(), Some(idle()), None, now());
+        let row = NodeRow::from_node(&Node::default(), Some(&idle()), None, now());
 
         assert_eq!(row.name, "-");
         assert_eq!(row.status, "Unknown");
@@ -810,7 +1060,7 @@ mod tests {
     fn requests_are_shown_against_allocatable_as_a_percentage() {
         let row = NodeRow::from_node(
             &healthy_node(),
-            Some(booked("1960m", "7762576Ki")),
+            Some(&booked("1960m", "7762576Ki")),
             None,
             now(),
         );
@@ -825,7 +1075,7 @@ mod tests {
     fn a_node_running_no_pods_reads_as_zero_rather_than_as_an_error() {
         // The common case for a freshly scaled node group, and the one place a
         // missing value would be easiest to mistake for a bug.
-        let row = NodeRow::from_node(&healthy_node(), Some(idle()), None, now());
+        let row = NodeRow::from_node(&healthy_node(), Some(&idle()), None, now());
 
         assert_eq!(row.cpu_requested.cell(quantity::cpu), "0 (0%)");
         assert_eq!(row.memory_requested.cell(quantity::memory), "0 (0%)");
@@ -852,7 +1102,7 @@ mod tests {
             status.allocatable = None;
         }
 
-        let row = NodeRow::from_node(&node, Some(booked("500m", "1Gi")), None, now());
+        let row = NodeRow::from_node(&node, Some(&booked("500m", "1Gi")), None, now());
         assert_eq!(row.cpu_requested.cell(quantity::cpu), "500m");
         assert_eq!(row.memory_requested.cell(quantity::memory), "1Gi");
         assert_eq!(row.cpu_requested.severity(), Severity::Unknown);
@@ -871,7 +1121,7 @@ mod tests {
 
         for (requested, expected) in cases {
             let row =
-                NodeRow::from_node(&healthy_node(), Some(booked(requested, "0")), None, now());
+                NodeRow::from_node(&healthy_node(), Some(&booked(requested, "0")), None, now());
             assert_eq!(row.cpu_requested.severity(), expected, "{requested}");
         }
     }
@@ -880,7 +1130,7 @@ mod tests {
     fn a_node_booked_past_its_allocatable_says_so_rather_than_capping() {
         // Pods placed before the kubelet revised its reservation really can add
         // up to more than allocatable, and that is the moment to say so.
-        let row = NodeRow::from_node(&healthy_node(), Some(booked("4312m", "0")), None, now());
+        let row = NodeRow::from_node(&healthy_node(), Some(&booked("4312m", "0")), None, now());
 
         assert_eq!(row.cpu_requested.cell(quantity::cpu), "4312m (110%)");
         assert_eq!(row.cpu_requested.severity(), Severity::Critical);
@@ -894,9 +1144,9 @@ mod tests {
         let second = with_status(&second, vec![condition("Ready", "False")]);
 
         let rows = [
-            NodeRow::from_node(&healthy_node(), Some(booked("1500m", "6Gi")), None, now()),
+            NodeRow::from_node(&healthy_node(), Some(&booked("1500m", "6Gi")), None, now()),
             // The second node is idle, which must read as a real zero.
-            NodeRow::from_node(&second, Some(idle()), None, now()),
+            NodeRow::from_node(&second, Some(&idle()), None, now()),
         ];
 
         assert_eq!(
@@ -911,7 +1161,7 @@ mod tests {
     fn live_usage_is_shown_against_allocatable_as_a_percentage() {
         let row = NodeRow::from_node(
             &healthy_node(),
-            Some(booked("1960m", "7762576Ki")),
+            Some(&booked("1960m", "7762576Ki")),
             Some(used("392m", "1552515Ki")),
             now(),
         );
@@ -929,7 +1179,7 @@ mod tests {
         // 3528m is exactly 90% of a 3920m allocatable.
         let row = NodeRow::from_node(
             &healthy_node(),
-            Some(booked("100m", "0")),
+            Some(&booked("100m", "0")),
             Some(used("3528m", "0")),
             now(),
         );
@@ -944,7 +1194,7 @@ mod tests {
     fn a_cluster_with_no_metrics_server_gains_no_empty_columns() {
         let rows = [NodeRow::from_node(
             &healthy_node(),
-            Some(booked("1500m", "6Gi")),
+            Some(&booked("1500m", "6Gi")),
             None,
             now(),
         )];
@@ -965,11 +1215,11 @@ mod tests {
         let rows = [
             NodeRow::from_node(
                 &healthy_node(),
-                Some(idle()),
+                Some(&idle()),
                 Some(used("392m", "1552515Ki")),
                 now(),
             ),
-            NodeRow::from_node(&second, Some(idle()), None, now()),
+            NodeRow::from_node(&second, Some(&idle()), None, now()),
         ];
 
         assert!(shows_usage(&rows));
@@ -982,7 +1232,7 @@ mod tests {
     fn usage_columns_sit_beside_the_capacity_they_are_a_share_of() {
         let rows = [NodeRow::from_node(
             &healthy_node(),
-            Some(booked("1500m", "6Gi")),
+            Some(&booked("1500m", "6Gi")),
             Some(used("392m", "1552515Ki")),
             now(),
         )];
@@ -998,7 +1248,7 @@ mod tests {
     fn a_footnote_explains_the_missing_usage_columns() {
         let rows = [NodeRow::from_node(
             &healthy_node(),
-            Some(idle()),
+            Some(&idle()),
             None,
             now(),
         )];
@@ -1024,7 +1274,7 @@ mod tests {
         // to fix something that is not broken.
         let rows = [NodeRow::from_node(
             &healthy_node(),
-            Some(idle()),
+            Some(&idle()),
             None,
             now(),
         )];
@@ -1055,7 +1305,7 @@ mod tests {
         // metrics-server going quiet never fails the request that asks it.
         let rows = [NodeRow::from_node(
             &healthy_node(),
-            Some(idle()),
+            Some(&idle()),
             Some(used("392m", "1552515Ki")),
             now(),
         )];
@@ -1082,7 +1332,7 @@ mod tests {
         // they must not read as one paragraph.
         let rows = [NodeRow::from_node(&healthy_node(), None, None, now())];
         let notes = [
-            requests_unavailable("no pods for you"),
+            requests_unavailable(&rows, "no pods for you"),
             usage_unavailable("no metrics for you"),
         ];
 
@@ -1097,7 +1347,10 @@ mod tests {
     #[test]
     fn a_footnote_explains_empty_request_columns() {
         let rows = [NodeRow::from_node(&healthy_node(), None, None, now())];
-        let note = requests_unavailable("prod (us-east-1) will not let you list this resource.");
+        let note = requests_unavailable(
+            &rows,
+            "prod (us-east-1) will not let you list this resource.",
+        );
 
         let output = render(&rows, "prod (us-east-1)", &[note], Width::Default);
         let (table, footnote) = output
@@ -1120,7 +1373,7 @@ mod tests {
         // anywhere in it, and that the table above it is untouched.
         let rows = [NodeRow::from_node(&healthy_node(), None, None, now())];
         let notes = [
-            requests_unavailable("no pods for you"),
+            requests_unavailable(&rows, "no pods for you"),
             crate::k8s::order::note(Order::Cpu, crate::k8s::order::Direction::Reversed)
                 .expect("a reordered listing should say so"),
         ];
@@ -1143,7 +1396,7 @@ mod tests {
         // and the third line is the flag that would have worked on this table.
         let rows = [NodeRow::from_node(
             &healthy_node(),
-            Some(idle()),
+            Some(&idle()),
             None,
             now(),
         )];
@@ -1176,7 +1429,7 @@ mod tests {
         }
         let rows = [NodeRow::from_node(
             &sampled_but_undescribed,
-            Some(idle()),
+            Some(&idle()),
             Some(used("392m", "1552515Ki")),
             now(),
         )];
@@ -1202,7 +1455,7 @@ mod tests {
         // the advice a paragraph later.
         let rows = [NodeRow::from_node(
             &healthy_node(),
-            Some(idle()),
+            Some(&idle()),
             None,
             now(),
         )];
@@ -1247,7 +1500,7 @@ mod tests {
         // is at the top, so there is nothing to apologise for.
         let rows = [NodeRow::from_node(
             &healthy_node(),
-            Some(idle()),
+            Some(&idle()),
             Some(used("392m", "1552515Ki")),
             now(),
         )];
@@ -1264,7 +1517,7 @@ mod tests {
         // everyone who has never typed `--sort`.
         let rows = [NodeRow::from_node(
             &healthy_node(),
-            Some(idle()),
+            Some(&idle()),
             None,
             now(),
         )];
@@ -1310,7 +1563,7 @@ mod tests {
     #[test]
     fn a_cluster_with_no_nodes_skips_the_footnote() {
         // There is a bigger problem than a missing column to explain.
-        let note = requests_unavailable("nope");
+        let note = requests_unavailable(&[], "nope");
         let message = render(&[], "prod (us-east-1)", &[note], Width::Default);
 
         assert!(!message.contains("CPU REQ"), "{message}");
@@ -1333,7 +1586,7 @@ mod tests {
         let joined = ago(50);
         let node = healthy_node();
 
-        let row = NodeRow::from_node(&node, Some(idle()), None, now());
+        let row = NodeRow::from_node(&node, Some(&idle()), None, now());
 
         assert_eq!(row.created_at, Some(joined.0));
         assert_eq!(row.age, "2d2h");
@@ -1344,7 +1597,7 @@ mod tests {
         let mut node = healthy_node();
         node.metadata.creation_timestamp = None;
 
-        let row = NodeRow::from_node(&node, Some(idle()), None, now());
+        let row = NodeRow::from_node(&node, Some(&idle()), None, now());
 
         assert_eq!(row.created_at, None);
         assert_eq!(row.age, "-");
@@ -1379,7 +1632,7 @@ mod tests {
 
     #[test]
     fn the_default_node_table_holds_the_wide_columns_back() {
-        let rows = [NodeRow::from_node(&wide_node(), Some(idle()), None, now())];
+        let rows = [NodeRow::from_node(&wide_node(), Some(&idle()), None, now())];
 
         let table = render(&rows, "prod (us-east-1)", &[], Width::Default);
         for held_back in [
@@ -1395,7 +1648,7 @@ mod tests {
 
     #[test]
     fn wide_adds_the_addresses_the_ami_the_kernel_and_the_runtime() {
-        let rows = [NodeRow::from_node(&wide_node(), Some(idle()), None, now())];
+        let rows = [NodeRow::from_node(&wide_node(), Some(&idle()), None, now())];
 
         assert_eq!(
             render(&rows, "prod (us-east-1)", &[], Width::Wide),
@@ -1409,7 +1662,7 @@ mod tests {
         // Someone comparing a wide listing against a plain one should not have
         // to re-find the columns they were already reading, so the wide columns
         // go on the end rather than beside VERSION where `kubectl` puts them.
-        let rows = [NodeRow::from_node(&wide_node(), Some(idle()), None, now())];
+        let rows = [NodeRow::from_node(&wide_node(), Some(&idle()), None, now())];
 
         let narrow = columns(&rows, Width::Default);
         let wide = columns(&rows, Width::Wide);
@@ -1433,12 +1686,12 @@ mod tests {
         // and MEM USE sit beside the capacities they are a share of.
         let rows = [NodeRow::from_node(
             &wide_node(),
-            Some(idle()),
+            Some(&idle()),
             Some(used("392m", "1552515Ki")),
             now(),
         )];
 
-        let headers: Vec<&str> = columns(&rows, Width::Wide)
+        let headers: Vec<String> = columns(&rows, Width::Wide)
             .iter()
             .map(|column| column.header())
             .collect();
@@ -1475,7 +1728,7 @@ mod tests {
             ]);
         }
 
-        let row = NodeRow::from_node(&node, Some(idle()), None, now());
+        let row = NodeRow::from_node(&node, Some(&idle()), None, now());
         assert_eq!(row.internal_ip, "10.0.1.9");
         assert_eq!(row.external_ip, "54.72.9.14");
     }
@@ -1493,7 +1746,7 @@ mod tests {
         }
 
         assert_eq!(
-            NodeRow::from_node(&node, Some(idle()), None, now()).internal_ip,
+            NodeRow::from_node(&node, Some(&idle()), None, now()).internal_ip,
             "10.0.1.9"
         );
     }
@@ -1504,7 +1757,7 @@ mod tests {
         // all, and the `nodeInfo` strings are not optional in the API — "not
         // reported" arrives as an empty string, which would render as a gap
         // that reads like a bug.
-        let row = NodeRow::from_node(&Node::default(), Some(idle()), None, now());
+        let row = NodeRow::from_node(&Node::default(), Some(&idle()), None, now());
 
         assert_eq!(row.internal_ip, "-");
         assert_eq!(row.external_ip, "-");
@@ -1527,7 +1780,7 @@ mod tests {
 
     #[test]
     fn a_wide_table_keeps_its_footnotes() {
-        let rows = [NodeRow::from_node(&wide_node(), Some(idle()), None, now())];
+        let rows = [NodeRow::from_node(&wide_node(), Some(&idle()), None, now())];
         let note = "Sorted by cpu.".to_owned();
 
         let output = render(
@@ -1538,5 +1791,468 @@ mod tests {
         );
 
         assert!(output.ends_with(&format!("\n\n{note}")), "{output}");
+    }
+
+    // --- Extended resources -------------------------------------------------
+
+    /// A GPU node group's node: four cards, and the `hugepages` entry every
+    /// real node carries beside them.
+    fn gpu_node() -> Node {
+        let mut node = healthy_node();
+        if let Some(status) = node.status.as_mut() {
+            status.capacity = Some(quantities(&[
+                ("cpu", "4"),
+                ("memory", "16374624Ki"),
+                ("hugepages-2Mi", "0"),
+                ("nvidia.com/gpu", "4"),
+            ]));
+            status.allocatable = Some(quantities(&[
+                ("cpu", "3920m"),
+                ("memory", "15525152Ki"),
+                ("hugepages-2Mi", "0"),
+                ("nvidia.com/gpu", "4"),
+            ]));
+        }
+        node
+    }
+
+    fn renamed(node: &Node, name: &str) -> Node {
+        let mut node = node.clone();
+        node.metadata.name = Some(name.to_owned());
+        node
+    }
+
+    /// A node whose device plugin has marked some cards unhealthy: it reports
+    /// `held` and will hand out only `offered`.
+    fn withholding_node(name: &str, offered: &str, held: &str) -> Node {
+        let mut node = renamed(&gpu_node(), name);
+        if let Some(status) = node.status.as_mut() {
+            status.capacity = Some(quantities(&[
+                ("cpu", "4"),
+                ("memory", "16374624Ki"),
+                ("nvidia.com/gpu", held),
+            ]));
+            status.allocatable = Some(quantities(&[
+                ("cpu", "3920m"),
+                ("memory", "15525152Ki"),
+                ("nvidia.com/gpu", offered),
+            ]));
+        }
+        node
+    }
+
+    fn booked_device(resource: &str, count: &str) -> Requests {
+        Requests {
+            extended: [(
+                resource.to_owned(),
+                Quantity::parse(count).unwrap_or_default(),
+            )]
+            .into_iter()
+            .collect(),
+            ..booked("1", "1Gi")
+        }
+    }
+
+    fn headings(rows: &[NodeRow], width: Width) -> Vec<String> {
+        columns(rows, width)
+            .iter()
+            .map(|column| column.header())
+            .collect()
+    }
+
+    fn device_cells(rows: &[NodeRow], resource: &str) -> Vec<String> {
+        rows.iter()
+            .map(|row| Column::Device(resource).cell(row))
+            .collect()
+    }
+
+    #[test]
+    fn a_device_plugin_resource_earns_a_column_of_its_own() {
+        let rows = [NodeRow::from_node(&gpu_node(), Some(&idle()), None, now())];
+
+        assert_eq!(
+            headings(&rows, Width::Default),
+            [
+                "NAME",
+                "STATUS",
+                "VERSION",
+                "CPU",
+                "CPU REQ",
+                "MEMORY",
+                "MEM REQ",
+                "NVIDIA.COM/GPU",
+                "AGE",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_cluster_with_no_devices_gains_no_columns() {
+        // The whole point of the condition: an EKS cluster of m5.xlarges must
+        // print exactly the table it printed before.
+        let rows = [NodeRow::from_node(
+            &healthy_node(),
+            Some(&idle()),
+            None,
+            now(),
+        )];
+
+        assert_eq!(
+            headings(&rows, Width::Default),
+            [
+                "NAME", "STATUS", "VERSION", "CPU", "CPU REQ", "MEMORY", "MEM REQ", "AGE"
+            ]
+        );
+        assert!(rows[0].devices.is_empty());
+    }
+
+    #[test]
+    fn the_resources_kubernetes_defines_itself_never_become_device_columns() {
+        // `hugepages-2Mi` sits in the same capacity map and is not a device; a
+        // column of zeroes headed `HUGEPAGES-2MI` on every node would be the
+        // noise this condition exists to avoid.
+        let rows = [NodeRow::from_node(&gpu_node(), Some(&idle()), None, now())];
+        let table = render(&rows, "prod (us-east-1)", &[], Width::Default);
+
+        assert!(!table.contains("HUGEPAGES"), "{table}");
+        assert_eq!(rows[0].devices.len(), 1, "{:?}", rows[0].devices);
+    }
+
+    #[test]
+    fn a_device_cell_shows_what_is_booked_out_of_what_is_offered() {
+        // The two numbers the question turns on: a pod asking for one more GPU
+        // fits here, and would not if this read 4/4.
+        let rows = [NodeRow::from_node(
+            &gpu_node(),
+            Some(&booked_device("nvidia.com/gpu", "2")),
+            None,
+            now(),
+        )];
+
+        assert_eq!(device_cells(&rows, "nvidia.com/gpu"), ["2/4 (50%)"]);
+    }
+
+    #[test]
+    fn a_device_nobody_has_asked_for_reads_as_a_real_zero() {
+        let rows = [NodeRow::from_node(&gpu_node(), Some(&idle()), None, now())];
+
+        assert_eq!(device_cells(&rows, "nvidia.com/gpu"), ["0/4 (0%)"]);
+    }
+
+    #[test]
+    fn a_column_appears_for_a_device_only_some_nodes_have() {
+        // A cluster with one GPU node group and one without. The CPU node reads
+        // `-` rather than `0/0`: it has no such hardware, which is a different
+        // answer from having none of it free.
+        let rows = [
+            NodeRow::from_node(
+                &renamed(&gpu_node(), "gpu-node"),
+                Some(&idle()),
+                None,
+                now(),
+            ),
+            NodeRow::from_node(
+                &renamed(&healthy_node(), "cpu-node"),
+                Some(&idle()),
+                None,
+                now(),
+            ),
+        ];
+
+        assert!(headings(&rows, Width::Default).contains(&"NVIDIA.COM/GPU".to_owned()));
+        assert_eq!(device_cells(&rows, "nvidia.com/gpu"), ["0/4 (0%)", "-"]);
+    }
+
+    #[test]
+    fn two_device_resources_get_a_column_each_in_name_order() {
+        // A mixed-vendor cluster is exactly why the heading keeps the domain:
+        // `GPU` over either column would be ambiguous over the other.
+        let mut node = renamed(&gpu_node(), "mixed-node");
+        if let Some(status) = node.status.as_mut() {
+            status.capacity = Some(quantities(&[
+                ("cpu", "4"),
+                ("memory", "16374624Ki"),
+                ("nvidia.com/gpu", "4"),
+                ("amd.com/gpu", "2"),
+            ]));
+            status.allocatable = Some(quantities(&[
+                ("cpu", "3920m"),
+                ("memory", "15525152Ki"),
+                ("nvidia.com/gpu", "4"),
+                ("amd.com/gpu", "2"),
+            ]));
+        }
+        let rows = [NodeRow::from_node(&node, Some(&idle()), None, now())];
+
+        let headings = headings(&rows, Width::Default);
+        let devices: Vec<&String> = headings
+            .iter()
+            .filter(|heading| heading.contains('/'))
+            .collect();
+        assert_eq!(devices, ["AMD.COM/GPU", "NVIDIA.COM/GPU"]);
+    }
+
+    #[test]
+    fn the_device_columns_sit_after_the_usage_ones_and_before_age() {
+        // The block of "what this machine can give out" stays together, and AGE
+        // stays last of the default columns where every `kubectl get` puts it.
+        let rows = [NodeRow::from_node(
+            &gpu_node(),
+            Some(&idle()),
+            Some(used("392m", "1552515Ki")),
+            now(),
+        )];
+
+        assert_eq!(
+            headings(&rows, Width::Default),
+            [
+                "NAME",
+                "STATUS",
+                "VERSION",
+                "CPU",
+                "CPU REQ",
+                "CPU USE",
+                "MEMORY",
+                "MEM REQ",
+                "MEM USE",
+                "NVIDIA.COM/GPU",
+                "AGE",
+            ]
+        );
+    }
+
+    #[test]
+    fn the_wide_tail_still_follows_the_device_columns() {
+        // Three conditions composing at once, which is the arrangement most
+        // likely to put a figure under the wrong heading.
+        let mut node = wide_node();
+        if let Some(status) = node.status.as_mut() {
+            status.capacity = Some(quantities(&[("cpu", "4"), ("nvidia.com/gpu", "4")]));
+            status.allocatable = Some(quantities(&[("cpu", "3920m"), ("nvidia.com/gpu", "4")]));
+        }
+        let rows = [NodeRow::from_node(&node, Some(&idle()), None, now())];
+
+        let narrow = columns(&rows, Width::Default);
+        let wide = columns(&rows, Width::Wide);
+
+        assert_eq!(wide[..narrow.len()], narrow[..]);
+        assert!(narrow.contains(&Column::Device("nvidia.com/gpu")));
+        assert_eq!(
+            wide[narrow.len()..],
+            [
+                Column::InternalIp,
+                Column::ExternalIp,
+                Column::OsImage,
+                Column::KernelVersion,
+                Column::ContainerRuntime,
+            ]
+        );
+    }
+
+    #[test]
+    fn a_gpu_table_lines_up_under_its_headings() {
+        // The whole table, to the byte: a device column is the first one whose
+        // heading is wider than its cells, and the alignment is what a reader
+        // uses to tell which number belongs to which node.
+        let rows = [NodeRow::from_node(
+            &gpu_node(),
+            Some(&booked_device("nvidia.com/gpu", "2")),
+            None,
+            now(),
+        )];
+
+        assert_eq!(
+            render(&rows, "prod (us-east-1)", &[], Width::Default),
+            "NAME                      STATUS  VERSION              CPU      CPU REQ  MEMORY         MEM REQ   NVIDIA.COM/GPU  AGE\n\
+             ip-10-0-1-9.ec2.internal  Ready   v1.33.1-eks-1a2b3c4  3920m/4  1 (26%)  14.8Gi/15.6Gi  1Gi (7%)  2/4 (50%)       2d2h"
+        );
+    }
+
+    #[test]
+    fn a_failed_pod_listing_leaves_the_device_cell_without_a_numerator() {
+        // The count came back with the nodes and is still good; only what is
+        // booked of it is unknown, so the cell keeps the half it has.
+        let rows = [NodeRow::from_node(&gpu_node(), None, None, now())];
+
+        assert_eq!(device_cells(&rows, "nvidia.com/gpu"), ["-/4"]);
+    }
+
+    #[test]
+    fn the_request_footnote_names_the_device_column_it_emptied() {
+        let rows = [NodeRow::from_node(&gpu_node(), None, None, now())];
+
+        let note = requests_unavailable(&rows, "prod (us-east-1) will not let you list pods.");
+
+        assert!(
+            note.starts_with(
+                "CPU REQ, MEM REQ, and the booked half of NVIDIA.COM/GPU are empty because"
+            ),
+            "{note}"
+        );
+        assert!(note.contains("will not let you list pods"), "{note}");
+    }
+
+    #[test]
+    fn the_request_footnote_is_unchanged_where_there_are_no_devices() {
+        // The overwhelmingly common cluster must read exactly as it did.
+        let rows = [NodeRow::from_node(&healthy_node(), None, None, now())];
+
+        assert_eq!(
+            requests_unavailable(&rows, "why"),
+            "CPU REQ and MEM REQ are empty because the pods could not be listed.\nwhy"
+        );
+    }
+
+    #[test]
+    fn a_node_offering_none_of_a_device_it_reports_shows_no_percentage() {
+        // Every card unhealthy, or a plugin that has registered and found
+        // nothing: `0/0` rather than a share of nothing.
+        let rows = [NodeRow::from_node(
+            &withholding_node("gpu-node", "0", "0"),
+            Some(&idle()),
+            None,
+            now(),
+        )];
+
+        assert_eq!(device_cells(&rows, "nvidia.com/gpu"), ["0/0"]);
+    }
+
+    #[test]
+    fn a_device_reported_only_as_capacity_stands_without_a_share() {
+        // A node caught mid-registration, which has reported one map and not
+        // the other. There is nothing to be a share of, so the figure is alone
+        // rather than divided by a number nobody has.
+        let mut node = renamed(&gpu_node(), "registering");
+        if let Some(status) = node.status.as_mut() {
+            status.allocatable = Some(quantities(&[("cpu", "3920m")]));
+        }
+        let rows = [NodeRow::from_node(
+            &node,
+            Some(&booked_device("nvidia.com/gpu", "1")),
+            None,
+            now(),
+        )];
+
+        assert!(headings(&rows, Width::Default).contains(&"NVIDIA.COM/GPU".to_owned()));
+        assert_eq!(device_cells(&rows, "nvidia.com/gpu"), ["1"]);
+    }
+
+    #[test]
+    fn a_node_holding_back_devices_it_has_earns_a_footnote() {
+        // The gap is invisible in a cell that shows what can be handed out, and
+        // it is the reason a GPU pod that should fit will not schedule.
+        let rows = [NodeRow::from_node(
+            &withholding_node("gpu-node", "3", "4"),
+            Some(&idle()),
+            None,
+            now(),
+        )];
+
+        let note = devices_withheld(&rows).expect("a withheld device should be footnoted");
+
+        assert!(
+            note.starts_with("gpu-node offers 3 of the 4 nvidia.com/gpu it reports."),
+            "{note}"
+        );
+        // Diagnosis is not enough: the note has to say where to look and what
+        // happens if nobody does.
+        assert!(note.contains("device-plugin"), "{note}");
+        assert!(note.contains("Pending"), "{note}");
+        // And the cell itself is unchanged — allocatable is still the number
+        // that decides whether the next pod fits.
+        assert_eq!(device_cells(&rows, "nvidia.com/gpu"), ["0/3 (0%)"]);
+    }
+
+    #[test]
+    fn a_node_offering_everything_it_has_earns_no_footnote() {
+        let rows = [NodeRow::from_node(&gpu_node(), Some(&idle()), None, now())];
+
+        assert_eq!(devices_withheld(&rows), None);
+        // And a listing with no nodes at all has nothing to say either.
+        assert_eq!(devices_withheld(&[]), None);
+    }
+
+    #[test]
+    fn the_withheld_footnote_names_the_worst_node_and_counts_the_others() {
+        // Two sick nodes and a healthy one. The named node is the one worth
+        // walking to, not the first one alphabetically, and the count is of
+        // machines to visit rather than of devices lost.
+        let rows = [
+            NodeRow::from_node(
+                &withholding_node("almost-fine", "3", "4"),
+                Some(&idle()),
+                None,
+                now(),
+            ),
+            NodeRow::from_node(
+                &withholding_node("badly-broken", "0", "8"),
+                Some(&idle()),
+                None,
+                now(),
+            ),
+            NodeRow::from_node(&renamed(&gpu_node(), "healthy"), Some(&idle()), None, now()),
+        ];
+
+        let note = devices_withheld(&rows).expect("two withheld devices should be footnoted");
+
+        assert!(
+            note.starts_with(
+                "2 nodes offer fewer devices than they report, including badly-broken, which \
+                 offers 0 of the 8 nvidia.com/gpu it has."
+            ),
+            "{note}"
+        );
+    }
+
+    #[test]
+    fn a_devices_share_divides_by_what_the_node_will_hand_out() {
+        // The same denominator the CPU and memory columns use, so a percentage
+        // means one thing across a row.
+        let rows = [NodeRow::from_node(
+            &withholding_node("gpu-node", "4", "8"),
+            Some(&booked_device("nvidia.com/gpu", "2")),
+            None,
+            now(),
+        )];
+        let device = rows[0].devices["nvidia.com/gpu"];
+
+        assert_eq!(device.share().ratio(), Some(0.5));
+        assert_eq!(
+            device.withheld(),
+            Some((
+                Quantity::parse("4").unwrap_or_default(),
+                Quantity::parse("8").unwrap_or_default()
+            ))
+        );
+    }
+
+    #[test]
+    fn a_device_whose_quantity_will_not_parse_is_still_a_column() {
+        // `Quantity::lookup` drops what it cannot read and logs it, so the
+        // count is unknown while the resource is not. Dropping the column
+        // instead would answer "does this node have GPUs?" with silence.
+        let mut node = renamed(&gpu_node(), "odd-node");
+        if let Some(status) = node.status.as_mut() {
+            status.capacity = Some(quantities(&[("cpu", "4"), ("nvidia.com/gpu", "four")]));
+            status.allocatable = Some(quantities(&[("cpu", "4"), ("nvidia.com/gpu", "four")]));
+        }
+        let rows = [NodeRow::from_node(&node, Some(&idle()), None, now())];
+
+        assert!(headings(&rows, Width::Default).contains(&"NVIDIA.COM/GPU".to_owned()));
+        assert_eq!(device_cells(&rows, "nvidia.com/gpu"), ["0"]);
+        // Nothing to compare, so nothing is accused of holding cards back.
+        assert_eq!(devices_withheld(&rows), None);
+    }
+
+    #[test]
+    fn a_node_with_no_status_at_all_reports_no_devices() {
+        let row = NodeRow::from_node(&Node::default(), Some(&idle()), None, now());
+
+        assert!(row.devices.is_empty());
+        assert_eq!(devices_withheld(std::slice::from_ref(&row)), None);
+        assert_eq!(
+            requests_unavailable(std::slice::from_ref(&row), "why"),
+            "CPU REQ and MEM REQ are empty because the pods could not be listed.\nwhy"
+        );
     }
 }

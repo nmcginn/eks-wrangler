@@ -857,3 +857,60 @@ One consequence worth naming: `Missing::usage`, which decides whether the
 "the columns are gone" rather than "the read failed". Both ways of losing them
 leave a footnote for it to point at, so the old reading would have printed the
 same advice twice, a paragraph apart — the thing decision 38 exists to prevent.
+
+### 42. A device is one column, and its shape is the pod table's, not this one's
+
+`nvidia.com/gpu` had been parsed correctly since decision 13 and shown nowhere,
+which made `eks nodes` unable to answer the one question a GPU cluster is ever
+asked: is there a card free. A column now appears for every extended resource
+some node in the listing reports, on the `any`-not-`all` rule the usage columns
+already follow, so a cluster of m5.xlarges prints exactly the table it printed
+before and a mixed cluster shows the CPU nodes a `-`.
+
+What counts as "extended" is a naming rule rather than a list of vendors, which
+is the point — the whole reason extended resources exist is that a cluster can
+invent one. `k8s::resource::is_extended` is Kubernetes' own definition: a
+fully-qualified name outside the `kubernetes.io` domain. That leaves `cpu`,
+`memory`, `pods`, `ephemeral-storage`, `hugepages-2Mi`, and the
+`attachable-volumes-*` limits sitting in the same capacity map alone. They are
+not devices, they have native meanings a table should state in native words, and
+a column headed `HUGEPAGES-2MI` reading `0` on every node is exactly the noise
+the condition above exists to avoid.
+
+The cell is `2/4 (50%)` — booked over allocatable — which is the **pod** table's
+usage cell rather than either of this table's two, and that is a deliberate
+inconsistency. `Capacity`'s pair prints allocatable over capacity, and for a
+device those are the same number on every healthy node; the gap between them is
+not the kubelet's routine reservation but a fault, so it belongs in a sentence
+rather than in a pair of figures a reader has to notice are different. `Share`'s
+`2 (50%)` hides the total, and for a device the total is the fact people came
+for: "this node has eight A100s" is not something to work back out of a
+percentage. So the device column shows both numbers, and the denominator is
+still allocatable — the same one CPU REQ and CPU USE divide by, so a percentage
+means one thing across a row.
+
+That choice hides one thing, and it is the thing this column was added for. A
+card the kubelet has and will not hand out — a plugin that marked one unhealthy,
+most often — shrinks allocatable and leaves the cell reading `0/3 (0%)` on a node
+with four. From the table that is a node with three free cards and a pod that
+will not schedule onto any of them. `devices_withheld` says so, names the node
+with the widest gap, counts the rest, and says where to look. It is a footnote
+rather than a third number in the cell because it is not routine: the ordinary
+node offers everything it has and earns no line.
+
+Requests grew the same shape one level down. `pods::Requests` keeps `cpu` and
+`memory` as fields — every caller wants them, every container may have them —
+and carries everything else in a `BTreeMap` keyed by the name the cluster
+invented. `plus` and `max` fold over the union, so a GPU asked for by one init
+container and not the next does not vanish from the pod's footprint, and the
+scheduler's arithmetic from decision 15 applies to devices without a second
+implementation. The cost is that `Requests` is no longer `Copy`; the call sites
+that felt it now borrow the totals rather than cloning a map per row.
+
+Two `-` characters can appear in a device column and they say different things.
+`-` alone is a node that does not report the resource: no such hardware, which is
+a different answer from having none free. `-/4` is a node that has four and a pod
+listing that failed, so only the numerator is unknown — the count came back with
+the nodes and is still good. The footnote that explains the failure names the
+device columns it emptied, for the reason decision 38 gives: a message that
+diagnoses without saying which columns it is about makes the reader find them.

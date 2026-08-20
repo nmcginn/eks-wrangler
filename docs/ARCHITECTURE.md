@@ -144,7 +144,10 @@ condition and its cell under a subtly different one shifts every figure to the
 right of it under the wrong heading, and the table still renders. `format::Width`
 sits with `format::table` rather than in `k8s`, because `--wide` decides nothing
 about what is fetched — everything the extra columns show already arrived with
-the nodes and pods.
+the nodes and pods. `format::list` sits beside it for the same reason: writing a
+set of names out as prose, serial comma and all, is a rule that belongs in one
+place whether the sentence around it is offering orderings to sort by or naming
+the columns a failed pod listing emptied.
 
 Selectors take the same shape in reverse: `k8s::selector` parses the label and
 field selectors a user types (`app=api`, `status.phase!=Running`) into a
@@ -186,6 +189,22 @@ the columns are shown and want dating, the read failed, or the read answered wit
 nothing and the table owes an explanation nobody was giving it. Which of the
 three a listing is in is asked of the rendered rows, not of the reply, so the
 footnote and the columns cannot disagree.
+
+Which resources a node has is a fifth computation, and the one whose columns are
+not known until the nodes arrive. `k8s::resource::is_extended` decides whether a
+name in a node's capacity map is a device the cluster added or one Kubernetes
+defines, by Kubernetes' own rule — qualified, and outside the `kubernetes.io`
+domain — so `nvidia.com/gpu` earns a column and `hugepages-2Mi` does not.
+`NodeRow` carries a `Device` per extended resource it reports, and
+`nodes::columns` takes the union across the listing, which is what lets a
+cluster with one GPU node group show the column on every row and a `-` on the
+nodes without the hardware. `Column` borrows the resource name from the rows for
+exactly this reason: it is the one column whose identity is data.
+
+The same names reach the other end of the pipeline through `pods::Requests`,
+which keeps `cpu` and `memory` as fields and everything else in a map, so
+`effective_requests` charges a pod's GPU by the scheduler's rules rather than by
+a second sum written for devices.
 
 Resource quantities get their own hop: the API server reports capacity as
 strings in a small grammar (`3920m`, `7134420Ki`, `1e3`), and `k8s::quantity`

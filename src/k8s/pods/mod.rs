@@ -29,6 +29,7 @@ use kube::Client;
 use kube::api::{Api, ListParams};
 
 use crate::k8s::quantity::Quantity;
+use crate::k8s::resource;
 
 pub mod order;
 pub mod row;
@@ -130,22 +131,34 @@ impl Selectors {
     }
 }
 
-/// CPU and memory asked for, as a pair, so the two are never added up in
-/// different orders in different places.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+/// What a pod or a container asked for, as one value, so the resources are
+/// never added up in different orders in different places.
+///
+/// `cpu` and `memory` are fields because every caller wants them and every
+/// container may have them. Everything else a manifest can ask for — a GPU, a
+/// dongle, a licence count — arrives under a name the cluster invented, so it
+/// lives in a map keyed by that name. A resource absent from the map was not
+/// asked for, which is a real zero rather than an unknown: the scheduler
+/// reserves nothing for a request nobody made.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Requests {
     pub cpu: Quantity,
     pub memory: Quantity,
+    /// Extended resources, keyed by their fully-qualified name — see
+    /// [`crate::k8s::resource::is_extended`] for what counts as one.
+    pub extended: BTreeMap<String, Quantity>,
 }
 
 impl Requests {
-    /// Componentwise sum.
+    /// Componentwise sum, over the union of the extended resources asked for.
     #[must_use]
-    pub fn plus(self, other: Self) -> Self {
-        Self {
-            cpu: self.cpu + other.cpu,
-            memory: self.memory + other.memory,
+    pub fn plus(mut self, other: Self) -> Self {
+        self.cpu = self.cpu + other.cpu;
+        self.memory = self.memory + other.memory;
+        for (name, amount) in other.extended {
+            self.combine(name, amount, std::ops::Add::add);
         }
+        self
     }
 
     /// Componentwise maximum.
@@ -153,25 +166,64 @@ impl Requests {
     /// Per-resource rather than picking the single "largest" container, which
     /// is what the scheduler does: a pod with a memory-hungry init container
     /// and a CPU-hungry one needs the peak of each, not the peak of whichever
-    /// happened to look bigger.
+    /// happened to look bigger. Extended resources take part on the same terms,
+    /// so a GPU asked for by one init container and not the next does not
+    /// disappear from the pod's footprint.
     #[must_use]
-    pub fn max(self, other: Self) -> Self {
-        Self {
-            cpu: self.cpu.max(other.cpu),
-            memory: self.memory.max(other.memory),
+    pub fn max(mut self, other: Self) -> Self {
+        self.cpu = self.cpu.max(other.cpu);
+        self.memory = self.memory.max(other.memory);
+        for (name, amount) in other.extended {
+            self.combine(name, amount, Quantity::max);
         }
+        self
     }
 
-    /// Read `cpu` and `memory` out of a resource map, treating an absent or
+    /// Fold one of `other`'s extended resources into ours.
+    ///
+    /// A name only one side carries needs no special case in either caller: an
+    /// absent entry is a zero, and both `+` and `max` leave the other operand
+    /// alone when handed one.
+    fn combine(
+        &mut self,
+        name: String,
+        amount: Quantity,
+        fold: fn(Quantity, Quantity) -> Quantity,
+    ) {
+        let entry = self.extended.entry(name).or_default();
+        *entry = fold(*entry, amount);
+    }
+
+    /// How much of one extended resource was asked for, zero if none was.
+    #[must_use]
+    pub fn extended(&self, resource: &str) -> Quantity {
+        self.extended.get(resource).copied().unwrap_or_default()
+    }
+
+    /// Read a container's requests out of a resource map, treating an absent or
     /// unreadable entry as nothing asked for.
     ///
     /// A container with no requests really has asked for nothing — the
     /// scheduler places it anywhere — so zero is the honest answer here rather
     /// than a missing value.
+    ///
+    /// Every extended resource in the map is carried through, rather than a
+    /// list of names this tool knows: the point of an extended resource is that
+    /// the cluster invented it, so the node's own capacity map is the only
+    /// authority on which ones exist, and it is the node table that decides
+    /// which of them earn a column.
     fn read(map: Option<&BTreeMap<String, ApiQuantity>>) -> Self {
         Self {
             cpu: Quantity::lookup(map, "cpu").unwrap_or_default(),
             memory: Quantity::lookup(map, "memory").unwrap_or_default(),
+            extended: map
+                .into_iter()
+                .flatten()
+                .filter(|(name, _)| resource::is_extended(name))
+                .filter_map(|(name, _)| {
+                    Quantity::lookup(map, name).map(|amount| (name.clone(), amount))
+                })
+                .collect(),
         }
     }
 }
@@ -193,7 +245,7 @@ pub fn effective_requests(pod: &Pod) -> Requests {
     let mut init_peak = Requests::default();
     for container in spec.init_containers.iter().flatten() {
         let requests = container_requests(container);
-        init_peak = init_peak.max(sidecars.plus(requests));
+        init_peak = init_peak.max(sidecars.clone().plus(requests.clone()));
         if is_sidecar(container) {
             sidecars = sidecars.plus(requests);
         }
@@ -249,7 +301,9 @@ pub fn by_node(pods: &[Pod]) -> BTreeMap<String, Requests> {
             continue;
         };
         let total = totals.entry(node.to_owned()).or_default();
-        *total = total.plus(effective_requests(pod));
+        // Taken rather than copied: a total carries a map of extended resources
+        // now, so it is moved through the sum instead of being cloned into it.
+        *total = std::mem::take(total).plus(effective_requests(pod));
     }
 
     totals
@@ -292,6 +346,7 @@ mod tests {
         Requests {
             cpu: quantity(cpu),
             memory: quantity(memory),
+            extended: BTreeMap::new(),
         }
     }
 
@@ -571,6 +626,183 @@ mod tests {
     #[test]
     fn no_pods_at_all_is_an_empty_map_rather_than_an_error() {
         assert!(by_node(&[]).is_empty());
+    }
+
+    /// A container asking for `count` of one extended resource and nothing else.
+    fn device_container(name: &str, resource: &str, count: &str) -> Container {
+        Container {
+            name: name.to_owned(),
+            resources: Some(ResourceRequirements {
+                requests: Some(
+                    [(resource.to_owned(), ApiQuantity(count.to_owned()))]
+                        .into_iter()
+                        .collect(),
+                ),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_pods_devices_are_summed_across_its_containers() {
+        let pod = pod(
+            "node-a",
+            spec(vec![
+                device_container("trainer", "nvidia.com/gpu", "1"),
+                device_container("sidecar-trainer", "nvidia.com/gpu", "1"),
+            ]),
+        );
+
+        assert_eq!(
+            effective_requests(&pod).extended("nvidia.com/gpu"),
+            quantity("2")
+        );
+    }
+
+    #[test]
+    fn a_device_nobody_asked_for_reads_as_zero_rather_than_as_missing() {
+        // The scheduler reserves nothing for a request nobody made, so this is
+        // a real zero and the node table renders it as one.
+        let pod = pod("node-a", spec(vec![container("app", "250m", "512Mi")]));
+
+        assert_eq!(
+            effective_requests(&pod).extended("nvidia.com/gpu"),
+            Quantity::default()
+        );
+        assert_eq!(
+            Requests::default().extended("nvidia.com/gpu"),
+            Quantity::default()
+        );
+    }
+
+    #[test]
+    fn a_device_follows_the_same_init_peak_rule_cpu_does() {
+        // An init container holding a GPU while it warms a model cache is the
+        // pod's footprint even though no app container asks for one; charging
+        // only the app containers would show the node as having a card free
+        // that the scheduler has already reserved.
+        let pod = pod(
+            "node-a",
+            PodSpec {
+                init_containers: Some(vec![device_container("warm", "nvidia.com/gpu", "1")]),
+                ..spec(vec![container("app", "250m", "512Mi")])
+            },
+        );
+
+        assert_eq!(
+            effective_requests(&pod).extended("nvidia.com/gpu"),
+            quantity("1")
+        );
+    }
+
+    #[test]
+    fn a_device_asked_for_by_a_sidecar_is_added_to_the_running_containers() {
+        // The sum branch rather than the max one, on the same `restartPolicy`
+        // rule the CPU total follows.
+        let mut proxy = device_container("proxy", "nvidia.com/gpu", "1");
+        proxy.restart_policy = Some("Always".to_owned());
+
+        let pod = pod(
+            "node-a",
+            PodSpec {
+                init_containers: Some(vec![proxy]),
+                ..spec(vec![device_container("app", "nvidia.com/gpu", "2")])
+            },
+        );
+
+        assert_eq!(
+            effective_requests(&pod).extended("nvidia.com/gpu"),
+            quantity("3")
+        );
+    }
+
+    #[test]
+    fn the_resources_kubernetes_defines_itself_stay_out_of_the_extended_map() {
+        // `hugepages-2Mi` and `ephemeral-storage` are native resources with a
+        // native meaning; treating them as devices would put a column headed
+        // `HUGEPAGES-2MI` on a table that has no idea what one is.
+        let mut app = container("app", "250m", "512Mi");
+        app.resources = Some(ResourceRequirements {
+            requests: Some(
+                [
+                    ("cpu", "250m"),
+                    ("hugepages-2Mi", "128Mi"),
+                    ("ephemeral-storage", "1Gi"),
+                    ("kubernetes.io/something", "1"),
+                ]
+                .into_iter()
+                .map(|(name, value)| (name.to_owned(), ApiQuantity(value.to_owned())))
+                .collect(),
+            ),
+            ..Default::default()
+        });
+
+        let requests = effective_requests(&pod("node-a", spec(vec![app])));
+
+        assert!(requests.extended.is_empty(), "{:?}", requests.extended);
+        assert_eq!(requests.cpu, quantity("250m"));
+    }
+
+    #[test]
+    fn node_totals_add_up_the_devices_of_every_pod_on_the_node() {
+        let pods = [
+            pod(
+                "node-a",
+                spec(vec![device_container("a", "nvidia.com/gpu", "1")]),
+            ),
+            pod(
+                "node-a",
+                spec(vec![device_container("b", "nvidia.com/gpu", "2")]),
+            ),
+            pod(
+                "node-b",
+                spec(vec![device_container("c", "amd.com/gpu", "1")]),
+            ),
+        ];
+
+        let totals = by_node(&pods);
+
+        assert_eq!(totals["node-a"].extended("nvidia.com/gpu"), quantity("3"));
+        // A device booked on one node must not turn up on another.
+        assert_eq!(
+            totals["node-a"].extended("amd.com/gpu"),
+            Quantity::default()
+        );
+        assert_eq!(totals["node-b"].extended("amd.com/gpu"), quantity("1"));
+    }
+
+    #[test]
+    fn two_different_devices_both_survive_the_sum_and_the_peak() {
+        // The union, in both folds: a resource only one side of `plus` or `max`
+        // carries must not be dropped by the one that does not know about it.
+        let pod = pod(
+            "node-a",
+            PodSpec {
+                init_containers: Some(vec![device_container("warm", "amd.com/gpu", "1")]),
+                ..spec(vec![device_container("app", "nvidia.com/gpu", "2")])
+            },
+        );
+
+        let requests = effective_requests(&pod);
+        assert_eq!(requests.extended("amd.com/gpu"), quantity("1"));
+        assert_eq!(requests.extended("nvidia.com/gpu"), quantity("2"));
+    }
+
+    #[test]
+    fn a_finished_pod_releases_the_devices_it_held() {
+        // The rule the CPU total already follows, asserted for devices too: a
+        // completed training Job must not make a GPU node look full.
+        let mut finished = pod(
+            "node-a",
+            spec(vec![device_container("trainer", "nvidia.com/gpu", "4")]),
+        );
+        finished.status = Some(PodStatus {
+            phase: Some("Succeeded".to_owned()),
+            ..Default::default()
+        });
+
+        assert!(by_node(&[finished]).is_empty());
     }
 
     #[test]

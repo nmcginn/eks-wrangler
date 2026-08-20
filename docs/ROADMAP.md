@@ -235,8 +235,15 @@ cluster.
   that appears only where the usage pair does not. It also puts two more columns
   on every listing, which is the default table's width, and that belongs with the
   narrow-mode task rather than arriving as a side effect.
+  A pod's *device* request is the same question with the same undecided answer
+  and one extra reason to wait: `eks nodes` now shows what each node has booked
+  of a GPU, so "which pod is holding the fourth card" is the follow-on question,
+  and it wants whatever column shape this task settles rather than a GPU-shaped
+  exception to it. `Requests::extended` already carries the figure.
   *Acceptance:* the figure is `effective_requests`'s, as the usage denominator
-  already is; whichever shape it takes, no listing shows one pod's request twice.
+  already is; whichever shape it takes, no listing shows one pod's request twice;
+  a device column on `eks pods` appears on the condition the node table's does —
+  some row in this listing asked for one — rather than on a second rule.
 
 - [ ] **Sort a pod listing by its share of what it asked for.**
   `--sort cpu` ranks the figure, which is the right key for "what is eating this
@@ -311,12 +318,50 @@ cluster.
 
 ### Follow-ups from the capacity columns
 
-- [ ] **Extended resources in the node table.**
+- [x] **Extended resources in the node table.**
   GPUs and other device-plugin resources (`nvidia.com/gpu`) are parsed correctly
   but never shown; a node table that hides the reason a pod will not schedule is
   doing half a job.
   *Acceptance:* a column appears only when some node in the listing reports the
   resource, so a CPU-only cluster gains no empty columns.
+  Landed as one column per resource, `2/4 (50%)` — booked over allocatable —
+  with `k8s::resource::is_extended` deciding which names qualify by Kubernetes'
+  own rule, so `hugepages-2Mi` and the `attachable-volumes-*` limits beside it
+  are left alone. `pods::Requests` grew a map so the scheduler arithmetic that
+  totals CPU totals devices too. A node that does not report the resource reads
+  `-` rather than `0/4`: no such hardware is a different answer from none free.
+  The count alone would have hidden the case the column exists for — a card the
+  kubelet has and will not offer — so `devices_withheld` names the node with the
+  widest gap and says to check its device plugin.
+
+- [ ] **Sort the node table by an extended resource.**
+  `eks nodes --sort cpu` finds the node closest to full and there is no way to
+  ask the same of the GPU column, which on a training cluster is the only column
+  anyone is reading. Separate because it turns on a decision the reviewer should
+  make rather than one this PR could guess: `--sort` is a `clap::ValueEnum` on
+  the domain type (decision 28) precisely so a bad value is rejected with the
+  valid ones listed, and a resource name is not one of a fixed set — it is
+  whatever the cluster invented, and is not known until the nodes have been
+  fetched, which is after the flag has been parsed. Taking this means either a
+  free-form `--sort` value validated against the rows instead of by `clap`, or a
+  second flag, and the answer applies to `eks pods` at the same time.
+  *Acceptance:* whichever shape it takes, the ordering ranks by share as the
+  other node orders do, and a node that does not report the resource sorts into
+  the unrankable tail under `k8s::order`'s existing rule rather than as a zero.
+
+- [ ] **Native resources that still have no column: `pods`, `ephemeral-storage`,
+  and `hugepages-*`.**
+  `is_extended` now names them explicitly as the things a device column is *not*,
+  which makes their absence a decision rather than an oversight — and `pods` is
+  already wanted by the pod-count task above, where it is the `maxPods` half.
+  Separate because each wants a heading and a denominator a reader recognises
+  rather than the device treatment: `ephemeral-storage` is a capacity pair like
+  memory, `hugepages-2Mi` reads `0` on almost every node and so wants the
+  `any`-not-`all` condition, and whether a cluster that uses none of them should
+  see any of this is the question. Not urgent: none of them was visible before
+  tonight either.
+  *Acceptance:* each column appears under a stated condition and reads in the
+  units of the thing it counts, not as a device count.
 
 - [ ] **A narrow mode for the node table.**
   `eks nodes` is now ten columns and around 140 characters wide on a cluster
@@ -326,6 +371,9 @@ cluster.
   `--wide` is the opt-in direction — and `k8s::nodes::columns` is the one place
   the column set is decided, so this is a third variant and a drop order rather
   than a new mechanism.
+  The device columns are the newest thing it has to place, and the hardest: a
+  `NVIDIA.COM/GPU` heading is fourteen characters over a cell of nine, and it is
+  the column nobody on a GPU cluster wants dropped.
   *Acceptance:* columns are dropped in a documented order to fit the terminal;
   the choice is a pure function over an available width, tested at 80, 100, and
   1 column.
@@ -371,6 +419,21 @@ cluster.
   pages arrive.
   *Acceptance:* paging is driven by a tested pure function over the continue
   token; a fixture with three pages is covered.
+
+- [ ] **Make a listing's footnotes a pure function.**
+  Every footnote's *wording* is a tested pure function; the list they are
+  assembled into is not, because assembly happens inside `commands::nodes::list`
+  between the requests, and that function needs a cluster. So the order the
+  notes come out in — which matters, since one of them points at "the reason
+  above" — is guaranteed by reading ten lines rather than by a test. Noticed
+  while adding a fifth note to that list and having to hold two failures back
+  until the rows existed. Separate because it is the same shape of work on
+  `commands::pods::list`, which assembles its own, and because the parameter
+  list is the design question: a function taking eight arguments is not obviously
+  better than the ten lines it replaces, and the alternative — a small
+  `Footnotes` builder both commands push into — is the reviewer's call.
+  *Acceptance:* the order of the assembled notes is asserted in a test with no
+  client; both listings assemble through the same thing.
 
 - [ ] **Move `eks contexts` onto the shared table renderer.**
   `format::table` now renders `eks nodes`; `commands::contexts` still has its

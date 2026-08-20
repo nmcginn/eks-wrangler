@@ -126,6 +126,31 @@ pub fn percentage(ratio: f64) -> String {
     format!("{:.0}%", ratio * 100.0)
 }
 
+/// Write a list of items out as prose: `a`, `a or b`, `a, b, or c`.
+///
+/// One function rather than a `join` at each call site, because the awkward
+/// part is not the join. It is the comma before the last item, which is what
+/// keeps `cpu, memory, or age` from reading as a two-item list ending in an odd
+/// pair — and a rule a sentence somewhere else would sooner or later get right
+/// a different way.
+///
+/// `conjunction` is the word before the last item, so the same function writes
+/// the "sort by one of these instead" advice and the "these columns are empty"
+/// footnote, which want `or` and `and` respectively.
+///
+/// `None` for an empty list, which forces the caller to decide what its
+/// sentence says when there is nothing to put in it rather than leaving a gap
+/// in the middle of one.
+#[must_use]
+pub fn list(items: &[String], conjunction: &str) -> Option<String> {
+    match items {
+        [] => None,
+        [only] => Some(only.clone()),
+        [first, second] => Some(format!("{first} {conjunction} {second}")),
+        [head @ .., last] => Some(format!("{}, {conjunction} {last}", head.join(", "))),
+    }
+}
+
 /// Render an aligned, `kubectl`-style table.
 ///
 /// Columns are as wide as their widest cell, separated by two spaces. The last
@@ -270,6 +295,30 @@ mod tests {
         // wants the number.
         assert_eq!(percentage(1.04), "104%");
         assert_eq!(percentage(4.5), "450%");
+    }
+
+    #[test]
+    fn a_list_puts_its_conjunction_before_the_last_item() {
+        let items = |names: &[&str]| -> Vec<String> {
+            names.iter().map(|name| (*name).to_owned()).collect()
+        };
+
+        assert_eq!(list(&items(&[]), "or"), None);
+        assert_eq!(list(&items(&["cpu"]), "or").as_deref(), Some("cpu"));
+        assert_eq!(
+            list(&items(&["cpu", "memory"]), "or").as_deref(),
+            Some("cpu or memory")
+        );
+        // The serial comma: without it, `cpu, memory or age` reads as a
+        // two-item list whose second item is an odd pair.
+        assert_eq!(
+            list(&items(&["cpu", "memory", "age"]), "or").as_deref(),
+            Some("cpu, memory, or age")
+        );
+        assert_eq!(
+            list(&items(&["CPU REQ", "MEM REQ"]), "and").as_deref(),
+            Some("CPU REQ and MEM REQ")
+        );
     }
 
     #[test]

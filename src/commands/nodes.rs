@@ -57,25 +57,23 @@ pub async fn list(
     // common, and metrics-server is an add-on EKS does not install for you.
     let mut footnotes = Vec::new();
 
+    // Both failures are held as explanations here and written under the table
+    // once the rows exist, rather than footnoted on the spot. The request
+    // footnote has to name the columns it emptied, and on a cluster with GPUs
+    // that list is not known until the nodes have been read.
     let requests = match pods {
-        Ok(pods) => Some(k8s_pods::by_node(&pods)),
+        Ok(pods) => Ok(k8s_pods::by_node(&pods)),
         Err(error) => {
             tracing::debug!(%error, "listing pods failed");
-            footnotes.push(k8s_nodes::requests_unavailable(&k8s::explain(
-                &error, &label,
-            )));
-            None
+            Err(k8s::explain(&error, &label))
         }
     };
 
     let usage = match usage {
-        Ok(usage) => Some(usage),
+        Ok(usage) => Ok(usage),
         Err(error) => {
             tracing::debug!(%error, "reading node metrics failed");
-            footnotes.push(k8s_nodes::usage_unavailable(&k8s_metrics::explain(
-                &error, &label,
-            )));
-            None
+            Err(k8s_metrics::explain(&error, &label))
         }
     };
 
@@ -94,7 +92,7 @@ pub async fn list(
             // Unlike the requests below, an absent node here is *not* a zero: it
             // is a node metrics-server has not sampled yet, and drawing it as
             // idle would be an invention. `None` reads as `-`.
-            usage.as_ref().and_then(|samples| {
+            usage.as_ref().ok().and_then(|samples| {
                 node.metadata
                     .name
                     .as_deref()
@@ -104,19 +102,22 @@ pub async fn list(
         })
         .collect();
 
+    // What a node running nothing has booked. Named here rather than built per
+    // row so the rows can borrow the totals instead of cloning a map each.
+    let nothing = k8s_pods::Requests::default();
+
     let mut rows: Vec<k8s_nodes::NodeRow> = nodes
         .iter()
         .zip(&samples)
         .map(|(node, sample)| {
             // A node absent from the totals is running nothing, which is a real
             // zero. Only a failed pod listing leaves the figure unknown.
-            let requested = requests.as_ref().map(|totals| {
+            let requested = requests.as_ref().ok().map(|totals| {
                 node.metadata
                     .name
                     .as_deref()
                     .and_then(|name| totals.get(name))
-                    .copied()
-                    .unwrap_or_default()
+                    .unwrap_or(&nothing)
             });
             k8s_nodes::NodeRow::from_node(node, requested, sample.map(|s| s.usage), now)
         })
@@ -128,13 +129,24 @@ pub async fn list(
     // promise rather than an accident.
     k8s_nodes::sort(&mut rows, order, direction);
 
+    // The two columns-are-missing footnotes, held back until now because the
+    // first of them names the columns the failure emptied and a device column
+    // is one of them. They stay in the order they always came in.
+    if let Err(explanation) = &requests {
+        footnotes.push(k8s_nodes::requests_unavailable(&rows, explanation));
+    }
+    if let Err(explanation) = &usage {
+        footnotes.push(k8s_nodes::usage_unavailable(explanation));
+    }
+
     // What became of the usage columns, asked of the rows rather than of the
     // request: a read that succeeded and returned nothing costs exactly the
     // columns a failed one does, and the two want opposite advice. Where the
     // columns did survive, they want a date instead — metrics-server going quiet
     // does not fail this request, so without one a stale figure and a fresh one
     // are the same table.
-    let usage_columns = k8s_metrics::Outcome::of(usage.as_ref(), k8s_nodes::shows_usage(&rows));
+    let usage_columns =
+        k8s_metrics::Outcome::of(usage.as_ref().ok(), k8s_nodes::shows_usage(&rows));
     match usage_columns {
         k8s_metrics::Outcome::Shown => footnotes.extend(
             k8s_metrics::freshness(samples.iter().flatten(), now).map(k8s_metrics::freshness_note),
@@ -146,6 +158,10 @@ pub async fn list(
         // explained.
         k8s_metrics::Outcome::Unreadable => {}
     }
+
+    // Under the notes about the columns that are missing, one about a column
+    // that is there and is quietly smaller than the hardware behind it.
+    footnotes.extend(k8s_nodes::devices_withheld(&rows));
 
     // Last of the footnotes, under whatever went wrong: a table nobody could
     // fill in is more urgent news than the order it came out in. The note is
@@ -160,7 +176,7 @@ pub async fn list(
     // the column that came up empty — in which case the note points at it
     // rather than repeating the advice a paragraph later.
     let missing = k8s_nodes::Missing {
-        requests: requests.is_none(),
+        requests: requests.is_err(),
         // The columns being gone, rather than the read having failed: both
         // reasons for their absence now have a footnote above for the note to
         // point back at.
