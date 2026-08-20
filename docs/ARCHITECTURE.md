@@ -11,8 +11,8 @@ src/
   cluster.rs           Turning kubeconfig entries into human-facing views.
   format.rs            Ages and aligned tables — pure string formatting.
   theme.rs             The entire colour palette and severity thresholds.
-  k8s/                 The Kubernetes client, quantities, selectors, nodes,
-                       pods, and metrics.
+  k8s/                 The Kubernetes client, paging and request budgets,
+                       quantities, selectors, nodes, pods, and metrics.
   commands/            One module per user-facing command.
   ui/                  The interactive dashboard.
 ```
@@ -206,6 +206,28 @@ which keeps `cpu` and `memory` as fields and everything else in a map, so
 `effective_requests` charges a pod's GPU by the scheduler's rules rather than by
 a second sum written for devices.
 
+Every one of those listings reaches the wire through one function. `k8s::page`
+asks for `page::SIZE` objects at a time and follows the `continue` token, so a
+cluster with ten thousand pods is a series of ordinary responses rather than one
+enormous one — and an ordinary cluster is still the single request it always
+was, because a first page that comes back short carries no token. The loop is
+four lines of I/O in `page::collect`; everything that decides whether there is
+another page lives in `page::Listing`, over a page of items and a token, which
+is what makes a three-page listing a fixture. It also spots the one shape of
+answer that could hang the tool for ever — a server handing back the token it
+was given — and stops rather than following it.
+
+`page::Budget` is `--timeout`, and it lives there because paging is what
+decides its unit. A listing is now several requests, so the budget is spent per
+request: a cluster large enough to need four pages should not be cut off for its
+size, only for going quiet. Cluster failures are therefore `page::Error` rather
+than `kube::Error` — the API failures and the one `kube` has no opinion about,
+since waiting for ever is a reasonable thing for a library to do and not for a
+command-line tool. The budget covers requests and not `k8s::connect`, and that
+is a limitation rather than a choice: `kube` runs a kubeconfig's credential
+helper with a blocking `std::process::Command`, so a hung `aws eks get-token`
+blocks the thread and no timeout around it would fire.
+
 Resource quantities get their own hop: the API server reports capacity as
 strings in a small grammar (`3920m`, `7134420Ki`, `1e3`), and `k8s::quantity`
 turns those into numbers before anything formats or divides them. It is a pure
@@ -242,9 +264,14 @@ Tests that need a fake cluster get fixtures, never live AWS.
 human, not code. `main` prints the whole context chain with `{:#}`.
 
 Errors from the cluster get one extra step: `k8s::client::explain` turns a
-`kube::Error` into a sentence naming the cluster and what to do next, and the
+`page::Error` into a sentence naming the cluster and what to do next, and the
 raw error goes to `tracing::debug` instead of the user's terminal. It is a pure
 function over a classified failure, so each message is asserted on in a test.
+Two of those classifications exist because listings are paged and budgeted: a
+`410` is a page marker that expired mid-listing, which is not the user's fault
+and wants "run it again"; and a `Slow` names the budget it overran and the
+larger one to type, spelled through `Budget` itself so the advice cannot suggest
+a value the flag would reject.
 
 `k8s::metrics::explain` is the one place that wraps it. Two failures dominate the
 metrics endpoint and a core-API caller never sees either — a `404` because

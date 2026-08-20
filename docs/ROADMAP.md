@@ -388,7 +388,7 @@ cluster.
   *Acceptance:* the count excludes finished pods, matching the requests total it
   sits beside; `maxPods` comes from the node's `allocatable["pods"]`.
 
-- [ ] **Paginate the pod listing.**
+- [x] **Paginate the pod listing.**
   `eks nodes` now fetches every pod in the cluster in one request to total the
   requests, and `eks pods -A` does the same to list them — twice over now, since
   the metrics listing beside it is unpaged too. On a large cluster that is the
@@ -396,6 +396,7 @@ cluster.
   listing has.
   *Acceptance:* pages with the same tested continue-token function the node
   listing uses; the two listings still run concurrently.
+  Landed with the node half, through one `k8s::page::collect`.
 
 - [ ] **Severity colour in the CLI table.**
   `nodes::Share::severity` classifies each percentage on the shared thresholds,
@@ -413,12 +414,43 @@ cluster.
 
 ### Follow-ups from the client bootstrap
 
-- [ ] **Paginate node listings.**
+- [x] **Paginate node listings.**
   `eks nodes` fetches every node in one request. A cluster with thousands of
   nodes deserves `limit`/`continue` paging, and eventually a spinner while the
   pages arrive.
   *Acceptance:* paging is driven by a tested pure function over the continue
   token; a fixture with three pages is covered.
+  The spinner half became its own entry below; it is a surface this tool does
+  not have yet rather than the rest of this task.
+
+- [ ] **Say that a listing is still arriving.**
+  Paging turned a slow listing into several requests, and `eks nodes` on a very
+  large cluster now spends that time as silently as it spent it before. A
+  spinner, or a `read 1,500 nodes…` counter on stderr, was the other half of the
+  paging task. Separate because it is the first thing this tool would ever write
+  to a terminal mid-command, and that needs the decision the severity-colour task
+  needs and does not yet have: what `eks` does when stdout is a pipe, and whether
+  `NO_COLOR` is the switch for movement as well as for colour. Building it before
+  that is answered would be guessing at both.
+  *Acceptance:* nothing is written when stdout is not a terminal, so a piped
+  listing is unchanged to the byte; the progress line goes to stderr and is
+  erased before the table is printed.
+
+- [ ] **A timeout that covers the credential helper.**
+  `--timeout` bounds requests to the cluster, and cannot bound what happens
+  before the first one: `kube` resolves a kubeconfig's auth eagerly and runs the
+  exec plugin with a blocking `std::process::Command`, so an `aws eks get-token`
+  that hangs — a laptop that has lost its route to the SSO endpoint — blocks the
+  thread rather than the future, and a `tokio::time::timeout` around
+  `k8s::connect` would never fire. Discovered while writing the flag, and
+  separate because the fix is a different mechanism on a different surface, not
+  a wider version of this one: the helper has to run on a blocking task, and
+  abandoning one does not kill the subprocess, so the runtime then has to be
+  shut down without waiting for it. It also wants its own message — a hung
+  credential helper is advice about the AWS CLI, not about a VPC.
+  *Acceptance:* `eks nodes --timeout 5s` gives up in five seconds against a
+  credential helper that never exits, and the process exits rather than waiting
+  for it; the message names the helper rather than the API server.
 
 - [ ] **Make a listing's footnotes a pure function.**
   Every footnote's *wording* is a tested pure function; the list they are
@@ -435,23 +467,28 @@ cluster.
   *Acceptance:* the order of the assembled notes is asserted in a test with no
   client; both listings assemble through the same thing.
 
-- [ ] **Move `eks contexts` onto the shared table renderer.**
+- [x] **Move `eks contexts` onto the shared table renderer.**
   `format::table` now renders `eks nodes`; `commands::contexts` still has its
   own copy, which also owns the `*` active-cluster gutter.
   *Acceptance:* one renderer, existing `contexts` output unchanged to the byte.
+  The gutter stayed behind: it is not a column, and a padded one would read
+  `*  prod`.
 
-- [ ] **Global flags before a subcommand.**
+- [x] **Global flags before a subcommand.**
   `eks --kubeconfig x contexts` is rejected because `args_conflicts_with_subcommands`
   treats the flag as the bare-dashboard form. Flags after the subcommand work,
   which makes the failure look arbitrary.
   *Acceptance:* both orders parse; a test covers each global flag in both
   positions.
 
-- [ ] **A `--timeout` for cluster requests.**
+- [x] **A `--timeout` for cluster requests.**
   A hung API server currently leaves `eks nodes` waiting forever with no way out
   but Ctrl-C.
   *Acceptance:* the default is documented; timing out names the cluster and
   suggests checking VPN or endpoint access.
+  Spent per request rather than per command, because paging made a listing
+  several of them. What it cannot cover is the credential helper, which is its
+  own entry above.
 
 ## Milestone 2 — The dashboard
 
@@ -465,7 +502,10 @@ cluster.
   Move fetching onto a background task feeding the UI over a channel. Refresh on
   an interval and on demand (`r`).
   *Acceptance:* the render loop never awaits a network call; a hung API call
-  leaves the UI fully navigable; refresh interval is configurable.
+  leaves the UI fully navigable; refresh interval is configurable; the fetches
+  go through `k8s::page::collect` with the same `Budget` the CLI uses, so a
+  request that never answers ends rather than pinning a background task for the
+  life of the session.
 
 - [ ] **Pod browsing.**
   Drill from a node into its pods, and from a pod into its containers. Namespace
@@ -539,6 +579,52 @@ cluster.
 ---
 
 ## Done
+
+- **Paginate node listings**, **Paginate the pod listing** (2026-08-20) — every
+  listing now goes through `k8s::page::collect`, which asks for 500 objects at a
+  time and follows the `continue` token: the node listing, both pod listings,
+  and both metrics endpoints. An ordinary cluster is unchanged, because a first
+  page that comes back short carries no token and ends the listing after the one
+  request it always took. The loop is four lines of I/O and every decision in it
+  is outside it — `page::Listing` holds the items, remembers the token the last
+  request carried, and answers `Page`/`Done`/`Stalled` — so three pages, an
+  empty listing, and a `"continue": ""` are fixtures rather than a cluster
+  somebody has to grow. `Stalled` is the case Kubernetes never produces and the
+  only one that could hang the tool for ever: a server handing back the token it
+  was given would page over the same objects until Ctrl-C, so it ends the
+  listing with a warning instead. The two metrics listings do not chunk —
+  metrics-server ignores `limit` and answers in one go — and go through the same
+  door anyway, because what that buys them is the request budget below.
+
+- **A `--timeout` for cluster requests** (2026-08-20) — `--timeout 30s` by
+  default, `0` to wait for as long as it takes, and a message that names the
+  budget it overran and the larger one to type: `did not answer within 5s … allow
+  it longer: --timeout 10s`. It is spent per request rather than per command,
+  which paging decided: a listing is several requests now, and a cluster large
+  enough to need four pages would otherwise be cut off for its size rather than
+  for being unreachable. `Budget` therefore lives in `k8s::page`, and prints a
+  spelling it can parse back, so the advice can never suggest a value the flag
+  would reject. Two failures that were raw HTTP became sentences on the way: a
+  `410` is a page marker that expired mid-listing, which wants "run it again"
+  rather than anything about credentials. What the flag cannot cover is the
+  credential helper, which `kube` runs with a blocking `std::process::Command` —
+  its own entry above, with the reason.
+
+- **Global flags before a subcommand** (2026-08-20) — `eks --context prod nodes`
+  parses, as `eks nodes --context prod` always did. `args_conflicts_with_subcommands`
+  was buying nothing: every argument this parser has at the top level is a global
+  one, meant to be legal beside a subcommand, so the setting only made the flag
+  order arbitrary. Each global flag is now asserted in both positions, including
+  the new `--timeout`.
+
+- **Move `eks contexts` onto the shared table renderer** (2026-08-20) — one set
+  of column-width rules in the tool rather than two, with the output asserted in
+  full rather than probed, since "unchanged to the byte" was the whole
+  requirement. The `*` gutter did not move into `format::table`: it is not a
+  column — a padded one would print `*  prod`, since every column carries its
+  own two-space separator — and no other listing has a row that is more current
+  than its neighbours, so the table is rendered without it and each line is
+  prefixed afterwards.
 
 - **Point the "nothing ranked" note at what would fix it** (2026-08-19) — the
   note now advises as well as diagnoses. Where a footnote above the table has

@@ -46,6 +46,7 @@ use serde::Deserialize;
 
 use crate::format;
 use crate::k8s::client;
+use crate::k8s::page;
 use crate::k8s::pods::{Scope, Selectors};
 use crate::k8s::quantity::Quantity;
 
@@ -602,7 +603,10 @@ pub fn pod_params(selectors: &Selectors) -> ListParams {
 /// alongside the node and pod listings.
 pub trait Source {
     /// Usage for every node the sampler has heard from.
-    fn node_usage(&self) -> impl Future<Output = Result<Vec<NodeMetrics>, kube::Error>> + Send;
+    fn node_usage(
+        &self,
+        budget: page::Budget,
+    ) -> impl Future<Output = Result<Vec<NodeMetrics>, page::Error>> + Send;
 
     /// Usage for the pods in `scope`, narrowed by the label half of
     /// `selectors` — see [`pod_params`] for why only that half.
@@ -610,29 +614,41 @@ pub trait Source {
         &self,
         scope: &Scope,
         selectors: &Selectors,
-    ) -> impl Future<Output = Result<Vec<PodMetrics>, kube::Error>> + Send;
+        budget: page::Budget,
+    ) -> impl Future<Output = Result<Vec<PodMetrics>, page::Error>> + Send;
 }
 
 /// The real thing: `metrics.k8s.io` on a live cluster.
 ///
-/// The only implementation that touches the network.
+/// The only implementation that touches the network, and it reads both
+/// listings through [`page::collect`] like every other listing in the tool.
+/// metrics-server itself does not chunk its answers — it serves what it has in
+/// memory in one go — so `limit` is a request it declines rather than obeys,
+/// and the loop finishes after one page. Going through the same path anyway is
+/// what puts the *budget* on these requests: a metrics endpoint that has
+/// stopped answering should cost the same wait as any other, not an unbounded
+/// one, and the columns it feeds are the ones the tool can do without.
 impl Source for Client {
-    fn node_usage(&self) -> impl Future<Output = Result<Vec<NodeMetrics>, kube::Error>> + Send {
+    fn node_usage(
+        &self,
+        budget: page::Budget,
+    ) -> impl Future<Output = Result<Vec<NodeMetrics>, page::Error>> + Send {
         let api: Api<NodeMetrics> = Api::all(self.clone());
-        async move { Ok(api.list(&ListParams::default()).await?.items) }
+        async move { page::collect(&api, &ListParams::default(), budget).await }
     }
 
     fn pod_usage(
         &self,
         scope: &Scope,
         selectors: &Selectors,
-    ) -> impl Future<Output = Result<Vec<PodMetrics>, kube::Error>> + Send {
+        budget: page::Budget,
+    ) -> impl Future<Output = Result<Vec<PodMetrics>, page::Error>> + Send {
         let api: Api<PodMetrics> = match scope {
             Scope::Namespace(name) => Api::namespaced(self.clone(), name),
             Scope::All => Api::all(self.clone()),
         };
         let params = pod_params(selectors);
-        async move { Ok(api.list(&params).await?.items) }
+        async move { page::collect(&api, &params, budget).await }
     }
 }
 
@@ -640,8 +656,11 @@ impl Source for Client {
 ///
 /// Generic over [`Source`] so the command layer's happy path and its
 /// degraded one are both reachable from a test without a cluster.
-pub async fn usage_by_node<S: Source>(source: &S) -> Result<BTreeMap<String, Sample>, kube::Error> {
-    Ok(by_node(&source.node_usage().await?))
+pub async fn usage_by_node<S: Source>(
+    source: &S,
+    budget: page::Budget,
+) -> Result<BTreeMap<String, Sample>, page::Error> {
+    Ok(by_node(&source.node_usage(budget).await?))
 }
 
 /// Fetch pod usage for `scope` and index it by namespace and name.
@@ -652,8 +671,9 @@ pub async fn usage_by_pod<S: Source>(
     source: &S,
     scope: &Scope,
     selectors: &Selectors,
-) -> Result<BTreeMap<PodKey, Sample>, kube::Error> {
-    Ok(by_pod(&source.pod_usage(scope, selectors).await?))
+    budget: page::Budget,
+) -> Result<BTreeMap<PodKey, Sample>, page::Error> {
+    Ok(by_pod(&source.pod_usage(scope, selectors, budget).await?))
 }
 
 /// Index a usage listing by node name.
@@ -686,25 +706,25 @@ pub fn by_node(metrics: &[NodeMetrics]) -> BTreeMap<String, Sample> {
 ///
 /// `cluster` is a human label such as `prod (us-east-1)`, not an ARN.
 #[must_use]
-pub fn explain(error: &kube::Error, cluster: &str) -> String {
-    match error {
+pub fn explain(error: &page::Error, cluster: &str) -> String {
+    match error.status_code() {
         // The aggregation layer answers for a group nobody registered with a
         // 404 — sometimes as a `Status`, sometimes as a bare `404 page not
         // found` that `kube` reconstructs into one. Either way this is the
         // fresh-EKS-cluster case, and it is not an error the user made.
-        kube::Error::Api(status) if status.code == 404 => format!(
+        Some(404) => format!(
             "{cluster} has no metrics.k8s.io API, so metrics-server does not appear to be installed.\n\
              Install it to see live usage: https://github.com/kubernetes-sigs/metrics-server"
         ),
         // Registered but not serving: metrics-server refuses to answer until it
         // has scraped every node once, which takes a minute or so after it
         // starts and forever if it cannot reach the kubelets.
-        kube::Error::Api(status) if status.code == 503 => format!(
+        Some(503) => format!(
             "metrics-server is registered on {cluster} but is not answering yet.\n\
              It stays unavailable until it has scraped every node once — give it a minute, \
              then check its pod in kube-system if it does not settle."
         ),
-        other => client::explain(other, cluster),
+        _ => client::explain(error, cluster),
     }
 }
 
@@ -716,8 +736,8 @@ mod tests {
 
     use super::*;
 
-    fn api_error(code: u16, message: &str) -> kube::Error {
-        kube::Error::Api(Status::failure(message, "Failure").with_code(code).boxed())
+    fn api_error(code: u16, message: &str) -> page::Error {
+        kube::Error::Api(Status::failure(message, "Failure").with_code(code).boxed()).into()
     }
 
     /// The instant every fixture here is dated against.
@@ -806,7 +826,10 @@ mod tests {
     }
 
     impl Source for Fake {
-        fn node_usage(&self) -> impl Future<Output = Result<Vec<NodeMetrics>, kube::Error>> + Send {
+        fn node_usage(
+            &self,
+            _budget: page::Budget,
+        ) -> impl Future<Output = Result<Vec<NodeMetrics>, page::Error>> + Send {
             let answer = match &self.nodes {
                 Ok(samples) => Ok(samples.clone()),
                 Err(code) => Err(api_error(*code, "no")),
@@ -818,7 +841,8 @@ mod tests {
             &self,
             _scope: &Scope,
             _selectors: &Selectors,
-        ) -> impl Future<Output = Result<Vec<PodMetrics>, kube::Error>> + Send {
+            _budget: page::Budget,
+        ) -> impl Future<Output = Result<Vec<PodMetrics>, page::Error>> + Send {
             let answer = match &self.pods {
                 Ok(samples) => Ok(samples.clone()),
                 Err(code) => Err(api_error(*code, "no")),
@@ -910,7 +934,9 @@ mod tests {
     #[tokio::test]
     async fn a_source_that_answers_is_indexed_straight_through() {
         let source = Fake::nodes(Ok(vec![sample("node-a", "412m", "3925716Ki")]));
-        let index = usage_by_node(&source).await.unwrap();
+        let index = usage_by_node(&source, page::Budget::default())
+            .await
+            .unwrap();
 
         assert_eq!(
             index["node-a"].usage.cpu,
@@ -921,7 +947,7 @@ mod tests {
     #[tokio::test]
     async fn a_source_that_fails_hands_the_error_back_for_explaining() {
         let source = Fake::nodes(Err(404));
-        let error = usage_by_node(&source)
+        let error = usage_by_node(&source, page::Budget::default())
             .await
             .expect_err("a 404 is not a usage listing");
 
@@ -965,6 +991,23 @@ mod tests {
 
         let forbidden = api_error(403, "Forbidden");
         assert!(explain(&forbidden, "prod").contains("access entry"));
+    }
+
+    #[test]
+    fn a_metrics_endpoint_that_never_answers_says_how_long_it_waited() {
+        // A metrics-server that has stopped answering used to hang the command
+        // for ever, since the usage read is joined with the listing that is not
+        // optional. It now costs the budget, and the footnote it earns has to
+        // say so rather than falling into the "not installed" advice — the
+        // endpoint may be there and simply unreachable.
+        let error = page::Error::TimedOut {
+            limit: std::time::Duration::from_secs(30),
+        };
+
+        let message = explain(&error, "prod (us-east-1)");
+        assert!(message.contains("within 30s"), "{message}");
+        assert!(message.contains("--timeout 1m"), "{message}");
+        assert!(!message.contains("Install it"), "{message}");
     }
 
     #[test]
@@ -1143,9 +1186,14 @@ mod tests {
             vec![container("app", "250m", "512Mi")],
         )]));
 
-        let index = usage_by_pod(&source, &Scope::All, &Selectors::default())
-            .await
-            .unwrap();
+        let index = usage_by_pod(
+            &source,
+            &Scope::All,
+            &Selectors::default(),
+            page::Budget::default(),
+        )
+        .await
+        .unwrap();
 
         assert_eq!(
             index[&("payments".to_owned(), "api-7c9f".to_owned())]
@@ -1160,9 +1208,14 @@ mod tests {
         let source = Fake::pods(Err(404));
         let scope = Scope::Namespace("payments".to_owned());
 
-        let error = usage_by_pod(&source, &scope, &Selectors::default())
-            .await
-            .expect_err("a 404 is not a usage listing");
+        let error = usage_by_pod(
+            &source,
+            &scope,
+            &Selectors::default(),
+            page::Budget::default(),
+        )
+        .await
+        .expect_err("a 404 is not a usage listing");
 
         assert!(explain(&error, "prod (us-east-1)").contains("metrics-server"));
     }

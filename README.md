@@ -337,10 +337,37 @@ refresh them instead of printing an HTTP status code.
 | `--sort-reverse` | Reverse `--sort`; unrankable rows stay at the end. Either flag adds a line under the table naming the order |
 | `--wide` | Add the extra columns `kubectl -o wide` shows. Pods: `IP`, `NOMINATED NODE`, `READINESS GATES`. Nodes: `INTERNAL-IP`, `EXTERNAL-IP`, `OS-IMAGE`, `KERNEL-VERSION`, `CONTAINER-RUNTIME` |
 | `--kubeconfig <PATH>` | Override the kubeconfig search path |
+| `--timeout <DURATION>` | How long to wait for any one request to the cluster. Default `30s`; `0` waits for as long as it takes |
 | `-v, --verbose` | Increase log verbosity (repeatable) |
 
 `KUBECONFIG` is honoured, including multi-path values, with the same precedence
 `kubectl` uses.
+
+All of these are global, and they parse on either side of the subcommand:
+`eks --context prod nodes` and `eks nodes --context prod` are the same command.
+
+### Big clusters, and slow ones
+
+Listings are read in pages of 500 — the same chunk size `kubectl` uses — so a
+cluster with ten thousand pods does not arrive as one enormous response. Nothing
+about a smaller cluster changes: a first page that comes back short ends the
+listing, so most clusters are still the single request they always were.
+
+`--timeout` is the other half of that, and it is spent per request rather than
+per command, so a cluster large enough to need several pages is not cut off for
+its size:
+
+```
+$ eks nodes --timeout 5s
+eks: prod (us-east-1) did not answer within 5s.
+A private EKS endpoint only answers from inside its VPC or over a VPN. If the cluster is merely busy, allow it longer: `--timeout 10s`.
+```
+
+That is the failure the flag exists for: a private endpoint reached from outside
+its VPC does not refuse the connection, it simply never answers. `--timeout 0`
+restores the old behaviour of waiting indefinitely. It covers requests, not the
+kubeconfig's credential helper — `aws eks get-token` runs before the first
+request and outside anything this flag can interrupt.
 
 ### Keys
 

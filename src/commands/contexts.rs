@@ -3,6 +3,7 @@
 use anyhow::{Context as _, Result, anyhow, bail};
 
 use crate::cluster::ClusterView;
+use crate::format;
 use crate::kubeconfig::{self, KubeConfig};
 
 /// Build the display views for every context in the config.
@@ -126,9 +127,17 @@ pub fn resolve_selector<'a>(views: &'a [ClusterView], selector: &str) -> Result<
 }
 
 /// Render the aligned cluster table.
+///
+/// The columns come from [`format::table`], the same renderer `eks nodes` and
+/// `eks pods` use, so there is one set of alignment rules in the tool rather
+/// than a copy per table.
+///
+/// The gutter stays here, because it is not a column. It is a fixed
+/// two-character marker written *outside* the table — a padded column would
+/// make the rows read `*  prod`, since every column carries a two-space
+/// separator after it — and it belongs to this listing alone: no other table
+/// has a row that is more "current" than its neighbours.
 fn render_table(views: &[ClusterView]) -> String {
-    // The active-cluster marker is a fixed two-character gutter rather than a
-    // padded column, so rows read as `* prod` instead of `*  prod`.
     const CURRENT: &str = "* ";
     const OTHER: &str = "  ";
 
@@ -138,11 +147,10 @@ fn render_table(views: &[ClusterView]) -> String {
             .to_owned();
     }
 
-    let headers = ["NAME", "REGION", "NAMESPACE"];
-    let rows: Vec<[String; 3]> = views
+    let rows: Vec<Vec<String>> = views
         .iter()
         .map(|v| {
-            [
+            vec![
                 v.display_name.clone(),
                 v.region.clone().unwrap_or_else(|| "-".to_owned()),
                 v.namespace.clone(),
@@ -150,45 +158,20 @@ fn render_table(views: &[ClusterView]) -> String {
         })
         .collect();
 
-    let widths: Vec<usize> = (0..headers.len())
-        .map(|column| {
-            rows.iter()
-                .map(|row| display_width(&row[column]))
-                .chain(std::iter::once(display_width(headers[column])))
-                .max()
-                .unwrap_or(0)
-        })
-        .collect();
+    // The header line takes the blank gutter, and then one per row in order —
+    // `format::table` emits exactly that many lines, headers first.
+    let gutters = std::iter::once(OTHER).chain(
+        views
+            .iter()
+            .map(|v| if v.is_current { CURRENT } else { OTHER }),
+    );
 
-    let mut out = String::new();
-    push_row(&mut out, OTHER, &headers.map(str::to_owned), &widths);
-    for (view, row) in views.iter().zip(&rows) {
-        let gutter = if view.is_current { CURRENT } else { OTHER };
-        push_row(&mut out, gutter, row, &widths);
-    }
-    out.trim_end().to_owned()
-}
-
-fn push_row(out: &mut String, gutter: &str, cells: &[String; 3], widths: &[usize]) {
-    out.push_str(gutter);
-
-    let last = cells.len() - 1;
-    for (index, cell) in cells.iter().enumerate() {
-        if index == last {
-            // Never pad the final column; trailing whitespace shows up in diffs
-            // and when users copy lines out of the terminal.
-            out.push_str(cell);
-        } else {
-            let pad = widths[index].saturating_sub(display_width(cell));
-            out.push_str(cell);
-            out.extend(std::iter::repeat_n(' ', pad + 2));
-        }
-    }
-    out.push('\n');
-}
-
-fn display_width(value: &str) -> usize {
-    value.chars().count()
+    format::table(&["NAME", "REGION", "NAMESPACE"], &rows)
+        .lines()
+        .zip(gutters)
+        .map(|(line, gutter)| format!("{gutter}{line}"))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 #[cfg(test)]
@@ -240,6 +223,47 @@ contexts:
         assert!(
             !output.contains("arn:aws:eks"),
             "the table should never show raw ARNs:\n{output}"
+        );
+    }
+
+    #[test]
+    fn the_table_is_exactly_what_it_was_before_it_shared_a_renderer() {
+        // Written out in full rather than probed with `contains`, because the
+        // point of moving onto `format::table` was that nothing about this
+        // output changes — including the two spaces between every column and the
+        // two-character gutter that is not one.
+        assert_eq!(
+            list(&config(), false),
+            [
+                "  NAME     REGION     NAMESPACE",
+                "* prod     us-east-1  default",
+                "  staging  us-west-2  payments",
+            ]
+            .join("\n")
+        );
+    }
+
+    #[test]
+    fn a_row_is_as_wide_as_the_widest_cell_in_its_column() {
+        // The alignment rule now belongs to `format::table`; this asserts the
+        // gutter still sits outside it, so a long name pushes the columns right
+        // without pushing the marker with them.
+        let views = vec![
+            ClusterView {
+                is_current: true,
+                ..view("long", "a-very-long-cluster-name")
+            },
+            view("short", "b"),
+        ];
+
+        assert_eq!(
+            render_table(&views),
+            [
+                "  NAME                      REGION     NAMESPACE",
+                "* a-very-long-cluster-name  us-east-1  default",
+                "  b                         us-east-1  default",
+            ]
+            .join("\n")
         );
     }
 

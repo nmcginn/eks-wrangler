@@ -21,6 +21,7 @@ pub use order::{Missing, Order, cause, ranks_any, sort};
 
 use crate::format;
 use crate::k8s::metrics::Usage;
+use crate::k8s::page;
 use crate::k8s::pods::Requests;
 use crate::k8s::quantity::{self, Quantity};
 use crate::k8s::resource;
@@ -28,10 +29,13 @@ use crate::theme::Severity;
 
 /// Ask the API server for every node in the cluster.
 ///
-/// The only function in this module that touches the network.
-pub async fn fetch(client: Client) -> Result<Vec<Node>, kube::Error> {
+/// The only function in this module that touches the network. A cluster with
+/// more nodes than one response should carry is read in pages — see
+/// [`crate::k8s::page`] — and `budget` limits how long each of those pages may
+/// take.
+pub async fn fetch(client: Client, budget: page::Budget) -> Result<Vec<Node>, page::Error> {
     let api: Api<Node> = Api::all(client);
-    Ok(api.list(&ListParams::default()).await?.items)
+    page::collect(&api, &ListParams::default(), budget).await
 }
 
 /// One node, reduced to what a person wants to see.

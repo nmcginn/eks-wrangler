@@ -8,20 +8,19 @@ use std::path::PathBuf;
 use clap::{Parser, Subcommand};
 
 use crate::k8s::nodes::Order as NodeOrder;
+use crate::k8s::page::Budget;
 use crate::k8s::pods::Order as PodOrder;
 
 /// Explore and interact with AWS EKS clusters.
 #[derive(Debug, Parser)]
-#[command(
-    name = "eks",
-    version,
-    about,
-    long_about = None,
-    propagate_version = true,
-    // Running `eks` bare should drop you straight into the dashboard; the
-    // subcommands are for scripting and quick one-shot answers.
-    args_conflicts_with_subcommands = true
-)]
+// Running `eks` bare drops you straight into the dashboard, which
+// `Option<Command>` is what provides; the subcommands are for scripting and
+// quick one-shot answers. `args_conflicts_with_subcommands` used to be set here
+// as well, and it bought nothing: every argument this parser has at the top
+// level is a *global* one, meant to be legal beside a subcommand, and the
+// setting made `eks --context prod nodes` an error while `eks nodes --context
+// prod` worked. Ordering that arbitrary reads as a bug rather than as a rule.
+#[command(name = "eks", version, about, long_about = None, propagate_version = true)]
 pub struct Cli {
     #[command(subcommand)]
     pub command: Option<Command>,
@@ -44,6 +43,12 @@ pub struct GlobalArgs {
     /// Path to a kubeconfig file (overrides KUBECONFIG).
     #[arg(long, global = true, value_name = "PATH", env = "KUBECONFIG")]
     pub kubeconfig: Option<PathBuf>,
+
+    /// How long to wait for any one request to the cluster. `0` waits for as
+    /// long as it takes. A listing too large for one response is read in
+    /// pages, and this is the limit on each page rather than on the command.
+    #[arg(long, global = true, value_name = "DURATION", default_value_t = Budget::default())]
+    pub timeout: Budget,
 
     /// Increase log verbosity. Repeat for more detail.
     #[arg(long, short = 'v', global = true, action = clap::ArgAction::Count)]
@@ -395,6 +400,94 @@ mod tests {
         let cli = parse(&["eks", "contexts", "--namespace", "payments", "-vv"]);
         assert_eq!(cli.global.namespace.as_deref(), Some("payments"));
         assert_eq!(cli.global.verbose, 2);
+    }
+
+    #[test]
+    fn every_global_flag_parses_on_either_side_of_the_subcommand() {
+        // `eks --kubeconfig x contexts` used to be rejected while
+        // `eks contexts --kubeconfig x` worked, which reads as a bug rather than
+        // as a rule — nobody can see where the line is.
+        let both_ways = |flag: &[&str]| {
+            let mut before = vec!["eks"];
+            before.extend_from_slice(flag);
+            before.push("nodes");
+
+            let mut after = vec!["eks", "nodes"];
+            after.extend_from_slice(flag);
+
+            (parse(&before), parse(&after))
+        };
+
+        let (before, after) = both_ways(&["--kubeconfig", "/tmp/kubeconfig"]);
+        assert_eq!(before.global.kubeconfig, after.global.kubeconfig);
+        assert_eq!(
+            before.global.kubeconfig.as_deref(),
+            Some(std::path::Path::new("/tmp/kubeconfig"))
+        );
+
+        let (before, after) = both_ways(&["--context", "prod"]);
+        assert_eq!(before.global.context, after.global.context);
+        assert_eq!(before.global.context.as_deref(), Some("prod"));
+
+        let (before, after) = both_ways(&["-n", "payments"]);
+        assert_eq!(before.global.namespace, after.global.namespace);
+        assert_eq!(before.global.namespace.as_deref(), Some("payments"));
+
+        let (before, after) = both_ways(&["--timeout", "5s"]);
+        assert_eq!(before.global.timeout, after.global.timeout);
+        assert_eq!(
+            before.global.timeout,
+            Budget::of(std::time::Duration::from_secs(5))
+        );
+
+        let (before, after) = both_ways(&["-vv"]);
+        assert_eq!(before.global.verbose, after.global.verbose);
+        assert_eq!(before.global.verbose, 2);
+    }
+
+    #[test]
+    fn a_global_flag_before_a_subcommand_leaves_the_subcommand_intact() {
+        // The failure mode of getting this wrong is subtler than a rejection:
+        // the flag parses and the subcommand quietly becomes the dashboard.
+        let cli = parse(&["eks", "--context", "prod", "pods", "-A"]);
+
+        let Some(Command::Pods { all_namespaces, .. }) = cli.command else {
+            panic!("expected a Pods command");
+        };
+        assert!(all_namespaces);
+        assert_eq!(cli.global.context.as_deref(), Some("prod"));
+    }
+
+    #[test]
+    fn a_bare_invocation_still_takes_the_global_flags() {
+        // `eks --context prod` is the dashboard, pointed at a cluster — the
+        // form the old conflict setting existed to protect.
+        let cli = parse(&["eks", "--context", "prod", "--timeout", "0"]);
+
+        assert!(cli.command.is_none());
+        assert_eq!(cli.global.context.as_deref(), Some("prod"));
+        assert_eq!(cli.global.timeout, Budget::unlimited());
+    }
+
+    #[test]
+    fn requests_wait_thirty_seconds_unless_told_otherwise() {
+        // Documented in the README and in `--help`; asserted here so the two
+        // cannot drift apart silently.
+        assert_eq!(parse(&["eks", "nodes"]).global.timeout, Budget::default());
+        assert_eq!(Budget::default().to_string(), "30s");
+    }
+
+    #[test]
+    fn a_timeout_that_is_not_a_duration_is_rejected_with_examples() {
+        // Before anything connects, and with the accepted spellings in the
+        // message — the same bargain `--sort` makes.
+        let error = Cli::try_parse_from(["eks", "nodes", "--timeout", "soon"])
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("soon"), "{error}");
+        assert!(error.contains("30s"), "{error}");
+        assert!(error.contains("500ms"), "{error}");
     }
 
     #[test]
