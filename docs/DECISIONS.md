@@ -914,3 +914,90 @@ listing that failed, so only the numerator is unknown — the count came back wi
 the nodes and is still good. The footnote that explains the failure names the
 device columns it emptied, for the reason decision 38 gives: a message that
 diagnoses without saying which columns it is about makes the reader find them.
+
+### 43. Every listing is paged, through one function
+
+`eks nodes` fetched every node in one request, and `eks pods -A` every pod —
+twice over on the node table, which totals the pods to fill in its request
+columns. On a cluster of any size that is the largest thing this tool asks for,
+and the API server has to hold the whole answer in memory before it sends a byte
+of it. Kubernetes' answer is `limit` and `continue`, and `k8s::page::collect` is
+now the single door every listing goes through: nodes, pods, scoped pods, and
+both metrics endpoints.
+
+`page::SIZE` is 500, which is `kubectl`'s own chunk size. It also settles the
+compatibility question, because a first page that comes back short carries no
+continue token: an ordinary cluster is exactly the one request it always was,
+and only a big one pays for a second.
+
+The loop is deliberately tiny and the decisions are all outside it.
+`page::Listing` holds the items, remembers the token the last request carried,
+and answers `Next::Page`/`Done`/`Stalled` — so a three-page listing, an empty
+one, an empty-string continue token, and a server that repeats its token are
+fixtures, and `collect` itself is four lines of I/O with nothing to get wrong.
+
+`Stalled` is the one case Kubernetes never produces and we handle anyway. A
+server that hands back the token it was given would page for ever, fetching the
+same objects, with the command never returning and nothing on screen to say why.
+It ends the listing with a `tracing::warn!` rather than an error, because the
+pages that did arrive are real: half a listing with a warning beside it beats no
+listing. It is not a footnote under the table — the shape the rest of this tool
+words such things in — because carrying "this may be short" up from the fetch
+would mean every listing function returning a pair, and this is a case a
+conformant server cannot reach.
+
+metrics-server does not chunk its replies: `limit` is a parameter it ignores, so
+those two listings finish after one page regardless. They go through `collect`
+anyway, because what that buys them is the *budget* below. A metrics endpoint
+that has gone quiet should cost the same wait as any other request, not an
+unbounded one, and it is the request whose columns the tool can most afford to
+lose.
+
+### 44. `--timeout` is spent per request, and cannot cover the credential helper
+
+A hung API server left `eks nodes` waiting for ever with no way out but Ctrl-C,
+and the shape of that failure is why it needs a flag rather than a constant: a
+private EKS endpoint reached from outside its VPC does not refuse the
+connection, it simply never answers. The default is 30 seconds — long enough
+that a busy API server is not cut off mid-answer, short enough that a wrong
+network is a sentence rather than a hang — and `--timeout 0` restores the old
+behaviour for anyone who wants it.
+
+Per *request* rather than per command, and decision 43 is why: a listing is now
+several requests, and a cluster large enough to need four pages would be cut off
+for its size rather than for being unreachable. The same reasoning puts `Budget`
+in `k8s::page` rather than in a module of its own — the unit of the budget is
+the unit of the paging.
+
+`Budget` parses `30s`, `500ms`, `2m`, `1h`, and a bare number of seconds, which
+is narrower than the Go duration grammar `kubectl` takes. The missing piece is
+the compound `1m30s`, and it is missing on purpose: `Display` has to print a
+spelling `from_str` reads back, because the timeout message ends with ``allow it
+longer: `--timeout 1m` `` and advice that names a value the flag would reject is
+worse than no advice. One unit in, one unit out, and a test asserts the round
+trip.
+
+What the flag cannot promise is the part before the first request. `kube`
+resolves a kubeconfig's auth eagerly and runs the exec plugin with a blocking
+`std::process::Command`, so an `aws eks get-token` that hangs blocks the thread
+rather than the future, and a `tokio::time::timeout` wrapped around
+`k8s::connect` would never fire. Covering it needs the helper moved onto a
+blocking task, and then a shutdown that does not wait for the abandoned one —
+a different piece of work, in the roadmap. Until then the flag's help says
+"request", which is what it means.
+
+### 45. `eks contexts` renders through `format::table`, gutter and all
+
+`format::table` came out of `eks nodes` and `commands::contexts` kept its own
+copy of the same column-width arithmetic, which is two chances to decide
+differently what "aligned" means. The table now comes from the shared renderer
+and the output is unchanged to the byte, which a test asserts in full rather
+than by probing with `contains`.
+
+The `*` marker did not move into it. It is not a column: a column would be
+padded to its width and followed by the standard two-space separator, so rows
+would read `*  prod`, and it is the only such marker in the tool — no other
+listing has a row that is more current than its neighbours. So the table is
+rendered without it and each line is prefixed afterwards, header included. That
+keeps the gutter's two characters a fact about this listing rather than a
+feature of every table.

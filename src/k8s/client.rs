@@ -10,6 +10,13 @@
 //! being built rather than on the first request. That is why building a client
 //! can fail with a credential error, and why [`explain`] is used on both paths.
 //!
+//! One thing that follows from that eager resolution is worth stating plainly,
+//! because it is a limit on what `--timeout` can promise: `kube` runs the exec
+//! plugin with a *blocking* `std::process::Command`, so a credential helper
+//! that hangs hangs the thread rather than the future, and no timeout wrapped
+//! around this function would ever fire. [`Budget`] therefore covers requests
+//! to the cluster — see [`crate::k8s::page`] — and the flag's help says so.
+//!
 //! Translating failures is the job that earns its keep. An EKS cluster whose
 //! SSO session expired answers with `401 Unauthorized`, and `kube` reports that
 //! faithfully as `ApiError: ... (Status { code: 401 ... })`. That is a correct
@@ -19,11 +26,14 @@
 //! is asserted on in tests rather than provoked from a cluster.
 
 use std::path::PathBuf;
+use std::time::Duration;
 
 use kube::config::{KubeConfigOptions, Kubeconfig};
 use kube::{Client, Config};
 
 use crate::cluster::ClusterView;
+use crate::format;
+use crate::k8s::page::{self, Budget};
 
 /// Failures from building a client, before any resource is requested.
 #[derive(Debug, thiserror::Error)]
@@ -84,7 +94,7 @@ pub async fn connect(paths: &[PathBuf], cluster: &ClusterView) -> Result<Client,
 
     Client::try_from(config).map_err(|source| {
         tracing::debug!(%source, "building a client failed");
-        Error::Cluster(explain(&source, &cluster.label()))
+        Error::Cluster(explain(&source.into(), &cluster.label()))
     })
 }
 
@@ -131,22 +141,40 @@ pub enum Failure {
     Forbidden,
     /// No answer from the API server at all.
     Unreachable,
+    /// No answer within the time the user allowed, carried here because the
+    /// advice has to name the budget it overran.
+    Slow(Duration),
+    /// A paged listing outlived the marker the cluster was keeping its place
+    /// with.
+    PageExpired,
     /// Anything we have no specific advice for.
     Other,
 }
 
 impl Failure {
-    /// Classify a `kube` error.
+    /// Classify a failed request.
     ///
     /// Deliberately coarse. Every arm has to lead to advice worth printing, and
     /// a wrong-but-plausible suggestion costs a user more time than an honest
     /// "here is the raw error".
     #[must_use]
-    pub fn of(error: &kube::Error) -> Self {
+    pub fn of(error: &page::Error) -> Self {
+        match error {
+            page::Error::TimedOut { limit } => Self::Slow(*limit),
+            page::Error::Api(error) => Self::of_api(error),
+        }
+    }
+
+    /// Classify a `kube` error, which is every failure that reached the cluster
+    /// or tried to.
+    fn of_api(error: &kube::Error) -> Self {
         match error {
             kube::Error::Api(status) => match status.code {
                 401 => Self::Credentials,
                 403 => Self::Forbidden,
+                // Only a paged listing sends a continue token, and only an
+                // expired one comes back as a `410`.
+                410 => Self::PageExpired,
                 _ => Self::Other,
             },
             // Every auth failure but one means "your credentials did not work".
@@ -162,12 +190,12 @@ impl Failure {
     }
 }
 
-/// Turn a `kube` error into the message a user should see, naming the cluster
+/// Turn a failed request into the message a user should see, naming the cluster
 /// they were talking to and what to do next.
 ///
 /// `cluster` is a human label such as `prod (us-east-1)`, not an ARN.
 #[must_use]
-pub fn explain(error: &kube::Error, cluster: &str) -> String {
+pub fn explain(error: &page::Error, cluster: &str) -> String {
     match Failure::of(error) {
         Failure::Credentials => format!(
             "{cluster} rejected your credentials — they are missing or expired.\n\
@@ -186,6 +214,22 @@ pub fn explain(error: &kube::Error, cluster: &str) -> String {
             "could not reach the API server for {cluster}.\n\
              Check your network, and note that a private EKS endpoint only answers from inside its VPC or over a VPN."
         ),
+        // The silent cousin of `Unreachable`, and the reason `--timeout` exists:
+        // a private endpoint reached from outside its VPC does not refuse the
+        // connection, it simply never answers. Same advice, plus the way out for
+        // the other case — a cluster that is only slow.
+        Failure::Slow(limit) => format!(
+            "{cluster} did not answer within {}.\n\
+             A private EKS endpoint only answers from inside its VPC or over a VPN. \
+             If the cluster is merely busy, allow it longer: `--timeout {}`.",
+            format::exact_duration(limit),
+            Budget::of(limit.checked_mul(2).unwrap_or(limit)),
+        ),
+        Failure::PageExpired => format!(
+            "{cluster} lost its place partway through this listing.\n\
+             A listing too large for one response is read in pages, and the marker between them \
+             expires after a few minutes. Run it again; if it keeps happening, ask for less at once."
+        ),
         // No advice worth inventing, so show the real thing rather than a
         // reassuring guess.
         Failure::Other => format!("talking to {cluster} failed: {error}"),
@@ -202,12 +246,13 @@ mod tests {
 
     use super::*;
 
-    fn api_error(code: u16) -> kube::Error {
+    fn api_error(code: u16) -> page::Error {
         kube::Error::Api(
             Status::failure("denied", "Forbidden")
                 .with_code(code)
                 .boxed(),
         )
+        .into()
     }
 
     /// A kubeconfig whose credential helper is a command that cannot exist, so
@@ -269,7 +314,7 @@ users:
     fn a_failed_credential_helper_is_a_credential_problem_too() {
         // `aws eks get-token` ran and exited non-zero — an expired SSO cache is
         // the common cause.
-        let error = kube::Error::Auth(kube::client::AuthError::ExecPluginFailed);
+        let error = page::Error::from(kube::Error::Auth(kube::client::AuthError::ExecPluginFailed));
 
         assert_eq!(Failure::of(&error), Failure::Credentials);
         assert!(explain(&error, "prod").contains("aws sso login"));
@@ -277,9 +322,8 @@ users:
 
     #[test]
     fn a_missing_credential_helper_suggests_installing_it_not_logging_in() {
-        let error = kube::Error::Auth(kube::client::AuthError::AuthExecStart(io::Error::new(
-            io::ErrorKind::NotFound,
-            "no such file or directory",
+        let error = page::Error::from(kube::Error::Auth(kube::client::AuthError::AuthExecStart(
+            io::Error::new(io::ErrorKind::NotFound, "no such file or directory"),
         )));
 
         assert_eq!(Failure::of(&error), Failure::HelperMissing);
@@ -300,15 +344,65 @@ users:
 
     #[test]
     fn a_connection_failure_mentions_the_private_endpoint_trap() {
-        let error = kube::Error::Service(Box::new(io::Error::new(
+        let error = page::Error::from(kube::Error::Service(Box::new(io::Error::new(
             io::ErrorKind::ConnectionRefused,
             "connection refused",
-        )));
+        ))));
 
         assert_eq!(Failure::of(&error), Failure::Unreachable);
         let message = explain(&error, "prod (us-east-1)");
         assert!(message.contains("could not reach"), "{message}");
         assert!(message.contains("VPN"), "{message}");
+    }
+
+    #[test]
+    fn a_request_that_ran_out_of_time_names_the_budget_and_a_bigger_one() {
+        // The failure `--timeout` exists for, and the one where "check your
+        // network" on its own is only half the advice: the other half is that
+        // the cluster may simply be slower than the budget allowed.
+        let error = page::Error::TimedOut {
+            limit: Duration::from_secs(30),
+        };
+        let message = explain(&error, "prod (us-east-1)");
+
+        assert_eq!(Failure::of(&error), Failure::Slow(Duration::from_secs(30)));
+        assert!(message.contains("prod (us-east-1)"), "{message}");
+        assert!(message.contains("within 30s"), "{message}");
+        assert!(message.contains("--timeout 1m"), "{message}");
+        assert!(message.contains("VPN"), "{message}");
+    }
+
+    #[test]
+    fn the_suggested_budget_is_one_a_user_could_type() {
+        // The doubling goes through `Budget`'s own spelling, so the advice can
+        // never suggest a value the flag would reject.
+        let doubled = |seconds| {
+            explain(
+                &page::Error::TimedOut {
+                    limit: Duration::from_secs(seconds),
+                },
+                "prod",
+            )
+        };
+
+        assert!(doubled(45).contains("--timeout 90s"), "{}", doubled(45));
+        assert!(doubled(30).contains("--timeout 1m"), "{}", doubled(30));
+    }
+
+    #[test]
+    fn an_expired_page_marker_says_to_run_it_again_not_to_log_in() {
+        // A `410` only ever reaches us partway through a paged listing, and it
+        // is not the user's fault or their credentials'.
+        let message = explain(&api_error(410), "prod (us-east-1)");
+
+        assert_eq!(Failure::of(&api_error(410)), Failure::PageExpired);
+        assert!(message.contains("prod (us-east-1)"), "{message}");
+        assert!(message.contains("Run it again"), "{message}");
+        assert!(!message.contains("aws sso login"), "{message}");
+        assert!(
+            !message.contains("410"),
+            "raw HTTP status leaked: {message}"
+        );
     }
 
     #[test]
@@ -328,9 +422,13 @@ users:
         let errors = [
             api_error(401),
             api_error(403),
+            api_error(410),
             api_error(500),
-            kube::Error::Auth(kube::client::AuthError::MissingCommand),
-            kube::Error::Service(Box::new(io::Error::other("boom"))),
+            kube::Error::Auth(kube::client::AuthError::MissingCommand).into(),
+            kube::Error::Service(Box::new(io::Error::other("boom"))).into(),
+            page::Error::TimedOut {
+                limit: Duration::from_secs(30),
+            },
         ];
 
         for error in &errors {

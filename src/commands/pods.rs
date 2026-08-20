@@ -10,6 +10,7 @@ use crate::commands::nodes::target_cluster;
 use crate::format::Width;
 use crate::k8s::metrics::{self as k8s_metrics};
 use crate::k8s::order::Direction;
+use crate::k8s::page;
 use crate::k8s::pods::{Order, PodRow, Scope, Selectors};
 use crate::k8s::{self, pods as k8s_pods, selector};
 use crate::kubeconfig::KubeConfig;
@@ -41,6 +42,9 @@ pub struct Request<'a> {
     /// `--wide`. Like `order`, applied to the finished rows: every column it
     /// adds arrived with the pods, so it costs no extra request.
     pub width: Width,
+    /// `--timeout`, spent per request rather than per command — a namespace big
+    /// enough to be read in several pages should not be cut off for its size.
+    pub budget: page::Budget,
 }
 
 /// Fetch and render the pod table for the selected cluster and scope.
@@ -66,8 +70,8 @@ pub async fn list(
     // Concurrently, not in sequence: the two requests are independent, and the
     // command should cost one round trip's worth of waiting rather than two.
     let (pods, usage) = tokio::join!(
-        k8s_pods::fetch_scope(client.clone(), &scope, &selectors),
-        k8s_metrics::usage_by_pod(&client, &scope, &selectors),
+        k8s_pods::fetch_scope(client.clone(), &scope, &selectors, request.budget),
+        k8s_metrics::usage_by_pod(&client, &scope, &selectors, request.budget),
     );
 
     let pods = pods.map_err(|error| {

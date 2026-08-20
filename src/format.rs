@@ -4,6 +4,8 @@
 //! a node created in the future, a table with no rows, a cell wider than its
 //! header — are settled by tests rather than by squinting at a terminal.
 
+use std::time::Duration;
+
 use k8s_openapi::jiff::SignedDuration;
 
 /// How many of a table's columns to print.
@@ -109,6 +111,36 @@ pub fn human_duration(delta: SignedDuration) -> String {
         format!("{years}y")
     } else {
         format!("{years}y{remainder}d")
+    }
+}
+
+/// A length of time written the shortest way that still means exactly this.
+///
+/// The opposite of [`human_duration`], which rounds an age to the unit a person
+/// reads it in. Nothing is rounded here, because this prints the number the
+/// *user* gave: it is how a `--timeout` is echoed back in an error message, and
+/// it is deliberately a spelling [`Budget`] can parse again, so
+/// ``allow longer: `--timeout 1m` `` is advice somebody can type rather than a
+/// riddle about what this tool calls a minute.
+///
+/// [`Budget`]: crate::k8s::page::Budget
+#[must_use]
+pub fn exact_duration(span: Duration) -> String {
+    let millis = span.as_millis();
+    // Below a second, or not a whole number of them: the only unit that can say
+    // this without rounding is the smallest one.
+    if millis == 0 {
+        return "0s".to_owned();
+    }
+    if !millis.is_multiple_of(1000) {
+        return format!("{millis}ms");
+    }
+
+    let seconds = span.as_secs();
+    if seconds.is_multiple_of(60) {
+        format!("{}m", seconds / 60)
+    } else {
+        format!("{seconds}s")
     }
 }
 
@@ -260,6 +292,26 @@ mod tests {
         // value in the AGE column.
         assert_eq!(human_duration(seconds(-30)), "0s");
         assert_eq!(human_duration(SignedDuration::from_hours(-24 * 400)), "0s");
+    }
+
+    #[test]
+    fn an_exact_duration_uses_the_largest_unit_that_loses_nothing() {
+        assert_eq!(exact_duration(Duration::from_secs(30)), "30s");
+        assert_eq!(exact_duration(Duration::from_secs(90)), "90s");
+        assert_eq!(exact_duration(Duration::from_secs(60)), "1m");
+        assert_eq!(exact_duration(Duration::from_secs(3600)), "60m");
+        assert_eq!(exact_duration(Duration::from_millis(500)), "500ms");
+        assert_eq!(exact_duration(Duration::from_millis(1_500)), "1500ms");
+        assert_eq!(exact_duration(Duration::ZERO), "0s");
+    }
+
+    #[test]
+    fn an_exact_duration_rounds_nothing_where_an_age_would() {
+        // The distinction between the two functions, in one assertion: five and
+        // a half minutes is an age of `5m30s` and a timeout of `330s`, and only
+        // the second can be typed back in after `--timeout`.
+        assert_eq!(human_duration(seconds(330)), "5m30s");
+        assert_eq!(exact_duration(Duration::from_secs(330)), "330s");
     }
 
     #[test]

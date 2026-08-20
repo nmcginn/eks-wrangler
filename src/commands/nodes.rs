@@ -10,6 +10,7 @@ use crate::commands::contexts;
 use crate::format::Width;
 use crate::k8s::metrics::{self as k8s_metrics};
 use crate::k8s::order::Direction;
+use crate::k8s::page;
 use crate::k8s::{self, nodes as k8s_nodes, pods as k8s_pods};
 use crate::kubeconfig::KubeConfig;
 
@@ -23,6 +24,10 @@ use crate::kubeconfig::KubeConfig;
 /// to the finished rows, so they change nothing about what is fetched — only
 /// the order it is read in. `width` is `--wide`, and is the same again: every
 /// column it adds arrived with the nodes, so it costs no extra request.
+///
+/// `budget` is `--timeout`, and it is per request rather than per command: each
+/// of the three listings below is read in pages, and a cluster large enough to
+/// need several of them should not be cut off for being large.
 pub async fn list(
     config: &KubeConfig,
     paths: &[PathBuf],
@@ -30,6 +35,7 @@ pub async fn list(
     order: k8s_nodes::Order,
     direction: Direction,
     width: Width,
+    budget: page::Budget,
 ) -> Result<String> {
     let target = target_cluster(config, selector)?;
     let label = target.label();
@@ -39,9 +45,9 @@ pub async fn list(
     // Concurrently, not in sequence: the three requests are independent, and the
     // command should cost one round trip's worth of waiting rather than three.
     let (nodes, pods, usage) = tokio::join!(
-        k8s_nodes::fetch(client.clone()),
-        k8s_pods::fetch(client.clone()),
-        k8s_metrics::usage_by_node(&client),
+        k8s_nodes::fetch(client.clone(), budget),
+        k8s_pods::fetch(client.clone(), budget),
+        k8s_metrics::usage_by_node(&client, budget),
     );
 
     let nodes = nodes.map_err(|error| {

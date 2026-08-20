@@ -19,7 +19,8 @@
 //! - Pod overhead, which a `RuntimeClass` adds for the sandbox itself, is charged
 //!   on top of both.
 //!
-//! [`fetch`] is the only function here that touches the network.
+//! [`fetch`] and [`fetch_scope`] are the only functions here that touch the
+//! network, and both read their listing in pages — see [`crate::k8s::page`].
 
 use std::collections::BTreeMap;
 
@@ -28,6 +29,7 @@ use k8s_openapi::apimachinery::pkg::api::resource::Quantity as ApiQuantity;
 use kube::Client;
 use kube::api::{Api, ListParams};
 
+use crate::k8s::page;
 use crate::k8s::quantity::Quantity;
 use crate::k8s::resource;
 
@@ -46,11 +48,14 @@ const LIVE_PODS: &str = "status.phase!=Succeeded,status.phase!=Failed";
 
 /// Ask the API server for every pod that is still occupying a node.
 ///
-/// The only function in this module that touches the network.
-pub async fn fetch(client: Client) -> Result<Vec<Pod>, kube::Error> {
+/// One of two functions here that touch the network, and the bigger of the two
+/// on any real cluster: every pod on every node, to total what each has booked.
+/// It is read in pages — see [`crate::k8s::page`] — with `budget` limiting how
+/// long each page may take.
+pub async fn fetch(client: Client, budget: page::Budget) -> Result<Vec<Pod>, page::Error> {
     let api: Api<Pod> = Api::all(client);
     let params = ListParams::default().fields(LIVE_PODS);
-    Ok(api.list(&params).await?.items)
+    page::collect(&api, &params, budget).await
 }
 
 /// Which pods a listing is about.
@@ -90,13 +95,14 @@ pub async fn fetch_scope(
     client: Client,
     scope: &Scope,
     selectors: &Selectors,
-) -> Result<Vec<Pod>, kube::Error> {
+    budget: page::Budget,
+) -> Result<Vec<Pod>, page::Error> {
     let api: Api<Pod> = match scope {
         Scope::Namespace(name) => Api::namespaced(client, name),
         Scope::All => Api::all(client),
     };
 
-    Ok(api.list(&selectors.to_params()).await?.items)
+    page::collect(&api, &selectors.to_params(), budget).await
 }
 
 /// Server-side selectors for a pod listing, already validated.

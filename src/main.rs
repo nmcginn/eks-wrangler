@@ -55,6 +55,7 @@ fn run(cli: Cli) -> Result<()> {
                 sort,
                 Direction::reversed(sort_reverse),
                 Width::widened(wide),
+                cli.global.timeout,
             ))?;
             print_line(&output);
             Ok(())
@@ -79,6 +80,7 @@ fn run(cli: Cli) -> Result<()> {
                     order: sort,
                     direction: Direction::reversed(sort_reverse),
                     width: Width::widened(wide),
+                    budget: cli.global.timeout,
                 },
             ))?;
             print_line(&output);
