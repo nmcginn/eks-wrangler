@@ -3,10 +3,12 @@
 //! Deliberately thin: parse, set up logging, dispatch, and turn errors into an
 //! exit code. Everything worth testing lives in the library.
 
+use std::io::IsTerminal;
 use std::process::ExitCode;
 
 use anyhow::{Result, bail};
 use clap::Parser;
+use ratatui::crossterm::terminal;
 use tracing_subscriber::EnvFilter;
 
 use eks::cli::{Cli, Command, GlobalArgs};
@@ -54,7 +56,7 @@ fn run(cli: Cli) -> Result<()> {
                 cli.global.context.as_deref(),
                 sort,
                 Direction::reversed(sort_reverse),
-                Width::widened(wide),
+                Width::for_terminal(wide, stdout_terminal_cols()),
                 cli.global.timeout,
             ))?;
             print_line(&output);
@@ -79,7 +81,12 @@ fn run(cli: Cli) -> Result<()> {
                     field_selector: field_selector.as_deref(),
                     order: sort,
                     direction: Direction::reversed(sort_reverse),
-                    width: Width::widened(wide),
+                    // `Width::Narrow` is treated as `Default` by the pod table
+                    // — no drop rule for it exists yet — so the pods listing
+                    // is unchanged and does not silently lose columns on a
+                    // small terminal. When it grows one, this line will not
+                    // need to change.
+                    width: Width::for_terminal(wide, stdout_terminal_cols()),
                     budget: cli.global.timeout,
                 },
             ))?;
@@ -120,6 +127,26 @@ fn print_line(output: &str) {
     if !output.is_empty() {
         println!("{output}");
     }
+}
+
+/// The terminal's column count where stdout is one, `None` otherwise.
+///
+/// Two questions and two answers, in that order: the terminal-size ioctl on
+/// stdout when stdout is a pipe returns the *stderr* terminal's width, which
+/// would narrow a piped listing based on the terminal that ran it and break
+/// the `eks nodes | grep foo` pipeline every script depends on. So the
+/// `IsTerminal` check has to come first, and a failed `size()` — no
+/// controlling terminal, an ioctl the platform does not support — also
+/// returns `None`: better an unnarrowed listing than a wrong one.
+///
+/// Impure and small on purpose; the arithmetic that decides which columns
+/// drop lives inside the node listing and is tested there without an ioctl
+/// in sight.
+fn stdout_terminal_cols() -> Option<u16> {
+    if !std::io::stdout().is_terminal() {
+        return None;
+    }
+    terminal::size().ok().map(|(cols, _rows)| cols)
 }
 
 fn init_tracing(global: &GlobalArgs) {

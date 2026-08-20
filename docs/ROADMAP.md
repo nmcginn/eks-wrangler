@@ -363,7 +363,7 @@ cluster.
   *Acceptance:* each column appears under a stated condition and reads in the
   units of the thing it counts, not as a device count.
 
-- [ ] **A narrow mode for the node table.**
+- [x] **A narrow mode for the node table.**
   `eks nodes` is now ten columns and around 140 characters wide on a cluster
   with metrics-server, which wraps on an 80-column terminal. The request and
   usage columns made this worse, and they are also the ones most worth keeping
@@ -377,6 +377,32 @@ cluster.
   *Acceptance:* columns are dropped in a documented order to fit the terminal;
   the choice is a pure function over an available width, tested at 80, 100, and
   1 column.
+  Landed as `Width::Narrow(u16)`, applied when stdout is a terminal and the
+  user did not type `--wide`. A pipe is not a "narrow terminal": stdout piped
+  gets the default table, byte for byte, so scripts parsing it do not break.
+  The drop order for nodes is a `DROP_ORDER` list of predicates in `k8s::nodes`
+  — VERSION, then AGE, then the REQ pair, then the USE pair, then CPU+MEMORY,
+  then every device column, then STATUS — and NAME never drops. Devices go
+  after the pair columns rather than before, so a GPU cluster keeps `GPU`
+  even after `CPU` has left; that was the reviewer's warning the task's
+  wording carried.
+
+- [ ] **A narrow mode for the pod table.**
+  `Width::Narrow(u16)` now exists on both listings, and the pod-table code path
+  treats it as `Default` — a Narrow variant reaches `k8s::pods::row::columns`
+  and falls through the `is_wide()` check. The pod table is the wider of the
+  two on a cluster with metrics-server and `--wide`, so it wants the same
+  treatment, but it wants its own drop order: NAMESPACE, IP, READINESS GATES,
+  and NOMINATED NODE all live there and nothing about node-table's list applies.
+  Separate because the drop order is a design question the reviewer should
+  settle — is IP dropped before or after AGE, does NAMESPACE go first under
+  `-A` as it does in `kubectl` — and building it before that would be
+  guessing at the answer. The main-loop plumbing is done: `stdout_terminal_cols`
+  is already passed to both listings.
+  *Acceptance:* the drop rule lives in `k8s::pods::row` beside `columns`,
+  matching the node table's shape; a piped `eks pods` is unchanged to the
+  byte; the choice is a pure function over an available width, tested at 80,
+  100, and 1 column.
 
 ### Follow-ups from the request columns
 

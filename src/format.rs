@@ -18,6 +18,15 @@ use k8s_openapi::jiff::SignedDuration;
 /// disagree about what "wide" means, which is the whole reason [`Direction`]
 /// lives in one place too.
 ///
+/// The third variant, [`Width::Narrow`], is the other end of `--wide`: on a
+/// terminal too small for the default table, a listing that knows it can drop
+/// columns instead of wrapping. It carries the target width the caller wants
+/// the row to fit in, because "narrow" means "this many characters" to a table
+/// and a listing that guessed at the number would get it wrong on the next
+/// resize. Which columns fall out under it is the listing's business — the
+/// pod table and the node table hold different things back and drop them in
+/// different orders — so this type only carries the ask, not the answer.
+///
 /// [`Direction`]: crate::k8s::order::Direction
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum Width {
@@ -26,6 +35,13 @@ pub enum Width {
     Default,
     /// Every column the listing has.
     Wide,
+    /// Fit the row inside this many characters.
+    ///
+    /// Carries the target width, so a `Narrow(80)` prints the same table as a
+    /// `Narrow(80)` on a different day — the terminal-size lookup is somebody
+    /// else's problem, and asserting the columns for a given width does not
+    /// need a terminal at all.
+    Narrow(u16),
 }
 
 impl Width {
@@ -38,6 +54,27 @@ impl Width {
     #[must_use]
     pub fn widened(yes: bool) -> Self {
         if yes { Self::Wide } else { Self::Default }
+    }
+
+    /// The width to render at, given `--wide` and a terminal's columns.
+    ///
+    /// `--wide` wins over everything: the user typed it, and a narrow terminal
+    /// is not a reason to override that. Otherwise, if we can see the terminal
+    /// — `terminal_cols = Some(n)` — narrow to fit it. If we cannot — stdout
+    /// is a pipe or a file, or the query failed — the [`Default`] set is
+    /// unchanged, so a piped listing is the same as it was, byte for byte, and
+    /// a script parsing it does not have to guess at the terminal that ran it.
+    ///
+    /// Pure over its inputs; the I/O lives at the call site.
+    ///
+    /// [`Default`]: Self::Default
+    #[must_use]
+    pub fn for_terminal(wide: bool, terminal_cols: Option<u16>) -> Self {
+        match (wide, terminal_cols) {
+            (true, _) => Self::Wide,
+            (false, Some(cols)) => Self::Narrow(cols),
+            (false, None) => Self::Default,
+        }
     }
 
     /// Whether the extra columns are shown.
@@ -323,6 +360,26 @@ mod tests {
         assert_eq!(Width::default(), Width::Default);
         assert!(Width::Wide.is_wide());
         assert!(!Width::Default.is_wide());
+        // `Narrow` is a request to drop columns, not an ask for the wide tail.
+        assert!(!Width::Narrow(80).is_wide());
+    }
+
+    #[test]
+    fn wide_wins_when_the_user_asked_for_it() {
+        // The user typed `--wide` on a small terminal deliberately: they want
+        // every column, and they will scroll. A choice that overrode them
+        // would make the flag mean nothing on the terminals it exists for.
+        assert_eq!(Width::for_terminal(true, Some(40)), Width::Wide);
+        assert_eq!(Width::for_terminal(true, None), Width::Wide);
+    }
+
+    #[test]
+    fn a_terminal_width_becomes_narrow_and_a_pipe_becomes_default() {
+        // A pipe is not a "narrow terminal": there is no terminal at all, and
+        // a listing that dropped columns for the length of a `grep` line
+        // would break every script parsing it.
+        assert_eq!(Width::for_terminal(false, Some(80)), Width::Narrow(80));
+        assert_eq!(Width::for_terminal(false, None), Width::Default);
     }
 
     #[test]
