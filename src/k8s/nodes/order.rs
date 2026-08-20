@@ -298,6 +298,7 @@ mod tests {
             os_image: "Amazon Linux 2023.9.20260714".to_owned(),
             kernel_version: "6.1.148-172.265.amzn2023.x86_64".to_owned(),
             container_runtime: "containerd://1.7.28".to_owned(),
+            devices: std::collections::BTreeMap::new(),
         }
     }
 

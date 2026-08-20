@@ -318,14 +318,10 @@ where
         .map(|value| value.get_name().to_owned())
         .collect();
 
-    match names.as_slice() {
-        [] => None,
-        [only] => Some(only.clone()),
-        [first, second] => Some(format!("{first} or {second}")),
-        // The comma before the last item is the one that keeps `cpu, memory, or
-        // age` from reading as a two-item list ending in one odd pair.
-        [head @ .., last] => Some(format!("{}, or {last}", head.join(", "))),
-    }
+    // The serial comma, and everything else about writing a list out as prose,
+    // is `format::list`'s: the same rule writes the footnote naming the columns
+    // a failed pod listing emptied.
+    crate::format::list(&names, "or")
 }
 
 #[cfg(test)]

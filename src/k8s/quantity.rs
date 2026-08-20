@@ -323,6 +323,19 @@ pub fn cpu(quantity: Quantity) -> String {
     }
 }
 
+/// A count of whole things: GPUs, dongles, licences.
+///
+/// Extended resources are integers by definition — a device plugin cannot
+/// advertise half a GPU and the scheduler will not hand one out — so this is
+/// [`cpu`]'s spelling under a name that says what is being counted. The
+/// fractional fallback is deliberate rather than rounded away: a cluster that
+/// somehow advertises `500m` of a device has a bug worth seeing, and a column
+/// reading `0` would hide it.
+#[must_use]
+pub fn count(quantity: Quantity) -> String {
+    cpu(quantity)
+}
+
 /// Memory, in the largest binary unit that leaves a number a person can read.
 ///
 /// One decimal place, and the `.0` trimmed: `15.6Gi`, `512Mi`, `4Gi`. This is
@@ -366,6 +379,15 @@ mod tests {
     /// Thousandths, which is what `Quantity` stores.
     fn parse(text: &str) -> i128 {
         Quantity::parse(text).unwrap().thousandths()
+    }
+
+    #[test]
+    fn a_count_of_devices_reads_as_a_whole_number() {
+        assert_eq!(count(Quantity::parse("4").unwrap()), "4");
+        assert_eq!(count(Quantity::parse("0").unwrap()), "0");
+        // A cluster advertising a fraction of a device has a bug worth seeing;
+        // a column reading `0` would hide it.
+        assert_eq!(count(Quantity::parse("500m").unwrap()), "500m");
     }
 
     #[test]

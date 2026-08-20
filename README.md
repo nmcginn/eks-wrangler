@@ -104,6 +104,37 @@ Usage is up to 6m10s old, averaged over 20s — more than two sampling windows, 
 metrics-server can stop scraping without failing this request; check its pod in kube-system.
 ```
 
+A node with a GPU — or anything else a device plugin advertises — gets a column
+for it, and only a node group that has one puts it there:
+
+```
+$ eks nodes --context training
+NAME                         STATUS  VERSION              CPU        CPU REQ      MEMORY         MEM REQ     NVIDIA.COM/GPU  AGE
+ip-10-0-4-31.ec2.internal    Ready   v1.33.1-eks-1a2b3c4  15890m/16  12 (76%)     58.5Gi/62Gi    40Gi (68%)  3/4 (75%)       6d
+ip-10-0-4-77.ec2.internal    Ready   v1.33.1-eks-1a2b3c4  15890m/16  2 (13%)      58.5Gi/62Gi    8Gi (14%)   0/4 (0%)        6d
+ip-10-0-11-200.ec2.internal  Ready   v1.33.1-eks-1a2b3c4  3920m/4    1500m (38%)  14.8Gi/15.6Gi  6Gi (41%)   -               12d
+```
+
+The cell is what the pods there have booked, out of what the node will hand out:
+`3/4 (75%)` is one card free, and the arithmetic that decides whether the next
+training job schedules. The last node is not a node with no cards free — it is a
+node with no cards, which is a different answer to whoever is looking for
+somewhere to put that job, so it reads `-` rather than `0/4`.
+
+Only resources the cluster added get a column. Kubernetes' own — `cpu`,
+`memory`, `pods`, `hugepages-2Mi`, and the `attachable-volumes-*` limits sitting
+in the same list — are left alone, so a cluster with no devices prints exactly
+the table it printed before.
+
+The column shows what the node will *hand out*, which leaves one thing invisible
+that the table exists to show: a card the kubelet has and is not offering,
+usually one its plugin has marked unhealthy. That earns a line of its own:
+
+```
+ip-10-0-4-31.ec2.internal offers 3 of the 4 nvidia.com/gpu it reports.
+A device a node has but will not offer is usually one its plugin marked unhealthy; check the device-plugin pods there, because a pod asking for the missing one will stay Pending.
+```
+
 `--sort` reorders the node listing too, by `name` (the default, unchanged),
 `status`, `cpu`, `memory`, `cpu-requested`, `memory-requested`, or `age`, and
 `--sort-reverse` flips any of them:
