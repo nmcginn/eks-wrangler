@@ -118,6 +118,24 @@ impl Quantity {
         }
     }
 
+    /// A count of whole things, as a quantity.
+    ///
+    /// The one value in this module that was never a string from the API
+    /// server: a node's pod count is counted here rather than reported, and it
+    /// still has to divide by an allocatable that *did* come from the API as a
+    /// quantity. Making the numerator the same type as the denominator is what
+    /// lets the pod column reuse the share arithmetic every other column on
+    /// that row goes through, instead of a second division written in integers.
+    #[must_use]
+    pub fn from_count(count: u32) -> Self {
+        Self {
+            // A count is whole units, and `u32::MAX` thousandths is nowhere
+            // near an `i128` — no node has four billion pods, and no cluster
+            // would survive one that did.
+            thousandths: i128::from(count) * 1000,
+        }
+    }
+
     /// Thousandths of a unit: millicores for CPU, thousandths of a byte for
     /// memory.
     #[must_use]
@@ -582,5 +600,24 @@ mod tests {
         // Nothing stops a device plugin reporting `1G`; a column mixing binary
         // and decimal units would be unreadable, so everything is shown one way.
         assert_eq!(memory(Quantity::parse("1G").unwrap()), "953.7Mi");
+    }
+    #[test]
+    fn a_count_divides_like_any_other_quantity() {
+        // The pod column's numerator is counted rather than parsed, and it
+        // still has to be a share of an allocatable that came off the wire as
+        // a string. One type for both halves is what lets it.
+        let pods = Quantity::from_count(12);
+        let limit = Quantity::parse("58").unwrap();
+
+        assert_eq!(count(pods), "12");
+        assert_eq!(pods.ratio_of(limit), Some(12.0 / 58.0));
+        assert_eq!(Quantity::from_count(0), Quantity::default());
+    }
+
+    #[test]
+    fn a_counted_quantity_survives_a_number_no_cluster_could_reach() {
+        // `u32::MAX` pods is absurd, and the point is that it is absurd rather
+        // than wrapped into something small and plausible.
+        assert_eq!(Quantity::from_count(u32::MAX).units(), i128::from(u32::MAX));
     }
 }

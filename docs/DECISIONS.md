@@ -1117,3 +1117,69 @@ cell, re-measure, drop, repeat — costs a listing's worth of string formatting
 per step, seven of them on a ten-thousand-pod table, for an answer that cannot
 have changed.
 
+
+### 48. The pod count rides with the request totals, and is a share like everything else
+
+`PODS` is a count, and every other figure on the node row is a measured
+quantity. Two choices follow from refusing to let that difference matter.
+
+**One walk over the pods, not two.** `pods::by_node` already decided, pod by
+pod, which pods are occupying which node — the terminal phases out, a
+`Terminating` pod still in, an unscheduled one charged to nobody. Counting in a
+second pass would be a second chance to answer that differently, and the failure
+would be invisible: a `PODS` cell saying 12 beside a `CPU REQ` cell totalling 14
+pods' requests is two plausible numbers, and nothing on screen says they
+disagree. So `by_node` returns a `Placed` — a count and a `Requests` — from the
+one loop, and `NodeRow::from_node` takes that one value rather than two
+parameters that could arrive out of step. It is also why a failed pod listing
+empties both halves together: they are the same `Option`.
+
+**The count becomes a `Quantity`.** The denominator, `allocatable["pods"]`, came
+off the wire as a quantity string, and the numerator is an integer we counted
+ourselves. `Quantity::from_count` makes them the same type, which buys the
+column `Share` entire: the ratio, `theme`'s severity thresholds, the cell
+format, and `nodes::order`'s `busiest` key, none of them written twice. The
+alternative — a bespoke pair of integers with its own division — would have been
+a second rule for what counts as hot and a second place to get "the API server
+reported no allocatable" wrong.
+
+The cell is `Share::pair`, `12/58 (21%)`, and not the `12 (21%)` the request
+columns use. `CPU REQ` can leave its denominator out because `CPU` is the column
+next to it; `PODS` has no such neighbour, and the limit is half of what the
+reader came for. It varies by instance type and by CNI configuration, so a bare
+`21%` names a fraction of a number nobody in front of the table knows. That is
+the same argument the device columns made, so `Device::cell` now delegates to
+`Share::pair` rather than keeping its own copy of the formatting.
+
+`allocatable`, not `capacity`, is the denominator. Both are reported and they
+differ: the kubelet's `--max-pods` and the VPC CNI's address budget land in
+allocatable, and it is the number the scheduler counts against. Dividing by
+capacity would flatter exactly the nodes whose CNI is the binding constraint,
+which on EKS is most of them.
+
+The column is unconditional, where the device columns appear only when some node
+reports the resource. `CPU REQ` is the closer analogue: every node has a pod
+limit, so there is no cluster the column would be a row of dashes on, and the
+one state that empties it — a failed pod listing — leaves it reading `-/58`,
+which still carries the limit. That is also why the footnote for that failure
+now names it: `requests_unavailable` says the *booked half* of `PODS` and the
+device columns is empty, because saying the columns were empty would be visibly
+untrue on screen.
+
+`--sort pods` comes with it, and ranks the share rather than the headcount, as
+every other node order does (decision 34). A node with 80 pods out of 234 is not
+the node to look at; the one with 50 out of 58 is. Its unrankable tail is the
+nodes with no count, under `k8s::order`'s existing two-tier rule, and
+`nodes::cause` maps it to the request footnote — the count is the pod listing's,
+so one failure explains all three of `cpu-requested`, `memory-requested`, and
+`pods`.
+
+In `DROP_ORDER` it goes third, after `VERSION` and `AGE` and ahead of the `REQ`
+pair. Two reasons, and the second is the one that settled it. A node runs out of
+CPU or memory long before it runs out of pod slots unless the CNI's address
+budget is what is short — so of the three booked figures this is the least often
+the binding one. And an 80-column node table has been keeping `CPU REQ` and `MEM
+REQ` since decision 46; a column added afterwards should not be what takes them
+away. The existing test asserting that 80 columns keep the request pair failed
+when `PODS` was placed later, which is exactly the signal that test was written
+to give.

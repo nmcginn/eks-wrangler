@@ -64,8 +64,8 @@ ClusterView ──► k8s::connect ──► Client ──┼─► pods::fetch 
 The three requests are issued concurrently — `eks nodes` should cost one round
 trip's wait, not three — and they fail independently. A node listing that fails
 ends the command. The other two only cost columns: a failed pod listing empties
-the request columns, and an absent metrics API drops the usage columns
-altogether, each adding a footnote saying why. Both failures are ordinary rather
+the request columns and the counted half of `PODS`, and an absent metrics API
+drops the usage columns altogether, each adding a footnote saying why. Both failures are ordinary rather
 than exceptional. A role that grants nodes but not pods across every namespace
 is a normal thing to have, and metrics-server is an add-on that EKS does not
 install for you, so on a fresh cluster there is simply nothing to show.
@@ -83,6 +83,16 @@ reserved for it, and `pods::by_node` totals those by node. Both are pure
 functions over `Pod` values, so the awkward parts — init containers, sidecars,
 pod overhead, a pod that has finished — are fixtures rather than a cluster you
 have to arrange.
+
+`by_node` returns a `Placed` rather than a bare `Requests`: the count of the
+pods it totalled, beside their totals. The count is the `PODS` column's
+numerator and it comes out of that one loop deliberately, because whatever rule
+decides a pod is occupying a node has to decide both numbers. A cell saying 12
+beside a request total covering 14 pods is two plausible figures with nothing
+on screen to say they disagree. `Quantity::from_count` then makes the count the
+same type as the `allocatable["pods"]` it is divided by, which is what lets the
+column reuse `Share` entire — the ratio, the severity thresholds, the cell, and
+the sort key — instead of a second division written in integers.
 
 `effective_requests` has two callers, deliberately: `pods::by_node` totals it per
 node for `eks nodes`, and `PodRow::from_pod` keeps it per pod as the denominator
@@ -129,7 +139,9 @@ has one, it is a choice — a node's denominator is the machine, so 95% of a sma
 one is comparable to 30% of a large one, while a pod's is whatever a manifest
 asked for, and 400% of a 10m request is 40m of anybody's cluster. `NodeRow`
 gained a `created_at` beside its rendered `age` for the same reason `PodRow` has
-one — two nodes can both read `3d` and be nearly a day apart.
+one — two nodes can both read `3d` and be nearly a day apart. `--sort pods` is
+the newest of the node orders and ranks a share too: the node worth looking at
+is the one with two slots left, not the one running the most pods.
 
 Which columns a table has is the same shape of decision, one hop later, and it is
 settled the same way: `k8s::nodes::columns` and `k8s::pods::row::columns` are
