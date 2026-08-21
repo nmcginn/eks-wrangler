@@ -1349,3 +1349,59 @@ than a way to reinstate a hang: an interactive helper waiting on a human is
 doing its job, and the tool now has a default that would cut it off after thirty
 seconds. That is the one behaviour change a user could dislike, and it is the
 reason the escape hatch is named in the sentence rather than left in `--help`.
+
+### 51. The dashboard fetches on a plain OS thread, not a shared `tokio` runtime
+
+The node pane needed a way to fetch without the render loop ever awaiting a
+network call — CLAUDE.md's rule that a key press is acknowledged within one
+frame leaves no other option. `commands::spawn` answers it with
+`std::thread::spawn` around a current-thread `tokio` runtime, built and shut
+down exactly the way `commands::block_on` already does for a one-shot command,
+delivering its result over a plain `std::sync::mpsc::Receiver` instead of
+returning it.
+
+The alternative was enabling `tokio`'s `sync` and `rt-multi-thread` features
+now and spawning the fetch as a task on a shared runtime built once at
+startup. That is the more conventional shape for async Rust, and it loses
+here on cost for what it buys: it adds two features and a second
+runtime-lifecycle model to a codebase that has deliberately kept exactly one
+(decision 9), for a task that only ever has one fetch in flight. The worry
+that motivated a second look — that "Background refresh" would need real
+cancellation to discard a stale, still-running fetch when the user asks for
+another — turns out not to bite. `page::Budget` already bounds `gather`'s
+worst-case wall-clock time, covering `k8s::connect` and every paged request
+behind it (decisions 44 and 50), and discarding a stale *result* is free
+either way: replacing a `Receiver` with a new one for the next fetch drops the
+old one, and the abandoned thread's `tx.send` on a disconnected channel simply
+fails silently, exactly as `spawn`'s own doc comment says it will.
+
+`spawn` is deliberately not `block_on` with a different return type. They
+answer different questions — return a value, or promise one later — and nudging
+one to grow into the other for the sake of a shared implementation would blur
+which contract a caller is relying on. What *is* shared is the one invariant
+that actually matters: `shutdown_background` rather than a dropped or joined
+runtime, so a credential helper `kube` left running is abandoned once, not
+waited for a second time on whichever thread happens to be shutting it down.
+
+### 52. A dashboard bar divides by allocatable, matching the CLI's percentage
+
+`nodes::Share::ratio()` — what `CPU USE`/`MEM USE` already divide by — is the
+denominator the node pane's utilisation bars use too, rather than capacity.
+Decision 22 left this open on the CLI side, naming capacity as the more
+literal reading of "is this machine busy" and putting it on the roadmap for
+whichever surface asked first: that surface is the dashboard bar, now, and it
+answers the other way.
+
+The reason is the same one decision 40 gives for the pod table's usage cell:
+the two surfaces sit side by side and a reader moving between them must not
+find the same node reading two different numbers. A bar and a CLI column that
+divided by different things could both be defensible in isolation and still
+teach the user something false the first time they compare a hot node in the
+dashboard against the table they just ran — worse than either reading alone,
+because it looks like a bug rather than a choice. Allocatable also costs
+nothing new: `Share` already carries it, so the bar is `Share::ratio()` and
+`Share::severity()` reused whole, not a second computation over
+`Capacity::allocatable_ratio()`, which stays unused and available for the
+"usage against capacity for the dashboard's bars" roadmap entry if a future
+change decides a bar answering "how busy is the box" is worth a second
+reading beside this one.

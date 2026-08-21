@@ -4,6 +4,7 @@
 //! exit code. Everything worth testing lives in the library.
 
 use std::io::IsTerminal;
+use std::path::PathBuf;
 use std::process::ExitCode;
 
 use anyhow::{Result, bail};
@@ -15,6 +16,7 @@ use eks::cli::{Cli, Command, GlobalArgs};
 use eks::commands::{self, contexts, nodes, pods};
 use eks::format::Width;
 use eks::k8s::order::Direction;
+use eks::k8s::page::Budget;
 use eks::kubeconfig::KubeConfig;
 use eks::theme::{ColourChoice, Palette};
 use eks::ui::{self, App};
@@ -39,7 +41,12 @@ fn run(cli: Cli) -> Result<()> {
     let config = KubeConfig::load_from(&paths)?;
 
     match cli.command.unwrap_or(Command::Dashboard) {
-        Command::Dashboard => dashboard(&config, cli.global.context.as_deref()),
+        Command::Dashboard => dashboard(
+            &config,
+            &paths,
+            cli.global.context.as_deref(),
+            cli.global.timeout,
+        ),
         Command::Contexts { quiet } => {
             print_line(&contexts::list(&config, quiet));
             Ok(())
@@ -104,7 +111,12 @@ fn run(cli: Cli) -> Result<()> {
     }
 }
 
-fn dashboard(config: &KubeConfig, requested_context: Option<&str>) -> Result<()> {
+fn dashboard(
+    config: &KubeConfig,
+    paths: &[PathBuf],
+    requested_context: Option<&str>,
+    budget: Budget,
+) -> Result<()> {
     let views = contexts::views(config);
     let mut app = App::new(views);
 
@@ -118,7 +130,20 @@ fn dashboard(config: &KubeConfig, requested_context: Option<&str>) -> Result<()>
         }
     }
 
-    ui::run(app)
+    // Kicked off before the terminal takes over, so the fetch is already in
+    // flight for the first frame — the loading state a bare `eks` shows is
+    // real, not simulated. No cluster selected, nothing to fetch: the empty
+    // kubeconfig message `draw_detail` prints does not depend on node state.
+    let nodes_rx = app.selected_cluster().map(|cluster| {
+        nodes::spawn_gather(
+            config.clone(),
+            paths.to_vec(),
+            Some(cluster.context_name.clone()),
+            budget,
+        )
+    });
+
+    ui::run(app, nodes_rx.as_ref())
 }
 
 /// Print a command's output, skipping the newline for empty results so

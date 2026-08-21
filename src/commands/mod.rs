@@ -5,6 +5,7 @@
 //! asserted on in unit tests instead of eyeballed.
 
 use std::future::Future;
+use std::sync::mpsc;
 
 use anyhow::{Context as _, Result};
 
@@ -41,6 +42,46 @@ pub fn block_on<T>(future: impl Future<Output = Result<T>>) -> Result<T> {
     runtime.shutdown_background();
 
     outcome
+}
+
+/// Run one async computation to completion on a background OS thread,
+/// delivering its result over a channel instead of returning it.
+///
+/// The counterpart to [`block_on`] for a caller that cannot block: the
+/// dashboard's render loop has to acknowledge a keypress within one frame, so
+/// it cannot wait on a cluster request the way a one-shot command does. This
+/// spawns a plain thread rather than a `tokio` worker — nothing here wants a
+/// shared multi-thread runtime for one request at a time — builds the same
+/// kind of current-thread runtime `block_on` does, and shuts it down the same
+/// way: a hung credential helper is left running rather than waited for a
+/// second time, for the reason `block_on`'s own doc comment gives.
+///
+/// A caller who stops listening (drops the [`mpsc::Receiver`]) simply never
+/// hears back; `tx.send` failing is not an error worth reporting; there is
+/// nobody left to report it to.
+pub fn spawn<T: Send + 'static>(
+    future: impl Future<Output = T> + Send + 'static,
+) -> mpsc::Receiver<T> {
+    let (tx, rx) = mpsc::channel();
+
+    std::thread::spawn(move || {
+        let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        else {
+            // Nothing here fits every caller's `T` well enough to report this
+            // with; the receiver simply never hears back, exactly as it would
+            // if the send below failed. Resource exhaustion, rare enough not
+            // to be worth constraining `T` to work around.
+            return;
+        };
+
+        let outcome = runtime.block_on(future);
+        runtime.shutdown_background();
+        let _ = tx.send(outcome);
+    });
+
+    rx
 }
 
 #[cfg(test)]
@@ -98,5 +139,34 @@ mod tests {
         .unwrap();
 
         assert_eq!(value, "awake");
+    }
+
+    #[test]
+    fn spawn_sends_back_what_the_future_resolved_to() {
+        let rx = spawn(async { 21 * 2 });
+        assert_eq!(rx.recv().unwrap(), 42);
+    }
+
+    #[test]
+    fn spawn_does_not_wait_for_a_blocking_task_that_will_not_end() {
+        // The same abandonment `block_on` relies on, proven on the thread
+        // `spawn` actually runs on rather than the calling one: if the
+        // runtime were dropped instead of shut down, this would take thirty
+        // seconds waiting for a task nothing can cancel.
+        let started = std::time::Instant::now();
+
+        let rx = spawn(async {
+            let _abandoned =
+                tokio::task::spawn_blocking(|| std::thread::sleep(Duration::from_secs(30)));
+            "not waiting"
+        });
+        let value = rx.recv().unwrap();
+        let elapsed = started.elapsed();
+
+        assert_eq!(value, "not waiting");
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "waited {elapsed:?} for a task that had already been given up on"
+        );
     }
 }

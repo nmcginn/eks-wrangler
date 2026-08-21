@@ -4,16 +4,23 @@
 //! I/O, so navigation can be tested by feeding it key events. Only [`run`]
 //! touches the real terminal.
 
+use std::sync::mpsc;
+use std::time::Duration;
+
 use anyhow::Result;
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, List, ListItem, ListState, Paragraph, Wrap};
 use ratatui::{Frame, Terminal};
-use std::time::Duration;
 
 use crate::cluster::ClusterView;
+use crate::k8s::nodes::NodeRow;
 use crate::theme::Theme;
+
+mod nodes;
+
+use nodes::NodesState;
 
 /// How long to wait for input before waking up to redraw. Short enough that
 /// live data will feel immediate once it exists, long enough to stay at
@@ -35,11 +42,12 @@ pub struct App {
     clusters: Vec<ClusterView>,
     selected: usize,
     theme: Theme,
+    nodes: NodesState,
 }
 
 impl App {
     /// Create an app over the clusters found in the kubeconfig, starting with
-    /// the active one selected.
+    /// the active one selected and its node pane loading.
     #[must_use]
     pub fn new(clusters: Vec<ClusterView>) -> Self {
         let selected = clusters.iter().position(|c| c.is_current).unwrap_or(0);
@@ -47,6 +55,7 @@ impl App {
             clusters,
             selected,
             theme: Theme::dark(),
+            nodes: NodesState::default(),
         }
     }
 
@@ -66,6 +75,24 @@ impl App {
     #[must_use]
     pub fn selected_cluster(&self) -> Option<&ClusterView> {
         self.clusters.get(self.selected)
+    }
+
+    /// What the node pane is showing.
+    #[must_use]
+    pub fn nodes(&self) -> &NodesState {
+        &self.nodes
+    }
+
+    /// Apply the outcome of a node fetch.
+    ///
+    /// The one state transition the background channel can cause, kept
+    /// beside [`on_key`](Self::on_key) so both are tested the same way:
+    /// build an `App`, call the method, assert what changed.
+    pub fn apply_nodes(&mut self, result: Result<Vec<NodeRow>, String>) {
+        self.nodes = match result {
+            Ok(rows) => NodesState::Loaded(rows),
+            Err(message) => NodesState::Error(message),
+        };
     }
 
     /// Highlight the cluster with this context name.
@@ -136,23 +163,45 @@ impl App {
 ///
 /// Terminal setup and teardown are handled by `ratatui`, which installs a panic
 /// hook so a crash cannot leave the user staring at a wedged shell.
-pub fn run(app: App) -> Result<()> {
+///
+/// `nodes_rx` is the background fetch `main` started for the selected
+/// cluster, if there is one — see
+/// [`commands::nodes::spawn_gather`](crate::commands::nodes::spawn_gather).
+/// This function never awaits it: each iteration only polls for a result
+/// that has already arrived, which is what keeps a hung request from
+/// blocking a keypress.
+pub fn run(
+    app: App,
+    nodes_rx: Option<&mpsc::Receiver<Result<Vec<NodeRow>, String>>>,
+) -> Result<()> {
     let mut terminal = ratatui::init();
-    let result = event_loop(&mut terminal, app);
+    let result = event_loop(&mut terminal, app, nodes_rx);
     ratatui::restore();
     result
 }
 
-fn event_loop<B>(terminal: &mut Terminal<B>, mut app: App) -> Result<()>
+fn event_loop<B>(
+    terminal: &mut Terminal<B>,
+    mut app: App,
+    nodes_rx: Option<&mpsc::Receiver<Result<Vec<NodeRow>, String>>>,
+) -> Result<()>
 where
     B: ratatui::backend::Backend,
     B::Error: std::error::Error + Send + Sync + 'static,
 {
     loop {
+        // Non-blocking: a fetch that has not finished yet leaves the pane
+        // exactly as it was, and one that finished while the user was
+        // pressing keys is picked up on the very next frame rather than
+        // waiting for a quiet moment.
+        if let Some(rx) = nodes_rx
+            && let Ok(result) = rx.try_recv()
+        {
+            app.apply_nodes(result);
+        }
+
         terminal.draw(|frame| draw(frame, &app))?;
 
-        // Only block for input; on timeout we fall through and redraw, which is
-        // where live cluster data will be picked up.
         if !event::poll(TICK)? {
             continue;
         }
@@ -241,41 +290,47 @@ fn draw_cluster_list(frame: &mut Frame, area: Rect, app: &App) {
 
 fn draw_detail(frame: &mut Frame, area: Rect, app: &App) {
     let theme = app.theme;
-
-    let body = match app.selected_cluster() {
-        Some(cluster) => {
-            let mut lines = vec![
-                detail_row("Context", &cluster.context_name, theme),
-                detail_row("Namespace", &cluster.namespace, theme),
-            ];
-            if let Some(region) = &cluster.region {
-                lines.push(detail_row("Region", region, theme));
-            }
-            if let Some(account) = &cluster.account_id {
-                lines.push(detail_row("Account", account, theme));
-            }
-            lines.push(Line::raw(""));
-            lines.push(Line::styled(
-                "Node and pod views land here next — see docs/ROADMAP.md.",
-                theme.dim(),
-            ));
-            lines
-        }
-        None => vec![Line::styled(
-            "No clusters in your kubeconfig. Run `aws eks update-kubeconfig --name <cluster>`.",
-            theme.dim(),
-        )],
-    };
-
     let block = Block::bordered()
         .title(" Overview ")
         .border_style(theme.pane_border(false))
         .title_style(theme.heading());
 
-    frame.render_widget(
-        Paragraph::new(body).block(block).wrap(Wrap { trim: true }),
-        area,
-    );
+    let Some(cluster) = app.selected_cluster() else {
+        frame.render_widget(
+            Paragraph::new(Line::styled(
+                "No clusters in your kubeconfig. Run `aws eks update-kubeconfig --name <cluster>`.",
+                theme.dim(),
+            ))
+            .block(block)
+            .wrap(Wrap { trim: true }),
+            area,
+        );
+        return;
+    };
+
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let mut summary = vec![
+        detail_row("Context", &cluster.context_name, theme),
+        detail_row("Namespace", &cluster.namespace, theme),
+    ];
+    if let Some(region) = &cluster.region {
+        summary.push(detail_row("Region", region, theme));
+    }
+    if let Some(account) = &cluster.account_id {
+        summary.push(detail_row("Account", account, theme));
+    }
+    summary.push(Line::raw(""));
+    let summary_height = u16::try_from(summary.len()).unwrap_or(u16::MAX);
+
+    let sections = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(summary_height), Constraint::Min(0)])
+        .split(inner);
+
+    frame.render_widget(Paragraph::new(summary), sections[0]);
+    nodes::draw(frame, sections[1], app.nodes(), theme);
 }
 
 fn detail_row<'a>(label: &'a str, value: &'a str, theme: Theme) -> Line<'a> {
@@ -431,6 +486,32 @@ mod tests {
     }
 
     #[test]
+    fn a_new_app_starts_loading_its_nodes() {
+        assert_eq!(app().nodes(), &NodesState::Loading);
+    }
+
+    #[test]
+    fn apply_nodes_moves_a_success_into_the_loaded_state() {
+        let mut app = app();
+
+        app.apply_nodes(Ok(Vec::new()));
+
+        assert_eq!(app.nodes(), &NodesState::Loaded(Vec::new()));
+    }
+
+    #[test]
+    fn apply_nodes_moves_a_failure_into_the_error_state() {
+        let mut app = app();
+
+        app.apply_nodes(Err("could not list nodes".to_owned()));
+
+        assert_eq!(
+            app.nodes(),
+            &NodesState::Error("could not list nodes".to_owned())
+        );
+    }
+
+    #[test]
     fn a_frame_renders_the_selected_cluster() {
         let mut terminal = Terminal::new(TestBackend::new(90, 20)).unwrap();
         let app = app();
@@ -442,6 +523,23 @@ mod tests {
         assert!(rendered.contains("beta"), "{rendered}");
         assert!(rendered.contains("us-east-1"), "{rendered}");
         assert!(rendered.contains("quit"), "{rendered}");
+    }
+
+    #[test]
+    fn first_paint_shows_loading_before_any_fetch_completes() {
+        // The acceptance criterion, literally: a freshly built `App` has
+        // never received a result over the channel, and the very first frame
+        // must not be blank while one is in flight.
+        let mut terminal = Terminal::new(TestBackend::new(90, 20)).unwrap();
+        let app = app();
+
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+
+        assert!(
+            terminal.backend().to_string().contains("Loading nodes"),
+            "{}",
+            terminal.backend().to_string()
+        );
     }
 
     #[test]

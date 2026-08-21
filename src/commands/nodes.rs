@@ -1,12 +1,13 @@
 //! `eks nodes` — the nodes of one cluster, as a table.
 
 use std::path::PathBuf;
+use std::sync::mpsc;
 
 use anyhow::{Result, anyhow};
 use k8s_openapi::jiff::Timestamp;
 
 use crate::cluster::ClusterView;
-use crate::commands::contexts;
+use crate::commands::{self, contexts};
 use crate::format::Width;
 use crate::k8s::metrics::{self as k8s_metrics};
 use crate::k8s::order::Direction;
@@ -43,24 +44,36 @@ pub struct Request {
     pub budget: page::Budget,
 }
 
-/// Fetch and render the node table for the selected cluster.
+/// What one fetch found, before either renderer decides what to do with it.
 ///
-/// `selector` is whatever the user passed to `--context`: a full context name,
-/// or the short cluster name `eks contexts` shows. `None` means the cluster
-/// their kubeconfig already points at. `request` is the rest of the flags.
-pub async fn list(
+/// `list` turns this into a table and its footnotes; the dashboard's node
+/// pane (via [`spawn_gather`]) turns it into a loaded `App` state. Splitting
+/// here — after the rows are built, before either renderer runs — is what
+/// stops the CLI table and the pane from quietly answering the same question
+/// two different ways.
+struct Gathered {
+    label: String,
+    rows: Vec<k8s_nodes::NodeRow>,
+    /// `Err` is already a sentence, via `k8s::explain`/`k8s_metrics::explain`.
+    requests: Result<(), String>,
+    usage: Result<(), String>,
+    /// Kept for the freshness note, which `list` builds and the pane does not
+    /// yet read.
+    samples: Vec<Option<k8s_metrics::Sample>>,
+    now: Timestamp,
+}
+
+/// Resolve the cluster, fetch nodes/pods/metrics concurrently, and reduce
+/// them to rows.
+///
+/// The one function [`list`] and [`spawn_gather`] both call, so the CLI table
+/// and the dashboard pane cannot drift about what a node's row means.
+async fn gather(
     config: &KubeConfig,
     paths: &[PathBuf],
     selector: Option<&str>,
-    request: Request,
-) -> Result<String> {
-    let Request {
-        order,
-        direction,
-        width,
-        palette,
-        budget,
-    } = request;
+    budget: page::Budget,
+) -> Result<Gathered> {
     let target = target_cluster(config, selector)?;
     let label = target.label();
 
@@ -85,7 +98,6 @@ pub async fn list(
     // columns and earn a footnote, because a partial answer beats no answer:
     // a read-only role that grants nodes but not pods across every namespace is
     // common, and metrics-server is an add-on EKS does not install for you.
-    let mut footnotes = Vec::new();
 
     // Both failures are held as explanations here and written under the table
     // once the rows exist, rather than footnoted on the spot. The request
@@ -137,7 +149,7 @@ pub async fn list(
     // map each.
     let nothing = k8s_pods::Placed::default();
 
-    let mut rows: Vec<k8s_nodes::NodeRow> = nodes
+    let rows: Vec<k8s_nodes::NodeRow> = nodes
         .iter()
         .zip(&samples)
         .map(|(node, sample)| {
@@ -153,12 +165,55 @@ pub async fn list(
             k8s_nodes::NodeRow::from_node(node, placed, sample.map(|s| s.usage), now)
         })
         .collect();
+
+    Ok(Gathered {
+        label,
+        rows,
+        // The map of totals has done its job once it is folded into the rows
+        // above; only whether it failed, and why, is wanted from here on.
+        requests: requests.map(|_| ()),
+        usage: usage.map(|_| ()),
+        samples,
+        now,
+    })
+}
+
+/// Fetch and render the node table for the selected cluster.
+///
+/// `selector` is whatever the user passed to `--context`: a full context name,
+/// or the short cluster name `eks contexts` shows. `None` means the cluster
+/// their kubeconfig already points at. `request` is the rest of the flags.
+pub async fn list(
+    config: &KubeConfig,
+    paths: &[PathBuf],
+    selector: Option<&str>,
+    request: Request,
+) -> Result<String> {
+    let Request {
+        order,
+        direction,
+        width,
+        palette,
+        budget,
+    } = request;
+
+    let Gathered {
+        label,
+        mut rows,
+        requests,
+        usage,
+        samples,
+        now,
+    } = gather(config, paths, selector, budget).await?;
+
     // Ordering lives in `k8s::nodes::order` rather than here, so the default and
     // the one `--sort` asks for are decided in the same place and by the same
     // rules — and so both can be tested on rows alone. The default is still by
     // name, which the API server happens to return today; sorting makes that a
     // promise rather than an accident.
     k8s_nodes::sort(&mut rows, order, direction);
+
+    let mut footnotes = Vec::new();
 
     // The two columns-are-missing footnotes, held back until now because the
     // first of them names the columns the failure emptied and a device column
@@ -220,6 +275,29 @@ pub async fn list(
     ));
 
     Ok(k8s_nodes::render(&rows, &label, &footnotes, width, palette))
+}
+
+/// Fetch this cluster's nodes on a background thread, delivering rows — or a
+/// message explaining why there are none — over a channel.
+///
+/// The dashboard's counterpart to [`list`]: the same `gather`, a
+/// `Vec<NodeRow>` rather than a rendered table, so the pane and the CLI table
+/// cannot drift about what a node's row means. Parameters are owned, unlike
+/// `gather`'s borrowed ones, because the future has to outlive this call —
+/// [`commands::spawn`] moves it onto another thread.
+#[must_use]
+pub fn spawn_gather(
+    config: KubeConfig,
+    paths: Vec<PathBuf>,
+    selector: Option<String>,
+    budget: page::Budget,
+) -> mpsc::Receiver<Result<Vec<k8s_nodes::NodeRow>, String>> {
+    commands::spawn(async move {
+        gather(&config, &paths, selector.as_deref(), budget)
+            .await
+            .map(|gathered| gathered.rows)
+            .map_err(|error| format!("{error:#}"))
+    })
 }
 
 /// Work out which cluster to talk to, before any network call happens.
