@@ -354,17 +354,17 @@ cluster.
   other node orders do, and a node that does not report the resource sorts into
   the unrankable tail under `k8s::order`'s existing rule rather than as a zero.
 
-- [ ] **Native resources that still have no column: `pods`, `ephemeral-storage`,
-  and `hugepages-*`.**
-  `is_extended` now names them explicitly as the things a device column is *not*,
-  which makes their absence a decision rather than an oversight — and `pods` is
-  already wanted by the pod-count task above, where it is the `maxPods` half.
-  Separate because each wants a heading and a denominator a reader recognises
-  rather than the device treatment: `ephemeral-storage` is a capacity pair like
-  memory, `hugepages-2Mi` reads `0` on almost every node and so wants the
-  `any`-not-`all` condition, and whether a cluster that uses none of them should
-  see any of this is the question. Not urgent: none of them was visible before
-  tonight either.
+- [ ] **Native resources that still have no column: `ephemeral-storage` and
+  `hugepages-*`.**
+  `is_extended` names them explicitly as the things a device column is *not*,
+  which makes their absence a decision rather than an oversight. `pods` has left
+  this list — the pod-count task below gave it a heading and a denominator of its
+  own. Separate because each of the two remaining wants a heading and a
+  denominator a reader recognises rather than the device treatment:
+  `ephemeral-storage` is a capacity pair like memory, `hugepages-2Mi` reads `0`
+  on almost every node and so wants the `any`-not-`all` condition, and whether a
+  cluster that uses none of them should see any of this is the question. Not
+  urgent: neither was ever visible.
   *Acceptance:* each column appears under a stated condition and reads in the
   units of the thing it counts, not as a device count.
 
@@ -432,19 +432,35 @@ cluster.
   second column back into a row that did not fit — or the note says the column
   is hidden and the drop rule stays as it is. The two read very differently on
   an 80-column terminal, and building either would be guessing at which.
+  The column-naming footnotes have the same fault and want the same answer:
+  `nodes::requests_unavailable` says which columns a failed pod listing emptied,
+  and on a narrow terminal some of those are columns the drop rule already took
+  away. True of `CPU REQ` and the device columns since narrow mode landed, and
+  of `PODS` from the night it arrived — which is the night it stopped being
+  hypothetical, since `PODS` is on every listing where a device column is not.
   *Acceptance:* whichever shape it takes, one wording and one rule for both
-  listings, through `k8s::order::note` as now; a listing wide enough to keep
-  every column says exactly what it says today.
+  listings, through `k8s::order::note` as now; the same answer reaches
+  `requests_unavailable`, which knows the rows but not the width today; a
+  listing wide enough to keep every column says exactly what it says today.
 
 ### Follow-ups from the request columns
 
-- [ ] **A pod count per node.**
+- [x] **A pod count per node.**
   The request totals are computed from a full pod listing that is then thrown
   away; `PODS` is one more column and the number people ask for next, alongside
   the node's `maxPods` limit, which is the *other* reason a pod will not
   schedule.
   *Acceptance:* the count excludes finished pods, matching the requests total it
   sits beside; `maxPods` comes from the node's `allocatable["pods"]`.
+  Landed as `12/58 (21%)`, the device columns' shape, because the limit varies
+  by instance type and by CNI configuration and a bare percentage names a
+  fraction of a number nobody knows. `pods::by_node` returns a `Placed` — the
+  count beside the totals, out of one walk — so the two halves cannot be about
+  different sets of pods, and one failed pod listing empties both.
+  `Quantity::from_count` makes the count the same type as the allocatable it
+  divides by, which buys `Share`'s ratio, thresholds, cell, and sort key
+  without a second division. `--sort pods` came with it, ranking the share as
+  the other node orders do.
 
 - [x] **Paginate the pod listing.**
   `eks nodes` now fetches every pod in the cluster in one request to total the

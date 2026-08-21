@@ -22,7 +22,7 @@ pub use order::{Missing, Order, cause, ranks_any, sort};
 use crate::format;
 use crate::k8s::metrics::Usage;
 use crate::k8s::page;
-use crate::k8s::pods::Requests;
+use crate::k8s::pods::{Placed, Requests};
 use crate::k8s::quantity::{self, Quantity};
 use crate::k8s::resource;
 use crate::theme::Severity;
@@ -61,6 +61,13 @@ pub struct NodeRow {
     pub cpu_used: Share,
     /// Memory the node is actually holding, from metrics-server.
     pub memory_used: Share,
+    /// How many pods are on the node, against how many it will accept.
+    ///
+    /// The third reason a pod will not schedule, and the one no amount of
+    /// spare CPU fixes: on EKS the limit is usually the number of addresses
+    /// the VPC CNI can hand out on that instance type, so a node with two
+    /// cores idle and 58 pods on it is full.
+    pub pods: Share,
     pub age: String,
     /// When the node joined, if it reported it — what `age` was rendered from.
     ///
@@ -154,32 +161,11 @@ impl Device {
 
     /// One table cell: what is booked, out of what the node will hand out.
     ///
-    /// `2/4 (50%)`, which is the pod table's usage cell rather than either of
-    /// this table's two. Neither of those fits: `Capacity`'s pair would print
-    /// allocatable over capacity, which for a device is the same number twice
-    /// on every healthy node, and `Share`'s `2 (50%)` hides the total — and for
-    /// a device the total is the fact people came for. "This node has eight
-    /// A100s" is not something to work back out of a percentage.
+    /// `2/4 (50%)` — [`Share::pair`], for the reason that method gives: for a
+    /// countable thing the total is the fact people came for, and "this node
+    /// has eight A100s" is not something to work back out of a percentage.
     fn cell(self) -> String {
-        let booked = self
-            .booked
-            .map_or_else(|| UNKNOWN.to_owned(), quantity::count);
-
-        let Some(allocatable) = self.capacity.allocatable else {
-            // Reported under `capacity` and not under `allocatable`, which
-            // happens for a moment while a node registers. There is nothing for
-            // the figure to be a share of, so it stands alone.
-            return booked;
-        };
-
-        let total = quantity::count(allocatable);
-        match self.share().ratio() {
-            Some(ratio) => format!("{booked}/{total} ({})", format::percentage(ratio)),
-            // No ratio means either no booked figure or a node offering none of
-            // a device it reports; `-/4` and `0/0` are both better than a
-            // percentage of nothing.
-            None => format!("{booked}/{total}"),
-        }
+        self.share().pair(quantity::count)
     }
 }
 
@@ -293,6 +279,38 @@ impl Share {
             None => show(amount),
         }
     }
+
+    /// The same cell with the denominator spelled out: `12/58 (21%)`.
+    ///
+    /// [`cell`](Self::cell) is right where the denominator is already on the
+    /// row — `CPU REQ` sits beside the `CPU` it is a share of, and printing
+    /// `3920m` twice would be noise. The columns that have no such neighbour
+    /// use this one instead: a device count and a pod count are each alone in
+    /// the table, and for a countable thing the total is half of what the
+    /// reader came for. "Four cards, three busy" is not something to work back
+    /// out of `3 (75%)`.
+    ///
+    /// A node that reported no allocatable leaves the figure standing alone —
+    /// there is nothing for it to be out of. A `None` amount still prints its
+    /// denominator, unlike [`cell`](Self::cell): `-/4` says the node has four
+    /// of something and we could not find out how many are spoken for, which
+    /// is strictly more than `-` says.
+    fn pair(self, show: fn(Quantity) -> String) -> String {
+        let amount = self.amount.map_or_else(|| UNKNOWN.to_owned(), show);
+
+        let Some(allocatable) = self.allocatable else {
+            return amount;
+        };
+
+        let total = show(allocatable);
+        match self.ratio() {
+            Some(ratio) => format!("{amount}/{total} ({})", format::percentage(ratio)),
+            // No ratio means either no figure to divide or a node offering none
+            // of what it reports; `-/4` and `0/0` are both better than a
+            // percentage of nothing.
+            None => format!("{amount}/{total}"),
+        }
+    }
 }
 
 /// Shown wherever the API server left a field empty. Matches the placeholder
@@ -305,7 +323,7 @@ impl NodeRow {
     /// `now` is a parameter rather than a call to the clock so the age column
     /// is testable and so every row in one listing shares a single instant.
     ///
-    /// `requested` is the total of the pods on this node — `Some(zero)` for a
+    /// `placed` is what the pods on this node add up to — `Some(zero)` for a
     /// node running nothing, and `None` only when the pods could not be listed
     /// at all.
     ///
@@ -316,7 +334,7 @@ impl NodeRow {
     #[must_use]
     pub fn from_node(
         node: &Node,
-        requested: Option<&Requests>,
+        placed: Option<&Placed>,
         used: Option<Usage>,
         now: Timestamp,
     ) -> Self {
@@ -330,6 +348,7 @@ impl NodeRow {
         let cordoned = node.spec.as_ref().and_then(|spec| spec.unschedulable) == Some(true);
         let cpu = Capacity::read(node, "cpu");
         let memory = Capacity::read(node, "memory");
+        let requested = placed.map(|placed| &placed.requests);
         // Read once and cloned into the three cells, so a node still
         // registering — which has no `nodeInfo` at all — cannot end up with
         // some of the three filled in and the rest not.
@@ -359,6 +378,17 @@ impl NodeRow {
             memory_used: Share {
                 amount: used.and_then(|usage| usage.memory),
                 allocatable: memory.allocatable,
+            },
+            pods: Share {
+                // Counted from the pod listing rather than read from the node's
+                // own status, which reports no such figure — and unknown, not
+                // zero, when that listing failed. A node drawn as empty is an
+                // invitation to schedule onto it.
+                amount: placed.map(|placed| Quantity::from_count(placed.pods)),
+                // `allocatable`, not `capacity`: the kubelet's `--max-pods`, and
+                // on EKS the VPC CNI's address budget, both land here, and it is
+                // the number the scheduler actually enforces.
+                allocatable: Capacity::read(node, "pods").allocatable,
             },
             version: info.map_or_else(|| UNKNOWN.to_owned(), |info| info.kubelet_version.clone()),
             age: node.metadata.creation_timestamp.as_ref().map_or_else(
@@ -527,6 +557,7 @@ pub(crate) enum Column<'a> {
     Memory,
     MemoryRequested,
     MemoryUsed,
+    Pods,
     /// One extended resource, by its fully-qualified name.
     ///
     /// The only column whose identity is not known until the nodes arrive, so
@@ -559,6 +590,7 @@ impl Column<'_> {
             Self::Memory => "MEMORY".to_owned(),
             Self::MemoryRequested => "MEM REQ".to_owned(),
             Self::MemoryUsed => "MEM USE".to_owned(),
+            Self::Pods => "PODS".to_owned(),
             Self::Device(name) => resource::heading(name),
             Self::Age => "AGE".to_owned(),
             Self::InternalIp => "INTERNAL-IP".to_owned(),
@@ -581,6 +613,11 @@ impl Column<'_> {
             Self::Memory => row.memory.cell(quantity::memory),
             Self::MemoryRequested => row.memory_requested.cell(quantity::memory),
             Self::MemoryUsed => row.memory_used.cell(quantity::memory),
+            // The limit is spelled out rather than left to the percentage,
+            // because it varies by instance type and by CNI configuration:
+            // `21%` means something quite different on a node that takes 17
+            // pods and one that takes 234, and nobody knows which this is.
+            Self::Pods => row.pods.pair(quantity::count),
             // A node that does not report this device at all reads `-`. It is
             // not a node with none free; it is a node with no such hardware,
             // and the two want different reactions from whoever is looking for
@@ -649,6 +686,11 @@ pub(crate) fn columns(rows: &[NodeRow], width: format::Width) -> Vec<Column<'_>>
     if usage {
         columns.push(Column::MemoryUsed);
     }
+    // PODS after the two resources it is measured beside and before the
+    // devices, because it is the third answer to the same question they answer
+    // — what will still fit here — and the one that is true of every node
+    // rather than only of the ones somebody put hardware in.
+    columns.push(Column::Pods);
     // Devices sit after the resources every node has and before AGE, so the
     // block of "what this machine can give out" stays together and AGE stays
     // last of the default columns, where every `kubectl get` puts it.
@@ -690,20 +732,27 @@ pub(crate) fn columns(rows: &[NodeRow], width: format::Width) -> Vec<Column<'_>>
 /// 1. `VERSION` — the same string on every node in a node group, easy to get
 ///    from `kubectl` on the day it matters.
 /// 2. `AGE` — a standard column but rarely the one people came for.
-/// 3. `CPU REQ` and `MEM REQ` — dropping the pair leaves capacity and usage
+/// 3. `PODS` — the first of the three booked figures to go, and deliberately
+///    ahead of the other two. It is a third answer to "what will still fit
+///    here", and the least often the binding one: a node runs out of CPU or
+///    memory long before it runs out of pod slots, unless the CNI's address
+///    budget is what is short. It also arrived last, and a column added later
+///    should not be the thing that evicts `CPU REQ` and `MEM REQ` from every
+///    80-column listing that has been keeping them.
+/// 4. `CPU REQ` and `MEM REQ` — dropping the pair leaves capacity and usage
 ///    side-by-side, which is the "how busy is this machine" question.
-/// 4. `CPU USE` and `MEM USE` — the pair the tool exists for, so late.
-/// 5. `CPU` and `MEMORY` — the machine's own specs, dropped before the device
+/// 5. `CPU USE` and `MEM USE` — the pair the tool exists for, so late.
+/// 6. `CPU` and `MEMORY` — the machine's own specs, dropped before the device
 ///    columns rather than after them: a device column only exists because
 ///    somebody installed the plugin that surfaces it, and a GPU cluster
 ///    surviving a narrow terminal with `GPU` intact and `CPU` gone is the
 ///    right trade — every listing has `CPU`, and only the interesting one has
 ///    the card.
-/// 6. Every device column, together — a GPU cluster wants them all or none,
+/// 7. Every device column, together — a GPU cluster wants them all or none,
 ///    and the alphabet is a bad rule for "which card is important". On a
 ///    cluster with no devices this step is a no-op and the next runs in the
 ///    same pass.
-/// 7. `STATUS` — the last thing to go before `NAME` is alone.
+/// 8. `STATUS` — the last thing to go before `NAME` is alone.
 ///
 /// `NAME` never drops. A row we cannot fit at all is still a row with a name;
 /// the terminal wraps it, and dropping the name would leave a row that no
@@ -713,6 +762,7 @@ pub(crate) fn columns(rows: &[NodeRow], width: format::Width) -> Vec<Column<'_>>
 const DROP_ORDER: &[fn(&Column<'_>) -> bool] = &[
     |c| matches!(c, Column::Version),
     |c| matches!(c, Column::Age),
+    |c| matches!(c, Column::Pods),
     |c| matches!(c, Column::CpuRequested | Column::MemoryRequested),
     |c| matches!(c, Column::CpuUsed | Column::MemoryUsed),
     |c| matches!(c, Column::Cpu | Column::Memory),
@@ -817,18 +867,25 @@ pub fn render(rows: &[NodeRow], cluster: &str, notes: &[String], width: format::
 /// usually that the user's role covers nodes but not pods cluster-wide.
 ///
 /// The columns it names come from the rows rather than from a constant, because
-/// a device column has a booked figure in it too and it goes the same way. It
-/// says "the booked half" of those because the rest of the cell survives: the
-/// device count came back with the nodes, and only the numerator is missing.
+/// a device column has a booked figure in it too and it goes the same way.
+///
+/// It says "the booked half" of `PODS` and the device columns because the rest
+/// of those cells survives: the pod limit and the device count came back with
+/// the nodes, and only the numerator is missing, so they read `-/58` rather
+/// than emptying. Saying they were empty would be visibly untrue on screen.
 #[must_use]
 pub fn requests_unavailable(rows: &[NodeRow], explanation: &str) -> String {
-    let devices: Vec<String> = device_names(rows)
-        .into_iter()
-        .map(resource::heading)
+    // PODS first and always: it is on every listing, where a device column is
+    // on the ones somebody put hardware in.
+    let counted: Vec<String> = std::iter::once("PODS".to_owned())
+        .chain(device_names(rows).into_iter().map(resource::heading))
         .collect();
 
-    let columns = match format::list(&devices, "and") {
-        Some(devices) => format!("CPU REQ, MEM REQ, and the booked half of {devices} are empty"),
+    let columns = match format::list(&counted, "and") {
+        Some(counted) => format!("CPU REQ, MEM REQ, and the booked half of {counted} are empty"),
+        // Unreachable while PODS is unconditional, and written as the honest
+        // fallback anyway rather than as an `expect` that would take a
+        // terminal down over a footnote.
         None => "CPU REQ and MEM REQ are empty".to_owned(),
     };
 
@@ -949,16 +1006,29 @@ mod tests {
     use super::*;
 
     /// Most tests care about a node's own fields, not its pods; this is the
-    /// "we listed the pods and found none" case, which is a real zero.
-    fn idle() -> Requests {
-        Requests::default()
+    /// "we listed the pods and found none" case, which is a real zero in both
+    /// halves — no pods, and nothing booked.
+    fn idle() -> Placed {
+        Placed::default()
     }
 
-    fn booked(cpu: &str, memory: &str) -> Requests {
-        Requests {
-            cpu: Quantity::parse(cpu).unwrap_or_default(),
-            memory: Quantity::parse(memory).unwrap_or_default(),
-            ..Requests::default()
+    /// A node with pods on it, between them booking `cpu` and `memory`.
+    ///
+    /// The count is fixed at a plausible number rather than derived from the
+    /// figures, because these tests are about the figures; the ones about the
+    /// count say so by calling [`running`].
+    fn booked(cpu: &str, memory: &str) -> Placed {
+        running(12, cpu, memory)
+    }
+
+    fn running(pods: u32, cpu: &str, memory: &str) -> Placed {
+        Placed {
+            pods,
+            requests: Requests {
+                cpu: Quantity::parse(cpu).unwrap_or_default(),
+                memory: Quantity::parse(memory).unwrap_or_default(),
+                ..Requests::default()
+            },
         }
     }
 
@@ -989,9 +1059,18 @@ mod tests {
             spec: Some(NodeSpec::default()),
             status: Some(NodeStatus {
                 conditions: Some(vec![condition("Ready", "True")]),
-                // What an m5.xlarge actually reports.
-                capacity: Some(quantities(&[("cpu", "4"), ("memory", "16374624Ki")])),
-                allocatable: Some(quantities(&[("cpu", "3920m"), ("memory", "15525152Ki")])),
+                // What an m5.xlarge actually reports — `pods` included, because
+                // every node has a limit and the table now shows it.
+                capacity: Some(quantities(&[
+                    ("cpu", "4"),
+                    ("memory", "16374624Ki"),
+                    ("pods", "58"),
+                ])),
+                allocatable: Some(quantities(&[
+                    ("cpu", "3920m"),
+                    ("memory", "15525152Ki"),
+                    ("pods", "58"),
+                ])),
                 node_info: Some(NodeSystemInfo {
                     kubelet_version: "v1.33.1-eks-1a2b3c4".to_owned(),
                     ..Default::default()
@@ -1207,6 +1286,127 @@ mod tests {
         assert_eq!(row.cpu_requested.severity(), Severity::Unknown);
     }
 
+    // --- The pod count ------------------------------------------------------
+
+    #[test]
+    fn the_pod_count_is_shown_against_the_limit_the_node_will_accept() {
+        // The third reason a pod will not schedule, and the one no amount of
+        // spare CPU fixes.
+        let row = NodeRow::from_node(&healthy_node(), Some(&running(12, "0", "0")), None, now());
+
+        assert_eq!(row.pods.pair(quantity::count), "12/58 (21%)");
+        assert_eq!(row.pods.ratio(), Some(12.0 / 58.0));
+    }
+
+    #[test]
+    fn the_pod_limit_is_the_allocatable_one_the_scheduler_enforces() {
+        // A node's `capacity.pods` and its `allocatable.pods` can differ, and
+        // only the second one is a promise: it is what the kubelet's
+        // `--max-pods` and the VPC CNI's address budget both land in, and what
+        // the scheduler actually counts against. Dividing by capacity would
+        // flatter every node whose CNI is the binding constraint, which on EKS
+        // is most of them.
+        let mut node = healthy_node();
+        if let Some(status) = node.status.as_mut() {
+            status.capacity = Some(quantities(&[("cpu", "4"), ("pods", "110")]));
+            status.allocatable = Some(quantities(&[("cpu", "3920m"), ("pods", "58")]));
+        }
+
+        let row = NodeRow::from_node(&node, Some(&running(29, "0", "0")), None, now());
+
+        assert_eq!(row.pods.pair(quantity::count), "29/58 (50%)");
+    }
+
+    #[test]
+    fn a_node_at_its_pod_limit_is_as_alarming_as_one_out_of_cpu() {
+        // The same `theme` thresholds every other share on the row goes
+        // through: a node that cannot take another pod is full, whatever its
+        // cores are doing.
+        let row = NodeRow::from_node(&healthy_node(), Some(&running(58, "0", "0")), None, now());
+
+        assert_eq!(row.pods.pair(quantity::count), "58/58 (100%)");
+        assert_eq!(row.pods.severity(), Severity::Critical);
+        // And the cores really are idle, which is the whole point of the
+        // column: nothing else on this row says the node is full.
+        assert_eq!(row.cpu_requested.severity(), Severity::Ok);
+    }
+
+    #[test]
+    fn a_node_running_nothing_has_a_pod_count_of_zero_rather_than_an_unknown() {
+        let row = NodeRow::from_node(&healthy_node(), Some(&idle()), None, now());
+
+        assert_eq!(row.pods.pair(quantity::count), "0/58 (0%)");
+        assert_eq!(row.pods.severity(), Severity::Ok);
+    }
+
+    #[test]
+    fn a_failed_pod_listing_leaves_the_pod_count_without_a_numerator() {
+        // The limit came back with the node and is still good; only the count
+        // is unknown. `-/58` says more than an empty cell would, and much less
+        // than `0/58` would falsely claim.
+        let row = NodeRow::from_node(&healthy_node(), None, None, now());
+
+        assert_eq!(row.pods.pair(quantity::count), "-/58");
+        assert_eq!(row.pods.severity(), Severity::Unknown);
+    }
+
+    #[test]
+    fn a_node_that_reports_no_pod_limit_still_shows_how_many_it_has() {
+        // A node mid-registration has no allocatable map at all. The count is
+        // a fact we worked out ourselves and is not the thing that went
+        // missing, so it stands alone rather than vanishing with the limit.
+        let mut node = healthy_node();
+        if let Some(status) = node.status.as_mut() {
+            status.allocatable = Some(quantities(&[("cpu", "3920m")]));
+        }
+
+        let row = NodeRow::from_node(&node, Some(&running(4, "0", "0")), None, now());
+
+        assert_eq!(row.pods.pair(quantity::count), "4");
+        assert_eq!(row.pods.ratio(), None);
+    }
+
+    #[test]
+    fn a_node_over_its_pod_limit_says_so_rather_than_capping() {
+        // Static pods and pods placed before `--max-pods` was lowered both do
+        // this, and it is exactly the moment to be told.
+        let row = NodeRow::from_node(&healthy_node(), Some(&running(60, "0", "0")), None, now());
+
+        assert_eq!(row.pods.pair(quantity::count), "60/58 (103%)");
+        assert_eq!(row.pods.severity(), Severity::Critical);
+    }
+
+    #[test]
+    fn a_node_that_will_accept_no_pods_at_all_shows_no_percentage() {
+        // A limit of zero has no percentage to be a share of, and `12/0` is a
+        // better answer than a division by nothing. The same rule `Share`
+        // already follows for a node reporting zero allocatable CPU.
+        let mut node = healthy_node();
+        if let Some(status) = node.status.as_mut() {
+            status.allocatable = Some(quantities(&[("cpu", "3920m"), ("pods", "0")]));
+        }
+
+        let row = NodeRow::from_node(&node, Some(&running(2, "0", "0")), None, now());
+
+        assert_eq!(row.pods.pair(quantity::count), "2/0");
+        assert_eq!(row.pods.severity(), Severity::Unknown);
+    }
+
+    #[test]
+    fn the_pod_column_sits_after_the_memory_it_is_the_third_answer_to() {
+        let rows = [NodeRow::from_node(
+            &healthy_node(),
+            Some(&booked("1500m", "6Gi")),
+            None,
+            now(),
+        )];
+
+        let headings = headings(&rows, Width::Default);
+        let at = |name: &str| headings.iter().position(|heading| heading == name);
+        assert!(at("PODS") > at("MEM REQ"), "{headings:?}");
+        assert!(at("PODS") < at("AGE"), "{headings:?}");
+    }
+
     #[test]
     fn requests_without_a_reported_allocatable_still_show_the_absolute_figure() {
         // A node caught mid-registration knows nothing about its own capacity,
@@ -1265,9 +1465,9 @@ mod tests {
 
         assert_eq!(
             render(&rows, "prod (us-east-1)", &[], Width::Default),
-            "NAME                         STATUS    VERSION              CPU      CPU REQ      MEMORY         MEM REQ    AGE\n\
-             ip-10-0-1-9.ec2.internal     Ready     v1.33.1-eks-1a2b3c4  3920m/4  1500m (38%)  14.8Gi/15.6Gi  6Gi (41%)  2d2h\n\
-             ip-10-0-11-200.ec2.internal  NotReady  v1.33.1-eks-1a2b3c4  3920m/4  0 (0%)       14.8Gi/15.6Gi  0 (0%)     60m"
+            "NAME                         STATUS    VERSION              CPU      CPU REQ      MEMORY         MEM REQ    PODS         AGE\n\
+             ip-10-0-1-9.ec2.internal     Ready     v1.33.1-eks-1a2b3c4  3920m/4  1500m (38%)  14.8Gi/15.6Gi  6Gi (41%)  12/58 (21%)  2d2h\n\
+             ip-10-0-11-200.ec2.internal  NotReady  v1.33.1-eks-1a2b3c4  3920m/4  0 (0%)       14.8Gi/15.6Gi  0 (0%)     0/58 (0%)    60m"
         );
     }
 
@@ -1353,8 +1553,8 @@ mod tests {
 
         assert_eq!(
             render(&rows, "prod (us-east-1)", &[], Width::Default),
-            "NAME                      STATUS  VERSION              CPU      CPU REQ      CPU USE     MEMORY         MEM REQ    MEM USE      AGE\n\
-             ip-10-0-1-9.ec2.internal  Ready   v1.33.1-eks-1a2b3c4  3920m/4  1500m (38%)  392m (10%)  14.8Gi/15.6Gi  6Gi (41%)  1.5Gi (10%)  2d2h"
+            "NAME                      STATUS  VERSION              CPU      CPU REQ      CPU USE     MEMORY         MEM REQ    MEM USE      PODS         AGE\n\
+             ip-10-0-1-9.ec2.internal  Ready   v1.33.1-eks-1a2b3c4  3920m/4  1500m (38%)  392m (10%)  14.8Gi/15.6Gi  6Gi (41%)  1.5Gi (10%)  12/58 (21%)  2d2h"
         );
     }
 
@@ -1523,7 +1723,30 @@ mod tests {
         assert_eq!(
             paragraphs[2],
             "Nothing here has cpu to sort by, for the reason above.\n\
-             Sort by status, cpu-requested, memory-requested, or age instead."
+             Sort by status, cpu-requested, memory-requested, pods, or age instead."
+        );
+    }
+
+    #[test]
+    fn sorting_by_pods_after_a_failed_pod_listing_points_at_the_footnote() {
+        // `eks nodes --sort pods` where the role grants nodes but not pods.
+        // Every count is unknown, so the ordering ranked nothing — and the
+        // request footnote above already says why, so the note points at it
+        // rather than explaining the same failure twice.
+        let rows = [NodeRow::from_node(&healthy_node(), None, None, now())];
+        let missing = Missing {
+            requests: true,
+            usage: true,
+        };
+        let notes = sort_notes(&rows, Order::Pods, missing);
+
+        assert_eq!(
+            notes,
+            [
+                "Sorted by pods.",
+                "Nothing here has pods to sort by, for the reason above.\n\
+                 Sort by status or age instead.",
+            ]
         );
     }
 
@@ -1584,7 +1807,7 @@ mod tests {
         assert_eq!(
             notes[1],
             "Nothing here has cpu to sort by, for the reason above.\n\
-             Sort by status, cpu-requested, memory-requested, or age instead."
+             Sort by status, cpu-requested, memory-requested, pods, or age instead."
         );
     }
 
@@ -1766,8 +1989,8 @@ mod tests {
 
         assert_eq!(
             render(&rows, "prod (us-east-1)", &[], Width::Wide),
-            "NAME                      STATUS  VERSION              CPU      CPU REQ  MEMORY         MEM REQ  AGE   INTERNAL-IP  EXTERNAL-IP  OS-IMAGE                      KERNEL-VERSION                   CONTAINER-RUNTIME\n\
-             ip-10-0-1-9.ec2.internal  Ready   v1.33.1-eks-1a2b3c4  3920m/4  0 (0%)   14.8Gi/15.6Gi  0 (0%)   2d2h  10.0.1.9     -            Amazon Linux 2023.9.20260714  6.1.148-172.265.amzn2023.x86_64  containerd://1.7.28"
+            "NAME                      STATUS  VERSION              CPU      CPU REQ  MEMORY         MEM REQ  PODS       AGE   INTERNAL-IP  EXTERNAL-IP  OS-IMAGE                      KERNEL-VERSION                   CONTAINER-RUNTIME\n\
+             ip-10-0-1-9.ec2.internal  Ready   v1.33.1-eks-1a2b3c4  3920m/4  0 (0%)   14.8Gi/15.6Gi  0 (0%)   0/58 (0%)  2d2h  10.0.1.9     -            Amazon Linux 2023.9.20260714  6.1.148-172.265.amzn2023.x86_64  containerd://1.7.28"
         );
     }
 
@@ -1822,6 +2045,7 @@ mod tests {
                 "MEMORY",
                 "MEM REQ",
                 "MEM USE",
+                "PODS",
                 "AGE",
                 "INTERNAL-IP",
                 "EXTERNAL-IP",
@@ -1917,12 +2141,14 @@ mod tests {
             status.capacity = Some(quantities(&[
                 ("cpu", "4"),
                 ("memory", "16374624Ki"),
+                ("pods", "58"),
                 ("hugepages-2Mi", "0"),
                 ("nvidia.com/gpu", "4"),
             ]));
             status.allocatable = Some(quantities(&[
                 ("cpu", "3920m"),
                 ("memory", "15525152Ki"),
+                ("pods", "58"),
                 ("hugepages-2Mi", "0"),
                 ("nvidia.com/gpu", "4"),
             ]));
@@ -1944,26 +2170,32 @@ mod tests {
             status.capacity = Some(quantities(&[
                 ("cpu", "4"),
                 ("memory", "16374624Ki"),
+                ("pods", "58"),
                 ("nvidia.com/gpu", held),
             ]));
             status.allocatable = Some(quantities(&[
                 ("cpu", "3920m"),
                 ("memory", "15525152Ki"),
+                ("pods", "58"),
                 ("nvidia.com/gpu", offered),
             ]));
         }
         node
     }
 
-    fn booked_device(resource: &str, count: &str) -> Requests {
-        Requests {
-            extended: [(
-                resource.to_owned(),
-                Quantity::parse(count).unwrap_or_default(),
-            )]
-            .into_iter()
-            .collect(),
-            ..booked("1", "1Gi")
+    fn booked_device(resource: &str, count: &str) -> Placed {
+        let base = booked("1", "1Gi");
+        Placed {
+            requests: Requests {
+                extended: [(
+                    resource.to_owned(),
+                    Quantity::parse(count).unwrap_or_default(),
+                )]
+                .into_iter()
+                .collect(),
+                ..base.requests
+            },
+            ..base
         }
     }
 
@@ -1994,6 +2226,7 @@ mod tests {
                 "CPU REQ",
                 "MEMORY",
                 "MEM REQ",
+                "PODS",
                 "NVIDIA.COM/GPU",
                 "AGE",
             ]
@@ -2014,7 +2247,7 @@ mod tests {
         assert_eq!(
             headings(&rows, Width::Default),
             [
-                "NAME", "STATUS", "VERSION", "CPU", "CPU REQ", "MEMORY", "MEM REQ", "AGE"
+                "NAME", "STATUS", "VERSION", "CPU", "CPU REQ", "MEMORY", "MEM REQ", "PODS", "AGE"
             ]
         );
         assert!(rows[0].devices.is_empty());
@@ -2129,6 +2362,7 @@ mod tests {
                 "MEMORY",
                 "MEM REQ",
                 "MEM USE",
+                "PODS",
                 "NVIDIA.COM/GPU",
                 "AGE",
             ]
@@ -2177,8 +2411,8 @@ mod tests {
 
         assert_eq!(
             render(&rows, "prod (us-east-1)", &[], Width::Default),
-            "NAME                      STATUS  VERSION              CPU      CPU REQ  MEMORY         MEM REQ   NVIDIA.COM/GPU  AGE\n\
-             ip-10-0-1-9.ec2.internal  Ready   v1.33.1-eks-1a2b3c4  3920m/4  1 (26%)  14.8Gi/15.6Gi  1Gi (7%)  2/4 (50%)       2d2h"
+            "NAME                      STATUS  VERSION              CPU      CPU REQ  MEMORY         MEM REQ   PODS         NVIDIA.COM/GPU  AGE\n\
+             ip-10-0-1-9.ec2.internal  Ready   v1.33.1-eks-1a2b3c4  3920m/4  1 (26%)  14.8Gi/15.6Gi  1Gi (7%)  12/58 (21%)  2/4 (50%)       2d2h"
         );
     }
 
@@ -2199,7 +2433,8 @@ mod tests {
 
         assert!(
             note.starts_with(
-                "CPU REQ, MEM REQ, and the booked half of NVIDIA.COM/GPU are empty because"
+                "CPU REQ, MEM REQ, and the booked half of PODS and NVIDIA.COM/GPU are empty \
+                 because"
             ),
             "{note}"
         );
@@ -2213,7 +2448,8 @@ mod tests {
 
         assert_eq!(
             requests_unavailable(&rows, "why"),
-            "CPU REQ and MEM REQ are empty because the pods could not be listed.\nwhy"
+            "CPU REQ, MEM REQ, and the booked half of PODS are empty \
+             because the pods could not be listed.\nwhy"
         );
     }
 
@@ -2366,7 +2602,8 @@ mod tests {
         assert_eq!(devices_withheld(std::slice::from_ref(&row)), None);
         assert_eq!(
             requests_unavailable(std::slice::from_ref(&row), "why"),
-            "CPU REQ and MEM REQ are empty because the pods could not be listed.\nwhy"
+            "CPU REQ, MEM REQ, and the booked half of PODS are empty \
+             because the pods could not be listed.\nwhy"
         );
     }
 
@@ -2409,17 +2646,36 @@ mod tests {
 
     #[test]
     fn a_narrow_terminal_drops_version_first() {
-        // The default row is 107 chars for the fixture — `NAME(24) STATUS(6)
-        // VERSION(19) CPU(7) CPU REQ(11) MEMORY(13) MEM REQ(9) AGE(4)` with
-        // seven two-space separators — and dropping just `VERSION` gets it to
-        // 86. `kubectl` prints VERSION too, so a person on a narrow terminal
-        // asking for it has somewhere to go; it is the right first thing to
-        // let go.
+        // The default row is 120 chars for the fixture — `NAME(24) STATUS(6)
+        // VERSION(19) CPU(7) CPU REQ(11) MEMORY(13) MEM REQ(9) PODS(11)
+        // AGE(4)` with eight two-space separators — and dropping just
+        // `VERSION` gets it to 99. `kubectl` prints VERSION too, so a person
+        // on a narrow terminal asking for it has somewhere to go; it is the
+        // right first thing to let go.
         assert_eq!(
             headings_at(&one_booked_row(), 100),
             [
-                "NAME", "STATUS", "CPU", "CPU REQ", "MEMORY", "MEM REQ", "AGE"
+                "NAME", "STATUS", "CPU", "CPU REQ", "MEMORY", "MEM REQ", "PODS", "AGE"
             ],
+        );
+    }
+
+    #[test]
+    fn the_pod_count_is_the_first_of_the_booked_figures_to_go() {
+        // Three columns answer "will another pod fit here", and this is the
+        // order they leave in. PODS goes first because it is the least often
+        // the binding one — and because a column added later must not be what
+        // evicts `CPU REQ` and `MEM REQ` from a listing that has been keeping
+        // them. 90 is past `VERSION` and `AGE` and into `PODS`.
+        let headings = headings_at(&one_booked_row(), 90);
+
+        assert!(
+            !headings.iter().any(|heading| heading == "PODS"),
+            "{headings:?}"
+        );
+        assert_eq!(
+            headings,
+            ["NAME", "STATUS", "CPU", "CPU REQ", "MEMORY", "MEM REQ"]
         );
     }
 
@@ -2495,6 +2751,25 @@ mod tests {
         assert!(!cols.contains(&"MEMORY".to_owned()), "{cols:?}");
         assert!(cols.contains(&"NAME".to_owned()));
         assert!(cols.contains(&"STATUS".to_owned()));
+    }
+
+    #[test]
+    fn a_device_column_outlasts_the_pod_count_too() {
+        // The same argument the CPU column loses: `PODS` is on every listing
+        // and the card count is only on the one somebody put hardware in. This
+        // is the assertion the placement of `PODS` in `DROP_ORDER` turns on, so
+        // it is worth making from the device end rather than only from the
+        // request end.
+        let rows = [NodeRow::from_node(
+            &gpu_node(),
+            Some(&booked_device("nvidia.com/gpu", "1")),
+            None,
+            now(),
+        )];
+
+        let cols = headings_at(&rows, 60);
+        assert!(cols.contains(&"NVIDIA.COM/GPU".to_owned()), "{cols:?}");
+        assert!(!cols.contains(&"PODS".to_owned()), "{cols:?}");
     }
 
     #[test]

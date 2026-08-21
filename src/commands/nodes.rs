@@ -108,24 +108,25 @@ pub async fn list(
         })
         .collect();
 
-    // What a node running nothing has booked. Named here rather than built per
-    // row so the rows can borrow the totals instead of cloning a map each.
-    let nothing = k8s_pods::Requests::default();
+    // A node running nothing: no pods, and nothing booked. Named here rather
+    // than built per row so the rows can borrow the totals instead of cloning a
+    // map each.
+    let nothing = k8s_pods::Placed::default();
 
     let mut rows: Vec<k8s_nodes::NodeRow> = nodes
         .iter()
         .zip(&samples)
         .map(|(node, sample)| {
             // A node absent from the totals is running nothing, which is a real
-            // zero. Only a failed pod listing leaves the figure unknown.
-            let requested = requests.as_ref().ok().map(|totals| {
+            // zero. Only a failed pod listing leaves the figures unknown.
+            let placed = requests.as_ref().ok().map(|totals| {
                 node.metadata
                     .name
                     .as_deref()
                     .and_then(|name| totals.get(name))
                     .unwrap_or(&nothing)
             });
-            k8s_nodes::NodeRow::from_node(node, requested, sample.map(|s| s.usage), now)
+            k8s_nodes::NodeRow::from_node(node, placed, sample.map(|s| s.usage), now)
         })
         .collect();
     // Ordering lives in `k8s::nodes::order` rather than here, so the default and

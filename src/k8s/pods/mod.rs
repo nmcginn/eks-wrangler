@@ -292,24 +292,49 @@ fn overhead(spec: &PodSpec) -> Requests {
     Requests::read(spec.overhead.as_ref())
 }
 
-/// Total the effective requests of every pod, keyed by the node it is on.
+/// What the pods on one node add up to.
+///
+/// Two facts from one walk, deliberately. A node's pod count and its request
+/// totals answer the same question — will the next pod fit here — and they are
+/// both derived by deciding, pod by pod, which ones are still occupying the
+/// node. Counting in a second pass would be a second chance to answer that
+/// differently, and a `PODS` cell that disagreed with the `CPU REQ` beside it
+/// about how many pods it had added up would be invisible on screen and wrong.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Placed {
+    /// How many pods are on the node.
+    ///
+    /// A `u32` because it is counted rather than measured: `maxPods` is 737 on
+    /// the largest instance type EKS offers, and the arithmetic that reaches a
+    /// cell divides it by that limit rather than adding it to anything.
+    pub pods: u32,
+    /// What those pods have booked between them.
+    pub requests: Requests,
+}
+
+/// Total what every pod has placed on the node it is on.
 ///
 /// Pods that have finished, and pods the scheduler has not placed yet, are
-/// left out: neither is holding anything on a node. A node with no pods is
-/// simply absent from the map — the caller knows its own node list and can tell
-/// "nothing running here" from "no such node" better than this function can.
+/// left out: neither is holding anything on a node, and neither counts against
+/// the node's pod limit. A node with no pods is simply absent from the map —
+/// the caller knows its own node list and can tell "nothing running here" from
+/// "no such node" better than this function can.
 #[must_use]
-pub fn by_node(pods: &[Pod]) -> BTreeMap<String, Requests> {
-    let mut totals: BTreeMap<String, Requests> = BTreeMap::new();
+pub fn by_node(pods: &[Pod]) -> BTreeMap<String, Placed> {
+    let mut totals: BTreeMap<String, Placed> = BTreeMap::new();
 
     for pod in pods {
         let Some(node) = occupied_node(pod) else {
             continue;
         };
         let total = totals.entry(node.to_owned()).or_default();
+        // Saturating for the reason `Quantity`'s addition is: a count that pins
+        // at the maximum is a visibly absurd number, where a wrapped one is a
+        // small plausible lie. Nothing real gets within four billion of it.
+        total.pods = total.pods.saturating_add(1);
         // Taken rather than copied: a total carries a map of extended resources
         // now, so it is moved through the sum instead of being cloned into it.
-        *total = std::mem::take(total).plus(effective_requests(pod));
+        total.requests = std::mem::take(&mut total.requests).plus(effective_requests(pod));
     }
 
     totals
@@ -353,6 +378,14 @@ mod tests {
             cpu: quantity(cpu),
             memory: quantity(memory),
             extended: BTreeMap::new(),
+        }
+    }
+
+    /// `pods` pods on one node, having booked `cpu` and `memory` between them.
+    fn placed(pods: u32, cpu: &str, memory: &str) -> Placed {
+        Placed {
+            pods,
+            requests: requests(cpu, memory),
         }
     }
 
@@ -577,8 +610,28 @@ mod tests {
         let totals = by_node(&pods);
 
         assert_eq!(totals.len(), 2);
-        assert_eq!(totals["node-a"], requests("1250m", "1536Mi"));
-        assert_eq!(totals["node-b"], requests("100m", "64Mi"));
+        assert_eq!(totals["node-a"], placed(2, "1250m", "1536Mi"));
+        assert_eq!(totals["node-b"], placed(1, "100m", "64Mi"));
+    }
+
+    #[test]
+    fn the_count_and_the_totals_come_out_of_one_walk_over_the_pods() {
+        // The property the `PODS` column depends on: whatever rule decides a
+        // pod is occupying a node decides both numbers, so a cell saying 3 and
+        // a cell saying what 3 pods booked cannot be about different threes.
+        let mut finished = pod("node-a", spec(vec![container("app", "1", "1Gi")]));
+        finished.status = Some(PodStatus {
+            phase: Some("Succeeded".to_owned()),
+            ..Default::default()
+        });
+        let pods = [
+            pod("node-a", spec(vec![container("app", "250m", "512Mi")])),
+            finished,
+            pod("node-a", spec(vec![container("app", "1", "1Gi")])),
+        ];
+
+        // The completed Job counts against neither half.
+        assert_eq!(by_node(&pods)["node-a"], placed(2, "1250m", "1536Mi"));
     }
 
     #[test]
@@ -606,7 +659,7 @@ mod tests {
                 "2026-08-18T12:00:00Z".parse().unwrap(),
             ));
 
-        assert_eq!(by_node(&[terminating])["node-a"], requests("1", "1Gi"));
+        assert_eq!(by_node(&[terminating])["node-a"], placed(1, "1", "1Gi"));
     }
 
     #[test]
@@ -769,13 +822,19 @@ mod tests {
 
         let totals = by_node(&pods);
 
-        assert_eq!(totals["node-a"].extended("nvidia.com/gpu"), quantity("3"));
+        assert_eq!(
+            totals["node-a"].requests.extended("nvidia.com/gpu"),
+            quantity("3")
+        );
         // A device booked on one node must not turn up on another.
         assert_eq!(
-            totals["node-a"].extended("amd.com/gpu"),
+            totals["node-a"].requests.extended("amd.com/gpu"),
             Quantity::default()
         );
-        assert_eq!(totals["node-b"].extended("amd.com/gpu"), quantity("1"));
+        assert_eq!(
+            totals["node-b"].requests.extended("amd.com/gpu"),
+            quantity("1")
+        );
     }
 
     #[test]

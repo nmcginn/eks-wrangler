@@ -52,6 +52,13 @@ pub enum Order {
     CpuRequested,
     /// Most memory booked by pods first; nodes with no pod total last.
     MemoryRequested,
+    /// Closest to its pod limit first; nodes with no pod count last.
+    ///
+    /// A share like the rest of the node orders, not a headcount: the node to
+    /// look at is the one with two slots left, not the one running the most
+    /// pods, and on a cluster of mixed instance types those are rarely the
+    /// same node.
+    Pods,
     /// Youngest first; nodes with no creation timestamp last.
     Age,
 }
@@ -82,6 +89,7 @@ fn rank(a: &NodeRow, b: &NodeRow, order: Order, direction: Direction) -> Orderin
             &busiest(b.memory_requested),
             direction,
         ),
+        Order::Pods => compare(&busiest(a.pods), &busiest(b.pods), direction),
         Order::Age => compare(&youngest(a), &youngest(b), direction),
     }
 }
@@ -116,6 +124,7 @@ fn ranked(row: &NodeRow, order: Order) -> bool {
         Order::Memory => busiest(row.memory_used).is_ranked(),
         Order::CpuRequested => busiest(row.cpu_requested).is_ranked(),
         Order::MemoryRequested => busiest(row.memory_requested).is_ranked(),
+        Order::Pods => busiest(row.pods).is_ranked(),
         Order::Age => youngest(row).is_ranked(),
     }
 }
@@ -128,7 +137,8 @@ fn ranked(row: &NodeRow, order: Order) -> bool {
 /// [`cause`] can be a pure function, testable without a cluster to break.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Missing {
-    /// The pod listing failed, so `CPU REQ` and `MEM REQ` are empty.
+    /// The pod listing failed, so `CPU REQ`, `MEM REQ`, and the counted half
+    /// of `PODS` are empty.
     pub requests: bool,
     /// There is no live usage in the table, so `CPU USE` and `MEM USE` are
     /// absent — either because the read failed, or because it succeeded and
@@ -155,7 +165,11 @@ pub struct Missing {
 pub fn cause(order: Order, missing: Missing) -> Cause {
     Cause::explained(match order {
         Order::Cpu | Order::Memory => missing.usage,
-        Order::CpuRequested | Order::MemoryRequested => missing.requests,
+        // `PODS` belongs here and not with the two above only because of where
+        // its number comes from: the count is the pod listing's, so the same
+        // failure empties it, even though the limit beside it is the node's own
+        // and is still on screen.
+        Order::CpuRequested | Order::MemoryRequested | Order::Pods => missing.requests,
         // Nothing the table footnotes can explain these away. A node with no
         // name, no status, or no creation timestamp is the API server being
         // strange, not a column this command failed to fetch.
@@ -250,13 +264,14 @@ mod tests {
     use crate::k8s::quantity::Quantity;
 
     /// Every ordering, for the tests that must hold of all of them.
-    const ORDERS: [Order; 7] = [
+    const ORDERS: [Order; 8] = [
         Order::Name,
         Order::Status,
         Order::Cpu,
         Order::Memory,
         Order::CpuRequested,
         Order::MemoryRequested,
+        Order::Pods,
         Order::Age,
     ];
 
@@ -291,6 +306,7 @@ mod tests {
             memory_requested: Share::default(),
             cpu_used: Share::default(),
             memory_used: Share::default(),
+            pods: Share::default(),
             age: "3h".to_owned(),
             created_at: Some(minutes_ago(180)),
             internal_ip: "10.0.1.9".to_owned(),
@@ -319,6 +335,18 @@ mod tests {
             cpu_requested: Share {
                 amount: requested.map(quantity),
                 allocatable: Some(quantity("4")),
+            },
+            ..row(name)
+        }
+    }
+
+    /// A node with `pods` pods on it out of a limit of `limit`, or with a pod
+    /// count nobody could read.
+    fn crowded(name: &str, pods: Option<u32>, limit: &str) -> NodeRow {
+        NodeRow {
+            pods: Share {
+                amount: pods.map(Quantity::from_count),
+                allocatable: Some(quantity(limit)),
             },
             ..row(name)
         }
@@ -847,6 +875,83 @@ mod tests {
         assert_eq!(
             crate::k8s::order::note(Order::CpuRequested, Direction::Natural).as_deref(),
             Some("Sorted by cpu-requested.")
+        );
+    }
+    #[test]
+    fn sorting_by_pods_ranks_the_share_of_the_limit_rather_than_the_headcount() {
+        // The node to go and look at is the one with two slots left, not the
+        // one running the most pods. On a cluster of mixed instance types
+        // those are different nodes, and only one of them is a problem.
+        let rows = [
+            crowded("big", Some(80), "234"),
+            crowded("small", Some(50), "58"),
+        ];
+
+        // 86% beats 34%, though 50 is the smaller headcount.
+        assert_eq!(
+            sorted(&rows, Order::Pods, Direction::Natural),
+            ["small", "big"]
+        );
+    }
+
+    #[test]
+    fn a_node_whose_pods_could_not_be_counted_sorts_into_the_tail() {
+        // A failed pod listing is not an empty node, and must not rank as one:
+        // sorting it among the genuinely idle nodes would be a claim about the
+        // machine rather than about what we failed to read.
+        let rows = [
+            crowded("unknown", None, "58"),
+            crowded("idle", Some(0), "58"),
+            crowded("full", Some(58), "58"),
+        ];
+
+        assert_eq!(
+            sorted(&rows, Order::Pods, Direction::Natural),
+            ["full", "idle", "unknown"]
+        );
+        // And reversing puts the busiest last without dragging the tail up
+        // with it.
+        assert_eq!(
+            sorted(&rows, Order::Pods, Direction::Reversed),
+            ["idle", "full", "unknown"]
+        );
+    }
+
+    #[test]
+    fn a_listing_with_no_pod_counts_at_all_ranks_nothing_under_pods() {
+        let rows = [crowded("a", None, "58"), crowded("b", None, "58")];
+
+        assert!(!ranks_any(&rows, Order::Pods));
+        // And one counted node is enough to put it at an end of the table.
+        let rows = [crowded("a", None, "58"), crowded("b", Some(3), "58")];
+        assert!(ranks_any(&rows, Order::Pods));
+    }
+
+    #[test]
+    fn the_failed_pod_listing_explains_an_unrankable_pod_ordering() {
+        // The same footnote that explains the empty `CPU REQ` explains this:
+        // the count is the pod listing's, so one failure takes all three.
+        assert_eq!(
+            cause(
+                Order::Pods,
+                Missing {
+                    requests: true,
+                    usage: false
+                }
+            ),
+            Cause::Explained
+        );
+        // The limit beside it is the node's own, so nothing about the metrics
+        // endpoint can account for this ordering.
+        assert_eq!(
+            cause(
+                Order::Pods,
+                Missing {
+                    requests: false,
+                    usage: true
+                }
+            ),
+            Cause::Unexplained
         );
     }
 }

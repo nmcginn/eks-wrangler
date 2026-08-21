@@ -55,9 +55,9 @@ cluster name:
 
 ```
 $ eks nodes --context staging
-NAME                         STATUS                       VERSION              CPU      CPU REQ      CPU USE      MEMORY         MEM REQ     MEM USE      AGE
-ip-10-0-1-9.ec2.internal     Ready                        v1.33.1-eks-1a2b3c4  3920m/4  1500m (38%)  392m (10%)   14.8Gi/15.6Gi  6Gi (41%)   3.7Gi (25%)  12d
-ip-10-0-11-200.ec2.internal  NotReady,SchedulingDisabled  v1.32.9-eks-9f8e7d6  3920m/4  3800m (97%)  1200m (31%)  14.8Gi/15.6Gi  15Gi (96%)  4Gi (27%)    10h
+NAME                         STATUS                       VERSION              CPU      CPU REQ      CPU USE      MEMORY         MEM REQ     MEM USE      PODS         AGE
+ip-10-0-1-9.ec2.internal     Ready                        v1.33.1-eks-1a2b3c4  3920m/4  1500m (38%)  392m (10%)   14.8Gi/15.6Gi  6Gi (41%)   3.7Gi (25%)  21/58 (36%)  12d
+ip-10-0-11-200.ec2.internal  NotReady,SchedulingDisabled  v1.32.9-eks-9f8e7d6  3920m/4  3800m (97%)  1200m (31%)  14.8Gi/15.6Gi  15Gi (96%)  4Gi (27%)    57/58 (98%)  10h
 
 Usage is up to 12s old, averaged over 20s.
 ```
@@ -67,6 +67,21 @@ ask for — over total capacity, the gap between them being what the kubelet
 reserves for itself. `CPU REQ` and `MEM REQ` are what the pods already on the
 node have booked, and what share of allocatable that is. The percentage, not the
 capacity, is what decides whether the next pod schedules.
+
+`PODS` is how many pods are on the node, out of how many it will accept. That
+limit is the third reason a pod will not schedule, and the one no amount of
+spare CPU fixes: on EKS it is usually the number of addresses the VPC CNI can
+hand out on that instance type, so the second node above is one pod from full
+whatever its cores are doing. The limit is spelled out rather than left to the
+percentage, because it varies by instance type and by CNI configuration: `36%`
+means something quite different on a node that takes 17 pods and one that takes
+234.
+
+The count is of the pods still occupying the node, which is the same set the
+request columns are totalled from: a `Completed` Job holds no slot and no
+memory, and is left out of both. So `PODS` and `CPU REQ` are always about the
+same pods. When the pod listing fails, the count goes with it and the cell
+reads `-/58` — the limit came back with the node and is still worth having.
 
 `CPU USE` and `MEM USE` are what the node is actually doing, sampled from
 metrics-server. They answer a different question from the request columns, and
@@ -109,10 +124,10 @@ for it, and only a node group that has one puts it there:
 
 ```
 $ eks nodes --context training
-NAME                         STATUS  VERSION              CPU        CPU REQ      MEMORY         MEM REQ     NVIDIA.COM/GPU  AGE
-ip-10-0-4-31.ec2.internal    Ready   v1.33.1-eks-1a2b3c4  15890m/16  12 (76%)     58.5Gi/62Gi    40Gi (68%)  3/4 (75%)       6d
-ip-10-0-4-77.ec2.internal    Ready   v1.33.1-eks-1a2b3c4  15890m/16  2 (13%)      58.5Gi/62Gi    8Gi (14%)   0/4 (0%)        6d
-ip-10-0-11-200.ec2.internal  Ready   v1.33.1-eks-1a2b3c4  3920m/4    1500m (38%)  14.8Gi/15.6Gi  6Gi (41%)   -               12d
+NAME                         STATUS  VERSION              CPU        CPU REQ      MEMORY         MEM REQ     PODS         NVIDIA.COM/GPU  AGE
+ip-10-0-4-31.ec2.internal    Ready   v1.33.1-eks-1a2b3c4  15890m/16  12 (76%)     58.5Gi/62Gi    40Gi (68%)  9/234 (4%)   3/4 (75%)       6d
+ip-10-0-4-77.ec2.internal    Ready   v1.33.1-eks-1a2b3c4  15890m/16  2 (13%)      58.5Gi/62Gi    8Gi (14%)   6/234 (3%)   0/4 (0%)        6d
+ip-10-0-11-200.ec2.internal  Ready   v1.33.1-eks-1a2b3c4  3920m/4    1500m (38%)  14.8Gi/15.6Gi  6Gi (41%)   21/58 (36%)  -               12d
 ```
 
 The cell is what the pods there have booked, out of what the node will hand out:
@@ -121,10 +136,11 @@ training job schedules. The last node is not a node with no cards free — it is
 node with no cards, which is a different answer to whoever is looking for
 somewhere to put that job, so it reads `-` rather than `0/4`.
 
-Only resources the cluster added get a column. Kubernetes' own — `cpu`,
-`memory`, `pods`, `hugepages-2Mi`, and the `attachable-volumes-*` limits sitting
-in the same list — are left alone, so a cluster with no devices prints exactly
-the table it printed before.
+Only resources the cluster added get a *device* column. Kubernetes' own —
+`cpu`, `memory`, `pods`, `hugepages-2Mi`, and the `attachable-volumes-*` limits
+sitting in the same list — are left out of that rule, so a cluster with no
+devices grows no columns from it. The first three have a heading of their own
+instead, in the units a reader recognises; the rest have none yet.
 
 The column shows what the node will *hand out*, which leaves one thing invisible
 that the table exists to show: a card the kubelet has and is not offering,
@@ -136,13 +152,14 @@ A device a node has but will not offer is usually one its plugin marked unhealth
 ```
 
 `--sort` reorders the node listing too, by `name` (the default, unchanged),
-`status`, `cpu`, `memory`, `cpu-requested`, `memory-requested`, or `age`, and
-`--sort-reverse` flips any of them:
+`status`, `cpu`, `memory`, `cpu-requested`, `memory-requested`, `pods`, or
+`age`, and `--sort-reverse` flips any of them:
 
 ```sh
 eks nodes --sort status              # the NotReady node, first
 eks nodes --sort cpu                 # the node closest to being full
 eks nodes --sort cpu-requested       # the node the scheduler will refuse next
+eks nodes --sort pods                # the node closest to its pod limit
 eks nodes --sort age --sort-reverse  # the node that has been up longest
 ```
 
@@ -333,8 +350,14 @@ it. Each table has its own order, and each keeps what it exists for until last:
 
 | Table | Dropped, in order | Never dropped |
 | --- | --- | --- |
-| `eks nodes` | `VERSION`, `AGE`, the `REQ` pair, the `USE` pair, `CPU` and `MEMORY`, the device columns, `STATUS` | `NAME` |
+| `eks nodes` | `VERSION`, `AGE`, `PODS`, the `REQ` pair, the `USE` pair, `CPU` and `MEMORY`, the device columns, `STATUS` | `NAME` |
 | `eks pods` | `AGE`, `NODE`, the usage pair, `RESTARTS`, `READY`, `STATUS` | `NAME`, and `NAMESPACE` under `-A` |
+
+`PODS` goes early, ahead of the `REQ` pair it belongs with, for two reasons: a
+node runs out of CPU or memory long before it runs out of pod slots unless the
+CNI's address budget is what is short, and a column added later should not be
+what evicts `CPU REQ` and `MEM REQ` from every 80-column listing that has been
+keeping them.
 
 Columns that are read together leave together: `CPU/REQ` without `MEMORY/REQ`
 beside it is half an answer, and an eye reading a row of pairs pairs the wrong
@@ -359,7 +382,7 @@ more columns, not for a table that gets out of the way.
 | `-A, --all-namespaces` | List pods across every namespace (`eks pods`) |
 | `-l, --selector <SEL>` | Filter pods by label selector (`eks pods`) |
 | `--field-selector <SEL>` | Filter pods by field selector (`eks pods`) |
-| `--sort <ORDER>` | Order the listing. Pods: `name` (default), `restarts`, `age`, `cpu`, `memory`. Nodes: `name` (default), `status`, `cpu`, `memory`, `cpu-requested`, `memory-requested`, `age` |
+| `--sort <ORDER>` | Order the listing. Pods: `name` (default), `restarts`, `age`, `cpu`, `memory`. Nodes: `name` (default), `status`, `cpu`, `memory`, `cpu-requested`, `memory-requested`, `pods`, `age` |
 | `--sort-reverse` | Reverse `--sort`; unrankable rows stay at the end. Either flag adds a line under the table naming the order |
 | `--wide` | Add the extra columns `kubectl -o wide` shows. Pods: `IP`, `NOMINATED NODE`, `READINESS GATES`. Nodes: `INTERNAL-IP`, `EXTERNAL-IP`, `OS-IMAGE`, `KERNEL-VERSION`, `CONTAINER-RUNTIME` |
 | `--kubeconfig <PATH>` | Override the kubeconfig search path |
