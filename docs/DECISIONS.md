@@ -70,9 +70,17 @@ change itself, and the loop began splitting on the line count rather than at a
 seam. #15 is the example: it landed a note saying an ordering had ranked nothing
 and deferred *pointing that note at the fix* to a second PR — one thought cut in
 half, and half of it below the bar priority 3 sets for error messages. The budget
-is now 200–400 lines of production change with tests on top, and a slice has to
-be complete before it is asked to be small. Deferral needs a seam to happen at:
-an untouched surface, an open design question, or a night's work of its own.
+was set to 200–400 lines of production change with tests on top, and a slice had
+to be complete before it was asked to be small. Deferral needs a seam to happen
+at: an untouched surface, an open design question, or a night's work of its own.
+
+*Amended again.* The replacement number turned out to be the same failure mode
+one size down: PRs were still being shaped to land under a ceiling rather than
+to finish the thought, and the remainder kept going back onto the roadmap
+instead of into the PR — the roadmap grew faster than it shrank. There is no
+line target now, in this decision or in `CLAUDE.md`. A PR is sized by whether
+it is a complete, reviewable change; nothing here caps how large that is
+allowed to be.
 
 ### 9. The async runtime is built per command, not around `main`
 
