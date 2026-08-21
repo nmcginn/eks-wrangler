@@ -2,20 +2,30 @@
 //!
 //! Two jobs live here, and the second one is the interesting one.
 //!
-//! Building a client is mechanical: read the same kubeconfig files the rest of
-//! the tool reads, pick a context, hand it to `kube`. No network traffic
-//! happens here, so nothing on this path can stall a first paint. It is *not*
-//! free of side effects, though: `kube` resolves the auth layer eagerly, so a
-//! context with an `exec` block runs `aws eks get-token` while the client is
-//! being built rather than on the first request. That is why building a client
-//! can fail with a credential error, and why [`explain`] is used on both paths.
+//! Building a client is *nearly* mechanical: read the same kubeconfig files the
+//! rest of the tool reads, pick a context, hand it to `kube`. No network
+//! traffic happens here, so nothing on this path can stall a first paint. It is
+//! not free of side effects, though, and the side effect is the reason this
+//! module is more than twenty lines: `kube` resolves the auth layer eagerly, so
+//! a context with an `exec` block runs `aws eks get-token` inside
+//! `Client::try_from` rather than on the first request. That is why building a
+//! client can fail with a credential error, and why [`explain`] is used on both
+//! paths.
 //!
-//! One thing that follows from that eager resolution is worth stating plainly,
-//! because it is a limit on what `--timeout` can promise: `kube` runs the exec
-//! plugin with a *blocking* `std::process::Command`, so a credential helper
-//! that hangs hangs the thread rather than the future, and no timeout wrapped
-//! around this function would ever fire. [`Budget`] therefore covers requests
-//! to the cluster — see [`crate::k8s::page`] — and the flag's help says so.
+//! It runs it with a *blocking* `std::process::Command`, on whatever thread
+//! asked. A credential helper that never comes back — an expired SSO session
+//! that wants a browser login, a laptop that has lost its route to the SSO
+//! endpoint — therefore blocks the thread rather than the future, and a
+//! `tokio::time::timeout` wrapped around this function would never fire. So the
+//! build goes onto a blocking task, where the timeout has something to interrupt:
+//! [`connect`] takes the same [`Budget`] the requests after it take, and spends
+//! it on the helper too.
+//!
+//! Abandoning a blocking task does not stop it — nothing here can kill a
+//! subprocess `kube` owns — so the other half of that timeout is
+//! [`crate::commands::block_on`], which shuts the runtime down instead of
+//! dropping it. Dropping one waits for its blocking tasks, and waiting for this
+//! one is the exact hang the budget was written to end.
 //!
 //! Translating failures is the job that earns its keep. An EKS cluster whose
 //! SSO session expired answers with `401 Unauthorized`, and `kube` reports that
@@ -24,11 +34,13 @@
 //! actual problem is that they need to run `aws sso login`. [`explain`] is
 //! where that translation happens, and it is a pure function so every message
 //! is asserted on in tests rather than provoked from a cluster.
+//! [`stalled_helper`] is the same idea for the failure above, which has no
+//! `kube::Error` behind it to classify.
 
 use std::path::PathBuf;
 use std::time::Duration;
 
-use kube::config::{KubeConfigOptions, Kubeconfig};
+use kube::config::{AuthInfo, KubeConfigOptions, Kubeconfig};
 use kube::{Client, Config};
 
 use crate::cluster::ClusterView;
@@ -54,6 +66,23 @@ pub enum Error {
     /// [`explain`].
     #[error("{0}")]
     Cluster(String),
+
+    /// The context's credential helper was still running when the budget ran
+    /// out. Carries its explanation from [`stalled_helper`], which is a
+    /// separate wording because there is no `kube::Error` behind this one to
+    /// classify — nothing was asked of the cluster yet.
+    #[error("{0}")]
+    HelperStalled(String),
+
+    /// The thread building the client stopped without answering. Only a panic
+    /// inside `kube` can do this, so there is no advice to give beyond what it
+    /// said on its way down.
+    #[error(
+        "building a client for {cluster} stopped unexpectedly: {message}\n\
+         That is a bug in eks or in the kube crate rather than something you did; \
+         please report it with the output of `eks -vv`."
+    )]
+    Interrupted { cluster: String, message: String },
 }
 
 fn format_paths(paths: &[PathBuf]) -> String {
@@ -67,7 +96,8 @@ fn format_paths(paths: &[PathBuf]) -> String {
         .join(", ")
 }
 
-/// Build a client for one cluster.
+/// Build a client for one cluster, giving up if the credential helper does not
+/// come back inside `budget`.
 ///
 /// `paths` is the same list the rest of the tool reads, so `--kubeconfig` and a
 /// multi-file `KUBECONFIG` behave identically here and in `eks contexts`.
@@ -76,7 +106,16 @@ fn format_paths(paths: &[PathBuf]) -> String {
 /// No network request is made, but the context's credential helper does run —
 /// see the module documentation — so failures here are translated with
 /// [`explain`] and name the cluster the way the user does.
-pub async fn connect(paths: &[PathBuf], cluster: &ClusterView) -> Result<Client, Error> {
+///
+/// `budget` is `--timeout`, the same value each request after this one is given.
+/// It is spent per step rather than shared: a helper that takes twenty seconds
+/// to refresh an SSO token has not used up the listing's time, any more than one
+/// page of that listing uses up the next page's.
+pub async fn connect(
+    paths: &[PathBuf],
+    cluster: &ClusterView,
+    budget: Budget,
+) -> Result<Client, Error> {
     let kubeconfig = read_merged(paths)?;
 
     let options = KubeConfigOptions {
@@ -92,10 +131,111 @@ pub async fn connect(paths: &[PathBuf], cluster: &ClusterView) -> Result<Client,
             message: source.to_string(),
         })?;
 
-    Client::try_from(config).map_err(|source| {
-        tracing::debug!(%source, "building a client failed");
-        Error::Cluster(explain(&source.into(), &cluster.label()))
-    })
+    let label = cluster.label();
+    // Read before `config` moves onto the blocking task, because the message
+    // for a helper that never answers has to name the command to run by hand.
+    let helper = helper_command(&config.auth_info);
+
+    // The one blocking call in the tool, and the reason it is on a blocking
+    // task: `Client::try_from` resolves the auth layer, which runs the
+    // kubeconfig's exec plugin with `std::process::Command::output`. On this
+    // thread that would block the timer below along with everything else.
+    let task = tokio::task::spawn_blocking(move || Client::try_from(config));
+
+    let finished = match budget.limit() {
+        // `--timeout 0`: the user asked to wait, so wait.
+        None => task.await,
+        Some(limit) => {
+            // Dropping the join handle abandons the task; it does not stop it,
+            // and nothing here can kill a subprocess `kube` owns. Declining to
+            // wait for it is `commands::block_on`'s half of this.
+            let Ok(finished) = tokio::time::timeout(limit, task).await else {
+                tracing::debug!(?limit, "the credential helper outlived the budget");
+                return Err(Error::HelperStalled(stalled_helper(
+                    &label,
+                    helper.as_deref(),
+                    limit,
+                )));
+            };
+            finished
+        }
+    };
+
+    finished
+        .map_err(|source| Error::Interrupted {
+            cluster: label.clone(),
+            message: source.to_string(),
+        })?
+        .map_err(|source| {
+            tracing::debug!(%source, "building a client failed");
+            Error::Cluster(explain(&source.into(), &label))
+        })
+}
+
+/// The command a context runs to get its credentials, spelled the way a user
+/// could paste it into a shell, or `None` for a context that authenticates
+/// some other way — a bare token, a client certificate, an in-cluster service
+/// account.
+///
+/// The `exec` block's environment comes out in front of it, as `NAME=value`
+/// assignments, because the point of printing the line is that running it
+/// reproduces what just hung. An EKS entry that sets `AWS_PROFILE` and is
+/// pasted without it runs against whatever profile the shell already had, which
+/// may well answer instantly — sending the user off to look for a problem
+/// somewhere else.
+///
+/// Pure over the `AuthInfo` the kubeconfig produced, so the wording around a
+/// stalled helper is tested against a fixture rather than provoked from a real
+/// `aws eks get-token`.
+#[must_use]
+pub fn helper_command(auth: &AuthInfo) -> Option<String> {
+    let exec = auth.exec.as_ref()?;
+    let command = exec.command.as_deref()?;
+
+    let mut line = String::new();
+
+    // The same two keys `kube` reads, and the same silence about an entry
+    // carrying anything else: a variable it will not pass is not one to print.
+    for variable in exec.env.iter().flatten() {
+        if let (Some(name), Some(value)) = (variable.get("name"), variable.get("value")) {
+            // The name is written bare. A shell will not accept a quoted one on
+            // the left of `=`, and a name that would need quoting is not a
+            // variable name.
+            line.push_str(name);
+            line.push('=');
+            line.push_str(&shell_word(value));
+            line.push(' ');
+        }
+    }
+
+    line.push_str(&shell_word(command));
+    for argument in exec.args.iter().flatten() {
+        line.push(' ');
+        line.push_str(&shell_word(argument));
+    }
+    Some(line)
+}
+
+/// One word of a command line, quoted if a shell would need it quoted.
+///
+/// The point of printing the helper's command is that the user can run it
+/// themselves, and an EKS `exec` block routinely carries an argument with a
+/// space in it — a role ARN with a path, a profile named after a team. A line
+/// they have to repair before it runs is worse than no line.
+fn shell_word(word: &str) -> String {
+    // The conservative set: anything a POSIX shell leaves alone unquoted.
+    let plain = !word.is_empty()
+        && word.chars().all(|c| {
+            c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '/' | ':' | '=' | '@' | ',')
+        });
+
+    if plain {
+        word.to_owned()
+    } else {
+        // The only way to get a single quote inside single quotes: end the
+        // string, escape one, start again.
+        format!("'{}'", word.replace('\'', r"'\''"))
+    }
 }
 
 /// Read and merge every kubeconfig file that exists, in precedence order.
@@ -236,11 +376,48 @@ pub fn explain(error: &page::Error, cluster: &str) -> String {
     }
 }
 
+/// The message for a credential helper that was still running when its budget
+/// ran out.
+///
+/// Beside [`explain`] rather than inside it, and deliberately: nothing has been
+/// asked of the cluster yet, so there is no `page::Error` to classify and no
+/// `Failure` this could be. The advice is about the AWS CLI on this machine
+/// rather than about a VPC, which is the whole reason the failure is worth
+/// telling apart from `Failure::Slow`.
+///
+/// `helper` is [`helper_command`]'s answer: the command line to run by hand,
+/// or `None` for a context with no `exec` block — which should not reach here,
+/// since nothing else on this path blocks, but is worded rather than
+/// `unwrap`ped.
+#[must_use]
+pub fn stalled_helper(cluster: &str, helper: Option<&str>, limit: Duration) -> String {
+    // Naming the command is the actionable half: running it by hand is the only
+    // way to see what it is stuck on, and it is deliberately not guessed at
+    // here. `aws eks get-token` hangs for several unrelated reasons — a
+    // blackholed IMDS address, an SSO endpoint with no route to it, a
+    // `credential_process` of the user's own that prompts — and naming the
+    // wrong one confidently would send them off to fix something that is fine.
+    let named = match helper {
+        Some(command) => format!("Its kubeconfig entry runs `{command}`, which has not come back"),
+        None => "The command its kubeconfig entry runs has not come back".to_owned(),
+    };
+
+    format!(
+        "getting credentials for {cluster} took longer than {}.\n\
+         {named}. Run it yourself to see what it is waiting for — a machine that has lost its \
+         route to AWS waits there rather than failing, and so does one prompting for a login. \
+         Allow it longer with `--timeout {}`, or `--timeout 0` to wait for as long as it takes.",
+        format::exact_duration(limit),
+        Budget::of(limit.checked_mul(2).unwrap_or(limit)),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
     use std::io;
+    use std::time::Instant;
 
     use kube::core::Status;
 
@@ -278,6 +455,69 @@ users:
         apiVersion: client.authentication.k8s.io/v1beta1
         command: eks-test-no-such-credential-helper
 ";
+
+    /// A kubeconfig whose credential helper never comes back inside any budget
+    /// a test would set — the shape of an `aws eks get-token` sitting on an SSO
+    /// prompt, without an AWS CLI, an SSO endpoint, or a cluster.
+    ///
+    /// Thirty seconds rather than for ever: if the abandonment ever regresses,
+    /// the test that uses this fails on its own assertion after half a minute
+    /// instead of hanging CI until somebody cancels it.
+    const SLOW_HELPER: &str = r"
+apiVersion: v1
+kind: Config
+current-context: prod
+clusters:
+  - name: prod
+    cluster:
+      server: https://127.0.0.1:6443
+contexts:
+  - name: prod
+    context:
+      cluster: prod
+      user: prod
+users:
+  - name: prod
+    user:
+      exec:
+        apiVersion: client.authentication.k8s.io/v1beta1
+        command: sleep
+        args: ['30']
+        interactiveMode: Never
+";
+
+    /// An `AuthInfo` carrying the exec block a kubeconfig would have parsed.
+    fn exec_auth(command: Option<&str>, args: &[&str]) -> AuthInfo {
+        AuthInfo {
+            exec: Some(kube::config::ExecConfig {
+                command: command.map(ToOwned::to_owned),
+                args: Some(args.iter().map(|a| (*a).to_owned()).collect()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    /// The same, with the `env` list a kubeconfig spells as `name`/`value`
+    /// pairs — which is how `kube` reads it too.
+    fn exec_auth_with_env(command: &str, args: &[&str], env: &[(&str, &str)]) -> AuthInfo {
+        let mut auth = exec_auth(Some(command), args);
+        if let Some(exec) = auth.exec.as_mut() {
+            exec.env = Some(
+                env.iter()
+                    .map(|(name, value)| {
+                        [
+                            ("name".to_owned(), (*name).to_owned()),
+                            ("value".to_owned(), (*value).to_owned()),
+                        ]
+                        .into_iter()
+                        .collect()
+                    })
+                    .collect(),
+            );
+        }
+        auth
+    }
 
     fn write_kubeconfig(dir: &std::path::Path, yaml: &str) -> PathBuf {
         let path = dir.join("config");
@@ -446,11 +686,15 @@ users:
         // Not a unit test of `explain` but of the path a user actually walks:
         // `kube` runs the exec plugin while building the client, so this is
         // where a laptop without the AWS CLI finds out.
+        //
+        // Under `--timeout 0`, which is also the only test of that branch: an
+        // unlimited budget must still await the blocking task rather than skip
+        // it, and a helper that cannot start still has to reach `explain`.
         let dir = tempfile::tempdir().unwrap();
         let paths = vec![write_kubeconfig(dir.path(), MISSING_HELPER)];
 
         // `Client` is not `Debug`, so unwrap the result by hand.
-        let Err(error) = connect(&paths, &view("prod")).await else {
+        let Err(error) = connect(&paths, &view("prod"), Budget::unlimited()).await else {
             panic!("a helper that does not exist cannot be run");
         };
 
@@ -464,11 +708,33 @@ users:
     }
 
     #[tokio::test]
+    async fn a_helper_that_answers_inside_the_budget_is_not_reported_as_stalled() {
+        // The other side of the timeout, and the one a wrong `match` arm would
+        // break silently: this helper fails immediately — it does not exist —
+        // so the budget has nothing to expire on, and the message must be the
+        // one about the AWS CLI rather than the one about waiting.
+        let dir = tempfile::tempdir().unwrap();
+        let paths = vec![write_kubeconfig(dir.path(), MISSING_HELPER)];
+
+        let Err(error) = connect(&paths, &view("prod"), Budget::of(Duration::from_secs(30))).await
+        else {
+            panic!("a helper that does not exist cannot be run");
+        };
+
+        let message = error.to_string();
+        assert!(message.contains("AWS CLI"), "{message}");
+        assert!(
+            !message.contains("took longer than"),
+            "a helper that failed at once was reported as slow: {message}"
+        );
+    }
+
+    #[tokio::test]
     async fn connecting_to_a_context_the_kubeconfig_does_not_have_says_so() {
         let dir = tempfile::tempdir().unwrap();
         let paths = vec![write_kubeconfig(dir.path(), MISSING_HELPER)];
 
-        let Err(error) = connect(&paths, &view("staging")).await else {
+        let Err(error) = connect(&paths, &view("staging"), Budget::default()).await else {
             panic!("there is no staging context in that file");
         };
 
@@ -489,5 +755,244 @@ users:
         let message = error.to_string();
         assert!(message.contains("/nope/one/config"), "{message}");
         assert!(message.contains("/nope/two/config"), "{message}");
+    }
+
+    #[test]
+    fn the_helper_command_is_spelled_the_way_it_could_be_typed() {
+        let auth = exec_auth(
+            Some("aws"),
+            &[
+                "--region",
+                "us-east-1",
+                "eks",
+                "get-token",
+                "--cluster-name",
+                "prod",
+            ],
+        );
+
+        assert_eq!(
+            helper_command(&auth).as_deref(),
+            Some("aws --region us-east-1 eks get-token --cluster-name prod")
+        );
+    }
+
+    #[test]
+    fn a_helper_argument_with_a_space_in_it_is_quoted() {
+        // An EKS exec block routinely carries one: a role ARN with a path, or a
+        // profile named after a team. Printing it bare would give the user a
+        // line that breaks into two words when they paste it.
+        let auth = exec_auth(
+            Some("aws"),
+            &["--profile", "prod admin", "eks", "get-token"],
+        );
+
+        assert_eq!(
+            helper_command(&auth).as_deref(),
+            Some("aws --profile 'prod admin' eks get-token")
+        );
+    }
+
+    #[test]
+    fn a_helper_argument_with_a_quote_in_it_still_pastes() {
+        // The awkward one: a single quote cannot be escaped inside single
+        // quotes, so the word has to be closed, the quote escaped, and the word
+        // reopened. Getting this wrong produces a line that hangs a shell.
+        let auth = exec_auth(Some("aws"), &["--profile", "o'brien"]);
+
+        assert_eq!(
+            helper_command(&auth).as_deref(),
+            Some(r"aws --profile 'o'\''brien'")
+        );
+    }
+
+    #[test]
+    fn the_helper_environment_comes_out_in_front_of_the_command() {
+        // Without it the pasted line runs against whatever profile the shell
+        // already had, which may answer at once — and then the user is looking
+        // for a problem somewhere that does not have one.
+        let auth = exec_auth_with_env(
+            "aws",
+            &["eks", "get-token"],
+            &[("AWS_PROFILE", "prod admin"), ("AWS_REGION", "us-east-1")],
+        );
+
+        assert_eq!(
+            helper_command(&auth).as_deref(),
+            Some("AWS_PROFILE='prod admin' AWS_REGION=us-east-1 aws eks get-token")
+        );
+    }
+
+    #[test]
+    fn a_helper_environment_entry_missing_a_name_or_a_value_is_skipped() {
+        // `kube` drops those entries rather than passing them, so printing one
+        // would put a variable in the line that the helper never had.
+        let mut auth = exec_auth(Some("aws"), &["eks", "get-token"]);
+        if let Some(exec) = auth.exec.as_mut() {
+            exec.env = Some(vec![
+                [("name".to_owned(), "AWS_PROFILE".to_owned())]
+                    .into_iter()
+                    .collect(),
+                [("value".to_owned(), "orphaned".to_owned())]
+                    .into_iter()
+                    .collect(),
+            ]);
+        }
+
+        assert_eq!(helper_command(&auth).as_deref(), Some("aws eks get-token"));
+    }
+
+    #[test]
+    fn an_empty_helper_argument_survives_as_an_empty_argument() {
+        // A shell splits on whitespace, so an empty word printed bare would
+        // vanish and the pasted line would run with one argument fewer than the
+        // one that hung.
+        let auth = exec_auth(Some("aws"), &["--profile", "", "eks"]);
+
+        assert_eq!(
+            helper_command(&auth).as_deref(),
+            Some("aws --profile '' eks")
+        );
+    }
+
+    #[test]
+    fn a_helper_with_no_arguments_is_just_its_command() {
+        let auth = exec_auth(Some("get-token.sh"), &[]);
+
+        assert_eq!(helper_command(&auth).as_deref(), Some("get-token.sh"));
+    }
+
+    #[test]
+    fn a_context_that_runs_no_helper_has_no_command_to_name() {
+        // A bare token, a client certificate, an in-cluster service account:
+        // three ways to authenticate with nothing to run and nothing to print.
+        assert_eq!(helper_command(&AuthInfo::default()), None);
+
+        // And the malformed case: an `exec` block with no `command` in it,
+        // which `kube` rejects later with `MissingCommand`.
+        assert_eq!(helper_command(&exec_auth(None, &["get-token"])), None);
+    }
+
+    #[test]
+    fn a_stalled_helper_names_the_command_and_a_bigger_budget() {
+        let message = stalled_helper(
+            "prod (us-east-1)",
+            Some("aws eks get-token --cluster-name prod"),
+            Duration::from_secs(5),
+        );
+
+        assert!(message.contains("prod (us-east-1)"), "{message}");
+        assert!(
+            message.contains("`aws eks get-token --cluster-name prod`"),
+            "{message}"
+        );
+        assert!(message.contains("longer than 5s"), "{message}");
+        assert!(message.contains("--timeout 10s"), "{message}");
+        assert!(message.contains("--timeout 0"), "{message}");
+    }
+
+    #[test]
+    fn a_stalled_helper_is_not_given_the_clusters_advice() {
+        // The distinction the failure exists for: `Failure::Slow` is a cluster
+        // that went quiet, and its advice is about private endpoints, VPCs, and
+        // VPNs. None of that is true of a subprocess on the user's own machine,
+        // and sending them to check a VPN over it would waste their afternoon.
+        let message = stalled_helper("prod", Some("aws eks get-token"), Duration::from_secs(30));
+
+        assert!(!message.contains("VPN"), "{message}");
+        assert!(!message.contains("VPC"), "{message}");
+        assert!(!message.contains("API server"), "{message}");
+        assert!(message.contains("Run it yourself"), "{message}");
+    }
+
+    #[test]
+    fn a_stalled_helper_with_no_command_to_name_still_reads_as_a_sentence() {
+        // Should not arise — nothing else on that path blocks — but a message
+        // with a hole in it is worse than a vaguer one, and `unwrap` is denied.
+        let message = stalled_helper("prod", None, Duration::from_secs(30));
+
+        assert!(message.contains("prod"), "{message}");
+        assert!(message.contains("has not come back"), "{message}");
+        assert!(
+            !message.contains("``"),
+            "empty command left a hole: {message}"
+        );
+    }
+
+    #[test]
+    fn the_suggested_budget_after_a_stall_is_one_a_user_could_type() {
+        // The same round trip `explain` depends on: the doubling is spelled
+        // through `Budget`, so the advice cannot name a value the flag rejects.
+        let doubled = |millis| stalled_helper("prod", Some("aws"), Duration::from_millis(millis));
+
+        assert!(doubled(250).contains("--timeout 500ms"), "{}", doubled(250));
+        assert!(
+            doubled(30_000).contains("--timeout 1m"),
+            "{}",
+            doubled(30_000)
+        );
+    }
+
+    #[test]
+    fn an_interrupted_build_says_it_is_a_bug_rather_than_the_users_fault() {
+        // Only a panic inside `kube` reaches this, so it is provoked by
+        // construction rather than by making a dependency fall over.
+        let error = Error::Interrupted {
+            cluster: "prod (us-east-1)".to_owned(),
+            message: "task panicked".to_owned(),
+        };
+
+        let message = error.to_string();
+        assert!(message.contains("prod (us-east-1)"), "{message}");
+        assert!(message.contains("bug"), "{message}");
+        assert!(message.contains("eks -vv"), "{message}");
+    }
+
+    #[test]
+    fn a_credential_helper_that_never_answers_is_given_up_on_and_left_behind() {
+        // The acceptance criterion, end to end and without a cluster: a helper
+        // that will not exit for thirty seconds, a budget of a quarter of a
+        // second, and a command that has to be back long before either.
+        //
+        // Through `commands::block_on` on purpose, because the second half of
+        // the fix lives there: `connect` can only abandon the blocking task,
+        // and dropping the runtime would wait out the full thirty seconds at
+        // the door. A plain `#[tokio::test]` here would pass the timeout and
+        // still hang.
+        let dir = tempfile::tempdir().unwrap();
+        let paths = vec![write_kubeconfig(dir.path(), SLOW_HELPER)];
+
+        let started = Instant::now();
+        let message = crate::commands::block_on(async move {
+            match connect(
+                &paths,
+                &view("prod"),
+                Budget::of(Duration::from_millis(250)),
+            )
+            .await
+            {
+                // `Client` is not `Debug`, so say it rather than unwrap it.
+                Ok(_) => Ok(String::new()),
+                Err(error) => Ok(error.to_string()),
+            }
+        })
+        .unwrap();
+        let elapsed = started.elapsed();
+
+        assert!(
+            !message.is_empty(),
+            "a helper that sleeps for thirty seconds cannot have returned a token"
+        );
+        assert!(message.contains("prod (us-east-1)"), "{message}");
+        assert!(message.contains("`sleep 30`"), "{message}");
+        assert!(message.contains("--timeout 500ms"), "{message}");
+        assert!(
+            !message.contains("VPN"),
+            "the cluster is blameless here: {message}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "waited {elapsed:?} for a helper nothing should have waited for"
+        );
     }
 }
