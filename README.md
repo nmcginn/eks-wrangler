@@ -387,6 +387,7 @@ more columns, not for a table that gets out of the way.
 | `--wide` | Add the extra columns `kubectl -o wide` shows. Pods: `IP`, `NOMINATED NODE`, `READINESS GATES`. Nodes: `INTERNAL-IP`, `EXTERNAL-IP`, `OS-IMAGE`, `KERNEL-VERSION`, `CONTAINER-RUNTIME` |
 | `--kubeconfig <PATH>` | Override the kubeconfig search path |
 | `--timeout <DURATION>` | How long to wait for any one request to the cluster. Default `30s`; `0` waits for as long as it takes |
+| `--color <WHEN>` | `auto` (default), `always`, or `never`. Spelled `--colour` too |
 | `-v, --verbose` | Increase log verbosity (repeatable) |
 
 `KUBECONFIG` is honoured, including multi-path values, with the same precedence
@@ -394,6 +395,37 @@ more columns, not for a table that gets out of the way.
 
 All of these are global, and they parse on either side of the subcommand:
 `eks --context prod nodes` and `eks nodes --context prod` are the same command.
+
+### Colour
+
+The listings put colour on the cells worth looking at, and on nothing else. A
+`NotReady` node, a `CrashLoopBackOff` pod, and a node at 92% of its allocatable
+are written in red; a cordoned node and one at 80% are amber; a cell reading `-`
+because a figure could not be read is greyed out, because that is an absence
+rather than an alarm.
+
+Everything that is fine is left alone. `Ready`, `Running`, and a node at 20% are
+printed in whatever colour your terminal was already using — so on a healthy
+cluster `eks nodes` emits no escape sequences at all, and every scrap of colour
+on screen is a row somebody should look at.
+
+By default colour appears only when stdout is a terminal. Pipe a listing
+anywhere — `eks nodes | grep NotReady`, `eks pods > pods.txt` — and it is the
+same bytes it was before colour existed, so nothing downstream has to strip
+escapes it did not ask for. `NO_COLOR` and `TERM=dumb` turn it off as well.
+
+`--color always` overrides all of that, which is what a pager wants:
+
+```
+$ eks nodes --color always | less -R
+```
+
+`--color never` overrides it the other way. Both are global flags, so they work
+on either listing and on either side of the subcommand.
+
+`eks contexts` is unaffected: none of its cells is a reading off a cluster, so
+there is nothing there to colour. The dashboard has its own palette and is not
+governed by these flags.
 
 ### Big clusters, and slow ones
 

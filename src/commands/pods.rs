@@ -14,6 +14,7 @@ use crate::k8s::page;
 use crate::k8s::pods::{Order, PodRow, Scope, Selectors};
 use crate::k8s::{self, pods as k8s_pods, selector};
 use crate::kubeconfig::KubeConfig;
+use crate::theme::Palette;
 
 /// What the user asked `eks pods` for, as it came off the command line.
 ///
@@ -42,6 +43,9 @@ pub struct Request<'a> {
     /// `--wide`. Like `order`, applied to the finished rows: every column it
     /// adds arrived with the pods, so it costs no extra request.
     pub width: Width,
+    /// Whether the graded cells are written in colour. Decided in `main`,
+    /// where stdout is, so nothing below here asks what a terminal is.
+    pub palette: Palette,
     /// `--timeout`, spent per request rather than per command — a namespace big
     /// enough to be read in several pages should not be cut off for its size.
     pub budget: page::Budget,
@@ -184,6 +188,7 @@ pub async fn list(
         &selectors,
         &notes,
         request.width,
+        request.palette,
     ))
 }
 

@@ -25,7 +25,7 @@ use crate::k8s::page;
 use crate::k8s::pods::{Placed, Requests};
 use crate::k8s::quantity::{self, Quantity};
 use crate::k8s::resource;
-use crate::theme::Severity;
+use crate::theme::{Palette, Severity};
 
 /// Ask the API server for every node in the cluster.
 ///
@@ -601,8 +601,16 @@ impl Column<'_> {
         }
     }
 
-    /// This column's cell for one row.
-    fn cell(self, row: &NodeRow) -> String {
+    /// This column's cell for one row: the text, and how alarming it is.
+    fn cell(self, row: &NodeRow) -> format::Cell {
+        match self.severity(row) {
+            Some(severity) => format::Cell::graded(self.text(row), severity),
+            None => format::Cell::plain(self.text(row)),
+        }
+    }
+
+    /// This column's text for one row.
+    fn text(self, row: &NodeRow) -> String {
         match self {
             Self::Name => row.name.clone(),
             Self::Status => row.status.clone(),
@@ -632,6 +640,53 @@ impl Column<'_> {
             Self::OsImage => row.os_image.clone(),
             Self::KernelVersion => row.kernel_version.clone(),
             Self::ContainerRuntime => row.container_runtime.clone(),
+        }
+    }
+
+    /// How alarming this column's value is on this row, or `None` for a column
+    /// that carries no judgement.
+    ///
+    /// The `None` columns are not an oversight, they are most of the table. A
+    /// node's name, its kubelet version, its age, its addresses, and the AMI it
+    /// booted are facts with nothing to be worried about; so is `CPU`, which
+    /// says how big the machine is and not how much of it is spoken for. Every
+    /// column that *is* graded here is a share of something — booked, burnt, or
+    /// counted — plus `STATUS`, which is the row's own health.
+    ///
+    /// Nothing new is decided here. `STATUS` takes the severity `NodeRow`
+    /// already carries so the CLI table and the dashboard cannot disagree about
+    /// what a cordoned node is, and every share takes
+    /// [`Share::severity`], which is
+    /// [`Severity::from_utilisation`]'s single set of thresholds. This function
+    /// only says *which cells* have a reading to colour.
+    ///
+    /// [`Severity::from_utilisation`]: crate::theme::Severity::from_utilisation
+    fn severity(self, row: &NodeRow) -> Option<Severity> {
+        match self {
+            Self::Status => Some(row.severity),
+            Self::CpuRequested => Some(row.cpu_requested.severity()),
+            Self::CpuUsed => Some(row.cpu_used.severity()),
+            Self::MemoryRequested => Some(row.memory_requested.severity()),
+            Self::MemoryUsed => Some(row.memory_used.severity()),
+            Self::Pods => Some(row.pods.severity()),
+            // A node with none of this hardware reads `-` and grades
+            // `Unknown`, which is the same answer the `-` in a request column
+            // gets: the cell is an absence, and a muted one says so.
+            Self::Device(name) => Some(
+                row.devices
+                    .get(name)
+                    .map_or(Severity::Unknown, |device| device.share().severity()),
+            ),
+            Self::Name
+            | Self::Version
+            | Self::Cpu
+            | Self::Memory
+            | Self::Age
+            | Self::InternalIp
+            | Self::ExternalIp
+            | Self::OsImage
+            | Self::KernelVersion
+            | Self::ContainerRuntime => None,
         }
     }
 }
@@ -808,7 +863,7 @@ fn narrow_to_fit<'a>(columns: &[Column<'a>], rows: &[NodeRow], target: u16) -> V
 fn widths(columns: &[Column<'_>], rows: &[NodeRow]) -> Vec<usize> {
     let headers: Vec<String> = columns.iter().map(|column| column.header()).collect();
     let headers: Vec<&str> = headers.iter().map(String::as_str).collect();
-    let cells: Vec<Vec<String>> = rows
+    let cells: Vec<Vec<format::Cell>> = rows
         .iter()
         .map(|row| columns.iter().map(|column| column.cell(row)).collect())
         .collect();
@@ -834,8 +889,21 @@ fn row_width(measured: &[(Column<'_>, usize)]) -> usize {
 /// [`usage_unavailable`]. They are dropped when there are no nodes, where a
 /// footnote about missing columns would only be noise on top of a bigger
 /// problem.
+///
+/// `palette` decides whether the graded cells — `STATUS`, and every share —
+/// are written in ink. It changes no column, no width, and no footnote: a
+/// [`Palette::Plain`] listing is this table exactly as it was before colour
+/// existed, and a coloured one has its columns in the same places.
+///
+/// [`Palette::Plain`]: crate::theme::Palette::Plain
 #[must_use]
-pub fn render(rows: &[NodeRow], cluster: &str, notes: &[String], width: format::Width) -> String {
+pub fn render(
+    rows: &[NodeRow],
+    cluster: &str,
+    notes: &[String],
+    width: format::Width,
+    palette: Palette,
+) -> String {
     if rows.is_empty() {
         return format!(
             "{cluster} reports no nodes.\n\
@@ -846,12 +914,12 @@ pub fn render(rows: &[NodeRow], cluster: &str, notes: &[String], width: format::
     let columns = columns(rows, width);
     let headings: Vec<String> = columns.iter().map(|column| column.header()).collect();
     let headers: Vec<&str> = headings.iter().map(String::as_str).collect();
-    let cells: Vec<Vec<String>> = rows
+    let cells: Vec<Vec<format::Cell>> = rows
         .iter()
         .map(|row| columns.iter().map(|column| column.cell(row)).collect())
         .collect();
 
-    let table = format::table(&headers, &cells);
+    let table = format::table(&headers, &cells, palette);
 
     if notes.is_empty() {
         table
@@ -1464,7 +1532,13 @@ mod tests {
         ];
 
         assert_eq!(
-            render(&rows, "prod (us-east-1)", &[], Width::Default),
+            render(
+                &rows,
+                "prod (us-east-1)",
+                &[],
+                Width::Default,
+                Palette::Plain
+            ),
             "NAME                         STATUS    VERSION              CPU      CPU REQ      MEMORY         MEM REQ    PODS         AGE\n\
              ip-10-0-1-9.ec2.internal     Ready     v1.33.1-eks-1a2b3c4  3920m/4  1500m (38%)  14.8Gi/15.6Gi  6Gi (41%)  12/58 (21%)  2d2h\n\
              ip-10-0-11-200.ec2.internal  NotReady  v1.33.1-eks-1a2b3c4  3920m/4  0 (0%)       14.8Gi/15.6Gi  0 (0%)     0/58 (0%)    60m"
@@ -1514,7 +1588,13 @@ mod tests {
         )];
 
         assert!(!shows_usage(&rows));
-        let table = render(&rows, "prod (us-east-1)", &[], Width::Default);
+        let table = render(
+            &rows,
+            "prod (us-east-1)",
+            &[],
+            Width::Default,
+            Palette::Plain,
+        );
         assert!(!table.contains("CPU USE"), "{table}");
         assert!(!table.contains("MEM USE"), "{table}");
     }
@@ -1552,7 +1632,13 @@ mod tests {
         )];
 
         assert_eq!(
-            render(&rows, "prod (us-east-1)", &[], Width::Default),
+            render(
+                &rows,
+                "prod (us-east-1)",
+                &[],
+                Width::Default,
+                Palette::Plain
+            ),
             "NAME                      STATUS  VERSION              CPU      CPU REQ      CPU USE     MEMORY         MEM REQ    MEM USE      PODS         AGE\n\
              ip-10-0-1-9.ec2.internal  Ready   v1.33.1-eks-1a2b3c4  3920m/4  1500m (38%)  392m (10%)  14.8Gi/15.6Gi  6Gi (41%)  1.5Gi (10%)  12/58 (21%)  2d2h"
         );
@@ -1568,14 +1654,26 @@ mod tests {
         )];
         let note = usage_unavailable("prod (us-east-1) has no metrics.k8s.io API.");
 
-        let output = render(&rows, "prod (us-east-1)", &[note], Width::Default);
+        let output = render(
+            &rows,
+            "prod (us-east-1)",
+            &[note],
+            Width::Default,
+            Palette::Plain,
+        );
         let (table, footnote) = output
             .split_once("\n\n")
             .expect("a blank line before the note");
 
         assert_eq!(
             table,
-            render(&rows, "prod (us-east-1)", &[], Width::Default)
+            render(
+                &rows,
+                "prod (us-east-1)",
+                &[],
+                Width::Default,
+                Palette::Plain
+            )
         );
         assert!(footnote.contains("CPU USE"), "{footnote}");
         assert!(footnote.contains("metrics.k8s.io"), "{footnote}");
@@ -1594,14 +1692,26 @@ mod tests {
         )];
         let note = usage_unsampled(&crate::k8s::metrics::unsampled("prod (us-east-1)"));
 
-        let output = render(&rows, "prod (us-east-1)", &[note], Width::Default);
+        let output = render(
+            &rows,
+            "prod (us-east-1)",
+            &[note],
+            Width::Default,
+            Palette::Plain,
+        );
         let (table, footnote) = output
             .split_once("\n\n")
             .expect("a blank line before the note");
 
         assert_eq!(
             table,
-            render(&rows, "prod (us-east-1)", &[], Width::Default)
+            render(
+                &rows,
+                "prod (us-east-1)",
+                &[],
+                Width::Default,
+                Palette::Plain
+            )
         );
         assert!(footnote.contains("CPU USE"), "{footnote}");
         assert!(footnote.contains("MEM USE"), "{footnote}");
@@ -1632,7 +1742,13 @@ mod tests {
             .expect("a stamped sample dates the listing");
         let note = crate::k8s::metrics::freshness_note(freshness);
 
-        let output = render(&rows, "prod (us-east-1)", &[note], Width::Default);
+        let output = render(
+            &rows,
+            "prod (us-east-1)",
+            &[note],
+            Width::Default,
+            Palette::Plain,
+        );
 
         assert!(
             output.ends_with("\n\nUsage is up to 12s old, averaged over 20s."),
@@ -1650,7 +1766,13 @@ mod tests {
             usage_unavailable("no metrics for you"),
         ];
 
-        let output = render(&rows, "prod (us-east-1)", &notes, Width::Default);
+        let output = render(
+            &rows,
+            "prod (us-east-1)",
+            &notes,
+            Width::Default,
+            Palette::Plain,
+        );
         let paragraphs: Vec<&str> = output.split("\n\n").collect();
 
         assert_eq!(paragraphs.len(), 3, "{output}");
@@ -1666,7 +1788,13 @@ mod tests {
             "prod (us-east-1) will not let you list this resource.",
         );
 
-        let output = render(&rows, "prod (us-east-1)", &[note], Width::Default);
+        let output = render(
+            &rows,
+            "prod (us-east-1)",
+            &[note],
+            Width::Default,
+            Palette::Plain,
+        );
         let (table, footnote) = output
             .split_once("\n\n")
             .expect("a blank line before the note");
@@ -1674,7 +1802,13 @@ mod tests {
         // The table is unchanged by the note; the note is what carries the news.
         assert_eq!(
             table,
-            render(&rows, "prod (us-east-1)", &[], Width::Default)
+            render(
+                &rows,
+                "prod (us-east-1)",
+                &[],
+                Width::Default,
+                Palette::Plain
+            )
         );
         assert!(footnote.contains("CPU REQ"), "{footnote}");
         assert!(footnote.contains("will not let you list"), "{footnote}");
@@ -1692,12 +1826,24 @@ mod tests {
                 .expect("a reordered listing should say so"),
         ];
 
-        let output = render(&rows, "prod (us-east-1)", &notes, Width::Default);
+        let output = render(
+            &rows,
+            "prod (us-east-1)",
+            &notes,
+            Width::Default,
+            Palette::Plain,
+        );
         let paragraphs: Vec<&str> = output.split("\n\n").collect();
 
         assert_eq!(
             paragraphs[0],
-            render(&rows, "prod (us-east-1)", &[], Width::Default)
+            render(
+                &rows,
+                "prod (us-east-1)",
+                &[],
+                Width::Default,
+                Palette::Plain
+            )
         );
         assert_eq!(paragraphs[2], "Sorted by cpu, reversed.");
     }
@@ -1716,7 +1862,13 @@ mod tests {
         )];
         let notes = sort_notes(&rows, Order::Cpu, no_usage());
 
-        let output = render(&rows, "prod (us-east-1)", &notes, Width::Default);
+        let output = render(
+            &rows,
+            "prod (us-east-1)",
+            &notes,
+            Width::Default,
+            Palette::Plain,
+        );
         let paragraphs: Vec<&str> = output.split("\n\n").collect();
 
         assert_eq!(paragraphs[1], "Sorted by cpu.");
@@ -1891,7 +2043,13 @@ mod tests {
         // only thing worth reading.
         let note = crate::k8s::order::note(Order::Cpu, crate::k8s::order::Direction::Natural)
             .expect("a reordered listing should say so");
-        let message = render(&[], "prod (us-east-1)", &[note], Width::Default);
+        let message = render(
+            &[],
+            "prod (us-east-1)",
+            &[note],
+            Width::Default,
+            Palette::Plain,
+        );
 
         assert!(!message.contains("Sorted by"), "{message}");
         assert!(message.contains("node groups"), "{message}");
@@ -1901,7 +2059,13 @@ mod tests {
     fn a_cluster_with_no_nodes_skips_the_footnote() {
         // There is a bigger problem than a missing column to explain.
         let note = requests_unavailable(&[], "nope");
-        let message = render(&[], "prod (us-east-1)", &[note], Width::Default);
+        let message = render(
+            &[],
+            "prod (us-east-1)",
+            &[note],
+            Width::Default,
+            Palette::Plain,
+        );
 
         assert!(!message.contains("CPU REQ"), "{message}");
         assert!(message.contains("node groups"), "{message}");
@@ -1909,7 +2073,7 @@ mod tests {
 
     #[test]
     fn an_empty_cluster_explains_itself_instead_of_printing_a_bare_header() {
-        let message = render(&[], "prod (us-east-1)", &[], Width::Default);
+        let message = render(&[], "prod (us-east-1)", &[], Width::Default, Palette::Plain);
 
         assert!(message.contains("prod (us-east-1)"), "{message}");
         assert!(message.contains("node groups"), "{message}");
@@ -1971,7 +2135,13 @@ mod tests {
     fn the_default_node_table_holds_the_wide_columns_back() {
         let rows = [NodeRow::from_node(&wide_node(), Some(&idle()), None, now())];
 
-        let table = render(&rows, "prod (us-east-1)", &[], Width::Default);
+        let table = render(
+            &rows,
+            "prod (us-east-1)",
+            &[],
+            Width::Default,
+            Palette::Plain,
+        );
         for held_back in [
             "INTERNAL-IP",
             "EXTERNAL-IP",
@@ -1988,7 +2158,7 @@ mod tests {
         let rows = [NodeRow::from_node(&wide_node(), Some(&idle()), None, now())];
 
         assert_eq!(
-            render(&rows, "prod (us-east-1)", &[], Width::Wide),
+            render(&rows, "prod (us-east-1)", &[], Width::Wide, Palette::Plain),
             "NAME                      STATUS  VERSION              CPU      CPU REQ  MEMORY         MEM REQ  PODS       AGE   INTERNAL-IP  EXTERNAL-IP  OS-IMAGE                      KERNEL-VERSION                   CONTAINER-RUNTIME\n\
              ip-10-0-1-9.ec2.internal  Ready   v1.33.1-eks-1a2b3c4  3920m/4  0 (0%)   14.8Gi/15.6Gi  0 (0%)   0/58 (0%)  2d2h  10.0.1.9     -            Amazon Linux 2023.9.20260714  6.1.148-172.265.amzn2023.x86_64  containerd://1.7.28"
         );
@@ -2103,7 +2273,7 @@ mod tests {
         assert_eq!(row.kernel_version, "-");
         assert_eq!(row.container_runtime, "-");
 
-        let table = render(&[row], "prod (us-east-1)", &[], Width::Wide);
+        let table = render(&[row], "prod (us-east-1)", &[], Width::Wide, Palette::Plain);
         assert!(table.contains("CONTAINER-RUNTIME"), "{table}");
     }
 
@@ -2111,8 +2281,8 @@ mod tests {
     fn an_empty_wide_listing_still_says_where_the_nodes_went() {
         // `--wide` changes columns, and there are no columns here to change.
         assert_eq!(
-            render(&[], "prod (us-east-1)", &[], Width::Wide),
-            render(&[], "prod (us-east-1)", &[], Width::Default)
+            render(&[], "prod (us-east-1)", &[], Width::Wide, Palette::Plain),
+            render(&[], "prod (us-east-1)", &[], Width::Default, Palette::Plain)
         );
     }
 
@@ -2126,6 +2296,7 @@ mod tests {
             "prod (us-east-1)",
             std::slice::from_ref(&note),
             Width::Wide,
+            Palette::Plain,
         );
 
         assert!(output.ends_with(&format!("\n\n{note}")), "{output}");
@@ -2208,7 +2379,7 @@ mod tests {
 
     fn device_cells(rows: &[NodeRow], resource: &str) -> Vec<String> {
         rows.iter()
-            .map(|row| Column::Device(resource).cell(row))
+            .map(|row| Column::Device(resource).text(row))
             .collect()
     }
 
@@ -2259,7 +2430,13 @@ mod tests {
         // column of zeroes headed `HUGEPAGES-2MI` on every node would be the
         // noise this condition exists to avoid.
         let rows = [NodeRow::from_node(&gpu_node(), Some(&idle()), None, now())];
-        let table = render(&rows, "prod (us-east-1)", &[], Width::Default);
+        let table = render(
+            &rows,
+            "prod (us-east-1)",
+            &[],
+            Width::Default,
+            Palette::Plain,
+        );
 
         assert!(!table.contains("HUGEPAGES"), "{table}");
         assert_eq!(rows[0].devices.len(), 1, "{:?}", rows[0].devices);
@@ -2410,7 +2587,13 @@ mod tests {
         )];
 
         assert_eq!(
-            render(&rows, "prod (us-east-1)", &[], Width::Default),
+            render(
+                &rows,
+                "prod (us-east-1)",
+                &[],
+                Width::Default,
+                Palette::Plain
+            ),
             "NAME                      STATUS  VERSION              CPU      CPU REQ  MEMORY         MEM REQ   PODS         NVIDIA.COM/GPU  AGE\n\
              ip-10-0-1-9.ec2.internal  Ready   v1.33.1-eks-1a2b3c4  3920m/4  1 (26%)  14.8Gi/15.6Gi  1Gi (7%)  12/58 (21%)  2/4 (50%)       2d2h"
         );
@@ -2639,8 +2822,20 @@ mod tests {
             columns(&rows, Width::Default)
         );
         assert_eq!(
-            render(&rows, "prod (us-east-1)", &[], Width::Narrow(200)),
-            render(&rows, "prod (us-east-1)", &[], Width::Default),
+            render(
+                &rows,
+                "prod (us-east-1)",
+                &[],
+                Width::Narrow(200),
+                Palette::Plain
+            ),
+            render(
+                &rows,
+                "prod (us-east-1)",
+                &[],
+                Width::Default,
+                Palette::Plain
+            ),
         );
     }
 
@@ -2694,7 +2889,15 @@ mod tests {
         // And the columns it reported really do fit: the assertion is over the
         // rendered table rather than over the arithmetic that chose it, so a
         // drop rule measuring rows the renderer disagreed with would fail here.
-        for line in render(&rows, "prod (us-east-1)", &[], Width::Narrow(80)).lines() {
+        for line in render(
+            &rows,
+            "prod (us-east-1)",
+            &[],
+            Width::Narrow(80),
+            Palette::Plain,
+        )
+        .lines()
+        {
             assert!(line.chars().count() <= 80, "{line:?} is wider than 80");
         }
     }
@@ -2811,5 +3014,262 @@ mod tests {
             assert!(!has_cpu_use || has_cpu, "{target}: {cols:?}");
             assert!(!has_mem_use || has_mem, "{target}: {cols:?}");
         }
+    }
+
+    // ---- Severity colour ----------------------------------------------------
+
+    /// A palette that paints, without asking a terminal anything.
+    fn colour() -> Palette {
+        Palette::choose(crate::theme::ColourChoice::Always, false, None, None)
+    }
+
+    #[test]
+    fn a_status_cell_is_graded_by_the_row_the_dashboard_would_grade() {
+        // Not a second reading of "is this node healthy": the CLI table takes
+        // the severity `NodeRow` already carries, so the two surfaces cannot
+        // come to disagree about a cordoned node.
+        let cases = [
+            (healthy_node(), Severity::Ok),
+            (
+                with_status(&healthy_node(), vec![condition("Ready", "False")]),
+                Severity::Critical,
+            ),
+            (with_status(&healthy_node(), vec![]), Severity::Unknown),
+        ];
+
+        for (node, expected) in cases {
+            let row = NodeRow::from_node(&node, Some(&idle()), None, now());
+            assert_eq!(Column::Status.severity(&row), Some(expected), "{row:?}");
+            assert_eq!(Column::Status.severity(&row), Some(row.severity));
+        }
+    }
+
+    #[test]
+    fn every_share_is_graded_and_nothing_else_is() {
+        // The columns that carry a reading, and the ones that carry a fact.
+        // `CPU` is the interesting `None`: it says how big the machine is, not
+        // how much of it is spoken for, and there is nothing about `3920m/4` to
+        // be worried about.
+        let row = NodeRow::from_node(
+            &gpu_node(),
+            Some(&booked("3800m", "15Gi")),
+            Some(used("400m", "2Gi")),
+            now(),
+        );
+
+        for column in [
+            Column::Status,
+            Column::CpuRequested,
+            Column::CpuUsed,
+            Column::MemoryRequested,
+            Column::MemoryUsed,
+            Column::Pods,
+            Column::Device("nvidia.com/gpu"),
+        ] {
+            assert!(
+                column.severity(&row).is_some(),
+                "{} should carry a reading",
+                column.header()
+            );
+        }
+
+        for column in [
+            Column::Name,
+            Column::Version,
+            Column::Cpu,
+            Column::Memory,
+            Column::Age,
+            Column::InternalIp,
+            Column::ExternalIp,
+            Column::OsImage,
+            Column::KernelVersion,
+            Column::ContainerRuntime,
+        ] {
+            assert_eq!(
+                column.severity(&row),
+                None,
+                "{} is a fact, not a reading",
+                column.header()
+            );
+        }
+    }
+
+    #[test]
+    fn a_share_takes_the_thresholds_it_already_had() {
+        // `Severity::from_utilisation`'s, through `Share::severity`. Nothing
+        // about what counts as hot is decided by the column.
+        let row = NodeRow::from_node(&healthy_node(), Some(&booked("3800m", "1Gi")), None, now());
+
+        assert_eq!(
+            Column::CpuRequested.severity(&row),
+            Some(row.cpu_requested.severity())
+        );
+        assert_eq!(
+            Column::CpuRequested.severity(&row),
+            Some(Severity::Critical)
+        );
+        assert_eq!(Column::MemoryRequested.severity(&row), Some(Severity::Ok));
+    }
+
+    #[test]
+    fn a_node_without_the_hardware_grades_its_dash_as_an_absence() {
+        // `-` is "no such card", not "none free", and a muted cell says so
+        // without joining the two nodes that do have one in red.
+        let rows = [
+            NodeRow::from_node(&gpu_node(), Some(&idle()), None, now()),
+            NodeRow::from_node(&healthy_node(), Some(&idle()), None, now()),
+        ];
+        let gpu = Column::Device("nvidia.com/gpu");
+
+        assert_eq!(gpu.text(&rows[1]), "-");
+        assert_eq!(gpu.severity(&rows[1]), Some(Severity::Unknown));
+        // The node that has them and has booked none is a real, calm zero.
+        assert_eq!(gpu.severity(&rows[0]), Some(Severity::Ok));
+    }
+
+    #[test]
+    fn a_failed_pod_listing_greys_the_columns_it_emptied() {
+        // The footnote already says why they are empty; the ink says which
+        // ones without the reader having to match a sentence to a heading.
+        let row = NodeRow::from_node(&healthy_node(), None, None, now());
+
+        assert_eq!(Column::CpuRequested.text(&row), "-");
+        assert_eq!(Column::CpuRequested.severity(&row), Some(Severity::Unknown));
+        assert_eq!(Column::Pods.severity(&row), Some(Severity::Unknown));
+    }
+
+    #[test]
+    fn a_plain_table_is_unchanged_to_the_byte() {
+        // The promise every listing here makes: `eks nodes | grep` gets what
+        // it always got. Asserted against the ink stripped back off the
+        // coloured one, so it covers the whole table rather than one column.
+        let rows = [
+            NodeRow::from_node(
+                &with_status(&healthy_node(), vec![condition("Ready", "False")]),
+                Some(&booked("3800m", "15Gi")),
+                Some(used("3900m", "15Gi")),
+                now(),
+            ),
+            NodeRow::from_node(
+                &renamed(&healthy_node(), "ip-10-0-2-3.ec2.internal"),
+                Some(&booked("100m", "1Gi")),
+                Some(used("50m", "512Mi")),
+                now(),
+            ),
+        ];
+
+        let plain = render(
+            &rows,
+            "prod (us-east-1)",
+            &[],
+            Width::Default,
+            Palette::Plain,
+        );
+        let inked = render(&rows, "prod (us-east-1)", &[], Width::Default, colour());
+
+        assert_ne!(plain, inked);
+        assert_eq!(plain, strip_ansi(&inked));
+    }
+
+    #[test]
+    fn only_the_alarming_rows_carry_ink() {
+        // The point of `Theme::severity_ink`: a healthy row is written in the
+        // terminal's own colour, so the one broken node is the only thing on
+        // screen with a colour on it.
+        let healthy = [NodeRow::from_node(
+            &healthy_node(),
+            Some(&booked("100m", "1Gi")),
+            Some(used("50m", "512Mi")),
+            now(),
+        )];
+
+        let table = render(&healthy, "prod (us-east-1)", &[], Width::Default, colour());
+        assert!(!table.contains('\u{1b}'), "{table:?}");
+    }
+
+    #[test]
+    fn a_footnote_is_never_written_in_ink() {
+        // Notes are prose under the table, not readings off it. A sentence in
+        // red would be shouting a second time about something the table has
+        // already coloured.
+        let rows = [NodeRow::from_node(
+            &with_status(&healthy_node(), vec![condition("Ready", "False")]),
+            Some(&idle()),
+            None,
+            now(),
+        )];
+        let note = "Live usage is not shown.".to_owned();
+
+        let table = render(
+            &rows,
+            "prod (us-east-1)",
+            std::slice::from_ref(&note),
+            Width::Default,
+            colour(),
+        );
+
+        let (_, footnotes) = table.split_at(table.find(&note).unwrap_or(0));
+        assert!(!footnotes.contains('\u{1b}'), "{footnotes:?}");
+    }
+
+    #[test]
+    fn narrowing_drops_the_same_columns_whether_or_not_there_is_ink() {
+        // The width arithmetic measures text, so the drop rule cannot be
+        // fooled into taking a column away because a cell was coloured. The
+        // node here is hot enough that every share is painted.
+        let rows: Vec<NodeRow> = ["ip-10-0-1-9", "ip-10-0-11-200", "ip-10-0-2-77"]
+            .into_iter()
+            .map(|name| {
+                NodeRow::from_node(
+                    &renamed(&gpu_node(), name),
+                    Some(&booked("3800m", "15Gi")),
+                    Some(used("3900m", "15Gi")),
+                    now(),
+                )
+            })
+            .collect();
+
+        for target in [1, 60, 80, 100, 200] {
+            let width = Width::Narrow(target);
+            assert_eq!(
+                render(&rows, "prod (us-east-1)", &[], width, Palette::Plain),
+                strip_ansi(&render(&rows, "prod (us-east-1)", &[], width, colour())),
+                "at {target} columns"
+            );
+        }
+    }
+
+    #[test]
+    fn an_empty_listing_says_the_same_thing_in_either_palette() {
+        // There is no table to colour, and the message under it is advice.
+        assert_eq!(
+            render(&[], "prod (us-east-1)", &[], Width::Default, colour()),
+            render(&[], "prod (us-east-1)", &[], Width::Default, Palette::Plain)
+        );
+    }
+
+    /// Every escape sequence removed from a rendered table.
+    ///
+    /// A copy of the pod table's, deliberately: a shared helper would be a
+    /// third opinion about what this crate emits, and the point of these tests
+    /// is that the renderer and the reader agree.
+    fn strip_ansi(rendered: &str) -> String {
+        let mut out = String::new();
+        let mut chars = rendered.chars().peekable();
+        while let Some(c) = chars.next() {
+            if c != '\u{1b}' {
+                out.push(c);
+                continue;
+            }
+            if chars.peek() == Some(&'[') {
+                chars.next();
+            }
+            for c in chars.by_ref() {
+                if ('@'..='~').contains(&c) {
+                    break;
+                }
+            }
+        }
+        out
     }
 }

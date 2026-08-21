@@ -16,6 +16,7 @@ use eks::commands::{self, contexts, nodes, pods};
 use eks::format::Width;
 use eks::k8s::order::Direction;
 use eks::kubeconfig::KubeConfig;
+use eks::theme::{ColourChoice, Palette};
 use eks::ui::{self, App};
 
 fn main() -> ExitCode {
@@ -54,10 +55,13 @@ fn run(cli: Cli) -> Result<()> {
                 &config,
                 &paths,
                 cli.global.context.as_deref(),
-                sort,
-                Direction::reversed(sort_reverse),
-                Width::for_terminal(wide, stdout_terminal_cols()),
-                cli.global.timeout,
+                nodes::Request {
+                    order: sort,
+                    direction: Direction::reversed(sort_reverse),
+                    width: Width::for_terminal(wide, stdout_terminal_cols()),
+                    palette: stdout_palette(cli.global.color),
+                    budget: cli.global.timeout,
+                },
             ))?;
             print_line(&output);
             Ok(())
@@ -82,6 +86,7 @@ fn run(cli: Cli) -> Result<()> {
                     order: sort,
                     direction: Direction::reversed(sort_reverse),
                     width: Width::for_terminal(wide, stdout_terminal_cols()),
+                    palette: stdout_palette(cli.global.color),
                     budget: cli.global.timeout,
                 },
             ))?;
@@ -122,6 +127,27 @@ fn print_line(output: &str) {
     if !output.is_empty() {
         println!("{output}");
     }
+}
+
+/// Whether this run prints colour, and in what.
+///
+/// The three impure answers `Palette::choose` needs, gathered in one place:
+/// whether stdout is a terminal, and what `NO_COLOR` and `TERM` say. Stdout
+/// specifically, and not stderr — colour goes into the table, and the table is
+/// what a pipe carries away. The rule itself, including which of the three
+/// wins, is `theme::Palette`'s and is tested there without an environment to
+/// set up.
+///
+/// `OsStr` rather than `String`: an environment variable that is not valid
+/// UTF-8 is still set, and `NO_COLOR=<invalid>` must turn colour off rather
+/// than be dropped as unreadable.
+fn stdout_palette(choice: ColourChoice) -> Palette {
+    Palette::choose(
+        choice,
+        std::io::stdout().is_terminal(),
+        std::env::var_os("NO_COLOR").as_deref(),
+        std::env::var_os("TERM").as_deref(),
+    )
 }
 
 /// The terminal's column count where stdout is one, `None` otherwise.

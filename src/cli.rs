@@ -10,6 +10,7 @@ use clap::{Parser, Subcommand};
 use crate::k8s::nodes::Order as NodeOrder;
 use crate::k8s::page::Budget;
 use crate::k8s::pods::Order as PodOrder;
+use crate::theme::ColourChoice;
 
 /// Explore and interact with AWS EKS clusters.
 #[derive(Debug, Parser)]
@@ -49,6 +50,17 @@ pub struct GlobalArgs {
     /// pages, and this is the limit on each page rather than on the command.
     #[arg(long, global = true, value_name = "DURATION", default_value_t = Budget::default())]
     pub timeout: Budget,
+
+    /// When to colour the listing: `auto` (a terminal that wants it), `always`,
+    /// or `never`. `auto` also honours `NO_COLOR`.
+    #[arg(
+        long = "color",
+        visible_alias = "colour",
+        global = true,
+        value_name = "WHEN",
+        default_value = "auto"
+    )]
+    pub color: ColourChoice,
 
     /// Increase log verbosity. Repeat for more detail.
     #[arg(long, short = 'v', global = true, action = clap::ArgAction::Count)]
@@ -597,5 +609,70 @@ mod tests {
         assert_eq!(sort, PodOrder::Cpu);
         assert!(sort_reverse);
         assert!(wide);
+    }
+
+    #[test]
+    fn colour_defaults_to_looking_at_the_terminal() {
+        // The listing people already have must not gain escape sequences
+        // because a flag was added; `auto` is the same rule they had before it
+        // existed, which is "a terminal gets colour and a pipe does not".
+        assert_eq!(parse(&["eks", "nodes"]).global.color, ColourChoice::Auto);
+        assert_eq!(ColourChoice::default(), ColourChoice::Auto);
+    }
+
+    #[test]
+    fn colour_takes_each_of_its_three_answers() {
+        for (flag, expected) in [
+            ("auto", ColourChoice::Auto),
+            ("always", ColourChoice::Always),
+            ("never", ColourChoice::Never),
+        ] {
+            let cli = parse(&["eks", "nodes", "--color", flag]);
+            assert_eq!(cli.global.color, expected, "--color {flag}");
+        }
+    }
+
+    #[test]
+    fn colour_is_spelled_both_ways() {
+        // Every sentence this project writes says "colour" and every other CLI
+        // in the terminal says "color". A user who types the one the README
+        // uses should not be told it does not exist.
+        assert_eq!(
+            parse(&["eks", "nodes", "--colour", "never"]).global.color,
+            ColourChoice::Never
+        );
+    }
+
+    #[test]
+    fn an_unknown_colour_setting_is_rejected_with_the_ones_that_exist() {
+        // The same bargain `--sort` and `--timeout` make: a bad value is
+        // rejected before anything connects, with the accepted spellings in
+        // the message.
+        let error = Cli::try_parse_from(["eks", "nodes", "--color", "sometimes"])
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("sometimes"), "{error}");
+        assert!(error.contains("auto"), "{error}");
+        assert!(error.contains("always"), "{error}");
+        assert!(error.contains("never"), "{error}");
+    }
+
+    #[test]
+    fn colour_is_global_like_every_other_flag() {
+        // It describes the output stream rather than one listing, so it parses
+        // on either side of the subcommand and on the bare dashboard form.
+        assert_eq!(
+            parse(&["eks", "--color", "never", "pods"]).global.color,
+            ColourChoice::Never
+        );
+        assert_eq!(
+            parse(&["eks", "pods", "--color", "never"]).global.color,
+            ColourChoice::Never
+        );
+        assert_eq!(
+            parse(&["eks", "--color", "always"]).global.color,
+            ColourChoice::Always
+        );
     }
 }

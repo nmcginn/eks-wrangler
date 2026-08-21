@@ -5,6 +5,7 @@ use anyhow::{Context as _, Result, anyhow, bail};
 use crate::cluster::ClusterView;
 use crate::format;
 use crate::kubeconfig::{self, KubeConfig};
+use crate::theme::Palette;
 
 /// Build the display views for every context in the config.
 #[must_use]
@@ -147,13 +148,13 @@ fn render_table(views: &[ClusterView]) -> String {
             .to_owned();
     }
 
-    let rows: Vec<Vec<String>> = views
+    let rows: Vec<Vec<format::Cell>> = views
         .iter()
         .map(|v| {
             vec![
-                v.display_name.clone(),
-                v.region.clone().unwrap_or_else(|| "-".to_owned()),
-                v.namespace.clone(),
+                format::Cell::plain(v.display_name.clone()),
+                format::Cell::plain(v.region.clone().unwrap_or_else(|| "-".to_owned())),
+                format::Cell::plain(v.namespace.clone()),
             ]
         })
         .collect();
@@ -166,7 +167,14 @@ fn render_table(views: &[ClusterView]) -> String {
             .map(|v| if v.is_current { CURRENT } else { OTHER }),
     );
 
-    format::table(&["NAME", "REGION", "NAMESPACE"], &rows)
+    // `Palette::Plain`, and not because colour is unwanted here: nothing in
+    // this table carries a severity. A context is not healthy or unhealthy —
+    // it is a name, a region, and a namespace read out of a file — so every
+    // cell above is plain, and a palette would have nothing to paint. The one
+    // mark that does single a row out, the `*` gutter, is not a severity
+    // either; whether it should be coloured is the same question `eks
+    // contexts` would ask of any highlight, and it is not this one.
+    format::table(&["NAME", "REGION", "NAMESPACE"], &rows, Palette::Plain)
         .lines()
         .zip(gutters)
         .map(|(line, gutter)| format!("{gutter}{line}"))

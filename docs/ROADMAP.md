@@ -472,7 +472,7 @@ cluster.
   listing uses; the two listings still run concurrently.
   Landed with the node half, through one `k8s::page::collect`.
 
-- [ ] **Severity colour in the CLI table.**
+- [x] **Severity colour in the CLI table.**
   `nodes::Share::severity` classifies each percentage on the shared thresholds,
   and the CLI table then prints it in plain text. A node at 97% deserves to look
   like it, at least when stdout is a terminal. `PodRow::severity` is now in the
@@ -485,6 +485,56 @@ cluster.
   what "hot" means for a pod against its request before colouring it.
   *Acceptance:* colour is suppressed when stdout is not a TTY and when `NO_COLOR`
   is set; the decision is a pure function, tested both ways.
+  Landed on both tables, with `Severity::Ok` deliberately *uncoloured*: a table
+  is ink on a line rather than a bar with a fill, and a healthy cluster is nearly
+  every cell, so painting all of them green would spend the strongest signal a
+  terminal has on the rows with nothing to say. `Theme::severity_ink` is that
+  second mapping — `None` for `Ok`, warning, danger, and muted for the rest — and
+  it decides only how a severity is drawn, never which one it is; a test asserts
+  it agrees with the dashboard's variant for variant. `format::Cell` carries the
+  severity beside the text so a drop rule cannot `retain` the two out of step,
+  and every width is measured from the text, so a coloured table and a plain one
+  have their columns in the same places at every narrow width. `--color` came
+  with it — `auto`, `always`, `never`, global, and `--colour` too — because
+  `NO_COLOR` and a TTY check between them have no way to get colour into a
+  pager. The pod usage pair stayed uncoloured, as the wording above asked; it is
+  the first entry below.
+
+### Follow-ups from the CLI colour
+
+- [ ] **What "hot" means for a pod against its own request.**
+  `eks pods` now colours `STATUS` and nothing else. `CPU/REQ` and `MEMORY/REQ`
+  carry a percentage and no `Severity`, because `Severity::from_utilisation`'s
+  thresholds are about a node's allocatable: 90% booked is nearly full there, and
+  a pod at 90% of the CPU it asked for is a well-sized pod. Colouring them on the
+  node's numbers would tell the reader something untrue, in red, on most of their
+  rows. Separate because it is the decision the entry above deliberately left
+  standing, and it is a decision rather than an implementation: whether a share
+  of a request has thresholds at all, whether the interesting direction is *over*
+  the request (throttled, about to be OOM-killed) rather than merely high, and
+  whether a limit — which this tool does not read yet — is the denominator that
+  would make the question answerable. "Sort a pod listing by its share of what it
+  asked for", above, is the same question asked of an ordering rather than of a
+  colour, and one answer should settle both.
+  *Acceptance:* whatever the rule is, it is a function beside
+  `Severity::from_utilisation` rather than a second set of numbers at the call
+  site, and `Column::severity` in `k8s::pods::row` reads it; the node columns are
+  unchanged.
+
+- [ ] **Whether anything in a table with no severities deserves colour.**
+  `--color` is global, and on `eks contexts` it has nothing to do: none of that
+  table's cells is a reading off a cluster. The one mark that does single a row
+  out is the `*` gutter, which the dashboard already draws in
+  `Severity::Ok` green — so the tool is inconsistent about the same marker across
+  two surfaces. Discovered while threading the palette through the third caller
+  of `format::table`. Separate because the answer is a design question this
+  change had no business guessing: a selection marker is not a severity, and
+  deciding it should be green pulls in the wider question of whether headings,
+  the active row, or a cluster's name are colour's business at all — which is the
+  light-theme task's territory as much as this one's.
+  *Acceptance:* whatever it turns into, `eks contexts` goes through the palette
+  it is given rather than a hardcoded `Palette::Plain`; a listing under
+  `--color never` is unchanged to the byte.
 
 ### Follow-ups from the client bootstrap
 
@@ -502,10 +552,15 @@ cluster.
   large cluster now spends that time as silently as it spent it before. A
   spinner, or a `read 1,500 nodes…` counter on stderr, was the other half of the
   paging task. Separate because it is the first thing this tool would ever write
-  to a terminal mid-command, and that needs the decision the severity-colour task
-  needs and does not yet have: what `eks` does when stdout is a pipe, and whether
-  `NO_COLOR` is the switch for movement as well as for colour. Building it before
-  that is answered would be guessing at both.
+  to a terminal mid-command. Half of what it was waiting on is now answered: the
+  severity-colour task settled what `eks` does when stdout is a pipe — nothing
+  that was not there before, byte for byte — and `theme::Palette` and
+  `--color` are the mechanism, so `Palette::is_colour` is a ready-made
+  "is anyone watching this". What is still open is the other half, and it is a
+  decision rather than a gap: this writes to *stderr*, where that answer does not
+  transfer — a piped table with a spinner still on the terminal beside it is
+  fine, and possibly the point — and whether `NO_COLOR` is the switch for
+  movement as well as for ink is nobody's settled convention.
   *Acceptance:* nothing is written when stdout is not a terminal, so a piped
   listing is unchanged to the byte; the progress line goes to stderr and is
   erased before the table is printed.

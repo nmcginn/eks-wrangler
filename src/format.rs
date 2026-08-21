@@ -8,6 +8,8 @@ use std::time::Duration;
 
 use k8s_openapi::jiff::SignedDuration;
 
+use crate::theme::{Palette, Severity};
+
 /// How many of a table's columns to print.
 ///
 /// Both listings hold a handful of columns back from their default table — a
@@ -220,6 +222,57 @@ pub fn list(items: &[String], conjunction: &str) -> Option<String> {
     }
 }
 
+/// One cell of a table: the text in it, and how alarming the value behind that
+/// text is.
+///
+/// The severity travels with the text rather than in a grid beside it because
+/// the two have to stay in step through a drop rule that removes columns and a
+/// renderer that pads them: a parallel `Vec<Vec<Option<Severity>>>` would be
+/// one `retain` away from colouring the wrong column, and nothing on screen
+/// would say so.
+///
+/// `None` is the ordinary case and the honest one. A name, an age, a kubelet
+/// version — most of a table is facts with no judgement attached, and a cell
+/// that carries no severity prints exactly as it did before colour existed,
+/// under any [`Palette`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Cell {
+    pub text: String,
+    pub severity: Option<Severity>,
+}
+
+impl Cell {
+    /// A cell with nothing to say about how worrying it is.
+    #[must_use]
+    pub fn plain(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            severity: None,
+        }
+    }
+
+    /// A cell carrying a judgement, which a colour palette may draw in ink.
+    #[must_use]
+    pub fn graded(text: impl Into<String>, severity: Severity) -> Self {
+        Self {
+            text: text.into(),
+            severity: Some(severity),
+        }
+    }
+}
+
+impl From<String> for Cell {
+    fn from(text: String) -> Self {
+        Self::plain(text)
+    }
+}
+
+impl From<&str> for Cell {
+    fn from(text: &str) -> Self {
+        Self::plain(text)
+    }
+}
+
 /// Render an aligned, `kubectl`-style table.
 ///
 /// Columns are as wide as their widest cell, separated by two spaces. The last
@@ -228,18 +281,31 @@ pub fn list(items: &[String], conjunction: &str) -> Option<String> {
 ///
 /// Rows shorter than `headers` are padded with empty cells and longer ones are
 /// truncated, so a caller cannot produce a ragged table by accident.
+///
+/// `palette` decides whether a cell carrying a [`Severity`] is written in ink.
+/// Alignment does not depend on it: every width here is measured from the
+/// cell's *text*, and the escape sequences are wrapped around the text after
+/// the padding has been worked out. A table printed with
+/// [`Palette::Colour`] and the same table printed with [`Palette::Plain`] have
+/// their columns in the same places, character for character — which is the
+/// property that makes colour safe to add to a listing that already narrows
+/// itself to a terminal.
+///
+/// Headers are never coloured. A heading is the name of a column, not a
+/// reading off it, and there is nothing about `STATUS` to be alarmed by.
 #[must_use]
-pub fn table(headers: &[&str], rows: &[Vec<String>]) -> String {
+pub fn table(headers: &[&str], rows: &[Vec<Cell>], palette: Palette) -> String {
     let widths = column_widths(headers, rows);
 
     let mut out = String::new();
     push_row(
         &mut out,
-        &headers.iter().map(|h| (*h).to_owned()).collect::<Vec<_>>(),
+        &headers.iter().map(|h| Cell::plain(*h)).collect::<Vec<_>>(),
         &widths,
+        palette,
     );
     for row in rows {
-        push_row(&mut out, row, &widths);
+        push_row(&mut out, row, &widths, palette);
     }
     out.trim_end().to_owned()
 }
@@ -281,15 +347,21 @@ pub fn row_width(widths: &[usize]) -> usize {
 ///
 /// What [`table`] pads to, and so what a listing deciding which columns it can
 /// afford has to measure by.
+///
+/// Measured from each cell's text, never from what a [`Palette`] would print
+/// for it: an escape sequence is bytes the terminal consumes and does not
+/// draw, so a width that counted them would pad every coloured column five
+/// characters too narrow and hand a listing's drop rule a row length nothing
+/// prints at.
 #[must_use]
-pub fn column_widths(headers: &[&str], rows: &[Vec<String>]) -> Vec<usize> {
+pub fn column_widths(headers: &[&str], rows: &[Vec<Cell>]) -> Vec<usize> {
     headers
         .iter()
         .enumerate()
         .map(|(column, header)| {
             rows.iter()
                 .filter_map(|row| row.get(column))
-                .map(|cell| display_width(cell))
+                .map(|cell| display_width(&cell.text))
                 .chain(std::iter::once(display_width(header)))
                 .max()
                 .unwrap_or(0)
@@ -297,13 +369,18 @@ pub fn column_widths(headers: &[&str], rows: &[Vec<String>]) -> Vec<usize> {
         .collect()
 }
 
-fn push_row(out: &mut String, cells: &[String], widths: &[usize]) {
+fn push_row(out: &mut String, cells: &[Cell], widths: &[usize], palette: Palette) {
     let mut line = String::new();
 
     for (column, width) in widths.iter().enumerate() {
-        let cell = cells.get(column).map_or("", String::as_str);
-        line.push_str(cell);
-        let pad = width.saturating_sub(display_width(cell));
+        let text = cells.get(column).map_or("", |cell| cell.text.as_str());
+        // The pad comes from the text and the ink goes on afterwards, so a
+        // coloured column is exactly as wide as the same column without ink.
+        let pad = width.saturating_sub(display_width(text));
+        match cells.get(column).and_then(|cell| cell.severity) {
+            Some(severity) => line.push_str(&palette.paint(text, severity)),
+            None => line.push_str(text),
+        }
         line.extend(std::iter::repeat_n(' ', pad + 2));
     }
 
@@ -327,6 +404,47 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
+    use crate::theme::ColourChoice;
+
+    /// A cell with no judgement attached — most of a table, and all of the
+    /// alignment tests below, which are about widths rather than about ink.
+    fn cell(text: &str) -> Cell {
+        Cell::plain(text)
+    }
+
+    /// A palette that paints, without asking a terminal anything.
+    fn colour() -> Palette {
+        Palette::choose(ColourChoice::Always, false, None, None)
+    }
+
+    /// The visible text of a rendered table: every escape sequence removed.
+    ///
+    /// Written here rather than pulled in, because a dependency that strips
+    /// ANSI would be a second opinion about what this crate emits — and the
+    /// point of these tests is that the two agree.
+    fn stripped(rendered: &str) -> String {
+        let mut out = String::new();
+        let mut chars = rendered.chars().peekable();
+        while let Some(c) = chars.next() {
+            if c != '\u{1b}' {
+                out.push(c);
+                continue;
+            }
+            // ESC `[` opens the sequence; the `[` itself is inside the range a
+            // final byte comes from, so it has to be stepped over before the
+            // scan starts or every sequence ends where it began.
+            if chars.peek() == Some(&'[') {
+                chars.next();
+            }
+            // Parameters and intermediates, then a final byte in `@`..=`~`.
+            for c in chars.by_ref() {
+                if ('@'..='~').contains(&c) {
+                    break;
+                }
+            }
+        }
+        out
+    }
 
     fn seconds(count: i64) -> SignedDuration {
         SignedDuration::from_secs(count)
@@ -475,12 +593,12 @@ mod tests {
     #[test]
     fn table_columns_are_as_wide_as_their_widest_cell() {
         let rows = vec![
-            vec!["ip-10-0-1-9".to_owned(), "Ready".to_owned()],
-            vec!["ip-10-0-11-200".to_owned(), "NotReady".to_owned()],
+            vec![cell("ip-10-0-1-9"), cell("Ready")],
+            vec![cell("ip-10-0-11-200"), cell("NotReady")],
         ];
 
         assert_eq!(
-            table(&["NAME", "STATUS"], &rows),
+            table(&["NAME", "STATUS"], &rows, Palette::Plain),
             "NAME            STATUS\n\
              ip-10-0-1-9     Ready\n\
              ip-10-0-11-200  NotReady"
@@ -490,29 +608,29 @@ mod tests {
     #[test]
     fn table_never_leaves_trailing_whitespace() {
         let rows = vec![
-            vec!["a".to_owned(), "long-value".to_owned()],
-            vec!["b".to_owned(), "x".to_owned()],
+            vec![cell("a"), cell("long-value")],
+            vec![cell("b"), cell("x")],
         ];
 
-        for line in table(&["ONE", "TWO"], &rows).lines() {
+        for line in table(&["ONE", "TWO"], &rows, Palette::Plain).lines() {
             assert_eq!(line.trim_end(), line, "line {line:?} has trailing spaces");
         }
     }
 
     #[test]
     fn table_with_no_rows_is_just_the_header() {
-        assert_eq!(table(&["NAME", "AGE"], &[]), "NAME  AGE");
+        assert_eq!(table(&["NAME", "AGE"], &[], Palette::Plain), "NAME  AGE");
     }
 
     #[test]
     fn table_pads_short_rows_and_ignores_extra_cells() {
         let rows = vec![
-            vec!["only-one".to_owned()],
-            vec!["a".to_owned(), "b".to_owned(), "ignored".to_owned()],
+            vec![cell("only-one")],
+            vec![cell("a"), cell("b"), cell("ignored")],
         ];
 
         assert_eq!(
-            table(&["ONE", "TWO"], &rows),
+            table(&["ONE", "TWO"], &rows, Palette::Plain),
             "ONE       TWO\n\
              only-one\n\
              a         b"
@@ -521,7 +639,7 @@ mod tests {
 
     #[test]
     fn table_with_no_columns_is_empty() {
-        assert_eq!(table(&[], &[vec!["orphan".to_owned()]]), "");
+        assert_eq!(table(&[], &[vec![cell("orphan")]], Palette::Plain), "");
     }
 
     /// The guarantee the narrowing rules in both listings are built on: the
@@ -533,12 +651,12 @@ mod tests {
     /// nothing prints at.
     #[test]
     fn a_measured_row_is_the_longest_line_table_prints() {
-        let cases: [(&[&str], Vec<Vec<String>>); 5] = [
+        let cases: [(&[&str], Vec<Vec<Cell>>); 5] = [
             (
                 &["NAME", "STATUS"],
                 vec![
-                    vec!["ip-10-0-1-9".to_owned(), "Ready".to_owned()],
-                    vec!["ip-10-0-11-200".to_owned(), "NotReady".to_owned()],
+                    vec![cell("ip-10-0-1-9"), cell("Ready")],
+                    vec![cell("ip-10-0-11-200"), cell("NotReady")],
                 ],
             ),
             // The widest cell is in the last column, which is the case the
@@ -546,26 +664,26 @@ mod tests {
             (
                 &["ONE", "TWO"],
                 vec![
-                    vec!["a".to_owned(), "long-value".to_owned()],
-                    vec!["b".to_owned(), "x".to_owned()],
+                    vec![cell("a"), cell("long-value")],
+                    vec![cell("b"), cell("x")],
                 ],
             ),
             // Ragged rows: one short, one with a cell the table ignores.
             (
                 &["ONE", "TWO"],
                 vec![
-                    vec!["only-one".to_owned()],
-                    vec!["a".to_owned(), "b".to_owned(), "ignored".to_owned()],
+                    vec![cell("only-one")],
+                    vec![cell("a"), cell("b"), cell("ignored")],
                 ],
             ),
             // No rows at all: the header line is the whole table.
             (&["NAME", "AGE"], vec![]),
             // One column, so there are no separators to count.
-            (&["NAME"], vec![vec!["api-7c9f".to_owned()]]),
+            (&["NAME"], vec![vec![cell("api-7c9f")]]),
         ];
 
         for (headers, rows) in cases {
-            let printed = table(headers, &rows)
+            let printed = table(headers, &rows, Palette::Plain)
                 .lines()
                 .map(|line| line.chars().count())
                 .max()
@@ -589,12 +707,133 @@ mod tests {
     }
 
     #[test]
+    fn a_table_of_plain_cells_is_the_same_bytes_under_any_palette() {
+        // Most of a table is facts with no judgement attached, and none of it
+        // may gain a byte because a palette was passed in. This is what keeps
+        // `eks contexts`, and every uncoloured column of the two listings,
+        // exactly as it was.
+        let rows = vec![
+            vec![cell("ip-10-0-1-9"), cell("Ready")],
+            vec![cell("ip-10-0-11-200"), cell("NotReady")],
+        ];
+
+        assert_eq!(
+            table(&["NAME", "STATUS"], &rows, colour()),
+            table(&["NAME", "STATUS"], &rows, Palette::Plain)
+        );
+    }
+
+    #[test]
+    fn ink_does_not_move_a_column() {
+        // The property the whole design rests on: widths come from the cell's
+        // text, and the escapes go on after the padding is worked out. Strip
+        // the ink back off a coloured table and the plain one is underneath,
+        // character for character — so a listing that narrows itself to a
+        // terminal narrows to the same columns either way.
+        let rows = vec![
+            vec![
+                cell("ip-10-0-1-9"),
+                Cell::graded("NotReady", Severity::Critical),
+                cell("v1.33.4-eks-1234567"),
+            ],
+            vec![
+                cell("ip-10-0-11-200"),
+                Cell::graded("Ready", Severity::Ok),
+                cell("v1.33.4-eks-1234567"),
+            ],
+            vec![
+                cell("ip-10-0-2-77"),
+                Cell::graded("Unknown", Severity::Unknown),
+                cell("-"),
+            ],
+        ];
+        let headers = ["NAME", "STATUS", "VERSION"];
+
+        let painted = table(&headers, &rows, colour());
+        assert_ne!(painted, table(&headers, &rows, Palette::Plain));
+        assert_eq!(stripped(&painted), table(&headers, &rows, Palette::Plain));
+    }
+
+    #[test]
+    fn a_coloured_table_still_leaves_no_trailing_whitespace() {
+        // The last cell is the awkward one: its ink ends in an escape, which
+        // `trim_end` cannot see, so the padding in front of it has to have
+        // gone before the ink went on.
+        let rows = vec![
+            vec![
+                cell("api-7c9f"),
+                Cell::graded("CrashLoopBackOff", Severity::Critical),
+            ],
+            vec![cell("db-0"), Cell::graded("Running", Severity::Ok)],
+        ];
+
+        for line in table(&["NAME", "STATUS"], &rows, colour()).lines() {
+            let visible = stripped(line);
+            assert_eq!(
+                visible.trim_end(),
+                visible,
+                "line {line:?} has trailing spaces"
+            );
+        }
+    }
+
+    #[test]
+    fn an_empty_graded_cell_leaves_no_ink_behind() {
+        // A row whose last cell is graded and empty: painting it would leave a
+        // line ending in a sequence with nothing inside it, which `trim_end`
+        // would then keep because an escape is not a space.
+        let rows = vec![vec![cell("only-one"), Cell::graded("", Severity::Critical)]];
+
+        let painted = table(&["ONE", "TWO"], &rows, colour());
+        assert_eq!(painted, table(&["ONE", "TWO"], &rows, Palette::Plain));
+        assert!(!painted.contains('\u{1b}'), "{painted:?}");
+    }
+
+    #[test]
+    fn a_heading_is_never_coloured() {
+        // A heading names a column; it is not a reading off one, and there is
+        // nothing about the word `STATUS` to be alarmed by.
+        let rows = vec![vec![Cell::graded("NotReady", Severity::Critical)]];
+
+        let header = table(&["STATUS"], &rows, colour())
+            .lines()
+            .next()
+            .map(str::to_owned)
+            .unwrap_or_default();
+        assert_eq!(header, "STATUS");
+    }
+
+    #[test]
+    fn a_measured_width_ignores_the_ink_a_cell_would_be_printed_in() {
+        // What a drop rule measures by. Counting escape bytes here would pad
+        // every coloured column short and stop the narrowing at a row length
+        // nothing prints at.
+        let graded = vec![vec![Cell::graded("CrashLoopBackOff", Severity::Critical)]];
+        let plain = vec![vec![cell("CrashLoopBackOff")]];
+
+        assert_eq!(
+            column_widths(&["STATUS"], &graded),
+            column_widths(&["STATUS"], &plain)
+        );
+        assert_eq!(column_widths(&["STATUS"], &graded), vec![16]);
+    }
+
+    #[test]
+    fn a_cell_carries_no_judgement_unless_it_was_given_one() {
+        // The `From` impls exist so a listing with nothing to grade — `eks
+        // contexts` — reads as a list of strings and gets the plain table.
+        assert_eq!(Cell::from("prod").severity, None);
+        assert_eq!(Cell::from("prod".to_owned()), Cell::plain("prod"));
+        assert_eq!(
+            Cell::graded("97%", Severity::Critical).severity,
+            Some(Severity::Critical)
+        );
+    }
+
+    #[test]
     fn a_table_with_no_columns_measures_nothing() {
         // The empty case is the one that would underflow a `len() - 1`, and a
         // listing that dropped every column would ask exactly this.
-        assert_eq!(
-            row_width(&column_widths(&[], &[vec!["orphan".to_owned()]])),
-            0
-        );
+        assert_eq!(row_width(&column_widths(&[], &[vec![cell("orphan")]])), 0);
     }
 }
