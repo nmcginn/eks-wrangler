@@ -654,7 +654,7 @@ cluster.
 
 ## Milestone 2 — The dashboard
 
-- [ ] **Node pane with live data.**
+- [x] **Node pane with live data.**
   Replace the placeholder overview with a node list: utilisation bars, pod
   counts, conditions.
   *Acceptance:* first paint happens before data arrives; loading state is
@@ -668,6 +668,15 @@ cluster.
   go through `k8s::page::collect` with the same `Budget` the CLI uses, so a
   request that never answers ends rather than pinning a background task for the
   life of the session.
+  The node pane's one-shot fetch (`commands::spawn`, `commands::nodes::gather`,
+  `App::apply_nodes`) is the mechanism this builds on rather than replaces.
+  It also has to settle the case the one-shot fetch left open: switching the
+  sidebar to a different cluster does not refetch today, so the node pane
+  keeps showing whichever cluster's nodes were fetched at startup even after
+  the "Overview" summary above it has moved to a new context. Whether a
+  selection change should trigger a fetch immediately, wait for the interval,
+  or something in between is exactly the kind of trigger this task already
+  has to design for `r`.
 
 - [ ] **Pod browsing.**
   Drill from a node into its pods, and from a pod into its containers. Namespace
@@ -688,6 +697,23 @@ cluster.
   `/` filters the current view. Fuzzy, case-insensitive, ranked.
   *Acceptance:* the matcher is a pure, tested function; filtering 10k rows stays
   under one frame — cover it with a benchmark.
+
+### Follow-ups from the node pane
+
+- [ ] **A node's full condition list, not just its derived status.**
+  The node pane reads "conditions" as `NodeRow::status`/`severity` — the same
+  derived `Ready`/`NotReady`/`Unknown`[,`SchedulingDisabled`] the CLI's
+  `STATUS` column shows — because that is the data `NodeRow` already carries.
+  `MemoryPressure`, `DiskPressure`, `PIDPressure`, and `NetworkUnavailable`
+  are a different, wider fact about a node that nothing in this tool parses or
+  shows yet. Separate because it is new data-model surface on `NodeRow`
+  neither listing has today, and because four more conditions do not fit a
+  one-line row — it wants a detail view for the selected node, which does not
+  exist before "Pod browsing" gives the pane a way to drill into anything.
+  *Acceptance:* whichever shape it takes, the condition list is a pure
+  function over a `Node`'s `status.conditions`, tested the way `status_text`
+  and `severity` already are; a node reporting none of the four pressure
+  conditions is not distinguished from one that has not reported at all.
 
 ## Milestone 3 — Polish
 
@@ -741,6 +767,26 @@ cluster.
 ---
 
 ## Done
+
+- **Node pane with live data** (2026-08-21) — the dashboard's "Overview" pane
+  grows a real node list under the cluster summary: name, status, a CPU and a
+  memory utilisation bar, and a pod count. `commands::nodes::gather` is the new
+  seam underneath both `eks nodes` and the pane — resolve the cluster, fetch
+  nodes/pods/metrics concurrently, reduce to `NodeRow`s — so `list` and the
+  pane's `spawn_gather` build rows through the one function and cannot drift
+  about what a node's row means; only the renderers differ, an ANSI table for
+  one and ratatui bars for the other. The fetch itself never touches the
+  render loop: `commands::spawn` runs it on a plain OS thread with its own
+  current-thread `tokio` runtime, shut down rather than joined for the same
+  reason `commands::block_on` is (decision 51), and delivers its result over an
+  `mpsc::Receiver` that `main` hands to `ui::run`. The loop polls it
+  non-blockingly once per iteration, ahead of drawing, so first paint always
+  shows `Loading nodes…` rather than waiting on the network, and a hung
+  request leaves every key fully live. `App` gained one field and one pure
+  transition, `apply_nodes`, tested the same way `on_key` is, with no channel
+  or thread anywhere near a test. The bars divide by allocatable, the same
+  denominator the CLI's `CPU USE`/`MEM USE` already do (decision 52), so the
+  pane and the table never disagree about one node.
 
 - **A timeout that covers the credential helper** (2026-08-21) — `--timeout` now
   bounds the step before the first request as well as every request after it, so
