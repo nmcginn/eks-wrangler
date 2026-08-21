@@ -551,7 +551,10 @@ cluster.
   Paging turned a slow listing into several requests, and `eks nodes` on a very
   large cluster now spends that time as silently as it spent it before. A
   spinner, or a `read 1,500 nodes…` counter on stderr, was the other half of the
-  paging task. Separate because it is the first thing this tool would ever write
+  paging task. The credential helper is the step that wants this most, and it
+  wants it first: it now runs under the same budget as a request, and a user who
+  waits thirty seconds for `aws eks get-token` has no way to know that is what
+  they are waiting for until it fails. Separate because it is the first thing this tool would ever write
   to a terminal mid-command. Half of what it was waiting on is now answered: the
   severity-colour task settled what `eks` does when stdout is a pipe — nothing
   that was not there before, byte for byte — and `theme::Palette` and
@@ -565,7 +568,7 @@ cluster.
   listing is unchanged to the byte; the progress line goes to stderr and is
   erased before the table is printed.
 
-- [ ] **A timeout that covers the credential helper.**
+- [x] **A timeout that covers the credential helper.**
   `--timeout` bounds requests to the cluster, and cannot bound what happens
   before the first one: `kube` resolves a kubeconfig's auth eagerly and runs the
   exec plugin with a blocking `std::process::Command`, so an `aws eks get-token`
@@ -580,6 +583,36 @@ cluster.
   *Acceptance:* `eks nodes --timeout 5s` gives up in five seconds against a
   credential helper that never exits, and the process exits rather than waiting
   for it; the message names the helper rather than the API server.
+  Landed as the two halves the wording predicted. `Client::try_from` — which is
+  where `kube` runs the exec plugin — moves onto `tokio::task::spawn_blocking`,
+  so the budget races a `JoinHandle` rather than a thread sitting in `waitpid`;
+  and `commands::block_on` calls `Runtime::shutdown_background` rather than
+  dropping the runtime, because dropping one waits for exactly the blocking task
+  that was just given up on. `k8s::client::stalled_helper` is the message, beside
+  `explain` rather than inside it since no request failed, and it names the
+  command out of the kubeconfig's own `exec` block — `helper_command`, quoted so
+  the user can paste it, because running it by hand is the only way to see what
+  it is waiting on. The helper is spent per step like every request after it, and
+  the message names `--timeout 0` as the way back to the old behaviour, which is
+  the answer for a helper that is legitimately waiting on a human.
+
+- [ ] **Stop the credential helper, rather than only stopping waiting for it.**
+  `--timeout` now ends the hang, and it ends it by abandonment: a blocking task
+  cannot be cancelled, so `eks` prints its message and exits while the `aws eks
+  get-token` it started keeps running. Usually harmless — the orphan exits or
+  dies with its network — but a helper `kube` left interactive still holds the
+  terminal's stdin, so it can sit there taking keystrokes from the shell that
+  gets its prompt back. Discovered while writing the abandonment, and separate
+  because the only way to kill a child is to own it: that means running the
+  `exec` block ourselves against the `client.authentication.k8s.io` protocol —
+  token and client-certificate credentials both — and handing `kube` a resolved
+  `Config` rather than a kubeconfig. That is a night on its own, and it turns on
+  a question this change had no business answering: whether `eks` wants to own
+  credential resolution at all, which is also what decides whether a token can
+  be refreshed partway through a paged listing.
+  *Acceptance:* the helper is gone by the time the process is; whatever runs it,
+  the failure still words itself through `k8s::client::stalled_helper` and names
+  the command through `helper_command` rather than a second spelling.
 
 - [ ] **Make a listing's footnotes a pure function.**
   Every footnote's *wording* is a tested pure function; the list they are
@@ -616,8 +649,8 @@ cluster.
   *Acceptance:* the default is documented; timing out names the cluster and
   suggests checking VPN or endpoint access.
   Spent per request rather than per command, because paging made a listing
-  several of them. What it cannot cover is the credential helper, which is its
-  own entry above.
+  several of them. What it could not cover at first was the credential helper;
+  that was its own entry, and is now ticked above.
 
 ## Milestone 2 — The dashboard
 
@@ -709,6 +742,24 @@ cluster.
 
 ## Done
 
+- **A timeout that covers the credential helper** (2026-08-21) — `--timeout` now
+  bounds the step before the first request as well as every request after it, so
+  an `aws eks get-token` that never comes back ends in a sentence rather than in
+  Ctrl-C. `kube` runs the exec plugin inside `Client::try_from`, with a blocking
+  `std::process::Command`, on whatever thread asked — so a timeout wrapped around
+  `k8s::connect` compiled and did nothing, with the timer and the future it was
+  racing on the same thread and the thread in `waitpid`. The build moves onto
+  `tokio::task::spawn_blocking` and the budget races the `JoinHandle` instead.
+  A blocking task cannot be cancelled, so giving up on one only stops waiting for
+  it: `commands::block_on` therefore shuts its runtime down rather than dropping
+  it, since dropping one waits for precisely the task that was abandoned — the
+  same hang, one frame later. The message is its own, because `Failure::Slow`
+  talks about VPCs and VPNs and none of that is true of a subprocess on the
+  user's laptop; it names the command out of the kubeconfig's `exec` block,
+  quoted so it can be pasted, and does not guess which of the several things that
+  hang `aws` is the one hanging this. `--timeout 0` is named in the sentence, as
+  the answer for a helper that is legitimately waiting on a human.
+
 - **Paginate node listings**, **Paginate the pod listing** (2026-08-20) — every
   listing now goes through `k8s::page::collect`, which asks for 500 objects at a
   time and follows the `continue` token: the node listing, both pod listings,
@@ -735,9 +786,10 @@ cluster.
   spelling it can parse back, so the advice can never suggest a value the flag
   would reject. Two failures that were raw HTTP became sentences on the way: a
   `410` is a page marker that expired mid-listing, which wants "run it again"
-  rather than anything about credentials. What the flag cannot cover is the
-  credential helper, which `kube` runs with a blocking `std::process::Command` —
-  its own entry above, with the reason.
+  rather than anything about credentials. What the flag could not cover on the
+  night it landed was the credential helper, which `kube` runs with a blocking
+  `std::process::Command` — its own entry then, and its own entry in this list
+  now.
 
 - **Global flags before a subcommand** (2026-08-20) — `eks --context prod nodes`
   parses, as `eks nodes --context prod` always did. `args_conflicts_with_subcommands`

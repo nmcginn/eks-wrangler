@@ -46,8 +46,10 @@ pub struct Request<'a> {
     /// Whether the graded cells are written in colour. Decided in `main`,
     /// where stdout is, so nothing below here asks what a terminal is.
     pub palette: Palette,
-    /// `--timeout`, spent per request rather than per command — a namespace big
+    /// `--timeout`, spent per step rather than per command — a namespace big
     /// enough to be read in several pages should not be cut off for its size.
+    /// The first step is the credential helper, which `k8s::connect` runs on a
+    /// blocking task so that this can bound it.
     pub budget: page::Budget,
 }
 
@@ -69,7 +71,7 @@ pub async fn list(
     let scope = scope_for(&target, request.namespace, request.all_namespaces)?;
     let selectors = selectors_for(request.label_selector, request.field_selector)?;
 
-    let client = k8s::connect(paths, &target).await?;
+    let client = k8s::connect(paths, &target, request.budget).await?;
 
     // Concurrently, not in sequence: the two requests are independent, and the
     // command should cost one round trip's worth of waiting rather than two.

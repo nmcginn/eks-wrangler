@@ -977,14 +977,12 @@ longer: `--timeout 1m` `` and advice that names a value the flag would reject is
 worse than no advice. One unit in, one unit out, and a test asserts the round
 trip.
 
-What the flag cannot promise is the part before the first request. `kube`
-resolves a kubeconfig's auth eagerly and runs the exec plugin with a blocking
-`std::process::Command`, so an `aws eks get-token` that hangs blocks the thread
-rather than the future, and a `tokio::time::timeout` wrapped around
-`k8s::connect` would never fire. Covering it needs the helper moved onto a
-blocking task, and then a shutdown that does not wait for the abandoned one —
-a different piece of work, in the roadmap. Until then the flag's help says
-"request", which is what it means.
+What the flag could not promise at first was the part before the first request:
+`kube` resolves a kubeconfig's auth eagerly and runs the exec plugin with a
+blocking `std::process::Command`, so an `aws eks get-token` that hangs blocked
+the thread rather than the future, and a `tokio::time::timeout` wrapped around
+`k8s::connect` would never have fired. Decision 50 covers it, and the flag's
+help now says "step" rather than "request".
 
 ### 45. `eks contexts` renders through `format::table`, gutter and all
 
@@ -1290,3 +1288,64 @@ rather than a switch — which is the light-theme task's problem, not this one's
 **`commands::nodes` grew a `Request` struct** to carry the palette, mirroring
 `eks pods` (decision 29). It was going to have to: `list` was already at seven
 parameters, four of them describing the same one request.
+
+### 50. `--timeout` covers the credential helper, on a task that is left behind
+
+`--timeout` bounded every request to the cluster and nothing before them, and
+the gap was the loudest failure the tool had left: a laptop that has lost its
+route to an SSO endpoint runs `aws eks get-token`, the helper sits there, and
+`eks nodes --timeout 5s` waited for ever with no way out but Ctrl-C. Decision 44
+named that as a limitation and this is the other half of it.
+
+The reason it was a limitation and not an oversight is that `kube` runs the exec
+plugin inside `Client::try_from`, with a blocking `std::process::Command::output`,
+on whatever thread asked. Wrapping `k8s::connect` in `tokio::time::timeout`
+compiles and does nothing: the timer and the future it is racing are on the same
+thread, and the thread is in `waitpid`. So the build moves onto
+`tokio::task::spawn_blocking`, and the timeout races the `JoinHandle` instead —
+which is a future that a running timer can actually beat.
+
+**The task is abandoned, not cancelled**, because a blocking task cannot be
+cancelled: dropping its handle stops anyone waiting on it and stops nothing
+else, and the subprocess belongs to `kube` rather than to us, so there is no
+child to kill from here. That makes the shutdown the second half of the fix.
+Dropping a Tokio runtime waits for its blocking tasks, so `commands::block_on`
+now calls `Runtime::shutdown_background` and returns: the thread finishes on its
+own if the helper ever exits, and returning from `main` ends the process either
+way. Without that line the timeout fires, the message prints, and the tool hangs
+at the door — which is the same hang, one frame later. A test in
+`commands::block_on` asserts it with a thirty-second blocking sleep and no
+kubeconfig at all.
+
+**Per step, like the requests.** The helper gets the same `--timeout` value each
+page of the listing after it gets, rather than a share of one command-wide
+budget — the reasoning of decision 44, applied one step earlier. A helper that
+spends twenty seconds refreshing an SSO token has not used up the listing's time,
+any more than one page uses up the next page's.
+
+**It is its own message.** `Failure::Slow` names the budget and then talks about
+VPCs, private endpoints, and VPNs, and none of that is true of a subprocess on
+the user's own laptop. `k8s::client::stalled_helper` sits beside `explain`
+rather than inside it, because there is no `kube::Error` behind this failure to
+classify — nothing has been asked of the cluster yet. It names the command the
+context runs and says to run it by hand, which is the only thing the user can
+usefully do: that is how they find out it is sitting on a browser prompt.
+`helper_command` builds that line out of the `AuthInfo` the kubeconfig produced
+and quotes what a shell would need quoted, since an EKS `exec` block routinely
+carries a profile or a role ARN with a space in it, and a command line the user
+has to repair before it runs is worse than none. The block's `env` comes out in
+front of the command as `NAME=value`, for the same reason and a sharper one: an
+entry that sets `AWS_PROFILE`, pasted without it, runs against whatever profile
+the shell already had and may answer instantly — which sends the user to look
+for a problem somewhere that does not have one. What is *not* in the sentence is
+a guess at which of the several things that hang `aws eks get-token` is hanging
+this one — a blackholed metadata address, an SSO endpoint with no route to it, a
+`credential_process` of the user's own that prompts — because naming the wrong
+one confidently costs more than naming none.
+
+The message also offers `--timeout 0`, which no other message does. It is the
+one failure where "wait for as long as it takes" is a reasonable answer rather
+than a way to reinstate a hang: an interactive helper waiting on a human is
+doing its job, and the tool now has a default that would cut it off after thirty
+seconds. That is the one behaviour change a user could dislike, and it is the
+reason the escape hatch is named in the sentence rather than left in `--help`.

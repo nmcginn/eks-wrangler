@@ -264,10 +264,14 @@ request: a cluster large enough to need four pages should not be cut off for its
 size, only for going quiet. Cluster failures are therefore `page::Error` rather
 than `kube::Error` — the API failures and the one `kube` has no opinion about,
 since waiting for ever is a reasonable thing for a library to do and not for a
-command-line tool. The budget covers requests and not `k8s::connect`, and that
-is a limitation rather than a choice: `kube` runs a kubeconfig's credential
-helper with a blocking `std::process::Command`, so a hung `aws eks get-token`
-blocks the thread and no timeout around it would fire.
+command-line tool. The budget covers `k8s::connect` too, and getting it there
+took a detour: `kube` runs a kubeconfig's credential helper with a blocking
+`std::process::Command` inside `Client::try_from`, so a hung `aws eks get-token`
+blocks the thread and a timeout on the same thread has nothing to interrupt. The
+build therefore runs on `spawn_blocking` and the budget races the `JoinHandle`.
+A blocking task cannot be cancelled, so giving up on one only stops waiting for
+it — which is why `commands::block_on` shuts its runtime down instead of
+dropping it (dropping one waits for exactly the task that was abandoned).
 
 Resource quantities get their own hop: the API server reports capacity as
 strings in a small grammar (`3920m`, `7134420Ki`, `1e3`), and `k8s::quantity`
@@ -277,8 +281,9 @@ which is why the whole suffix table is covered by tests rather than by whatever
 instance types happen to be in the cluster you tried it on.
 
 Only the async commands build a Tokio runtime, and they build it themselves —
-see `commands::block_on`. `eks contexts` still starts with nothing but a file
-read. When the dashboard grows live data (see `docs/ROADMAP.md`), fetching moves
+see `commands::block_on`, which is also where an abandoned credential helper is
+left behind rather than waited for. `eks contexts` still starts with nothing but
+a file read. When the dashboard grows live data (see `docs/ROADMAP.md`), fetching moves
 onto a background task feeding `App` over a channel; the render loop will never
 await it.
 
@@ -313,6 +318,14 @@ Two of those classifications exist because listings are paged and budgeted: a
 and wants "run it again"; and a `Slow` names the budget it overran and the
 larger one to type, spelled through `Budget` itself so the advice cannot suggest
 a value the flag would reject.
+
+`k8s::client::stalled_helper` sits beside `explain` rather than among its
+branches, for the reason `k8s::metrics::unsampled` does: no request failed, so
+there is no `kube::Error` to classify. It is the sentence for a credential
+helper that outlived the budget, and it names the command that context runs —
+built by `helper_command` out of the kubeconfig's own `exec` block and quoted so
+the user can paste it — because running it by hand is the only way to see what
+it is waiting for.
 
 `k8s::metrics::explain` is the one place that wraps it. Two failures dominate the
 metrics endpoint and a core-API caller never sees either — a `404` because

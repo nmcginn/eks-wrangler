@@ -45,7 +45,8 @@ pub struct GlobalArgs {
     #[arg(long, global = true, value_name = "PATH", env = "KUBECONFIG")]
     pub kubeconfig: Option<PathBuf>,
 
-    /// How long to wait for any one request to the cluster. `0` waits for as
+    /// How long to wait for any one step of talking to the cluster: the
+    /// kubeconfig's credential helper, and then each request. `0` waits for as
     /// long as it takes. A listing too large for one response is read in
     /// pages, and this is the limit on each page rather than on the command.
     #[arg(long, global = true, value_name = "DURATION", default_value_t = Budget::default())]

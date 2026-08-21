@@ -20,18 +20,34 @@ pub mod pods;
 /// current-thread runtime is enough — a one-shot command spends its life
 /// waiting on a single request, and spawning worker threads to watch it idle
 /// would only cost startup time.
+///
+/// The runtime is shut down rather than dropped, and that line is the second
+/// half of `--timeout` covering the credential helper. Dropping a runtime waits
+/// for its blocking tasks to finish, and exactly one blocking task exists in
+/// this tool: the kubeconfig's exec plugin, run inside `Client::try_from` (see
+/// [`crate::k8s::client`]). A helper that never exits cannot be cancelled and
+/// cannot be killed from here, so once the budget has given up on it, waiting
+/// for it at the door would reinstate the hang the budget just ended.
 pub fn block_on<T>(future: impl Future<Output = Result<T>>) -> Result<T> {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .context("could not start the async runtime needed to talk to the cluster")?;
 
-    runtime.block_on(future)
+    let outcome = runtime.block_on(future);
+
+    // Abandoned rather than awaited: the thread finishes on its own if the
+    // helper ever exits, and returning from `main` ends the process either way.
+    runtime.shutdown_background();
+
+    outcome
 }
 
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use std::time::Duration;
 
     use super::*;
 
@@ -48,11 +64,35 @@ mod tests {
     }
 
     #[test]
+    fn block_on_does_not_wait_for_a_blocking_task_that_will_not_end() {
+        // The credential-helper case with no credential helper in it: a
+        // blocking task cannot be cancelled, so the only way out of one that
+        // has stopped answering is to stop waiting for it. Dropping the
+        // runtime here instead of shutting it down would make this test take
+        // thirty seconds — which is exactly the hang `--timeout` ends.
+        let started = std::time::Instant::now();
+
+        let value = block_on(async {
+            let _abandoned =
+                tokio::task::spawn_blocking(|| std::thread::sleep(Duration::from_secs(30)));
+            Ok("not waiting")
+        })
+        .unwrap();
+        let elapsed = started.elapsed();
+
+        assert_eq!(value, "not waiting");
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "waited {elapsed:?} at the door for a task that had already been given up on"
+        );
+    }
+
+    #[test]
     fn block_on_drives_timers_so_a_command_can_wait_on_one() {
         // `enable_all` is what makes this work; without the time driver a
         // sleeping request would hang forever instead of timing out.
         let value = block_on(async {
-            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            tokio::time::sleep(Duration::from_millis(1)).await;
             Ok("awake")
         })
         .unwrap();
