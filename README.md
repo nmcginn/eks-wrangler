@@ -324,6 +324,32 @@ Credentials come from the kubeconfig context itself, so whatever works for
 `kubectl` works here. When they have expired, `eks` says so and tells you how to
 refresh them instead of printing an HTTP status code.
 
+### Narrow terminals
+
+The other end of `--wide`. Both tables are wider than an 80-column terminal on a
+cluster with metrics-server, and a wrapped table is harder to read than a shorter
+one, so when `eks` is printing to a terminal it drops columns until the row fits
+it. Each table has its own order, and each keeps what it exists for until last:
+
+| Table | Dropped, in order | Never dropped |
+| --- | --- | --- |
+| `eks nodes` | `VERSION`, `AGE`, the `REQ` pair, the `USE` pair, `CPU` and `MEMORY`, the device columns, `STATUS` | `NAME` |
+| `eks pods` | `AGE`, `NODE`, the usage pair, `RESTARTS`, `READY`, `STATUS` | `NAME`, and `NAMESPACE` under `-A` |
+
+Columns that are read together leave together: `CPU/REQ` without `MEMORY/REQ`
+beside it is half an answer, and an eye reading a row of pairs pairs the wrong
+ones. On a GPU cluster the node table keeps `NVIDIA.COM/GPU` after `CPU` has
+gone, because the card is what you came for and the cores were always going to
+be there. `NAMESPACE` stays on a `-A` listing for the reason `NAME` does: under
+`-A`, the pair is the pod's identity, and `coredns-abc` on its own names two
+pods on a cluster running a copy of it somewhere else.
+
+Nothing is dropped when the output is not a terminal. `eks pods | grep api` and
+`eks nodes > nodes.txt` print the default table, byte for byte, whatever the
+window that ran them looks like — a script's columns must not depend on a
+terminal size it never sees. `--wide` also wins outright: it is a request for
+more columns, not for a table that gets out of the way.
+
 ### Options
 
 | Flag | Description |

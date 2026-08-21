@@ -147,9 +147,17 @@ about what is fetched — everything the extra columns show already arrived with
 the nodes and pods. Its `Narrow(u16)` variant is the other end of `--wide`:
 the same one type carries "widen" and "fit this many characters" so both
 listings agree on what the flag means, and each is free to decide its own drop
-order. The node table's lives in `k8s::nodes::DROP_ORDER`; the terminal-size
-lookup lives in one function in `main.rs`, so the arithmetic that picks
-columns has no ioctl to fake in a test. `format::list` sits beside it for the same reason: writing a
+order. Each table's lives beside its `columns` function — `k8s::nodes::DROP_ORDER`
+and `k8s::pods::row::DROP_ORDER` — and the two are different lists because the
+tables hold different things: a node's `VERSION` goes first, a pod's `AGE` does.
+What they share is the measurement: `format::column_widths` and
+`format::row_width`, the same pair `format::table` pads and separates by, so a
+drop rule cannot stop at a width the renderer does not print at. Each rule
+measures the listing once and then drops columns by arithmetic over the widths,
+because a column's width does not depend on which of its neighbours are still
+there. The
+terminal-size lookup lives in one function in `main.rs`, so the arithmetic that
+picks columns has no ioctl to fake in a test. `format::list` sits beside it for the same reason: writing a
 set of names out as prose, serial comma and all, is a rule that belongs in one
 place whether the sentence around it is offering orderings to sort by or naming
 the columns a failed pod listing emptied.

@@ -230,18 +230,7 @@ pub fn list(items: &[String], conjunction: &str) -> Option<String> {
 /// truncated, so a caller cannot produce a ragged table by accident.
 #[must_use]
 pub fn table(headers: &[&str], rows: &[Vec<String>]) -> String {
-    let widths: Vec<usize> = headers
-        .iter()
-        .enumerate()
-        .map(|(column, header)| {
-            rows.iter()
-                .filter_map(|row| row.get(column))
-                .map(|cell| display_width(cell))
-                .chain(std::iter::once(display_width(header)))
-                .max()
-                .unwrap_or(0)
-        })
-        .collect();
+    let widths = column_widths(headers, rows);
 
     let mut out = String::new();
     push_row(
@@ -253,6 +242,59 @@ pub fn table(headers: &[&str], rows: &[Vec<String>]) -> String {
         push_row(&mut out, row, &widths);
     }
     out.trim_end().to_owned()
+}
+
+/// How wide a row of columns this wide prints — the widest line [`table`]
+/// will produce for them.
+///
+/// A listing narrowing itself to a terminal has to know what a row measures
+/// before it can decide which column to drop, and the only honest answer is
+/// the renderer's own arithmetic: a second sum kept beside the drop rule would
+/// drift from [`table`] the day a separator changed, and the listing would
+/// then drop a column to fit a width nothing prints at. So the renderer and
+/// both drop rules go through this and [`column_widths`], and "as wide as the
+/// widest cell, two spaces between" is stated once.
+///
+/// The answer is the nominal row width rather than something shorter, even
+/// though [`table`] trims every line: the line carrying the widest cell of the
+/// last column has every column before it padded to full width, so that line
+/// is exactly this long and no line is longer.
+///
+/// Widths rather than the cells they came from, because a drop rule asks this
+/// once per step and the answer changes while the widths do not — a column is
+/// as wide as its own widest cell whatever its neighbours do. So a listing
+/// measures once with [`column_widths`] and then does arithmetic over a dozen
+/// numbers, rather than rendering every cell again at every step.
+///
+/// `0` for a table with no columns, which has no lines to measure.
+#[must_use]
+pub fn row_width(widths: &[usize]) -> usize {
+    // `len() - 1` separators, and no separators at all when there are no
+    // columns — the subtraction that would wrap is the empty case.
+    let Some(separators) = widths.len().checked_sub(1) else {
+        return 0;
+    };
+    widths.iter().sum::<usize>() + 2 * separators
+}
+
+/// Each column as wide as its widest cell, or its header where that is wider.
+///
+/// What [`table`] pads to, and so what a listing deciding which columns it can
+/// afford has to measure by.
+#[must_use]
+pub fn column_widths(headers: &[&str], rows: &[Vec<String>]) -> Vec<usize> {
+    headers
+        .iter()
+        .enumerate()
+        .map(|(column, header)| {
+            rows.iter()
+                .filter_map(|row| row.get(column))
+                .map(|cell| display_width(cell))
+                .chain(std::iter::once(display_width(header)))
+                .max()
+                .unwrap_or(0)
+        })
+        .collect()
 }
 
 fn push_row(out: &mut String, cells: &[String], widths: &[usize]) {
@@ -480,5 +522,79 @@ mod tests {
     #[test]
     fn table_with_no_columns_is_empty() {
         assert_eq!(table(&[], &[vec!["orphan".to_owned()]]), "");
+    }
+
+    /// The guarantee the narrowing rules in both listings are built on: the
+    /// width measured from `column_widths` is the number of characters `table`
+    /// will actually print at its widest. Asserted over the same awkward
+    /// tables the renderer's own tests use — a cell wider than its header, a
+    /// ragged row, a header-only table — because a drop rule that measured a
+    /// row the renderer disagreed with would drop a column to fit a width
+    /// nothing prints at.
+    #[test]
+    fn a_measured_row_is_the_longest_line_table_prints() {
+        let cases: [(&[&str], Vec<Vec<String>>); 5] = [
+            (
+                &["NAME", "STATUS"],
+                vec![
+                    vec!["ip-10-0-1-9".to_owned(), "Ready".to_owned()],
+                    vec!["ip-10-0-11-200".to_owned(), "NotReady".to_owned()],
+                ],
+            ),
+            // The widest cell is in the last column, which is the case the
+            // trailing-pad trim could have made shorter than the nominal width.
+            (
+                &["ONE", "TWO"],
+                vec![
+                    vec!["a".to_owned(), "long-value".to_owned()],
+                    vec!["b".to_owned(), "x".to_owned()],
+                ],
+            ),
+            // Ragged rows: one short, one with a cell the table ignores.
+            (
+                &["ONE", "TWO"],
+                vec![
+                    vec!["only-one".to_owned()],
+                    vec!["a".to_owned(), "b".to_owned(), "ignored".to_owned()],
+                ],
+            ),
+            // No rows at all: the header line is the whole table.
+            (&["NAME", "AGE"], vec![]),
+            // One column, so there are no separators to count.
+            (&["NAME"], vec![vec!["api-7c9f".to_owned()]]),
+        ];
+
+        for (headers, rows) in cases {
+            let printed = table(headers, &rows)
+                .lines()
+                .map(|line| line.chars().count())
+                .max()
+                .unwrap_or(0);
+            assert_eq!(
+                row_width(&column_widths(headers, &rows)),
+                printed,
+                "headers {headers:?} rows {rows:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_row_is_its_columns_plus_two_spaces_between_them() {
+        // The separator rule on its own, without a table to build: one column
+        // has no separators, and each one after it costs two characters.
+        assert_eq!(row_width(&[]), 0);
+        assert_eq!(row_width(&[5]), 5);
+        assert_eq!(row_width(&[5, 3]), 10);
+        assert_eq!(row_width(&[5, 3, 1]), 13);
+    }
+
+    #[test]
+    fn a_table_with_no_columns_measures_nothing() {
+        // The empty case is the one that would underflow a `len() - 1`, and a
+        // listing that dropped every column would ask exactly this.
+        assert_eq!(
+            row_width(&column_widths(&[], &[vec!["orphan".to_owned()]])),
+            0
+        );
     }
 }
