@@ -1050,3 +1050,70 @@ sequence: `VERSION`, `AGE`, the `REQ` pair, the `USE` pair, `CPU` and
 `NAME` never drops. A row we cannot fit at all is still a row with a name; the
 terminal wraps it, and dropping the name would leave a listing that has no
 answer for "which node is this".
+
+### 47. The pod table's drop order, and one measurement for both tables
+
+`Width::Narrow` landed with the node table (decision 46) and the pod table
+treated it as `Default`: a `Narrow` reaches `k8s::pods::row::columns`, falls
+through the `is_wide()` check, and prints the full row on a terminal too small
+for it. `eks pods` is the wider of the two listings on a cluster with
+metrics-server, so it wanted the same treatment; what it could not take was the
+node table's list, because none of the columns in it are the same columns.
+
+The pod order is `AGE`, `NODE`, the usage pair, `RESTARTS`, `READY`, `STATUS`,
+with `NAME` and `NAMESPACE` never dropped. Three rules shaped it:
+
+- **The table's own repetition goes first.** `AGE` is the cheapest column on
+  the row and the least of it, and it is the one fact the table already says
+  twice: `RESTARTS` carries `9 (5m ago)`, so "when did this last change"
+  survives it leaving.
+- **A follow-up question goes before a first one.** `NODE` is the widest cell
+  in the table on EKS, where a node is a forty-character DNS name, and which
+  machine a pod is on is what you ask *after* you know which pod you are
+  looking at. Every column that stays is there to find that pod, and dropping
+  `NODE` lands on `kubectl get pods`'s own column set, where a reader's habits
+  already are.
+- **The health columns outlast the rest, and `STATUS` outlasts them.** A
+  listing down to a name and one word keeps the word that names the problem;
+  `READY`'s `0/1` is the detail under `CrashLoopBackOff` rather than a fact of
+  its own, and `RESTARTS` is the widest of the three. This is the one step of
+  the order that is a judgement rather than a deduction — `Running 0/1` is a
+  real pod, and an argument for `READY` outlasting `STATUS` could be made.
+
+`NAMESPACE` never dropping is the pod table's own rule, and it is not the node
+table's `NAME` rule wearing a hat. The column is in the table only under `-A`,
+and there a name is not an identity: `coredns-abc` in `kube-system` and a copy
+of it in another namespace are two pods, and the column the user widened the
+scope to get is the only thing telling them apart. Under `-A` the pair is the
+name, so it drops when `NAME` does, which is never.
+
+The `--wide` columns are not in the list, because they cannot be in the table:
+`Width::for_terminal(true, _)` answers `Wide`, so a `Narrow` listing never
+carried `IP`, `NOMINATED NODE`, or `READINESS GATES` in the first place. A step
+for them would be a step that never fires.
+
+The measurement moved. `k8s::nodes::row_width` mirrored `format::table`'s
+arithmetic by hand, with a comment saying the drop rule was its only caller —
+which was true for one night. A second caller is the condition that changes the
+answer, so the rule lives in `format` now, as the pair `column_widths` (as wide
+as the widest cell, or the header) and `row_width` (two spaces between, and
+none after the last), with `format::table` and both drop rules going through
+them. Two copies of that would be free to drift, and a listing measuring rows
+the renderer disagreed with would drop a column to fit a width nothing prints
+at. A test ties the two to the renderer: a row measured from `column_widths`
+is exactly the longest line `table` actually prints, over a cell wider than its
+header, a ragged row, a header-only table, and a single column with no
+separators to count. Both listings assert the same thing from the other end —
+every line of a `Narrow(80)` render is at most 80 characters — so the guarantee
+is checked against rendered output rather than against the arithmetic that
+chose the columns.
+
+Splitting the two is also what makes narrowing one pass over the listing rather
+than one per drop step. A column is as wide as its own widest cell whatever its
+neighbours do, so dropping one changes which widths are in the sum and not what
+any of them are: each rule measures once, zips the widths onto the columns, and
+then does arithmetic over a dozen numbers. The obvious loop — re-render every
+cell, re-measure, drop, repeat — costs a listing's worth of string formatting
+per step, seven of them on a ten-thousand-pod table, for an answer that cannot
+have changed.
+

@@ -81,11 +81,6 @@ fn run(cli: Cli) -> Result<()> {
                     field_selector: field_selector.as_deref(),
                     order: sort,
                     direction: Direction::reversed(sort_reverse),
-                    // `Width::Narrow` is treated as `Default` by the pod table
-                    // — no drop rule for it exists yet — so the pods listing
-                    // is unchanged and does not silently lose columns on a
-                    // small terminal. When it grows one, this line will not
-                    // need to change.
                     width: Width::for_terminal(wide, stdout_terminal_cols()),
                     budget: cli.global.timeout,
                 },
@@ -140,8 +135,8 @@ fn print_line(output: &str) {
 /// returns `None`: better an unnarrowed listing than a wrong one.
 ///
 /// Impure and small on purpose; the arithmetic that decides which columns
-/// drop lives inside the node listing and is tested there without an ioctl
-/// in sight.
+/// drop lives inside each listing — `k8s::nodes` and `k8s::pods::row` — and is
+/// tested there without an ioctl in sight.
 fn stdout_terminal_cols() -> Option<u16> {
     if !std::io::stdout().is_terminal() {
         return None;

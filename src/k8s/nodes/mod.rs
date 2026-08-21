@@ -671,7 +671,7 @@ pub(crate) fn columns(rows: &[NodeRow], width: format::Width) -> Vec<Column<'_>>
             ]);
             columns
         }
-        format::Width::Narrow(target) => narrow_to_fit(columns, rows, target),
+        format::Width::Narrow(target) => narrow_to_fit(&columns, rows, target),
     }
 }
 
@@ -728,47 +728,48 @@ const DROP_ORDER: &[fn(&Column<'_>) -> bool] = &[
 /// long node names — the last step leaves only `NAME` and the row prints
 /// wider than the target, which is the terminal's problem to wrap rather than
 /// ours to solve by dropping the name too.
-fn narrow_to_fit<'a>(
-    mut columns: Vec<Column<'a>>,
-    rows: &[NodeRow],
-    target: u16,
-) -> Vec<Column<'a>> {
+fn narrow_to_fit<'a>(columns: &[Column<'a>], rows: &[NodeRow], target: u16) -> Vec<Column<'a>> {
+    // Measured once: a column is as wide as its own widest cell whatever its
+    // neighbours do, so dropping one changes which widths are in the sum and
+    // not what any of them are. Rendering every cell in the listing again at
+    // each step would be the same answer for a listing's worth of work.
+    let mut measured: Vec<(Column<'a>, usize)> =
+        columns.iter().copied().zip(widths(columns, rows)).collect();
+
     let target = usize::from(target);
     for step in DROP_ORDER {
-        if row_width(&columns, rows) <= target {
-            return columns;
+        if row_width(&measured) <= target {
+            break;
         }
-        columns.retain(|column| !step(column));
+        measured.retain(|(column, _)| !step(column));
     }
-    columns
+
+    measured.into_iter().map(|(column, _)| column).collect()
 }
 
-/// How wide the table's row will be when rendered.
+/// How wide each of these columns will be when rendered.
 ///
-/// Mirrors [`crate::format::table`]'s arithmetic: each column is as wide as
-/// its widest cell or its header, separated by two spaces, with the trailing
-/// pad on the last column trimmed. Kept beside [`narrow_to_fit`] rather than
-/// exposed from `format` because the drop rule is the only caller — the
-/// renderer measures its own columns from the strings it is about to print,
-/// and a second computation shared between the two would be a second chance
-/// for the two to disagree.
-fn row_width(columns: &[Column<'_>], rows: &[NodeRow]) -> usize {
-    if columns.is_empty() {
-        return 0;
-    }
-    let widths: usize = columns
+/// Asks [`format::column_widths`] the question, over the same headers and
+/// cells [`render`] is about to hand [`format::table`]. The arithmetic itself
+/// — each column as wide as its widest cell, two spaces between — belongs to
+/// the renderer: a copy of it here would be free to drift, and a drop rule
+/// measuring rows the renderer disagreed with would stop at a width nothing
+/// prints at.
+fn widths(columns: &[Column<'_>], rows: &[NodeRow]) -> Vec<usize> {
+    let headers: Vec<String> = columns.iter().map(|column| column.header()).collect();
+    let headers: Vec<&str> = headers.iter().map(String::as_str).collect();
+    let cells: Vec<Vec<String>> = rows
         .iter()
-        .map(|column| {
-            let header = column.header().chars().count();
-            let widest_cell = rows
-                .iter()
-                .map(|row| column.cell(row).chars().count())
-                .max()
-                .unwrap_or(0);
-            header.max(widest_cell)
-        })
-        .sum();
-    widths + 2 * (columns.len() - 1)
+        .map(|row| columns.iter().map(|column| column.cell(row)).collect())
+        .collect();
+
+    format::column_widths(&headers, &cells)
+}
+
+/// How wide the row of the columns still standing will be.
+fn row_width(measured: &[(Column<'_>, usize)]) -> usize {
+    let widths: Vec<usize> = measured.iter().map(|(_, width)| *width).collect();
+    format::row_width(&widths)
 }
 
 /// Render the `eks nodes` table.
@@ -2434,10 +2435,12 @@ mod tests {
             headings_at(&rows, 80),
             ["NAME", "STATUS", "CPU", "CPU REQ", "MEMORY", "MEM REQ"],
         );
-        assert!(
-            row_width(&columns(&rows, Width::Narrow(80)), &rows) <= 80,
-            "the reported columns must actually fit 80"
-        );
+        // And the columns it reported really do fit: the assertion is over the
+        // rendered table rather than over the arithmetic that chose it, so a
+        // drop rule measuring rows the renderer disagreed with would fail here.
+        for line in render(&rows, "prod (us-east-1)", &[], Width::Narrow(80)).lines() {
+            assert!(line.chars().count() <= 80, "{line:?} is wider than 80");
+        }
     }
 
     #[test]

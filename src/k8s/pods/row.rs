@@ -793,6 +793,12 @@ impl Column {
 /// `NOMINATED NODE` is the answer "nothing is being preempted", and dropping
 /// the column would leave the user unable to tell that from a flag that did
 /// nothing.
+///
+/// [`Width::Narrow`] then drops columns from that set until the row fits its
+/// target — see [`DROP_ORDER`]. `Wide` is never narrowed: the user typed
+/// `--wide` for the extra columns, not for a table that keeps away from them.
+///
+/// [`Width::Narrow`]: format::Width::Narrow
 pub(crate) fn columns(scope: &super::Scope, rows: &[PodRow], width: format::Width) -> Vec<Column> {
     let mut columns = Vec::with_capacity(12);
     if scope.needs_namespace_column() {
@@ -829,7 +835,113 @@ pub(crate) fn columns(scope: &super::Scope, rows: &[PodRow], width: format::Widt
     if width.is_wide() {
         columns.extend([Column::NominatedNode, Column::ReadinessGates]);
     }
-    columns
+    match width {
+        format::Width::Default | format::Width::Wide => columns,
+        format::Width::Narrow(target) => narrow_to_fit(&columns, rows, target),
+    }
+}
+
+/// The order columns get dropped in when [`Width::Narrow`] cannot fit them all.
+///
+/// A list of predicates rather than a ranking, like the node table's, because
+/// the usage columns want to leave together: `CPU/REQ` beside `AGE` with no
+/// `MEMORY/REQ` between them is half an answer to "what is this burning", and
+/// the eye reading a row of pairs pairs the wrong ones.
+///
+/// The steps, and why they are in this order:
+///
+/// 1. `AGE` — the cheapest column on the row and the least of it. It is also
+///    the one fact the table says twice: `RESTARTS` carries `9 (5m ago)`, so
+///    "when did this last change" survives `AGE` leaving.
+/// 2. `NODE` — the widest cell in the table on EKS, where a node is a
+///    forty-character DNS name, and a follow-up question rather than a first
+///    one: which machine a pod is on matters once you know which pod you are
+///    looking at, and every column that stays is there to find that pod.
+///    Dropping it lands on `kubectl get pods`'s own column set, which is where
+///    a reader's habits are.
+/// 3. `CPU/REQ` and `MEMORY/REQ`, together — the pair the tool exists for, so
+///    late, and the same "both or neither" rule the node table's pairs follow.
+/// 4. `RESTARTS` — the first of the three health columns to go, because it is
+///    the widest of them and because a pod restarting is usually a pod
+///    `STATUS` has something to say about.
+/// 5. `READY` — five characters, and the refinement of `STATUS` rather than a
+///    fact of its own: `0/1` is the detail under `CrashLoopBackOff`.
+/// 6. `STATUS` — the last thing to go, as on the node table. A listing down to
+///    a name and one word keeps the word that names a problem.
+///
+/// `NAME` never drops, for the node table's reason: a row we cannot fit is
+/// still a row about something, and a listing with no names is about nothing.
+/// `NAMESPACE` never drops either, which is the pod table's own rule: it is in
+/// this table only under `-A`, where a name is not an identity — `coredns-xyz`
+/// in `kube-system` and in a copy of it somewhere else are two pods, and the
+/// column the user widened the scope to get is the only thing telling them
+/// apart. It is the second half of `NAME` here, not a column beside it.
+///
+/// The `--wide` columns are not in the list because they cannot be in the
+/// table: [`format::Width::for_terminal`] answers `Wide` when `--wide` was
+/// typed, so a `Narrow` listing never carried `IP`, `NOMINATED NODE`, or
+/// `READINESS GATES` in the first place. A step for them would be a step that
+/// never fires.
+///
+/// [`Width::Narrow`]: format::Width::Narrow
+const DROP_ORDER: &[fn(&Column) -> bool] = &[
+    |c| matches!(c, Column::Age),
+    |c| matches!(c, Column::Node),
+    |c| matches!(c, Column::Cpu { .. } | Column::Memory { .. }),
+    |c| matches!(c, Column::Restarts),
+    |c| matches!(c, Column::Ready),
+    |c| matches!(c, Column::Status),
+];
+
+/// Drop columns from `columns` in [`DROP_ORDER`] until the row fits `target`.
+///
+/// Stops as soon as the row fits, so on a wide-enough terminal a
+/// `Narrow(target)` returns exactly what `Default` does, byte for byte —
+/// narrowing is subtraction, and a table that already fits has nothing to
+/// subtract. When even the columns that never drop are too wide — a
+/// one-column terminal, or a namespace and a pod name that do not fit
+/// together — the last step leaves `NAME` (and `NAMESPACE` under `-A`) and the
+/// row prints wider than the target. That is the terminal's problem to wrap,
+/// rather than ours to solve by printing rows nobody can identify.
+fn narrow_to_fit(columns: &[Column], rows: &[PodRow], target: u16) -> Vec<Column> {
+    // Measured once: a column is as wide as its own widest cell whatever its
+    // neighbours do, so dropping one changes which widths are in the sum and
+    // not what any of them are. Rendering every cell in the listing again at
+    // each step would be the same answer for a listing's worth of work.
+    let mut measured: Vec<(Column, usize)> =
+        columns.iter().copied().zip(widths(columns, rows)).collect();
+
+    let target = usize::from(target);
+    for step in DROP_ORDER {
+        if row_width(&measured) <= target {
+            break;
+        }
+        measured.retain(|(column, _)| !step(column));
+    }
+
+    measured.into_iter().map(|(column, _)| column).collect()
+}
+
+/// How wide each of these columns will be when rendered.
+///
+/// The node table's twin, and asks the same question of the same function:
+/// [`format::column_widths`], over the headers and cells [`render`] is about
+/// to hand [`format::table`]. Measuring any other way would let the drop rule
+/// stop at a width the renderer does not print at.
+fn widths(columns: &[Column], rows: &[PodRow]) -> Vec<usize> {
+    let headers: Vec<&str> = columns.iter().map(|column| column.header()).collect();
+    let cells: Vec<Vec<String>> = rows
+        .iter()
+        .map(|row| columns.iter().map(|column| column.cell(row)).collect())
+        .collect();
+
+    format::column_widths(&headers, &cells)
+}
+
+/// How wide the row of the columns still standing will be.
+fn row_width(measured: &[(Column, usize)]) -> usize {
+    let widths: Vec<usize> = measured.iter().map(|(_, width)| *width).collect();
+    format::row_width(&widths)
 }
 
 /// Render the `eks pods` table.
@@ -3007,5 +3119,290 @@ mod tests {
         );
 
         assert!(output.ends_with(&format!("\n\n{note}")), "{output}");
+    }
+
+    // --- Narrow mode --------------------------------------------------------
+    //
+    // The width tests measure `requesting_rows`: two pods, each asking for
+    // something and each sampled, which is the shape nearly every real
+    // deployment has and the widest the default table gets without `--wide`.
+
+    fn headings_at(scope: &Scope, rows: &[PodRow], target: u16) -> Vec<&'static str> {
+        columns(scope, rows, Width::Narrow(target))
+            .iter()
+            .map(|column| column.header())
+            .collect()
+    }
+
+    fn one_namespace() -> Scope {
+        Scope::Namespace("payments".to_owned())
+    }
+
+    #[test]
+    fn a_wide_enough_narrow_pod_table_is_the_default_one_byte_for_byte() {
+        // Narrowing is subtraction, and a table that already fits has nothing
+        // to subtract: a terminal roomier than the row must leave it alone,
+        // columns and rendered bytes alike. 200 cols is wider than any table
+        // this file produces.
+        let rows = requesting_rows();
+        let scope = one_namespace();
+
+        assert_eq!(
+            columns(&scope, &rows, Width::Narrow(200)),
+            columns(&scope, &rows, Width::Default)
+        );
+        assert_eq!(
+            render(
+                &rows,
+                "prod (us-east-1)",
+                &scope,
+                &unfiltered(),
+                &[],
+                Width::Narrow(200)
+            ),
+            render(
+                &rows,
+                "prod (us-east-1)",
+                &scope,
+                &unfiltered(),
+                &[],
+                Width::Default
+            ),
+        );
+    }
+
+    #[test]
+    fn a_hundred_columns_drops_age_first() {
+        // The fixture's default row is 104 characters, and `AGE` is the
+        // cheapest thing on it: three characters of information the table
+        // already carries in `RESTARTS`'s `9 (5m ago)`.
+        let rows = requesting_rows();
+
+        assert_eq!(
+            headings_at(&one_namespace(), &rows, 100),
+            [
+                "NAME",
+                "READY",
+                "STATUS",
+                "RESTARTS",
+                "CPU/REQ",
+                "MEMORY/REQ",
+                "NODE"
+            ],
+        );
+    }
+
+    #[test]
+    fn eighty_columns_keep_the_usage_pair_and_let_the_node_go() {
+        // 80 cols is the width every laptop lid narrows to under a docked
+        // browser. `NODE` is the widest cell in the table — a node is a
+        // forty-character DNS name on EKS — and it answers the question you
+        // ask *after* you have found the pod, so it goes before the columns
+        // that find it.
+        let rows = requesting_rows();
+        let scope = one_namespace();
+
+        assert_eq!(
+            headings_at(&scope, &rows, 80),
+            [
+                "NAME",
+                "READY",
+                "STATUS",
+                "RESTARTS",
+                "CPU/REQ",
+                "MEMORY/REQ"
+            ],
+        );
+        // And the columns it reported really do fit: the assertion is over the
+        // rendered table rather than over the arithmetic that chose it, so a
+        // drop rule measuring rows the renderer disagreed with would fail here.
+        let table = render(
+            &rows,
+            "prod (us-east-1)",
+            &scope,
+            &unfiltered(),
+            &[],
+            Width::Narrow(80),
+        );
+        for line in table.lines() {
+            assert!(line.chars().count() <= 80, "{line:?} is wider than 80");
+        }
+    }
+
+    #[test]
+    fn a_row_narrower_than_the_name_still_prints_the_name() {
+        // `--width 1`, the acceptance-test extreme: every droppable column is
+        // gone and `NAME` stays, even though the row is still wider than one
+        // character. A listing of rows nobody can identify is worse than a
+        // listing the terminal wraps.
+        assert_eq!(
+            headings_at(&one_namespace(), &requesting_rows(), 1),
+            ["NAME"]
+        );
+    }
+
+    #[test]
+    fn a_terminal_reporting_no_columns_at_all_is_the_same_as_one_column() {
+        // A `Narrow(0)` is a terminal-size query that answered nonsense rather
+        // than a width anybody has. Nothing fits it, so the drop rule runs to
+        // the end and leaves what it never drops — the same answer as 1, and
+        // not an underflow or an empty row.
+        assert_eq!(
+            headings_at(&one_namespace(), &requesting_rows(), 0),
+            ["NAME"]
+        );
+    }
+
+    #[test]
+    fn the_columns_that_fit_are_measured_from_the_cells_not_the_headings() {
+        // `NODE` is four characters of heading over a forty-character node
+        // name, and the drop rule has to read the cells to know that. The same
+        // listing on a cluster with short node names keeps the column at a
+        // width where the EKS-shaped one loses it.
+        let mut short = healthy();
+        if let Some(spec) = short.spec.as_mut() {
+            spec.node_name = Some("node-1".to_owned());
+        }
+        let short = [PodRow::from_pod(&short, None, now())];
+        let long = [PodRow::from_pod(&healthy(), None, now())];
+        let scope = one_namespace();
+
+        assert!(headings_at(&scope, &short, 45).contains(&"NODE"));
+        assert!(!headings_at(&scope, &long, 45).contains(&"NODE"));
+    }
+
+    #[test]
+    fn a_cluster_wide_listing_keeps_the_namespace_beside_the_name() {
+        // Under `-A` a pod's identity is the pair: `coredns-abc` in
+        // `kube-system` and a copy of it elsewhere are two different pods, and
+        // `NAMESPACE` is the column the user widened the scope to get. So it
+        // drops when `NAME` does, which is never.
+        let rows = requesting_rows();
+
+        assert_eq!(headings_at(&Scope::All, &rows, 1), ["NAMESPACE", "NAME"]);
+        // And it is still the first column at a width that drops nothing else,
+        // rather than having been shuffled to the end by the retain.
+        assert_eq!(
+            columns(&Scope::All, &rows, Width::Narrow(200)),
+            columns(&Scope::All, &rows, Width::Default)
+        );
+    }
+
+    #[test]
+    fn the_usage_columns_leave_together_rather_than_singly() {
+        // `CPU/REQ` beside `AGE` with no `MEMORY/REQ` between them is half an
+        // answer, and an eye reading a row of pairs pairs the wrong ones. The
+        // same rule the node table's REQ and USE pairs follow.
+        let rows = requesting_rows();
+        let scope = one_namespace();
+
+        // A width tight enough to lose one of them loses both, at every step
+        // small enough to force the question. A loop rather than one number,
+        // because the invariant is the pairing and not the fixture's exact
+        // cell widths.
+        for target in [1_u16, 20, 40, 60, 73] {
+            let cols = headings_at(&scope, &rows, target);
+            assert_eq!(
+                cols.contains(&"CPU/REQ"),
+                cols.contains(&"MEMORY/REQ"),
+                "{target}: {cols:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_health_columns_go_last_and_status_goes_after_ready() {
+        // What survives when almost nothing does: the word that names the
+        // problem. `READY`'s `0/1` is the detail under `CrashLoopBackOff`, so
+        // it goes first of the two, and `RESTARTS` — the widest of the three
+        // health columns — goes before either.
+        let rows = requesting_rows();
+        let scope = one_namespace();
+
+        assert_eq!(
+            headings_at(&scope, &rows, 50),
+            ["NAME", "READY", "STATUS", "RESTARTS"]
+        );
+        assert_eq!(headings_at(&scope, &rows, 30), ["NAME", "READY", "STATUS"]);
+        assert_eq!(headings_at(&scope, &rows, 22), ["NAME", "STATUS"]);
+    }
+
+    #[test]
+    fn wide_beats_narrow_when_both_could_apply() {
+        // `--wide` was typed; the terminal was not. `Width::for_terminal`
+        // makes that choice, and this asserts the listing agrees: a `Wide` is
+        // the wide set even where the row is far past any terminal.
+        let rows = requesting_rows();
+        let wide = columns(&one_namespace(), &rows, Width::Wide);
+
+        assert!(wide.contains(&Column::Ip));
+        assert!(wide.contains(&Column::NominatedNode));
+        assert!(wide.contains(&Column::ReadinessGates));
+    }
+
+    #[test]
+    fn an_empty_listing_says_the_same_thing_at_any_width() {
+        // There are no columns to drop and no table to fit them in; a terminal
+        // width must not change the sentence explaining why the listing is
+        // blank.
+        let scope = one_namespace();
+        let empty = render(
+            &[],
+            "prod (us-east-1)",
+            &scope,
+            &unfiltered(),
+            &[],
+            Width::Default,
+        );
+
+        for width in [Width::Narrow(1), Width::Narrow(80), Width::Narrow(200)] {
+            assert_eq!(
+                render(&[], "prod (us-east-1)", &scope, &unfiltered(), &[], width),
+                empty
+            );
+        }
+    }
+
+    #[test]
+    fn a_narrowed_table_still_renders_its_footnotes() {
+        // The notes are the reason a missing column is not a mystery, and a
+        // narrow terminal is where columns go missing. Dropping them to save
+        // two lines would take away the explanation exactly where it is most
+        // needed.
+        let rows = requesting_rows();
+        let note = usage_unavailable("Install metrics-server to see live usage.");
+
+        let table = render(
+            &rows,
+            "prod (us-east-1)",
+            &one_namespace(),
+            &unfiltered(),
+            std::slice::from_ref(&note),
+            Width::Narrow(60),
+        );
+
+        assert!(table.ends_with(&note), "{table}");
+    }
+
+    #[test]
+    fn a_listing_with_no_metrics_narrows_from_its_own_shorter_row() {
+        // The usage columns are absent on a cluster with no metrics-server, so
+        // the row starts shorter and the same terminal drops less. The drop
+        // rule reads the columns the listing actually has rather than the ones
+        // it might have had.
+        let rows = [
+            PodRow::from_pod(&healthy(), None, now()),
+            PodRow::from_pod(&healthy(), None, now()),
+        ];
+        let scope = one_namespace();
+
+        assert_eq!(
+            headings_at(&scope, &rows, 80),
+            ["NAME", "READY", "STATUS", "RESTARTS", "AGE", "NODE"]
+        );
+        assert_eq!(
+            columns(&scope, &rows, Width::Narrow(80)),
+            columns(&scope, &rows, Width::Default)
+        );
     }
 }

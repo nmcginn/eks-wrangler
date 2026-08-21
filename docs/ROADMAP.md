@@ -233,8 +233,10 @@ cluster.
   `262m/500m (52%)` cell would print the same number twice, so taking this means
   either a column and a plainer usage cell — the node table's shape — or a column
   that appears only where the usage pair does not. It also puts two more columns
-  on every listing, which is the default table's width, and that belongs with the
-  narrow-mode task rather than arriving as a side effect.
+  on every listing, which is the default table's width — less of an objection now
+  that `k8s::pods::row::DROP_ORDER` exists and a new column can say where it
+  drops, but still a decision about what the default table is before it is one
+  about what a narrow table keeps.
   A pod's *device* request is the same question with the same undecided answer
   and one extra reason to wait: `eks nodes` now shows what each node has booked
   of a GPU, so "which pod is holding the fourth card" is the follow-on question,
@@ -300,7 +302,10 @@ cluster.
   per row is a column, and the pod table is already the wider of the two
   listings, so it belongs with the narrow-mode decision rather than arriving
   ahead of it; a marker on the stale rows instead is the other design, and it
-  needs `Severity` colour to exist before it reads as anything.
+  needs `Severity` colour to exist before it reads as anything. The narrow-mode
+  half of that is settled now that both tables have a drop order: a column
+  taking this on arrives with a place in `DROP_ORDER` rather than as one more
+  thing nothing can drop.
   *Acceptance:* whichever shape it takes, the staleness rule stays
   `Freshness::is_stale`'s rather than a second reading of "a couple of windows";
   a listing where every sample is current gains nothing.
@@ -387,22 +392,49 @@ cluster.
   even after `CPU` has left; that was the reviewer's warning the task's
   wording carried.
 
-- [ ] **A narrow mode for the pod table.**
+- [x] **A narrow mode for the pod table.**
   `Width::Narrow(u16)` now exists on both listings, and the pod-table code path
   treats it as `Default` — a Narrow variant reaches `k8s::pods::row::columns`
   and falls through the `is_wide()` check. The pod table is the wider of the
   two on a cluster with metrics-server and `--wide`, so it wants the same
   treatment, but it wants its own drop order: NAMESPACE, IP, READINESS GATES,
   and NOMINATED NODE all live there and nothing about node-table's list applies.
-  Separate because the drop order is a design question the reviewer should
-  settle — is IP dropped before or after AGE, does NAMESPACE go first under
-  `-A` as it does in `kubectl` — and building it before that would be
-  guessing at the answer. The main-loop plumbing is done: `stdout_terminal_cols`
-  is already passed to both listings.
+  The main-loop plumbing is done: `stdout_terminal_cols` is already passed to
+  both listings.
   *Acceptance:* the drop rule lives in `k8s::pods::row` beside `columns`,
   matching the node table's shape; a piped `eks pods` is unchanged to the
   byte; the choice is a pure function over an available width, tested at 80,
   100, and 1 column.
+  Landed as `k8s::pods::row::DROP_ORDER`: AGE, NODE, the usage pair, RESTARTS,
+  READY, STATUS, with NAME never dropped and NAMESPACE never dropped either —
+  under `-A` the pair is the pod's identity rather than a column beside its
+  name. The wide columns the task worried about turned out not to be a
+  question: `--wide` wins at the type gate, so a narrowed listing never carried
+  IP, NOMINATED NODE, or READINESS GATES to drop, and the order the task asked
+  the reviewer to settle is an order over the default columns only. AGE goes
+  first because RESTARTS already says `9 (5m ago)`; NODE second because it is
+  the widest cell in the table on EKS and answers the question you ask after
+  you have found the pod. The measurement both tables narrow by is now
+  `format::column_widths` and `format::row_width`, the pair the renderer itself
+  pads and separates by, rather than a copy of its arithmetic per table.
+
+- [ ] **A sort note that names a column the terminal dropped.**
+  `eks nodes --sort cpu` and `eks pods --sort cpu` print `Sorted by cpu.` under
+  the table, and on a terminal narrow enough the column that ordering ranks is
+  one of the ones the drop rule took away — so the listing names an ordering
+  over a column the reader cannot see, which is the complaint the "nothing
+  ranked" note was written to answer in the other direction. True of `eks nodes`
+  since narrow mode landed there and of `eks pods` from tonight; noticed while
+  writing the pod drop order. Separate because it is one answer for both tables
+  and the answer is the reviewer's: either the ordering's column is exempt from
+  `DROP_ORDER` — which means deciding what `--sort cpu` protects on a node,
+  where `CPU USE` cannot stay without the `CPU` it is a share of, and so drags a
+  second column back into a row that did not fit — or the note says the column
+  is hidden and the drop rule stays as it is. The two read very differently on
+  an 80-column terminal, and building either would be guessing at which.
+  *Acceptance:* whichever shape it takes, one wording and one rule for both
+  listings, through `k8s::order::note` as now; a listing wide enough to keep
+  every column says exactly what it says today.
 
 ### Follow-ups from the request columns
 
