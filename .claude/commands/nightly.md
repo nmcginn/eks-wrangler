@@ -11,11 +11,11 @@ built around. Then:
 ## 1. Choose the task
 
 Read `docs/ROADMAP.md` and take the **highest-priority unchecked task** that fits
-in a single PR — roughly 200–400 lines of production change, with its tests on
-top. Read `CLAUDE.md`'s "What one pull request means" before you size anything:
-the tests in this codebase are two to four times the length of the code they
-cover, and judging a task by the total diff is what makes a night's work look
-too big when it is not.
+in a single, complete PR. Read `CLAUDE.md`'s "What one pull request means"
+before you size anything: there is no line target, and the tests in this
+codebase are two to four times the length of the code they cover — judging a
+task by the total diff is what makes a night's work look too big when it is
+not.
 
 Before starting, check open pull requests. If a previous night's PR is still open
 and unmerged, prefer work that does not conflict with it, or address review
@@ -71,10 +71,9 @@ one question to it: **would the reviewer expect this to be in the PR already?**
   finish it.
 
 An entry that fails the question is not an entry. Delete it and do the work now,
-even if that takes the PR past the size you planned — a finished change at 600
-lines beats two thirds of one at 400 and a second review of the same paragraph
-tomorrow. Whether the extra work is small is not the test; whether it completes
-a thought this PR started is.
+however large that makes the PR — a finished change beats two thirds of one and
+a second review of the same paragraph tomorrow. Whether the extra work is small
+is not the test; whether it completes a thought this PR started is.
 
 Keep the entries that pass, and in the PR give each one a sentence saying why it
 is separate. If you cannot write that sentence, it was not a follow-up.
