@@ -1183,3 +1183,110 @@ REQ` since decision 46; a column added afterwards should not be what takes them
 away. The existing test asserting that 80 columns keep the request pair failed
 when `PODS` was placed later, which is exactly the signal that test was written
 to give.
+
+### 49. Colour is spent on the rows worth looking at, and on nothing else
+
+`nodes::Share::severity` and `PodRow::severity` had classified every percentage
+and every pod status since they were written, and the CLI table then printed the
+answer in plain text. A node at 97% looked exactly like a node at 4%.
+
+The obvious implementation was to reuse `Theme::severity`, which the dashboard
+already draws bars with, and paint each graded cell in it. That is wrong, and the
+reason is what most of this change turns on: `Theme::severity` writes
+`Severity::Ok` in green. A dashboard draws a severity as a *shape* — a bar filled
+green along its length is a quantity, and the green is the fill. A table draws it
+as ink on a line somebody is scanning, and on a healthy cluster nearly every cell
+is `Ok`. Painting all of them green would put the strongest signal a terminal has
+on the rows with nothing to say, and leave the one broken node competing with two
+hundred green neighbours for the eye.
+
+So there is a second mapping, `Theme::severity_ink`, and `Ok` maps to `None`:
+the absence of an escape sequence, so the cell prints in whatever colour the
+user's terminal was already using — which is what the whole table printed in
+before this existed. `Warn` and `Critical` take the theme's warning and danger
+colours. `Unknown` is muted rather than alarming, because it is an absence: a `-`
+where a figure could not be read, and greying it out says so without shouting.
+The consequence, and the point: on a healthy cluster `eks nodes` emits no escape
+sequences at all, and every byte of colour on screen is a row somebody should
+look at.
+
+What that mapping is *not* is a second opinion about what counts as hot. The
+thresholds stay `Severity::from_utilisation`'s, one rule for both surfaces; a
+test asserts the two mappings agree variant for variant, differing only in that a
+table leaves `Ok` alone. `Column::severity` on each table likewise only says
+which cells carry a reading — it re-reads `row.severity` and `Share::severity`
+and invents nothing.
+
+**The severity travels in the cell.** `format::Cell` is a `String` and an
+`Option<Severity>`, rather than `table` taking a parallel grid of colours. Both
+listings narrow themselves to a terminal by `retain`ing over their columns, and a
+parallel grid would be one `retain` away from colouring the wrong column with
+nothing on screen to say so.
+
+**Ink never moves a column.** Every width comes from the cell's text and the
+escapes are wrapped around it after the padding is decided, so a coloured table
+and a plain one have their columns in the same places, character for character.
+Both listings assert it directly: strip the escapes back off and the plain table
+is underneath, at every narrow width as well as the default. It is also why an
+empty graded cell is left alone — a zero-width cell in escapes is a sequence
+`table`'s trailing-space trim cannot see, and it would leave a line ending in ink
+with nothing inside it.
+
+**Headers and footnotes stay plain.** A heading names a column; it is not a
+reading off one. A footnote is prose under the table, and it is usually
+explaining something the table has already coloured — saying it a second time in
+red is shouting.
+
+**The pod table colours `STATUS` and nothing else, on purpose.** `READY` is not a
+second column to colour: `0/1` is *why* a `Running` pod grades `Warn`, so
+colouring it would paint one judgement across two columns. `CPU/REQ` and
+`MEMORY/REQ` are a gap rather than a rule, and the gap is deliberate.
+`Severity::from_utilisation`'s thresholds are about a node's allocatable, where
+90% booked is nearly full; a pod at 90% of the CPU it asked for is a well-sized
+pod, and one at 400% of a 10m request is burning 40m and is nobody's emergency.
+Colouring those cells on the node's thresholds would tell the reader something
+untrue, in red, on most of their rows. What "hot" means for a pod against its own
+request is a decision, and it is on the roadmap rather than in this change.
+
+**`--color`, and who wins.** `auto` is the default and is the rule the tool
+already followed for narrowing: a terminal gets colour, a pipe or a file does
+not, so `eks nodes | grep NotReady` is the bytes it always was. `auto` also
+honours [`NO_COLOR`](https://no-color.org/) — set and *not empty*, because an
+empty value is the spec's own way of saying "not set" and a shell that exports
+`NO_COLOR=` into every process must not silently disable colour everywhere — and
+`TERM=dumb`, the one value that promises no escape sequences are understood.
+`--color always` overrides all three, which is what makes `eks nodes --color
+always | less -R` work; `--color never` overrides them the other way. The flag is
+global rather than per-listing because it describes the output stream and not one
+table, and it is a `clap::ValueEnum` on the domain type for the reason `--sort`
+is one (decision 28): `--color sometimes` is rejected with the three that exist
+listed, before anything connects.
+
+`eks contexts` renders through `format::table` (decision 45) and gains nothing
+from any of this, because none of its cells carries a severity — a context is a
+name, a region, and a namespace read out of a file, and there is nothing about it
+to be alarmed by. `--color always` there is a flag with nothing to do, which is
+honest. The one mark that does single a row out, the `*` gutter, is not a
+severity either, and whether it deserves a colour is a separate question on the
+roadmap.
+
+**The escape sequences are written here rather than taken from `crossterm`.**
+`theme::foreground` maps a `ratatui::style::Color` to an SGR sequence, every
+variant spelled out with no catch-all arm — so a colour added to `ratatui` in a
+future release stops the build rather than silently printing plain — and a test
+asserts the exact bytes for each. A sequence with a typo in it is a column five
+characters out of place on somebody else's terminal, and only an assertion on the
+bytes catches that. The theme's own colours are 24-bit; a terminal that does not
+understand `38;2;r;g;b` ignores the sequence, which leaves the same table in the
+colour it had before, and `NO_COLOR` or `--color never` is there for anything
+stranger.
+
+**The dashboard is out of scope for `NO_COLOR`.** The TUI keeps its colours
+whatever the environment says. `NO_COLOR` is about software that adds colour to
+text it prints; a full-screen interface made of borders, panes, and a selected
+row is not that, and honouring the variable there would mean a monochrome theme
+rather than a switch — which is the light-theme task's problem, not this one's.
+
+**`commands::nodes` grew a `Request` struct** to carry the palette, mirroring
+`eks pods` (decision 29). It was going to have to: `list` was already at seven
+parameters, four of them describing the same one request.

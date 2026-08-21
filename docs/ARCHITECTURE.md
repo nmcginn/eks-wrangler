@@ -10,7 +10,8 @@ src/
   kubeconfig.rs        Reading and safely rewriting kubeconfig files.
   cluster.rs           Turning kubeconfig entries into human-facing views.
   format.rs            Ages and aligned tables — pure string formatting.
-  theme.rs             The entire colour palette and severity thresholds.
+  theme.rs             The entire colour palette, the severity thresholds, and
+                       the CLI's colour palette and escape sequences.
   k8s/                 The Kubernetes client, paging and request budgets,
                        quantities, selectors, nodes, pods, and metrics.
   commands/            One module per user-facing command.
@@ -173,6 +174,21 @@ picks columns has no ioctl to fake in a test. `format::list` sits beside it for 
 set of names out as prose, serial comma and all, is a rule that belongs in one
 place whether the sentence around it is offering orderings to sort by or naming
 the columns a failed pod listing emptied.
+
+Colour is the same split again, and it is why a `format::Cell` carries a
+`Severity` beside its text rather than a table being handed a grid of colours to
+apply. Which cells are *readings* rather than facts is each listing's answer —
+`Column::severity` in `k8s::nodes` and `k8s::pods::row` — and it is a re-reading
+of severities the rows already carry, never a new rule about what counts as hot.
+How a severity is *drawn* is `theme`'s: `Theme::severity` for a dashboard bar
+and `Theme::severity_ink` for a line of terminal text, which are deliberately
+not the same four colours. Whether it is drawn at all is `theme::Palette`, a
+pure function over `--color`, whether stdout is a terminal, `NO_COLOR`, and
+`TERM`; the I/O behind those answers happens once in `main.rs`, next to the
+terminal-size lookup, for the same reason. The renderer then pads by the cell's
+*text* and wraps the escapes around it afterwards, so a coloured table and a
+plain one have their columns in the same places — which is what lets the drop
+rules above keep measuring rows without knowing colour exists.
 
 Selectors take the same shape in reverse: `k8s::selector` parses the label and
 field selectors a user types (`app=api`, `status.phase!=Running`) into a

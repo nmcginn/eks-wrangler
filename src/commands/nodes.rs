@@ -13,30 +13,52 @@ use crate::k8s::order::Direction;
 use crate::k8s::page;
 use crate::k8s::{self, nodes as k8s_nodes, pods as k8s_pods};
 use crate::kubeconfig::KubeConfig;
+use crate::theme::Palette;
+
+/// What the user asked `eks nodes` for, as it came off the command line.
+///
+/// A struct rather than five more parameters, for the reason `eks pods`'s
+/// flags travel as one (decision 29): the flags describe a single request, and
+/// a row of same-typed positional arguments is how an ordering quietly ends up
+/// in the direction's slot. Every field is applied to the finished rows, so
+/// none of them changes what is fetched — only how it is read back.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Request {
+    /// `--sort`.
+    pub order: k8s_nodes::Order,
+    /// `--sort-reverse`, which flips `order` without moving the rows the
+    /// ordering has nothing to rank — those stay in the tail.
+    pub direction: Direction,
+    /// `--wide`, or the width of the terminal this is being printed into.
+    /// Every column it adds arrived with the nodes, so it costs no request.
+    pub width: Width,
+    /// Whether the graded cells are written in colour. Decided in `main`,
+    /// where stdout is, so nothing below here asks what a terminal is.
+    pub palette: Palette,
+    /// `--timeout`, spent per request rather than per command: each of the
+    /// three listings below is read in pages, and a cluster large enough to
+    /// need several of them should not be cut off for being large.
+    pub budget: page::Budget,
+}
 
 /// Fetch and render the node table for the selected cluster.
 ///
 /// `selector` is whatever the user passed to `--context`: a full context name,
 /// or the short cluster name `eks contexts` shows. `None` means the cluster
-/// their kubeconfig already points at.
-///
-/// `order` and `direction` are `--sort` and `--sort-reverse`. They are applied
-/// to the finished rows, so they change nothing about what is fetched — only
-/// the order it is read in. `width` is `--wide`, and is the same again: every
-/// column it adds arrived with the nodes, so it costs no extra request.
-///
-/// `budget` is `--timeout`, and it is per request rather than per command: each
-/// of the three listings below is read in pages, and a cluster large enough to
-/// need several of them should not be cut off for being large.
+/// their kubeconfig already points at. `request` is the rest of the flags.
 pub async fn list(
     config: &KubeConfig,
     paths: &[PathBuf],
     selector: Option<&str>,
-    order: k8s_nodes::Order,
-    direction: Direction,
-    width: Width,
-    budget: page::Budget,
+    request: Request,
 ) -> Result<String> {
+    let Request {
+        order,
+        direction,
+        width,
+        palette,
+        budget,
+    } = request;
     let target = target_cluster(config, selector)?;
     let label = target.label();
 
@@ -195,7 +217,7 @@ pub async fn list(
         |candidate| k8s_nodes::ranks_any(&rows, candidate),
     ));
 
-    Ok(k8s_nodes::render(&rows, &label, &footnotes, width))
+    Ok(k8s_nodes::render(&rows, &label, &footnotes, width, palette))
 }
 
 /// Work out which cluster to talk to, before any network call happens.

@@ -900,6 +900,7 @@ mod tests {
             &super::super::Selectors::default(),
             &[],
             crate::format::Width::Default,
+            crate::theme::Palette::Plain,
         );
 
         let printed: Vec<&str> = table
@@ -935,6 +936,7 @@ mod tests {
             &super::super::Selectors::default(),
             &[],
             crate::format::Width::Default,
+            crate::theme::Palette::Plain,
         );
 
         let printed: Vec<&str> = table
