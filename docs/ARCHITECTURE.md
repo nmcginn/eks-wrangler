@@ -283,9 +283,37 @@ instance types happen to be in the cluster you tried it on.
 Only the async commands build a Tokio runtime, and they build it themselves —
 see `commands::block_on`, which is also where an abandoned credential helper is
 left behind rather than waited for. `eks contexts` still starts with nothing but
-a file read. When the dashboard grows live data (see `docs/ROADMAP.md`), fetching moves
-onto a background task feeding `App` over a channel; the render loop will never
-await it.
+a file read.
+
+The dashboard's node pane refreshes itself in the background rather than
+fetching once at startup: `main` builds one closure over the config,
+kubeconfig paths, and request budget (`commands::nodes::spawn_gather`), and
+`ui::event_loop` calls it again on the refresh interval (`--refresh`), on
+`r`, and whenever the sidebar selects a different cluster. The render loop
+never awaits any of those calls — each iteration only polls the channel for a
+result that has already arrived, the same non-blocking `try_recv` the
+original one-shot fetch used, so a hung request never costs the UI a
+keypress. A selection change resets the pane to `Loading` first, since a
+different cluster's request is not the one the pane is showing; `r` and the
+interval leave the existing rows up while their fetch is in flight, and a
+failure that arrives after a successful load keeps them rather than blanking
+the pane over one bad poll. See decision 55.
+
+The dashboard also gained its first drill-down: `Enter` on a highlighted node
+opens the pods placed on it, and `Esc` backs out rather than always quitting.
+That needed a second axis of state beyond which cluster is selected —
+`Focus` says which pane `j`/`k`/`Home`/`End` move the highlight in
+(`Sidebar` or `Detail`, toggled by `Tab`), and `View` says what the detail
+pane is showing (`Overview` or `NodePods { node }`). Both are read by
+`App::on_key`, which is still the one place a keypress becomes a state
+change, and by `ui::draw`, which uses `Focus` to decide which pane's border
+gets `Theme::pane_border`'s focus colour and whether a row highlight is
+drawn at all. `ui::event_loop` watches `App::view()` for a change the same
+way it already watched the selected cluster, and starts a
+`commands::pods::spawn_gather_for_node` fetch when it sees one — a second
+`PodsFetcher` closure beside `NodesFetcher`, both boxed trait objects rather
+than generics on `run`/`event_loop`, so a third pane's fetch trigger does
+not add a third type parameter. See decision 56.
 
 ## Testing
 
