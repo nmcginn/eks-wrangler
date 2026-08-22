@@ -660,7 +660,7 @@ cluster.
   *Acceptance:* first paint happens before data arrives; loading state is
   visible; `TestBackend` tests for loading, loaded, and error states.
 
-- [ ] **Background refresh.**
+- [x] **Background refresh.**
   Move fetching onto a background task feeding the UI over a channel. Refresh on
   an interval and on demand (`r`).
   *Acceptance:* the render loop never awaits a network call; a hung API call
@@ -767,6 +767,31 @@ cluster.
 ---
 
 ## Done
+
+- **Background refresh** (2026-08-22) — the node pane no longer fetches once
+  at startup and stops: `--refresh` (default `15s`, `0` to disable) starts a
+  new fetch on an interval, `r` refreshes on demand, and selecting a
+  different cluster in the sidebar refetches immediately rather than leaving
+  the previous cluster's rows on screen under the new one's name. `main`
+  builds one `spawn_nodes` closure over the config, kubeconfig paths, and
+  `--timeout` budget, and hands it to `ui::run` alongside the same
+  `commands::nodes::spawn_gather` receiver it always started before the
+  terminal took over — every fetch after that first one goes through the
+  closure instead of a second mechanism. The render loop still never awaits a
+  network call: it polls the channel non-blockingly once a frame, exactly as
+  the one-shot fetch did. `App::start_loading_nodes` is the new pure
+  transition for a selection change; `r` and the interval deliberately do not
+  call it, so the pane keeps showing its current rows while a fetch for the
+  *same* cluster is in flight rather than flashing back to `Loading` every
+  refresh. `NodesState::Loaded` gained `refresh_error`, because that same
+  choice means a failure can no longer be presented as "nothing loaded" —
+  `App::apply_nodes` now only moves to `NodesState::Error` when nothing had
+  loaded yet; a failure after a successful fetch keeps the last good rows and
+  notes the failure under the heading instead of blanking a working pane over
+  one bad poll. `RefreshInterval` wraps `k8s::page::Budget` for its grammar
+  and round trip rather than growing a second duration parser, staying its
+  own type because `0` means something different for the two flags. See
+  decision 55.
 
 - **Carry the freshness and unsampled notes into the dashboard's panes**
   (2026-08-22) — the node pane now says how old its usage bars are, in a line

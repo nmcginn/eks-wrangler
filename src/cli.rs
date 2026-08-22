@@ -11,6 +11,7 @@ use crate::k8s::nodes::Order as NodeOrder;
 use crate::k8s::page::Budget;
 use crate::k8s::pods::Order as PodOrder;
 use crate::theme::ColourChoice;
+use crate::ui::RefreshInterval;
 
 /// Explore and interact with AWS EKS clusters.
 #[derive(Debug, Parser)]
@@ -62,6 +63,13 @@ pub struct GlobalArgs {
         default_value = "auto"
     )]
     pub color: ColourChoice,
+
+    /// How often the dashboard's panes refresh themselves in the background,
+    /// on top of pressing `r` to refresh on demand. `0` turns automatic
+    /// refresh off. The CLI listings ignore this flag: they print once and
+    /// exit.
+    #[arg(long, global = true, value_name = "DURATION", default_value_t = RefreshInterval::default())]
+    pub refresh: RefreshInterval,
 
     /// Increase log verbosity. Repeat for more detail.
     #[arg(long, short = 'v', global = true, action = clap::ArgAction::Count)]
@@ -488,6 +496,44 @@ mod tests {
         // cannot drift apart silently.
         assert_eq!(parse(&["eks", "nodes"]).global.timeout, Budget::default());
         assert_eq!(Budget::default().to_string(), "30s");
+    }
+
+    #[test]
+    fn the_dashboard_refreshes_every_fifteen_seconds_unless_told_otherwise() {
+        assert_eq!(parse(&["eks"]).global.refresh, RefreshInterval::default());
+        assert_eq!(RefreshInterval::default().to_string(), "15s");
+    }
+
+    #[test]
+    fn refresh_is_a_global_flag_that_parses_on_either_side_of_a_subcommand() {
+        let before = parse(&["eks", "--refresh", "5s", "nodes"]);
+        let after = parse(&["eks", "nodes", "--refresh", "5s"]);
+
+        assert_eq!(before.global.refresh, after.global.refresh);
+        assert_eq!(
+            before.global.refresh,
+            RefreshInterval::every(std::time::Duration::from_secs(5))
+        );
+    }
+
+    #[test]
+    fn refresh_zero_turns_automatic_refresh_off() {
+        assert_eq!(
+            parse(&["eks", "--refresh", "0"]).global.refresh,
+            RefreshInterval::never()
+        );
+    }
+
+    #[test]
+    fn a_refresh_interval_that_is_not_a_duration_is_rejected_with_examples() {
+        // Same grammar as `--timeout`, so the same bargain: reject before
+        // anything starts, with the accepted spellings in the message.
+        let error = Cli::try_parse_from(["eks", "--refresh", "soon"])
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("soon"), "{error}");
+        assert!(error.contains("30s"), "{error}");
     }
 
     #[test]

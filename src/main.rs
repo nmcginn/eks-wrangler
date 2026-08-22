@@ -19,7 +19,7 @@ use eks::k8s::order::Direction;
 use eks::k8s::page::Budget;
 use eks::kubeconfig::KubeConfig;
 use eks::theme::{ColourChoice, Palette};
-use eks::ui::{self, App};
+use eks::ui::{self, App, RefreshInterval};
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
@@ -46,6 +46,7 @@ fn run(cli: Cli) -> Result<()> {
             &paths,
             cli.global.context.as_deref(),
             cli.global.timeout,
+            cli.global.refresh,
         ),
         Command::Contexts { quiet } => {
             print_line(&contexts::list(&config, quiet));
@@ -116,6 +117,7 @@ fn dashboard(
     paths: &[PathBuf],
     requested_context: Option<&str>,
     budget: Budget,
+    refresh: RefreshInterval,
 ) -> Result<()> {
     let views = contexts::views(config);
     let mut app = App::new(views);
@@ -130,20 +132,32 @@ fn dashboard(
         }
     }
 
+    // Every fetch after this one — `r`, the refresh interval, a different
+    // cluster selected in the sidebar — goes through this closure too, so
+    // `ui::run` never has to know how a `NodesFetch` is built, only how to
+    // ask for one.
+    let spawn_nodes = {
+        let config = config.clone();
+        let paths = paths.to_vec();
+        move |context: &str| {
+            nodes::spawn_gather(
+                config.clone(),
+                paths.clone(),
+                Some(context.to_owned()),
+                budget,
+            )
+        }
+    };
+
     // Kicked off before the terminal takes over, so the fetch is already in
     // flight for the first frame — the loading state a bare `eks` shows is
     // real, not simulated. No cluster selected, nothing to fetch: the empty
     // kubeconfig message `draw_detail` prints does not depend on node state.
-    let nodes_rx = app.selected_cluster().map(|cluster| {
-        nodes::spawn_gather(
-            config.clone(),
-            paths.to_vec(),
-            Some(cluster.context_name.clone()),
-            budget,
-        )
-    });
+    let nodes_rx = app
+        .selected_cluster()
+        .map(|cluster| spawn_nodes(&cluster.context_name));
 
-    ui::run(app, nodes_rx.as_ref())
+    ui::run(app, nodes_rx, spawn_nodes, refresh)
 }
 
 /// Print a command's output, skipping the newline for empty results so

@@ -32,6 +32,12 @@ pub enum NodesState {
         /// when the columns have nothing to date, including when the metrics
         /// read failed outright: a bar reading `-` already says so.
         usage_note: Option<String>,
+        /// Set when the most recent *background* refresh failed after an
+        /// earlier fetch had already succeeded. The rows shown are still the
+        /// last good listing — wiping them because one poll failed would
+        /// make a transient network blip look like the cluster lost every
+        /// node.
+        refresh_error: Option<String>,
     },
     /// The fetch failed; the message is already a full sentence, via
     /// `k8s::explain`.
@@ -49,8 +55,18 @@ pub(super) fn draw(frame: &mut Frame, area: Rect, state: &NodesState, theme: The
         NodesState::Loaded { rows, .. } if rows.is_empty() => {
             vec![Line::styled("This cluster has no nodes.", theme.dim())]
         }
-        NodesState::Loaded { rows, usage_note } => {
+        NodesState::Loaded {
+            rows,
+            usage_note,
+            refresh_error,
+        } => {
             let mut lines = vec![Line::styled("NODES", theme.heading())];
+            if let Some(error) = refresh_error {
+                lines.push(Line::styled(
+                    format!("Last refresh failed: {error}"),
+                    theme.severity(Severity::Warn),
+                ));
+            }
             // Split rather than handed straight to one `Line`: a stale sample
             // earns a second sentence of advice, and `ratatui` does not treat
             // an embedded `\n` as a line break the way a terminal does.
@@ -202,6 +218,7 @@ mod tests {
         NodesState::Loaded {
             rows,
             usage_note: None,
+            refresh_error: None,
         }
     }
 
@@ -304,6 +321,7 @@ mod tests {
         let state = NodesState::Loaded {
             rows: vec![node("worker-1")],
             usage_note: Some("Usage is up to 8s old, averaged over 20s.".to_owned()),
+            refresh_error: None,
         };
 
         let rendered = render(&state);
@@ -326,6 +344,7 @@ mod tests {
                  in kube-system."
                     .to_owned(),
             ),
+            refresh_error: None,
         };
 
         // Wide enough that neither sentence wraps a second time on top of the
@@ -354,11 +373,32 @@ mod tests {
         let state = NodesState::Loaded {
             rows: Vec::new(),
             usage_note: Some("Usage is up to 8s old, averaged over 20s.".to_owned()),
+            refresh_error: None,
         };
 
         let rendered = render(&state);
 
         assert!(rendered.contains("no nodes"), "{rendered}");
         assert!(!rendered.contains("Usage is up to"), "{rendered}");
+    }
+
+    #[test]
+    fn a_failed_refresh_keeps_the_last_good_rows_visible() {
+        let state = NodesState::Loaded {
+            rows: vec![node("worker-1")],
+            usage_note: None,
+            refresh_error: Some("could not list nodes: nope".to_owned()),
+        };
+
+        let rendered = render(&state);
+
+        assert!(rendered.contains("Last refresh failed"), "{rendered}");
+        assert!(rendered.contains("worker-1"), "{rendered}");
+    }
+
+    #[test]
+    fn no_refresh_error_is_shown_when_the_last_fetch_succeeded() {
+        let rendered = render(&loaded(vec![node("worker-1")]));
+        assert!(!rendered.contains("Last refresh failed"), "{rendered}");
     }
 }

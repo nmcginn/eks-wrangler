@@ -283,9 +283,21 @@ instance types happen to be in the cluster you tried it on.
 Only the async commands build a Tokio runtime, and they build it themselves —
 see `commands::block_on`, which is also where an abandoned credential helper is
 left behind rather than waited for. `eks contexts` still starts with nothing but
-a file read. When the dashboard grows live data (see `docs/ROADMAP.md`), fetching moves
-onto a background task feeding `App` over a channel; the render loop will never
-await it.
+a file read.
+
+The dashboard's node pane refreshes itself in the background rather than
+fetching once at startup: `main` builds one closure over the config,
+kubeconfig paths, and request budget (`commands::nodes::spawn_gather`), and
+`ui::event_loop` calls it again on the refresh interval (`--refresh`), on
+`r`, and whenever the sidebar selects a different cluster. The render loop
+never awaits any of those calls — each iteration only polls the channel for a
+result that has already arrived, the same non-blocking `try_recv` the
+original one-shot fetch used, so a hung request never costs the UI a
+keypress. A selection change resets the pane to `Loading` first, since a
+different cluster's request is not the one the pane is showing; `r` and the
+interval leave the existing rows up while their fetch is in flight, and a
+failure that arrives after a successful load keeps them rather than blanking
+the pane over one bad poll. See decision 55.
 
 ## Testing
 

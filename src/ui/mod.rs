@@ -4,8 +4,9 @@
 //! I/O, so navigation can be tested by feeding it key events. Only [`run`]
 //! touches the real terminal.
 
+use std::str::FromStr;
 use std::sync::mpsc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -16,6 +17,7 @@ use ratatui::{Frame, Terminal};
 
 use crate::cluster::ClusterView;
 use crate::commands::nodes::NodesFetch;
+use crate::k8s::page::{Budget, ParseError};
 use crate::theme::Theme;
 
 mod nodes;
@@ -26,6 +28,61 @@ use nodes::NodesState;
 /// live data will feel immediate once it exists, long enough to stay at
 /// effectively zero CPU while idle.
 const TICK: Duration = Duration::from_millis(250);
+
+/// How often the dashboard automatically starts a new node fetch, on top of
+/// pressing `r` to refresh on demand.
+///
+/// Delegates entirely to [`Budget`]'s grammar and round trip — `30s`, `500ms`,
+/// `2m`, a bare number of seconds — because a second parser for the same
+/// durations would only be a second place for it to drift from `--timeout`'s.
+/// The number means something different here, though: `0` turns automatic
+/// refresh off rather than "wait forever" for one request, so this stays its
+/// own type rather than reusing `Budget` at the call site, where a field
+/// named `refresh: Budget` would read as a request timeout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RefreshInterval(Budget);
+
+impl RefreshInterval {
+    /// Refresh every `duration`.
+    #[must_use]
+    pub fn every(duration: Duration) -> Self {
+        Self(Budget::of(duration))
+    }
+
+    /// Never refresh automatically; `r` still works.
+    #[must_use]
+    pub fn never() -> Self {
+        Self(Budget::unlimited())
+    }
+
+    /// How long to wait between automatic refreshes, or `None` for never.
+    #[must_use]
+    pub fn interval(self) -> Option<Duration> {
+        self.0.limit()
+    }
+}
+
+impl Default for RefreshInterval {
+    /// Fifteen seconds: often enough that a pane feels alive, rarely enough
+    /// that an idle dashboard is not a standing drain on the API server.
+    fn default() -> Self {
+        Self::every(Duration::from_secs(15))
+    }
+}
+
+impl FromStr for RefreshInterval {
+    type Err = ParseError;
+
+    fn from_str(input: &str) -> Result<Self, Self::Err> {
+        Budget::from_str(input).map(Self)
+    }
+}
+
+impl std::fmt::Display for RefreshInterval {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
 
 /// What the event loop should do after handling an input.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -85,17 +142,44 @@ impl App {
 
     /// Apply the outcome of a node fetch.
     ///
-    /// The one state transition the background channel can cause, kept
-    /// beside [`on_key`](Self::on_key) so both are tested the same way:
-    /// build an `App`, call the method, assert what changed.
+    /// One of the two state transitions the background channel can cause,
+    /// kept beside [`on_key`](Self::on_key) so both are tested the same way:
+    /// build an `App`, call the method, assert what changed. A failure after
+    /// an earlier fetch had already loaded keeps the last good rows on
+    /// screen rather than blanking them — background refresh means a
+    /// transient failure is no longer the *first* answer a pane can get, and
+    /// the pane should not read as "the cluster lost every node" over one
+    /// missed poll.
     pub fn apply_nodes(&mut self, result: Result<NodesFetch, String>) {
-        self.nodes = match result {
-            Ok(fetch) => NodesState::Loaded {
+        self.nodes = match (result, std::mem::take(&mut self.nodes)) {
+            (Ok(fetch), _) => NodesState::Loaded {
                 rows: fetch.rows,
                 usage_note: fetch.usage_note,
+                refresh_error: None,
             },
-            Err(message) => NodesState::Error(message),
+            (
+                Err(message),
+                NodesState::Loaded {
+                    rows, usage_note, ..
+                },
+            ) => NodesState::Loaded {
+                rows,
+                usage_note,
+                refresh_error: Some(message),
+            },
+            (Err(message), _) => NodesState::Error(message),
         };
+    }
+
+    /// Reset the node pane to `Loading`.
+    ///
+    /// Called before a fetch starts for a cluster the pane has not shown
+    /// data for yet — selecting a different cluster in the sidebar — so the
+    /// pane does not keep displaying the previous cluster's rows while a
+    /// different one's request is in flight, which would read as the new
+    /// cluster's data rather than stale leftovers.
+    pub fn start_loading_nodes(&mut self) {
+        self.nodes = NodesState::Loading;
     }
 
     /// Highlight the cluster with this context name.
@@ -167,34 +251,55 @@ impl App {
 /// Terminal setup and teardown are handled by `ratatui`, which installs a panic
 /// hook so a crash cannot leave the user staring at a wedged shell.
 ///
-/// `nodes_rx` is the background fetch `main` started for the selected
-/// cluster, if there is one — see
-/// [`commands::nodes::spawn_gather`](crate::commands::nodes::spawn_gather).
-/// This function never awaits it: each iteration only polls for a result
-/// that has already arrived, which is what keeps a hung request from
-/// blocking a keypress.
-pub fn run(app: App, nodes_rx: Option<&mpsc::Receiver<Result<NodesFetch, String>>>) -> Result<()> {
+/// `nodes_rx` is the background fetch `main` already started for the selected
+/// cluster before the terminal took over, if there is one, so the first frame
+/// never waits on it. `spawn_nodes` is how every fetch after that one is
+/// started — on `r`, on the refresh interval, and when the sidebar selects a
+/// different cluster — built by the caller over the config, kubeconfig paths,
+/// and request budget the CLI itself uses (see
+/// [`commands::nodes::spawn_gather`](crate::commands::nodes::spawn_gather)).
+/// This function never awaits a fetch: each iteration only polls for a result
+/// that has already arrived, which is what keeps a hung request from blocking
+/// a keypress.
+pub fn run<F>(
+    app: App,
+    nodes_rx: Option<mpsc::Receiver<Result<NodesFetch, String>>>,
+    spawn_nodes: F,
+    refresh: RefreshInterval,
+) -> Result<()>
+where
+    F: Fn(&str) -> mpsc::Receiver<Result<NodesFetch, String>>,
+{
     let mut terminal = ratatui::init();
-    let result = event_loop(&mut terminal, app, nodes_rx);
+    let result = event_loop(&mut terminal, app, nodes_rx, spawn_nodes, refresh);
     ratatui::restore();
     result
 }
 
-fn event_loop<B>(
+fn event_loop<B, F>(
     terminal: &mut Terminal<B>,
     mut app: App,
-    nodes_rx: Option<&mpsc::Receiver<Result<NodesFetch, String>>>,
+    mut nodes_rx: Option<mpsc::Receiver<Result<NodesFetch, String>>>,
+    spawn_nodes: F,
+    refresh: RefreshInterval,
 ) -> Result<()>
 where
     B: ratatui::backend::Backend,
     B::Error: std::error::Error + Send + Sync + 'static,
+    F: Fn(&str) -> mpsc::Receiver<Result<NodesFetch, String>>,
 {
+    // What the pane's rows currently belong to, so a change is detectable
+    // without the fetch itself carrying its own request back to compare —
+    // `App` only ever knows the cluster it is showing *now*.
+    let mut selected_context = app.selected_cluster().map(|c| c.context_name.clone());
+    let mut next_refresh = schedule(refresh);
+
     loop {
         // Non-blocking: a fetch that has not finished yet leaves the pane
         // exactly as it was, and one that finished while the user was
         // pressing keys is picked up on the very next frame rather than
         // waiting for a quiet moment.
-        if let Some(rx) = nodes_rx
+        if let Some(rx) = &nodes_rx
             && let Ok(result) = rx.try_recv()
         {
             app.apply_nodes(result);
@@ -202,16 +307,68 @@ where
 
         terminal.draw(|frame| draw(frame, &app))?;
 
+        if next_refresh.is_some_and(|at| Instant::now() >= at) {
+            refetch(&spawn_nodes, &mut nodes_rx, selected_context.as_deref());
+            next_refresh = schedule(refresh);
+        }
+
         if !event::poll(TICK)? {
             continue;
         }
 
-        if let Event::Key(key) = event::read()?
-            && app.on_key(key) == Flow::Quit
-        {
+        let Event::Key(key) = event::read()? else {
+            continue;
+        };
+
+        if app.on_key(key) == Flow::Quit {
             return Ok(());
         }
+
+        if is_refresh_key(key) {
+            refetch(&spawn_nodes, &mut nodes_rx, selected_context.as_deref());
+            next_refresh = schedule(refresh);
+        }
+
+        // A selection change is a fetch trigger in its own right, and an
+        // immediate one: waiting for the interval would leave the pane
+        // showing the *previous* cluster's rows under the newly selected
+        // cluster's name for however long that takes.
+        let now_selected = app.selected_cluster().map(|c| c.context_name.clone());
+        if now_selected != selected_context {
+            selected_context = now_selected;
+            app.start_loading_nodes();
+            refetch(&spawn_nodes, &mut nodes_rx, selected_context.as_deref());
+            next_refresh = schedule(refresh);
+        }
     }
+}
+
+/// Start a fetch for whichever cluster is selected, replacing whatever was
+/// in flight. A no-op when nothing is selected — an empty kubeconfig has no
+/// cluster to fetch.
+fn refetch<F>(
+    spawn_nodes: &F,
+    nodes_rx: &mut Option<mpsc::Receiver<Result<NodesFetch, String>>>,
+    selected_context: Option<&str>,
+) where
+    F: Fn(&str) -> mpsc::Receiver<Result<NodesFetch, String>>,
+{
+    if let Some(context) = selected_context {
+        *nodes_rx = Some(spawn_nodes(context));
+    }
+}
+
+/// When the next automatic refresh is due, or never.
+fn schedule(refresh: RefreshInterval) -> Option<Instant> {
+    refresh.interval().map(|interval| Instant::now() + interval)
+}
+
+/// Whether this key asks for a refresh right now, independent of the
+/// interval. Release events are excluded for the same reason
+/// [`App::on_key`] excludes them: they would otherwise fire a second fetch
+/// per press on platforms that report both halves of a keystroke.
+fn is_refresh_key(key: KeyEvent) -> bool {
+    key.kind != KeyEventKind::Release && key.code == KeyCode::Char('r')
 }
 
 /// Draw one frame.
@@ -341,7 +498,12 @@ fn detail_row<'a>(label: &'a str, value: &'a str, theme: Theme) -> Line<'a> {
 }
 
 fn draw_footer(frame: &mut Frame, area: Rect, theme: Theme) {
-    let hints = [("j/k", "move"), ("enter", "open"), ("q", "quit")];
+    let hints = [
+        ("j/k", "move"),
+        ("enter", "open"),
+        ("r", "refresh"),
+        ("q", "quit"),
+    ];
 
     let mut spans = vec![Span::raw(" ")];
     for (key, action) in hints {
@@ -500,7 +662,8 @@ mod tests {
             app.nodes(),
             &NodesState::Loaded {
                 rows: Vec::new(),
-                usage_note: None
+                usage_note: None,
+                refresh_error: None,
             }
         );
     }
@@ -515,6 +678,54 @@ mod tests {
             app.nodes(),
             &NodesState::Error("could not list nodes".to_owned())
         );
+    }
+
+    #[test]
+    fn a_failed_refresh_after_a_loaded_pane_keeps_its_rows() {
+        // Background refresh means a failure is no longer necessarily the
+        // *first* answer a pane gets: one bad poll after a good one must not
+        // blank a working dashboard back to an error screen.
+        let mut app = app();
+        app.apply_nodes(Ok(NodesFetch::default()));
+
+        app.apply_nodes(Err("could not list nodes: nope".to_owned()));
+
+        assert_eq!(
+            app.nodes(),
+            &NodesState::Loaded {
+                rows: Vec::new(),
+                usage_note: None,
+                refresh_error: Some("could not list nodes: nope".to_owned()),
+            }
+        );
+    }
+
+    #[test]
+    fn a_successful_refresh_clears_an_earlier_refresh_failure() {
+        let mut app = app();
+        app.apply_nodes(Ok(NodesFetch::default()));
+        app.apply_nodes(Err("could not list nodes: nope".to_owned()));
+
+        app.apply_nodes(Ok(NodesFetch::default()));
+
+        assert_eq!(
+            app.nodes(),
+            &NodesState::Loaded {
+                rows: Vec::new(),
+                usage_note: None,
+                refresh_error: None,
+            }
+        );
+    }
+
+    #[test]
+    fn start_loading_nodes_resets_a_loaded_pane_to_loading() {
+        let mut app = app();
+        app.apply_nodes(Ok(NodesFetch::default()));
+
+        app.start_loading_nodes();
+
+        assert_eq!(app.nodes(), &NodesState::Loading);
     }
 
     #[test]
@@ -566,5 +777,49 @@ mod tests {
         terminal.draw(|frame| draw(frame, &app)).unwrap();
 
         assert!(terminal.backend().to_string().contains("update-kubeconfig"));
+    }
+
+    #[test]
+    fn r_requests_a_refresh() {
+        assert!(is_refresh_key(press(KeyCode::Char('r'))));
+        assert!(!is_refresh_key(press(KeyCode::Char('x'))));
+    }
+
+    #[test]
+    fn a_release_of_r_does_not_request_a_refresh() {
+        // The same double-fire release events would cause in `App::on_key`,
+        // for the same reason: acting on both halves of one keystroke would
+        // start two fetches per press on a platform that reports both.
+        let mut release = press(KeyCode::Char('r'));
+        release.kind = KeyEventKind::Release;
+
+        assert!(!is_refresh_key(release));
+    }
+
+    #[test]
+    fn schedule_is_none_when_automatic_refresh_is_off() {
+        assert_eq!(schedule(RefreshInterval::never()), None);
+    }
+
+    #[test]
+    fn schedule_is_due_after_the_configured_interval() {
+        let before = Instant::now();
+        let at = schedule(RefreshInterval::every(Duration::from_secs(15))).unwrap();
+
+        assert!(at > before);
+        assert!(at <= before + Duration::from_secs(15) + Duration::from_millis(50));
+    }
+
+    #[test]
+    fn refresh_interval_parses_and_prints_the_same_grammar_timeout_does() {
+        assert_eq!(
+            RefreshInterval::from_str("15s").unwrap(),
+            RefreshInterval::every(Duration::from_secs(15))
+        );
+        assert_eq!(
+            RefreshInterval::from_str("0").unwrap(),
+            RefreshInterval::never()
+        );
+        assert_eq!(RefreshInterval::default().to_string(), "15s");
     }
 }

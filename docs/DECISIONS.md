@@ -1481,3 +1481,65 @@ reading's second sentence — telling the reader to check metrics-server's pod
 `NODES` heading and the rows, in the header a pane has and a footnote list
 does not, and it is silent on an empty node list: there is no usage to date
 when nothing is running, whatever the read answered.
+
+### 55. Background refresh: an immediate refetch on selection, a quiet one on
+the interval and on `r`
+
+The node pane's fetch used to be one-shot: `main` started it before the
+terminal took over and nothing ever asked again. The roadmap task left two
+triggers besides the interval for this change to design — `r`, and the
+sidebar selecting a different cluster — and both needed an answer before
+either could be built.
+
+**Selection change refetches immediately and resets to `Loading`.** The
+alternative — waiting for the interval, or leaving the previous cluster's
+rows on screen until it elapses — reads as a bug: a user who switches
+clusters in the sidebar is looking at the new one's name over the old one's
+node list, which is worse than a blank pane with "Loading nodes…" in it.
+`App::start_loading_nodes` is the pure half of that (a fourth transition
+tested the way `apply_nodes` and `on_key` are); the event loop pairs it with
+an immediate call through `spawn_nodes`, the same closure `r` and the
+interval use.
+
+**`r` and the interval do *not* reset to `Loading`.** These refresh a cluster
+the pane is already showing, and blanking a working table to redraw the same
+rows a second later is the flicker background refresh exists to avoid — the
+whole point is that the pane goes on being readable while a request is in
+flight. The old rows stay up until the new fetch answers.
+
+That choice has a consequence `apply_nodes` had to absorb: a failed
+background poll can no longer be presented as "no data at all," because there
+usually *is* data — the last good listing. `apply_nodes` therefore only moves
+to `NodesState::Error` on a failure with nothing loaded yet (the original,
+one-shot case); a failure after a successful load keeps the rows and adds
+`refresh_error`, a message the pane shows as a line under `NODES` without
+touching the table beneath it. A transient blip reads as a transient blip
+instead of as the cluster losing every node.
+
+**The interval is its own type, not a reused `Budget`.** `--timeout` and the
+new `--refresh` parse and print the same grammar — `Budget`'s — so
+`RefreshInterval` is a one-line wrapper delegating both directions rather
+than a second grammar. It stays a distinct type anyway: the two flags mean
+opposite things by `0` on the same underlying number (a timeout of zero would
+never finish; a refresh interval of zero is simply "don't," and `r` still
+works), and a field typed `Budget` at the call site would read as a request
+timeout to a reviewer skimming `ui::mod.rs`. It is global on the CLI, like
+`--color` and `--timeout`, because the flag has to reach the bare `eks`
+invocation, the common case, and `Command::Dashboard` has no arguments of its
+own for a subcommand nobody types to carry.
+
+**Fetching moved from a receiver to a closure.** `ui::run` used to take the
+one `mpsc::Receiver` `main` had already started; it now takes that same
+initial receiver *and* `spawn_nodes: impl Fn(&str) -> mpsc::Receiver<...>`,
+built once in `main` over the config, kubeconfig paths, and budget the CLI
+commands use, so every fetch after the first — `r`, the interval, a new
+selection — goes through `commands::nodes::spawn_gather` the same way the
+startup one did. The event loop stays generic over the closure rather than
+depending on `commands::nodes` directly, which is what keeps `ui::event_loop`
+testable in principle without a `KubeConfig` in scope, even though the loop
+itself is the I/O layer and untested today for the same reason it always was
+— the render loop's job here is only to decide *when* to call the closure.
+A caller who replaces `nodes_rx` while an older fetch is still running simply
+stops listening for it, per `commands::spawn`'s existing contract; the
+abandoned thread finishes on its own and nothing needed a cancellation
+mechanism.

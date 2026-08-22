@@ -387,6 +387,7 @@ more columns, not for a table that gets out of the way.
 | `--wide` | Add the extra columns `kubectl -o wide` shows. Pods: `IP`, `NOMINATED NODE`, `READINESS GATES`. Nodes: `INTERNAL-IP`, `EXTERNAL-IP`, `OS-IMAGE`, `KERNEL-VERSION`, `CONTAINER-RUNTIME` |
 | `--kubeconfig <PATH>` | Override the kubeconfig search path |
 | `--timeout <DURATION>` | How long to wait for any one request to the cluster. Default `30s`; `0` waits for as long as it takes |
+| `--refresh <DURATION>` | How often the dashboard refreshes its panes in the background. Default `15s`; `0` turns automatic refresh off (`r` still refreshes on demand) |
 | `--color <WHEN>` | `auto` (default), `always`, or `never`. Spelled `--colour` too |
 | `-v, --verbose` | Increase log verbosity (repeatable) |
 
@@ -456,6 +457,7 @@ request and outside anything this flag can interrupt.
 | --- | --- |
 | `j` / `k`, `↓` / `↑` | Move |
 | `Home` / `End` | Jump to first / last |
+| `r` | Refresh the node pane now |
 | `q`, `Esc`, `Ctrl-C` | Quit |
 
 ## Development
