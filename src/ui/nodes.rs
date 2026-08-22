@@ -9,7 +9,7 @@ use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Wrap};
 
-use crate::k8s::nodes::{NodeRow, Share};
+use crate::k8s::nodes::{Capacity, NodeRow, Share};
 use crate::k8s::quantity::{self, Quantity};
 use crate::theme::{Severity, Theme};
 
@@ -58,25 +58,39 @@ fn node_line(row: &NodeRow, theme: Theme) -> Line<'static> {
         Span::styled(row.status.clone(), theme.severity(row.severity)),
         Span::raw("  "),
     ];
-    spans.extend(bar("CPU", row.cpu_used, quantity::cpu, theme));
+    spans.extend(bar("CPU", row.cpu_used, row.cpu, quantity::cpu, theme));
     spans.push(Span::raw("  "));
-    spans.extend(bar("MEM", row.memory_used, quantity::memory, theme));
+    spans.extend(bar(
+        "MEM",
+        row.memory_used,
+        row.memory,
+        quantity::memory,
+        theme,
+    ));
     spans.push(Span::raw("  "));
     spans.push(Span::styled(pods_text(row.pods), theme.dim()));
     Line::from(spans)
 }
 
-/// One labelled utilisation bar: `CPU ███████░░░ 1.5/4`, filled and coloured
-/// by [`Share::ratio`]/[`Share::severity`] — the same figures the CLI's
-/// `CPU USE` column reads, divided by the same allocatable denominator, so
-/// the bar and the table never disagree about one node.
+/// One labelled utilisation bar: `CPU ███████░░░ 1.5/4`.
+///
+/// The CLI's `CPU USE` column reads `share` against *allocatable* — the
+/// right denominator for "will another pod fit". A bar is asking "is this
+/// machine busy", so it fills and colours against `capacity`'s raw
+/// `capacity` figure instead: a node pinned at 100% of allocatable still has
+/// the kubelet's own reserve behind it, and should not draw as a full bar for
+/// headroom nothing can schedule into. The figure printed beside the bar is
+/// still `share.amount` — the two readings never disagree about what is
+/// actually being used, only about what it is a share of.
 fn bar(
     label: &'static str,
     share: Share,
+    capacity: Capacity,
     show: fn(Quantity) -> String,
     theme: Theme,
 ) -> Vec<Span<'static>> {
-    let filled = filled_cells(share.ratio(), BAR_WIDTH);
+    let ratio = share.ratio_of(capacity.capacity);
+    let filled = filled_cells(ratio, BAR_WIDTH);
     let empty = BAR_WIDTH - filled;
     let text = share.amount.map_or_else(|| "-".to_owned(), show);
 
@@ -84,7 +98,7 @@ fn bar(
         Span::styled(format!("{label} "), theme.dim()),
         Span::styled(
             "█".repeat(usize::from(filled)),
-            theme.severity(share.severity()),
+            theme.severity(share.severity_of(capacity.capacity)),
         ),
         Span::styled("░".repeat(usize::from(empty)), theme.dim()),
         Span::raw(" "),
@@ -125,12 +139,18 @@ mod tests {
     use ratatui::backend::TestBackend;
 
     use super::*;
-    use crate::k8s::nodes::Capacity;
 
     fn share(amount: &str, allocatable: &str) -> Share {
         Share {
             amount: Some(Quantity::parse(amount).unwrap()),
             allocatable: Some(Quantity::parse(allocatable).unwrap()),
+        }
+    }
+
+    fn capacity(allocatable: &str, capacity: &str) -> Capacity {
+        Capacity {
+            allocatable: Some(Quantity::parse(allocatable).unwrap()),
+            capacity: Some(Quantity::parse(capacity).unwrap()),
         }
     }
 
@@ -140,8 +160,11 @@ mod tests {
             status: "Ready".to_owned(),
             severity: Severity::Ok,
             version: "v1.31".to_owned(),
-            cpu: Capacity::default(),
-            memory: Capacity::default(),
+            // Allocatable a little below capacity, the ordinary kubelet
+            // reserve, so this fixture's bars exercise both denominators
+            // rather than only the one every other field happens to share.
+            cpu: capacity("4", "4.2"),
+            memory: capacity("8Gi", "8.5Gi"),
             cpu_requested: Share::default(),
             memory_requested: Share::default(),
             cpu_used: share("1500m", "4"),
@@ -184,6 +207,32 @@ mod tests {
         // 0.86 of 10 cells is 8.6, which reads as "nearly full" rounded to 9,
         // not "mostly empty" truncated to 8.
         assert_eq!(filled_cells(Some(0.86), 10), 9);
+    }
+
+    #[test]
+    fn the_bar_fills_and_colours_against_capacity_rather_than_allocatable() {
+        // 5.5 of 6 allocatable cores is 92% — over the critical threshold,
+        // the reading the CLI's `CPU USE` column would show. The same 5.5
+        // against the node's raw 8-core capacity is 69%, comfortably ok: the
+        // kubelet's own reserve is headroom nothing can schedule into, and
+        // the bar should read the second number, not the first.
+        let hot_by_allocatable = capacity("6", "8");
+        let used = share("5500m", "6");
+
+        let spans = bar(
+            "CPU",
+            used,
+            hot_by_allocatable,
+            quantity::cpu,
+            Theme::dark(),
+        );
+
+        assert_eq!(
+            spans[1].content.chars().count(),
+            7,
+            "5.5/8 = 69%, rounds to 7 of 10 cells, not 9 of 10 for 5.5/6"
+        );
+        assert_eq!(spans[1].style, Theme::dark().severity(Severity::Ok));
     }
 
     #[test]

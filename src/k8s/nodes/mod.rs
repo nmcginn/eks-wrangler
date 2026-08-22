@@ -241,6 +241,20 @@ pub struct Share {
 }
 
 impl Share {
+    /// The measured fraction of an explicit denominator, if both halves are
+    /// known.
+    ///
+    /// Can exceed 1.0 either way round. [`ratio`](Self::ratio) always divides
+    /// by `allocatable`, which is the right denominator for "will another pod
+    /// fit". A caller asking a different question of the same measurement —
+    /// the dashboard's utilisation bar asks "is this machine busy", and wants
+    /// the node's raw capacity, kubelet reserve included — passes the
+    /// denominator it means instead of the one `Share` happens to carry.
+    #[must_use]
+    pub fn ratio_of(self, denominator: Option<Quantity>) -> Option<f64> {
+        self.amount?.ratio_of(denominator?)
+    }
+
     /// The measured fraction of allocatable, if both halves are known.
     ///
     /// Can exceed 1.0 either way round. Allocatable is what the scheduler
@@ -251,15 +265,23 @@ impl Share {
     /// exactly the moment someone wants to know.
     #[must_use]
     pub fn ratio(self) -> Option<f64> {
-        self.amount?.ratio_of(self.allocatable?)
+        self.ratio_of(self.allocatable)
+    }
+
+    /// How alarming an explicit denominator's fraction is, on the shared
+    /// `theme` thresholds — see [`ratio_of`](Self::ratio_of) for why a caller
+    /// would want one.
+    #[must_use]
+    pub fn severity_of(self, denominator: Option<Quantity>) -> Severity {
+        self.ratio_of(denominator)
+            .map_or(Severity::Unknown, Severity::from_utilisation)
     }
 
     /// How alarming that fraction is, on the shared `theme` thresholds, so the
     /// CLI table and the dashboard cannot disagree about what counts as hot.
     #[must_use]
     pub fn severity(self) -> Severity {
-        self.ratio()
-            .map_or(Severity::Unknown, Severity::from_utilisation)
+        self.severity_of(self.allocatable)
     }
 
     /// One table cell: the figure, and what share of the node it is.
@@ -1352,6 +1374,61 @@ mod tests {
         assert_eq!(row.memory_requested.cell(quantity::memory), "-");
         assert_eq!(row.cpu_requested.ratio(), None);
         assert_eq!(row.cpu_requested.severity(), Severity::Unknown);
+    }
+
+    // --- An explicit denominator ---------------------------------------------
+
+    #[test]
+    fn ratio_of_reads_the_denominator_it_is_given_rather_than_allocatable() {
+        let share = Share {
+            amount: Some(Quantity::parse("5500m").unwrap()),
+            allocatable: Some(Quantity::parse("6").unwrap()),
+        };
+
+        // `ratio()` still answers "will another pod fit" against
+        // allocatable...
+        assert_eq!(share.ratio(), Some(5500.0 / 6000.0));
+        // ...and `ratio_of` answers whatever question the caller asked, here
+        // the node's raw 8-core capacity — the "is this machine busy"
+        // reading a dashboard bar wants.
+        let capacity = Some(Quantity::parse("8").unwrap());
+        assert_eq!(share.ratio_of(capacity), Some(5500.0 / 8000.0));
+    }
+
+    #[test]
+    fn ratio_of_is_unknown_with_no_amount_or_no_denominator() {
+        let unmeasured = Share {
+            amount: None,
+            allocatable: Some(Quantity::parse("6").unwrap()),
+        };
+        assert_eq!(
+            unmeasured.ratio_of(Some(Quantity::parse("8").unwrap())),
+            None
+        );
+
+        let measured = Share {
+            amount: Some(Quantity::parse("1").unwrap()),
+            allocatable: None,
+        };
+        assert_eq!(measured.ratio_of(None), None);
+    }
+
+    #[test]
+    fn severity_of_can_disagree_with_severity_over_the_same_measurement() {
+        // The same 5.5-core reading is critical against a 6-core allocatable
+        // and merely ok against an 8-core capacity — the whole reason a
+        // dashboard bar and a `CPU USE` cell are allowed to read differently
+        // for one node.
+        let share = Share {
+            amount: Some(Quantity::parse("5500m").unwrap()),
+            allocatable: Some(Quantity::parse("6").unwrap()),
+        };
+
+        assert_eq!(share.severity(), Severity::Critical);
+        assert_eq!(
+            share.severity_of(Some(Quantity::parse("8").unwrap())),
+            Severity::Ok
+        );
     }
 
     // --- The pod count ------------------------------------------------------

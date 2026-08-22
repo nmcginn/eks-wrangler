@@ -1413,3 +1413,32 @@ nothing new: `Share` already carries it, so the bar is `Share::ratio()` and
 "usage against capacity for the dashboard's bars" roadmap entry if a future
 change decides a bar answering "how busy is the box" is worth a second
 reading beside this one.
+
+Superseded by decision 53: that roadmap entry came due and was taken.
+
+### 53. The dashboard bar now divides by capacity; the CLI table still divides by allocatable
+
+Decision 52 picked allocatable for the bar too, on the strength of "a bar and
+a table that divide by different things teach the user something false the
+first time they compare them." The roadmap task that decision left open —
+"usage against capacity for the dashboard's bars" — asks for exactly that
+divergence anyway, on the grounds decision 22 gave first: a bar answers "is
+this machine busy", a capacity question, and a table cell answers "will
+another pod fit", an allocatable one. Two different questions answered
+honestly is not the same failure as two answers to one question that
+disagree.
+
+`Share::ratio()`/`severity()` are unchanged — they still divide by
+`allocatable`, so `CPU USE`/`MEM USE` and the request columns read exactly as
+before. The choice moved to the call site rather than staying baked into
+`Share`: `ratio_of`/`severity_of` take an explicit denominator, and
+`ui::nodes::bar` is the one caller so far that passes `Capacity::capacity`
+rather than `Share::allocatable`. A future column or pane that wants the
+capacity reading gets it without a second field on `Share` or a second type.
+
+Worth flagging for review rather than assuming settled: decision 52's warning
+about the two surfaces disagreeing still holds in spirit — a node pinned at
+100% of allocatable now draws a bar that is not full, and a reader comparing
+the two side by side has to know why. It is outweighed here by the roadmap
+task's explicit ask, but if a reviewer would rather the two readings match,
+the fix is `bar`'s call site, not `Share`.
