@@ -24,7 +24,15 @@ pub enum NodesState {
     Loading,
     /// The cluster answered — possibly with zero nodes, a real answer for a
     /// control-plane-only or still-provisioning cluster.
-    Loaded(Vec<NodeRow>),
+    Loaded {
+        rows: Vec<NodeRow>,
+        /// How stale the usage bars are, worded through
+        /// `k8s::nodes::usage_note` — the CLI table's freshness/unsampled
+        /// footnote, carried into the pane instead of a footnote list. `None`
+        /// when the columns have nothing to date, including when the metrics
+        /// read failed outright: a bar reading `-` already says so.
+        usage_note: Option<String>,
+    },
     /// The fetch failed; the message is already a full sentence, via
     /// `k8s::explain`.
     Error(String),
@@ -38,11 +46,20 @@ pub(super) fn draw(frame: &mut Frame, area: Rect, state: &NodesState, theme: The
             message.clone(),
             theme.severity(Severity::Critical),
         )],
-        NodesState::Loaded(rows) if rows.is_empty() => {
+        NodesState::Loaded { rows, .. } if rows.is_empty() => {
             vec![Line::styled("This cluster has no nodes.", theme.dim())]
         }
-        NodesState::Loaded(rows) => {
+        NodesState::Loaded { rows, usage_note } => {
             let mut lines = vec![Line::styled("NODES", theme.heading())];
+            // Split rather than handed straight to one `Line`: a stale sample
+            // earns a second sentence of advice, and `ratatui` does not treat
+            // an embedded `\n` as a line break the way a terminal does.
+            if let Some(note) = usage_note {
+                lines.extend(
+                    note.lines()
+                        .map(|line| Line::styled(line.to_owned(), theme.dim())),
+                );
+            }
             lines.extend(rows.iter().map(|row| node_line(row, theme)));
             lines
         }
@@ -181,6 +198,13 @@ mod tests {
         }
     }
 
+    fn loaded(rows: Vec<NodeRow>) -> NodesState {
+        NodesState::Loaded {
+            rows,
+            usage_note: None,
+        }
+    }
+
     fn render(state: &NodesState) -> String {
         let mut terminal = Terminal::new(TestBackend::new(90, 20)).unwrap();
         terminal
@@ -243,10 +267,7 @@ mod tests {
 
     #[test]
     fn loaded_state_shows_each_nodes_name_and_status() {
-        let rendered = render(&NodesState::Loaded(vec![
-            node("worker-1"),
-            node("worker-2"),
-        ]));
+        let rendered = render(&loaded(vec![node("worker-1"), node("worker-2")]));
         assert!(rendered.contains("worker-1"), "{rendered}");
         assert!(rendered.contains("worker-2"), "{rendered}");
         assert!(rendered.contains("Ready"), "{rendered}");
@@ -254,7 +275,7 @@ mod tests {
 
     #[test]
     fn an_empty_node_list_says_so_rather_than_rendering_nothing() {
-        let rendered = render(&NodesState::Loaded(Vec::new()));
+        let rendered = render(&loaded(Vec::new()));
         assert!(rendered.contains("no nodes"), "{rendered}");
     }
 
@@ -266,7 +287,7 @@ mod tests {
 
     #[test]
     fn rendering_the_node_pane_survives_a_tiny_terminal() {
-        let state = NodesState::Loaded(vec![node("worker-1")]);
+        let state = loaded(vec![node("worker-1")]);
         for (width, height) in [(1, 1), (8, 3), (20, 2), (200, 60)] {
             let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
             terminal
@@ -276,5 +297,68 @@ mod tests {
                 })
                 .unwrap();
         }
+    }
+
+    #[test]
+    fn a_usage_note_appears_above_the_rows_it_dates() {
+        let state = NodesState::Loaded {
+            rows: vec![node("worker-1")],
+            usage_note: Some("Usage is up to 8s old, averaged over 20s.".to_owned()),
+        };
+
+        let rendered = render(&state);
+
+        assert!(rendered.contains("Usage is up to 8s old"), "{rendered}");
+        assert!(rendered.contains("worker-1"), "{rendered}");
+    }
+
+    #[test]
+    fn a_multi_line_usage_note_renders_as_separate_lines() {
+        // `freshness_note`'s stale wording is two sentences joined by `\n`;
+        // `ratatui` does not treat that as a line break on its own, so `draw`
+        // has to split it before handing it to a `Line`.
+        let state = NodesState::Loaded {
+            rows: vec![node("worker-1")],
+            usage_note: Some(
+                "Usage is up to 6m10s old, averaged over 20s \u{2014} more than two sampling \
+                 windows, so these figures are stale.\n\
+                 metrics-server can stop scraping without failing this request; check its pod \
+                 in kube-system."
+                    .to_owned(),
+            ),
+        };
+
+        // Wide enough that neither sentence wraps a second time on top of the
+        // split this test is actually about.
+        let mut terminal = Terminal::new(TestBackend::new(200, 20)).unwrap();
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                draw(frame, area, &state, Theme::dark());
+            })
+            .unwrap();
+        let rendered = terminal.backend().to_string();
+
+        assert!(rendered.contains("these figures are stale"), "{rendered}");
+        assert!(rendered.contains("kube-system"), "{rendered}");
+    }
+
+    #[test]
+    fn no_usage_note_is_shown_when_there_is_nothing_to_date() {
+        let rendered = render(&loaded(vec![node("worker-1")]));
+        assert!(!rendered.contains("Usage is up to"), "{rendered}");
+    }
+
+    #[test]
+    fn a_usage_note_is_not_shown_over_an_empty_node_list() {
+        let state = NodesState::Loaded {
+            rows: Vec::new(),
+            usage_note: Some("Usage is up to 8s old, averaged over 20s.".to_owned()),
+        };
+
+        let rendered = render(&state);
+
+        assert!(rendered.contains("no nodes"), "{rendered}");
+        assert!(!rendered.contains("Usage is up to"), "{rendered}");
     }
 }

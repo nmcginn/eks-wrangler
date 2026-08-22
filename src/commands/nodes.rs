@@ -277,11 +277,24 @@ pub async fn list(
     Ok(k8s_nodes::render(&rows, &label, &footnotes, width, palette))
 }
 
+/// What the node pane's background fetch delivers.
+///
+/// Rows, and how stale the usage figures on them are — see
+/// [`k8s_nodes::usage_note`]. A struct rather than a bare `Vec<NodeRow>`
+/// because the pane wants both, and the note is not a fact any single row
+/// carries: it is a property of the sample as a whole, the same reason the
+/// CLI table foots it once rather than per row.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct NodesFetch {
+    pub rows: Vec<k8s_nodes::NodeRow>,
+    pub usage_note: Option<String>,
+}
+
 /// Fetch this cluster's nodes on a background thread, delivering rows — or a
 /// message explaining why there are none — over a channel.
 ///
-/// The dashboard's counterpart to [`list`]: the same `gather`, a
-/// `Vec<NodeRow>` rather than a rendered table, so the pane and the CLI table
+/// The dashboard's counterpart to [`list`]: the same `gather`, reduced to a
+/// [`NodesFetch`] rather than a rendered table, so the pane and the CLI table
 /// cannot drift about what a node's row means. Parameters are owned, unlike
 /// `gather`'s borrowed ones, because the future has to outlive this call —
 /// [`commands::spawn`] moves it onto another thread.
@@ -291,11 +304,23 @@ pub fn spawn_gather(
     paths: Vec<PathBuf>,
     selector: Option<String>,
     budget: page::Budget,
-) -> mpsc::Receiver<Result<Vec<k8s_nodes::NodeRow>, String>> {
+) -> mpsc::Receiver<Result<NodesFetch, String>> {
     commands::spawn(async move {
         gather(&config, &paths, selector.as_deref(), budget)
             .await
-            .map(|gathered| gathered.rows)
+            .map(|gathered| {
+                let usage_note = k8s_nodes::usage_note(
+                    &gathered.rows,
+                    &gathered.usage,
+                    &gathered.samples,
+                    gathered.now,
+                    &gathered.label,
+                );
+                NodesFetch {
+                    rows: gathered.rows,
+                    usage_note,
+                }
+            })
             .map_err(|error| format!("{error:#}"))
     })
 }

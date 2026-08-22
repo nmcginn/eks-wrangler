@@ -20,7 +20,7 @@ pub mod order;
 pub use order::{Missing, Order, cause, ranks_any, sort};
 
 use crate::format;
-use crate::k8s::metrics::Usage;
+use crate::k8s::metrics::{self, Sample, Usage};
 use crate::k8s::page;
 use crate::k8s::pods::{Placed, Requests};
 use crate::k8s::quantity::{self, Quantity};
@@ -560,6 +560,39 @@ fn severity(ready: Option<bool>, cordoned: bool) -> Severity {
 pub fn shows_usage(rows: &[NodeRow]) -> bool {
     rows.iter()
         .any(|row| row.cpu_used.amount.is_some() || row.memory_used.amount.is_some())
+}
+
+/// The usage-freshness note for a renderer that keeps its own copy of the
+/// rows rather than printing a footnote list — the dashboard's node pane.
+///
+/// `list` foots the CLI table with a wrapped version of this: `Unsampled`
+/// gets [`usage_unsampled`], which names `CPU USE` and `MEM USE` because
+/// those are the table's own headings. The pane's bars have no such headings,
+/// so this uses [`metrics::unsampled`] bare rather than inventing a second
+/// wrapping for columns that do not exist. `Unreadable` says nothing here —
+/// the pane has no footnote list to add `usage_unavailable` to yet, and a
+/// bar reading `-` already says the figure did not arrive.
+///
+/// The classification is [`metrics::Outcome::of`], asked of the rows rather
+/// than of the read result, for the reason its own doc comment gives: a read
+/// that answered for pods a selector kept out of the table must not be
+/// called `Shown` here either. `usage` is `Ok` when the read succeeded,
+/// whatever it found — only whether it happened is asked, not what failed.
+#[must_use]
+pub fn usage_note(
+    rows: &[NodeRow],
+    usage: &Result<(), String>,
+    samples: &[Option<Sample>],
+    now: Timestamp,
+    label: &str,
+) -> Option<String> {
+    match metrics::Outcome::of(usage.as_ref().ok(), shows_usage(rows)) {
+        metrics::Outcome::Shown => {
+            metrics::freshness(samples.iter().flatten(), now).map(metrics::freshness_note)
+        }
+        metrics::Outcome::Unsampled => Some(metrics::unsampled(label)),
+        metrics::Outcome::Unreadable => None,
+    }
 }
 
 /// One column of the node table.
@@ -1697,6 +1730,77 @@ mod tests {
         assert_eq!(rows[1].cpu_used.cell(quantity::cpu), "-");
         // The zero requests still read as a real zero beside the unknown usage.
         assert_eq!(rows[1].cpu_requested.cell(quantity::cpu), "0 (0%)");
+    }
+
+    // --- `usage_note`, the dashboard pane's reading of the same three cases -
+
+    fn sampled(cpu: &str, memory: &str, seconds_ago: i64) -> Sample {
+        Sample {
+            usage: used(cpu, memory),
+            taken_at: Some(now() - SignedDuration::from_secs(seconds_ago)),
+            window: Some(SignedDuration::from_secs(20)),
+        }
+    }
+
+    #[test]
+    fn usage_note_dates_the_listing_when_the_columns_reached_the_rows() {
+        let rows = [NodeRow::from_node(
+            &healthy_node(),
+            Some(&idle()),
+            Some(used("392m", "1552515Ki")),
+            now(),
+        )];
+        let samples = [Some(sampled("392m", "1552515Ki", 8))];
+
+        let note = usage_note(&rows, &Ok(()), &samples, now(), "prod (us-east-1)");
+
+        assert_eq!(
+            note.as_deref(),
+            Some("Usage is up to 8s old, averaged over 20s.")
+        );
+    }
+
+    #[test]
+    fn usage_note_for_an_unsampled_listing_is_the_bare_metrics_wording() {
+        // The pane has no `CPU USE`/`MEM USE` headings to name, unlike the CLI
+        // table's `usage_unsampled`, so this must not wrap the sentence in
+        // language about columns the pane does not have.
+        let rows = [NodeRow::from_node(
+            &healthy_node(),
+            Some(&idle()),
+            None,
+            now(),
+        )];
+
+        let note = usage_note(&rows, &Ok(()), &[None], now(), "prod (us-east-1)");
+
+        assert_eq!(
+            note.as_deref(),
+            Some(metrics::unsampled("prod (us-east-1)").as_str())
+        );
+        assert!(!note.unwrap().contains("CPU USE"));
+    }
+
+    #[test]
+    fn usage_note_is_silent_when_the_metrics_read_failed() {
+        // Out of scope for this task: the pane has no footnote list yet to add
+        // `usage_unavailable`'s explanation to, and the bars already read `-`.
+        let rows = [NodeRow::from_node(
+            &healthy_node(),
+            Some(&idle()),
+            None,
+            now(),
+        )];
+
+        let note = usage_note(
+            &rows,
+            &Err("no metrics.k8s.io API".to_owned()),
+            &[None],
+            now(),
+            "prod (us-east-1)",
+        );
+
+        assert_eq!(note, None);
     }
 
     #[test]

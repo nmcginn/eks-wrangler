@@ -15,7 +15,7 @@ use ratatui::widgets::{Block, List, ListItem, ListState, Paragraph, Wrap};
 use ratatui::{Frame, Terminal};
 
 use crate::cluster::ClusterView;
-use crate::k8s::nodes::NodeRow;
+use crate::commands::nodes::NodesFetch;
 use crate::theme::Theme;
 
 mod nodes;
@@ -88,9 +88,12 @@ impl App {
     /// The one state transition the background channel can cause, kept
     /// beside [`on_key`](Self::on_key) so both are tested the same way:
     /// build an `App`, call the method, assert what changed.
-    pub fn apply_nodes(&mut self, result: Result<Vec<NodeRow>, String>) {
+    pub fn apply_nodes(&mut self, result: Result<NodesFetch, String>) {
         self.nodes = match result {
-            Ok(rows) => NodesState::Loaded(rows),
+            Ok(fetch) => NodesState::Loaded {
+                rows: fetch.rows,
+                usage_note: fetch.usage_note,
+            },
             Err(message) => NodesState::Error(message),
         };
     }
@@ -170,10 +173,7 @@ impl App {
 /// This function never awaits it: each iteration only polls for a result
 /// that has already arrived, which is what keeps a hung request from
 /// blocking a keypress.
-pub fn run(
-    app: App,
-    nodes_rx: Option<&mpsc::Receiver<Result<Vec<NodeRow>, String>>>,
-) -> Result<()> {
+pub fn run(app: App, nodes_rx: Option<&mpsc::Receiver<Result<NodesFetch, String>>>) -> Result<()> {
     let mut terminal = ratatui::init();
     let result = event_loop(&mut terminal, app, nodes_rx);
     ratatui::restore();
@@ -183,7 +183,7 @@ pub fn run(
 fn event_loop<B>(
     terminal: &mut Terminal<B>,
     mut app: App,
-    nodes_rx: Option<&mpsc::Receiver<Result<Vec<NodeRow>, String>>>,
+    nodes_rx: Option<&mpsc::Receiver<Result<NodesFetch, String>>>,
 ) -> Result<()>
 where
     B: ratatui::backend::Backend,
@@ -494,9 +494,15 @@ mod tests {
     fn apply_nodes_moves_a_success_into_the_loaded_state() {
         let mut app = app();
 
-        app.apply_nodes(Ok(Vec::new()));
+        app.apply_nodes(Ok(NodesFetch::default()));
 
-        assert_eq!(app.nodes(), &NodesState::Loaded(Vec::new()));
+        assert_eq!(
+            app.nodes(),
+            &NodesState::Loaded {
+                rows: Vec::new(),
+                usage_note: None
+            }
+        );
     }
 
     #[test]
