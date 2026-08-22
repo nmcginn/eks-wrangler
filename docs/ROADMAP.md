@@ -660,7 +660,7 @@ cluster.
   *Acceptance:* first paint happens before data arrives; loading state is
   visible; `TestBackend` tests for loading, loaded, and error states.
 
-- [ ] **Background refresh.**
+- [x] **Background refresh.**
   Move fetching onto a background task feeding the UI over a channel. Refresh on
   an interval and on demand (`r`).
   *Acceptance:* the render loop never awaits a network call; a hung API call
@@ -678,11 +678,37 @@ cluster.
   or something in between is exactly the kind of trigger this task already
   has to design for `r`.
 
-- [ ] **Pod browsing.**
-  Drill from a node into its pods, and from a pod into its containers. Namespace
-  filter. Breadcrumbs showing where you are.
+- [x] **Pod browsing: drill from a node into its pods.**
+  `Enter` on a highlighted node opens the pods placed on it; `Esc` backs out to
+  the node list rather than quitting, and only quits once there is nowhere
+  left to back out to. Breadcrumbs are the detail pane's own title: `
+  Overview › <node> `.
   *Acceptance:* every view is reachable and escapable by keyboard alone;
   navigation state transitions are unit-tested without a terminal.
+  Landed with a decision the task's wording had not settled: the node list had
+  no selection of its own before now, so drilling into a row needed a focus
+  model between the sidebar and the detail pane first. `Tab` toggles focus
+  between `Focus::Sidebar` and `Focus::Detail`; `j`/`k`/`Home`/`End` move
+  whichever one is focused, and the focused pane's border switches to
+  `Theme::pane_border`'s focus colour, the mechanism the sidebar already had
+  and the detail pane had never used. `App::view` is a `View` enum rather than
+  a stack, since there is exactly one level of drill-down today; a pod's
+  containers is the next one and the natural place it grows into a `Vec<View>`
+  instead of a third variant. Split from the rest of the original task at the
+  seam its own wording drew: a pod's containers and a namespace filter are
+  both a second fetch this change did not need to build, so they are their own
+  entries below rather than a guess at their shape.
+
+- [ ] **Drill from a pod into its containers.**
+  The other half of "Pod browsing", split out because it needs a second fetch
+  the node-drilldown pane does not: containers, images, and restart reasons
+  live nowhere in `PodRow` yet, which is also what "Pod detail view" below is
+  waiting on. `View` gains a sibling to `NodePods` here, and `App::view` most
+  likely becomes a small stack rather than a two-variant enum once there are
+  two levels to back out of one at a time.
+  *Acceptance:* `Esc` backs out one level at a time rather than straight to
+  `Overview`; the same focus model drills in and out without a second
+  mechanism.
 
 - [ ] **Pod detail view.**
   Containers, images, resource requests/limits, restart reasons, recent events.
@@ -708,8 +734,11 @@ cluster.
   are a different, wider fact about a node that nothing in this tool parses or
   shows yet. Separate because it is new data-model surface on `NodeRow`
   neither listing has today, and because four more conditions do not fit a
-  one-line row — it wants a detail view for the selected node, which does not
-  exist before "Pod browsing" gives the pane a way to drill into anything.
+  one-line row — it wants a detail view for the selected node, and `Enter` on
+  one now drills into its pods rather than such a view. Whether a node's own
+  detail belongs behind a different key, or the pods list gains a header
+  section for it, is the same kind of question "Pod browsing" left the
+  reviewer once already.
   *Acceptance:* whichever shape it takes, the condition list is a pure
   function over a `Node`'s `status.conditions`, tested the way `status_text`
   and `severity` already are; a node reporting none of the four pressure
@@ -767,6 +796,51 @@ cluster.
 ---
 
 ## Done
+
+- **Pod browsing: drill from a node into its pods** (2026-08-22) — `Enter` on
+  a highlighted node in the `Overview` pane opens the pods placed on it;
+  `Esc` backs out to the node list, and only quits the dashboard once there
+  is nowhere left to back out to. The block's own title carries the
+  breadcrumb: ` Overview › worker-3 `. This needed a focus model the
+  dashboard did not have before tonight — the node list had no selection of
+  its own, only the sidebar did — so `Tab` now toggles `Focus` between
+  `Sidebar` and `Detail`, `j`/`k`/`Home`/`End` move whichever one is
+  focused, and the focused pane's border switches to
+  `Theme::pane_border`'s existing focus colour, which only the sidebar used
+  before. `App::view` is a two-variant `View` rather than a stack, since a
+  pod's containers — the next drill-down level the roadmap asks for — is
+  the natural point to grow it into a `Vec<View>` instead of a third case
+  guessed at ahead of time. Fetching is
+  `commands::pods::spawn_gather_for_node`, filtering on `spec.nodeName`
+  across every namespace; unlike the
+  node pane it does not refresh in the background or carry usage figures,
+  both left as follow-ups once a second pane exists to weigh them against.
+  See decision 56.
+
+- **Background refresh** (2026-08-22) — the node pane no longer fetches once
+  at startup and stops: `--refresh` (default `15s`, `0` to disable) starts a
+  new fetch on an interval, `r` refreshes on demand, and selecting a
+  different cluster in the sidebar refetches immediately rather than leaving
+  the previous cluster's rows on screen under the new one's name. `main`
+  builds one `spawn_nodes` closure over the config, kubeconfig paths, and
+  `--timeout` budget, and hands it to `ui::run` alongside the same
+  `commands::nodes::spawn_gather` receiver it always started before the
+  terminal took over — every fetch after that first one goes through the
+  closure instead of a second mechanism. The render loop still never awaits a
+  network call: it polls the channel non-blockingly once a frame, exactly as
+  the one-shot fetch did. `App::start_loading_nodes` is the new pure
+  transition for a selection change; `r` and the interval deliberately do not
+  call it, so the pane keeps showing its current rows while a fetch for the
+  *same* cluster is in flight rather than flashing back to `Loading` every
+  refresh. `NodesState::Loaded` gained `refresh_error`, because that same
+  choice means a failure can no longer be presented as "nothing loaded" —
+  `App::apply_nodes` now only moves to `NodesState::Error` when nothing had
+  loaded yet; a failure after a successful fetch keeps the last good rows and
+  notes the failure under the heading instead of blanking a working pane over
+  one bad poll. `RefreshInterval` wraps `k8s::page::Budget` for its grammar
+  and round trip rather than growing a second duration parser, staying its
+  own type because `0` means something different for the two flags. See
+  decision 55.
 
 - **Carry the freshness and unsampled notes into the dashboard's panes**
   (2026-08-22) — the node pane now says how old its usage bars are, in a line

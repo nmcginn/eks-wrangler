@@ -1481,3 +1481,138 @@ reading's second sentence — telling the reader to check metrics-server's pod
 `NODES` heading and the rows, in the header a pane has and a footnote list
 does not, and it is silent on an empty node list: there is no usage to date
 when nothing is running, whatever the read answered.
+
+### 55. Background refresh: an immediate refetch on selection, a quiet one on
+the interval and on `r`
+
+The node pane's fetch used to be one-shot: `main` started it before the
+terminal took over and nothing ever asked again. The roadmap task left two
+triggers besides the interval for this change to design — `r`, and the
+sidebar selecting a different cluster — and both needed an answer before
+either could be built.
+
+**Selection change refetches immediately and resets to `Loading`.** The
+alternative — waiting for the interval, or leaving the previous cluster's
+rows on screen until it elapses — reads as a bug: a user who switches
+clusters in the sidebar is looking at the new one's name over the old one's
+node list, which is worse than a blank pane with "Loading nodes…" in it.
+`App::start_loading_nodes` is the pure half of that (a fourth transition
+tested the way `apply_nodes` and `on_key` are); the event loop pairs it with
+an immediate call through `spawn_nodes`, the same closure `r` and the
+interval use.
+
+**`r` and the interval do *not* reset to `Loading`.** These refresh a cluster
+the pane is already showing, and blanking a working table to redraw the same
+rows a second later is the flicker background refresh exists to avoid — the
+whole point is that the pane goes on being readable while a request is in
+flight. The old rows stay up until the new fetch answers.
+
+That choice has a consequence `apply_nodes` had to absorb: a failed
+background poll can no longer be presented as "no data at all," because there
+usually *is* data — the last good listing. `apply_nodes` therefore only moves
+to `NodesState::Error` on a failure with nothing loaded yet (the original,
+one-shot case); a failure after a successful load keeps the rows and adds
+`refresh_error`, a message the pane shows as a line under `NODES` without
+touching the table beneath it. A transient blip reads as a transient blip
+instead of as the cluster losing every node.
+
+**The interval is its own type, not a reused `Budget`.** `--timeout` and the
+new `--refresh` parse and print the same grammar — `Budget`'s — so
+`RefreshInterval` is a one-line wrapper delegating both directions rather
+than a second grammar. It stays a distinct type anyway: the two flags mean
+opposite things by `0` on the same underlying number (a timeout of zero would
+never finish; a refresh interval of zero is simply "don't," and `r` still
+works), and a field typed `Budget` at the call site would read as a request
+timeout to a reviewer skimming `ui::mod.rs`. It is global on the CLI, like
+`--color` and `--timeout`, because the flag has to reach the bare `eks`
+invocation, the common case, and `Command::Dashboard` has no arguments of its
+own for a subcommand nobody types to carry.
+
+**Fetching moved from a receiver to a closure.** `ui::run` used to take the
+one `mpsc::Receiver` `main` had already started; it now takes that same
+initial receiver *and* `spawn_nodes: impl Fn(&str) -> mpsc::Receiver<...>`,
+built once in `main` over the config, kubeconfig paths, and budget the CLI
+commands use, so every fetch after the first — `r`, the interval, a new
+selection — goes through `commands::nodes::spawn_gather` the same way the
+startup one did. The event loop stays generic over the closure rather than
+depending on `commands::nodes` directly, which is what keeps `ui::event_loop`
+testable in principle without a `KubeConfig` in scope, even though the loop
+itself is the I/O layer and untested today for the same reason it always was
+— the render loop's job here is only to decide *when* to call the closure.
+A caller who replaces `nodes_rx` while an older fetch is still running simply
+stops listening for it, per `commands::spawn`'s existing contract; the
+abandoned thread finishes on its own and nothing needed a cancellation
+mechanism.
+
+Amended by decision 56: the closure stopped being generic once a second pane
+needed its own, for the reason given there.
+
+### 56. Pod browsing needed a focus model first, and the fetch closures became
+boxed rather than generic
+
+"Pod browsing"'s first slice — `Enter` on a node opens its pods — turned out
+to have a prerequisite the roadmap task had not named: the node list had no
+selection of its own to drill *from*. Only the sidebar could be navigated;
+the detail pane was a fixed list nothing pointed a highlight at. Two
+interaction questions sat behind that gap — how keyboard focus should move
+between the sidebar and the detail pane, and whether `Esc` should keep
+meaning "quit" once there was somewhere to back out to first — and both were
+put to the user rather than guessed at, the same way a reviewer would have
+been asked on a task this shaped. The answers: `Tab` toggles focus, and `Esc`
+backs out one level before it quits.
+
+`Focus` is a two-variant enum, `Sidebar`/`Detail`, toggled by `Tab` and read
+by `App::on_key` to decide which of two sets of movement methods `j`/`k`/
+`Home`/`End` call, and by `draw_cluster_list`/`draw_detail` to decide which
+border gets `Theme::pane_border`'s focus colour — the mechanism the sidebar
+already used alone, now shared rather than duplicated for a second pane.
+`detail_selected` is one `usize` on `App` rather than a field per view,
+because exactly one list is ever on screen in the detail pane at a time; it
+is reset to `0` on every view change and every fresh load specifically so it
+cannot point past the end of a list that just arrived shorter than the one
+before it.
+
+`View` is `Overview | NodePods { node: String }` rather than a stack, on the
+same reasoning `RefreshInterval` got its own type over reusing `Budget`: a
+`Vec<View>` would be guessing at a shape one more case cannot justify, and
+today there is exactly one level of drill-down. The roadmap's own next slice
+— a pod's containers — is what a stack is *for*, and is left to add one
+rather than have this change build it against a single example.
+
+`Esc`'s rule is `back_or_quit`: back out of `View::NodePods` when there is
+one, quit otherwise. `q` and `Ctrl-C` are unconditional either way, so a
+user who wants out does not have to remember how deep they are.
+
+Row highlighting reuses the pattern `Theme::selected` already had for the
+sidebar's `List` widget, adapted for the node and pod panes' hand-built
+`Line`s: `Line::style(theme.selected())` sets the line's own style, which
+`ratatui` patches *underneath* each span's — so a row's severity colouring
+(a `CrashLoopBackOff` in red, say) survives being highlighted, because the
+span's foreground is more specific than the line's and wins, while the
+line's background shows through wherever a span left one unset. The
+highlight itself only appears while `Focus::Detail` holds focus, unlike the
+sidebar's own selection, which stays visible under either focus — the
+sidebar's highlight answers "what is this dashboard showing", a question
+that does not stop being true when `Tab` moves the keys elsewhere, while the
+detail pane's answers "what would `Enter` open right now", which is not true
+the moment focus leaves it.
+
+The pod-browsing pane fetches once per node rather than joining the node
+pane's background refresh: `commands::pods::spawn_gather_for_node` filters
+`Scope::All` on `spec.nodeName`, across every namespace, and carries no
+usage figures — metrics wiring for a third pane, and whether it should
+refresh on the same interval the node pane does, are both weighed better
+once there is a pane to review them against than guessed at alongside the
+navigation this change exists to add. `PodsState`'s `apply_pods` therefore
+always overwrites on failure, unlike `NodesState::apply_nodes`: there is no
+earlier good listing for *this* node to protect, only for whichever one was
+open before it.
+
+`ui::run` and `ui::event_loop` took a `spawn_pods: impl Fn(&str, &str) ->
+...` alongside `spawn_nodes` for exactly as long as it took to notice the
+shape: two closures now, generic on both, and a third pane would make three.
+`NodesFetcher` and `PodsFetcher` are boxed trait objects instead, so `run`'s
+signature does not grow a type parameter every time a pane gains its own
+fetch trigger — a distinction (which closure a function happens to be)
+nothing outside `main` needs at the type level. The dynamic dispatch this
+costs is one call per keypress or refresh tick, not per frame.
