@@ -455,10 +455,18 @@ request and outside anything this flag can interrupt.
 
 | Key | Action |
 | --- | --- |
-| `j` / `k`, `↓` / `↑` | Move |
+| `Tab` | Switch focus between the cluster list and the detail pane |
+| `j` / `k`, `↓` / `↑` | Move the highlight in whichever pane has focus |
 | `Home` / `End` | Jump to first / last |
+| `Enter` | Drill in — open the highlighted node's pods |
+| `Esc` | Back out one level; quits once there is nowhere left to back out to |
 | `r` | Refresh the node pane now |
-| `q`, `Esc`, `Ctrl-C` | Quit |
+| `q`, `Ctrl-C` | Quit |
+
+Focus starts on the cluster list; the focused pane's border is highlighted.
+`Enter` on a node in the detail pane opens the pods placed on it, with a
+breadcrumb in the pane's own title (` Overview › <node> `); `Esc` returns to
+the node list.
 
 ## Development
 

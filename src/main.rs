@@ -136,17 +136,33 @@ fn dashboard(
     // cluster selected in the sidebar — goes through this closure too, so
     // `ui::run` never has to know how a `NodesFetch` is built, only how to
     // ask for one.
-    let spawn_nodes = {
+    let spawn_nodes: ui::NodesFetcher = {
         let config = config.clone();
         let paths = paths.to_vec();
-        move |context: &str| {
+        Box::new(move |context: &str| {
             nodes::spawn_gather(
                 config.clone(),
                 paths.clone(),
                 Some(context.to_owned()),
                 budget,
             )
-        }
+        })
+    };
+
+    // The pod-browsing pane's counterpart: called once each time drilling
+    // into a node changes which one the detail pane is showing.
+    let spawn_pods: ui::PodsFetcher = {
+        let config = config.clone();
+        let paths = paths.to_vec();
+        Box::new(move |context: &str, node: &str| {
+            pods::spawn_gather_for_node(
+                config.clone(),
+                paths.clone(),
+                Some(context.to_owned()),
+                node.to_owned(),
+                budget,
+            )
+        })
     };
 
     // Kicked off before the terminal takes over, so the fetch is already in
@@ -157,7 +173,7 @@ fn dashboard(
         .selected_cluster()
         .map(|cluster| spawn_nodes(&cluster.context_name));
 
-    ui::run(app, nodes_rx, spawn_nodes, refresh)
+    ui::run(app, nodes_rx, &spawn_nodes, &spawn_pods, refresh)
 }
 
 /// Print a command's output, skipping the newline for empty results so

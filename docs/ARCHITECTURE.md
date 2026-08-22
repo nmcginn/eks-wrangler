@@ -299,6 +299,22 @@ interval leave the existing rows up while their fetch is in flight, and a
 failure that arrives after a successful load keeps them rather than blanking
 the pane over one bad poll. See decision 55.
 
+The dashboard also gained its first drill-down: `Enter` on a highlighted node
+opens the pods placed on it, and `Esc` backs out rather than always quitting.
+That needed a second axis of state beyond which cluster is selected —
+`Focus` says which pane `j`/`k`/`Home`/`End` move the highlight in
+(`Sidebar` or `Detail`, toggled by `Tab`), and `View` says what the detail
+pane is showing (`Overview` or `NodePods { node }`). Both are read by
+`App::on_key`, which is still the one place a keypress becomes a state
+change, and by `ui::draw`, which uses `Focus` to decide which pane's border
+gets `Theme::pane_border`'s focus colour and whether a row highlight is
+drawn at all. `ui::event_loop` watches `App::view()` for a change the same
+way it already watched the selected cluster, and starts a
+`commands::pods::spawn_gather_for_node` fetch when it sees one — a second
+`PodsFetcher` closure beside `NodesFetcher`, both boxed trait objects rather
+than generics on `run`/`event_loop`, so a third pane's fetch trigger does
+not add a third type parameter. See decision 56.
+
 ## Testing
 
 Run `make test`. The suite needs no cluster, no credentials, and no network, and

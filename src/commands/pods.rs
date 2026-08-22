@@ -1,12 +1,13 @@
 //! `eks pods` — the pods of one namespace, or of every namespace, as a table.
 
 use std::path::PathBuf;
+use std::sync::mpsc;
 
 use anyhow::{Result, anyhow};
 use k8s_openapi::jiff::Timestamp;
 
 use crate::cluster::ClusterView;
-use crate::commands::nodes::target_cluster;
+use crate::commands::{self, nodes::target_cluster};
 use crate::format::Width;
 use crate::k8s::metrics::{self as k8s_metrics};
 use crate::k8s::order::Direction;
@@ -192,6 +193,71 @@ pub async fn list(
         request.width,
         request.palette,
     ))
+}
+
+/// What the pod-drilldown pane's background fetch delivers.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PodsFetch {
+    pub rows: Vec<PodRow>,
+}
+
+/// Fetch the pods placed on one node, on a background thread.
+///
+/// The dashboard's pod-browsing pane calls this once each time it is asked to
+/// show a different node — unlike the node pane, it does not refresh itself
+/// on an interval yet, which the dashboard follow-ups leave as its own task.
+/// No usage figures are fetched either: a node's pods are already a full
+/// round trip of their own, and wiring `metrics.k8s.io` into a third pane
+/// reads better as a considered addition than as a rider on this one.
+#[must_use]
+pub fn spawn_gather_for_node(
+    config: KubeConfig,
+    paths: Vec<PathBuf>,
+    cluster: Option<String>,
+    node: String,
+    budget: page::Budget,
+) -> mpsc::Receiver<Result<PodsFetch, String>> {
+    commands::spawn(async move {
+        gather_for_node(&config, &paths, cluster.as_deref(), &node, budget)
+            .await
+            .map_err(|error| format!("{error:#}"))
+    })
+}
+
+/// The `spawn_gather_for_node` future, kept separate so its early returns can
+/// use `?` against one `Result` instead of matching by hand.
+async fn gather_for_node(
+    config: &KubeConfig,
+    paths: &[PathBuf],
+    selector: Option<&str>,
+    node: &str,
+    budget: page::Budget,
+) -> Result<PodsFetch> {
+    let target = target_cluster(config, selector)?;
+    let label = target.label();
+    let client = k8s::connect(paths, &target, budget).await?;
+
+    // Every namespace: a node's pods are not scoped to one, and the pane
+    // answers "what is running here", not "what is running in this
+    // namespace". `spec.nodeName` is safe to interpolate unquoted — it comes
+    // from a `NodeRow` the API server itself named, never from what a user
+    // typed, and a Kubernetes node name cannot contain the characters the
+    // field-selector grammar treats specially.
+    let selectors = Selectors {
+        label: None,
+        field: Some(format!("spec.nodeName={node}")),
+    };
+    let pods = k8s_pods::fetch_scope(client, &Scope::All, &selectors, budget)
+        .await
+        .map_err(|error| anyhow!(k8s::explain(&error, &label)))?;
+
+    let now = Timestamp::now();
+    let rows = pods
+        .iter()
+        .map(|pod| PodRow::from_pod(pod, None, now))
+        .collect();
+
+    Ok(PodsFetch { rows })
 }
 
 /// Validate the label and field selectors, before any network call.

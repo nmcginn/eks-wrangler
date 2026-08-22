@@ -44,8 +44,32 @@ pub enum NodesState {
     Error(String),
 }
 
+impl NodesState {
+    /// The rows this state is showing, or an empty slice for every state
+    /// that has none — which is what lets `App` bound its row selection
+    /// against "however many rows there are" without matching on the state
+    /// itself.
+    #[must_use]
+    pub fn rows(&self) -> &[NodeRow] {
+        match self {
+            Self::Loaded { rows, .. } => rows,
+            Self::Loading | Self::Error(_) => &[],
+        }
+    }
+}
+
 /// Draw whatever the node pane currently knows.
-pub(super) fn draw(frame: &mut Frame, area: Rect, state: &NodesState, theme: Theme) {
+///
+/// `selected` highlights a row — `None` when the pane does not currently
+/// hold keyboard focus, so the highlight disappears the moment `Tab` moves
+/// it back to the sidebar.
+pub(super) fn draw(
+    frame: &mut Frame,
+    area: Rect,
+    state: &NodesState,
+    selected: Option<usize>,
+    theme: Theme,
+) {
     let lines: Vec<Line> = match state {
         NodesState::Loading => vec![Line::styled("Loading nodes…", theme.dim())],
         NodesState::Error(message) => vec![Line::styled(
@@ -76,7 +100,11 @@ pub(super) fn draw(frame: &mut Frame, area: Rect, state: &NodesState, theme: The
                         .map(|line| Line::styled(line.to_owned(), theme.dim())),
                 );
             }
-            lines.extend(rows.iter().map(|row| node_line(row, theme)));
+            lines.extend(
+                rows.iter()
+                    .enumerate()
+                    .map(|(index, row)| node_line(row, Some(index) == selected, theme)),
+            );
             lines
         }
     };
@@ -84,7 +112,7 @@ pub(super) fn draw(frame: &mut Frame, area: Rect, state: &NodesState, theme: The
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), area);
 }
 
-fn node_line(row: &NodeRow, theme: Theme) -> Line<'static> {
+fn node_line(row: &NodeRow, selected: bool, theme: Theme) -> Line<'static> {
     let mut spans = vec![
         Span::styled(row.name.clone(), theme.body()),
         Span::raw("  "),
@@ -102,7 +130,13 @@ fn node_line(row: &NodeRow, theme: Theme) -> Line<'static> {
     ));
     spans.push(Span::raw("  "));
     spans.push(Span::styled(pods_text(row.pods), theme.dim()));
-    Line::from(spans)
+
+    let line = Line::from(spans);
+    if selected {
+        line.style(theme.selected())
+    } else {
+        line
+    }
 }
 
 /// One labelled utilisation bar: `CPU ███████░░░ 1.5/4`.
@@ -227,7 +261,7 @@ mod tests {
         terminal
             .draw(|frame| {
                 let area = frame.area();
-                draw(frame, area, state, Theme::dark());
+                draw(frame, area, state, None, Theme::dark());
             })
             .unwrap();
         terminal.backend().to_string()
@@ -310,7 +344,7 @@ mod tests {
             terminal
                 .draw(|frame| {
                     let area = frame.area();
-                    draw(frame, area, &state, Theme::dark());
+                    draw(frame, area, &state, None, Theme::dark());
                 })
                 .unwrap();
         }
@@ -353,7 +387,7 @@ mod tests {
         terminal
             .draw(|frame| {
                 let area = frame.area();
-                draw(frame, area, &state, Theme::dark());
+                draw(frame, area, &state, None, Theme::dark());
             })
             .unwrap();
         let rendered = terminal.backend().to_string();
@@ -400,5 +434,32 @@ mod tests {
     fn no_refresh_error_is_shown_when_the_last_fetch_succeeded() {
         let rendered = render(&loaded(vec![node("worker-1")]));
         assert!(!rendered.contains("Last refresh failed"), "{rendered}");
+    }
+
+    #[test]
+    fn rows_returns_nothing_for_loading_or_error() {
+        assert!(NodesState::Loading.rows().is_empty());
+        assert!(NodesState::Error("nope".to_owned()).rows().is_empty());
+    }
+
+    #[test]
+    fn rows_returns_the_loaded_rows() {
+        let state = loaded(vec![node("worker-1"), node("worker-2")]);
+        assert_eq!(state.rows().len(), 2);
+    }
+
+    #[test]
+    fn drawing_a_selected_row_does_not_panic_at_any_width() {
+        // The highlight is a background colour patched onto the row's own
+        // spans, not a second widget — this is the case that would panic if
+        // the index it names were out of bounds.
+        let state = loaded(vec![node("worker-1")]);
+        let mut terminal = Terminal::new(TestBackend::new(90, 20)).unwrap();
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                draw(frame, area, &state, Some(0), Theme::dark());
+            })
+            .unwrap();
     }
 }
