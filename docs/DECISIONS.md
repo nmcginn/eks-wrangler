@@ -1442,3 +1442,42 @@ about the two surfaces disagreeing still holds in spirit — a node pinned at
 the two side by side has to know why. It is outweighed here by the roadmap
 task's explicit ask, but if a reviewer would rather the two readings match,
 the fix is `bar`'s call site, not `Share`.
+
+### 54. The node pane's usage note is worded bare, not through the CLI's wrapper
+
+The CLI table's third usage outcome — a metrics read that answered with
+nothing sampled yet — earns `k8s::nodes::usage_unsampled`, which names `CPU
+USE` and `MEM USE` because those are the columns going missing. The node
+pane's bars have no such headings; they are just labelled `CPU` and `MEM`
+already, in the row itself. So `k8s::nodes::usage_note`, the pane's reading of
+the same three-way `metrics::Outcome`, calls `metrics::unsampled` and
+`metrics::freshness_note` directly rather than through the CLI's wrapper,
+which is what the roadmap task asked for by naming those two functions
+specifically rather than their CLI-side callers.
+
+The fourth outcome the CLI table has — a read that failed outright, footnoted
+via `usage_unavailable` — is deliberately not carried over. The task was
+scoped to the freshness and unsampled notes, and the pane already says
+"nothing here" for a failed read the only way it currently can: every bar
+reads `-`. Wiring the explanation through would mean giving the pane
+something like the CLI's footnote list, which is the shape question the
+"nothing ranked" and sort-note follow-ups are already waiting on the reviewer
+to settle — bundling it into this change would be answering that question by
+accident rather than on purpose.
+
+The note lives on `NodesState::Loaded` as a second field beside the rows,
+built once by `commands::nodes::spawn_gather` from the same `Gathered` the CLI
+table's footnotes come from — `k8s_nodes::usage_note(&rows, &usage, &samples,
+now, &label)` — so the pane and the table read one classification, never two.
+The transfer type, `commands::nodes::NodesFetch`, is a struct rather than a
+`(Vec<NodeRow>, Option<String>)` tuple over the channel, so the note is a
+named field at both ends instead of a position to keep straight.
+
+`ui::nodes::draw` splits the note on `\n` into one `Line` per sentence before
+handing it to the pane: `ratatui` does not treat an embedded newline as a
+break the way a terminal printing the same string does, and the stale
+reading's second sentence — telling the reader to check metrics-server's pod
+— would otherwise run together with the first. The note sits between the
+`NODES` heading and the rows, in the header a pane has and a footnote list
+does not, and it is silent on an empty node list: there is no usage to date
+when nothing is running, whatever the read answered.

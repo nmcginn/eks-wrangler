@@ -310,7 +310,7 @@ cluster.
   `Freshness::is_stale`'s rather than a second reading of "a couple of windows";
   a listing where every sample is current gains nothing.
 
-- [ ] **Carry the freshness and unsampled notes into the dashboard's panes.**
+- [x] **Carry the freshness and unsampled notes into the dashboard's panes.**
   The third of the notes that will want a pane's header rather than a footnote
   under a scrolling list, and it pairs with the two sort-note entries above. A
   pane refreshing in the background makes it matter more than it does on the
@@ -767,6 +767,23 @@ cluster.
 ---
 
 ## Done
+
+- **Carry the freshness and unsampled notes into the dashboard's panes**
+  (2026-08-22) — the node pane now says how old its usage bars are, in a line
+  under the `NODES` heading: `Usage is up to 8s old, averaged over 20s.`, or
+  the stale wording past two windows, or a sentence saying metrics-server has
+  not sampled anything here yet. `k8s::nodes::usage_note` is the pane's own
+  reading of the same three-way `k8s::metrics::Outcome` the CLI table already
+  classifies its footnotes by, worded through `metrics::freshness_note` and
+  `metrics::unsampled` directly rather than the CLI's `usage_unsampled` —
+  that wrapper names `CPU USE`/`MEM USE`, columns the pane's bars do not have
+  headings for. A failed metrics read is left silent, out of scope for this
+  task: the pane has no footnote list yet to hand `usage_unavailable`'s
+  explanation to, and every bar already reads `-`. `commands::nodes::gather`
+  is unchanged; `spawn_gather` now reduces it to a `NodesFetch { rows,
+  usage_note }` instead of a bare `Vec<NodeRow>`, so the pane and the CLI
+  table read one classification off one fetch rather than two. See decision
+  54.
 
 - **Usage against capacity for the dashboard's bars** (2026-08-22) — the node
   pane's CPU and memory bars now fill and colour against the node's raw
