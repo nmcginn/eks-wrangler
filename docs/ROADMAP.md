@@ -261,7 +261,7 @@ cluster.
   under `k8s::order`'s existing rule rather than a second one; `--sort cpu` is
   unchanged.
 
-- [ ] **Usage against capacity for the dashboard's bars.**
+- [x] **Usage against capacity for the dashboard's bars.**
   `nodes::Share` divides usage by *allocatable*, which is the right denominator
   for "will another pod fit". A utilisation bar is asking a different question —
   "is this machine busy" — and wants capacity underneath it, so a node at 100%
@@ -767,6 +767,22 @@ cluster.
 ---
 
 ## Done
+
+- **Usage against capacity for the dashboard's bars** (2026-08-22) — the node
+  pane's CPU and memory bars now fill and colour against the node's raw
+  `capacity`, not the `allocatable` the CLI's `CPU USE`/`MEM USE` columns
+  divide by: a node pinned at 100% of allocatable no longer draws a full bar
+  when a slice of the machine is still kubelet reserve nothing can schedule
+  into. `nodes::Share` gained `ratio_of`/`severity_of`, taking the denominator
+  as a parameter rather than always reading `self.allocatable`, so the choice
+  is explicit at each call site instead of baked into the type; `ratio()` and
+  `severity()` are unchanged wrappers, and every existing reading — the CLI
+  table, the request columns — is unaffected. `ui::nodes::bar` is the one
+  caller so far that asks for the capacity reading, passing the node's
+  `Capacity` alongside the `Share` it already had. See decision 53: this
+  deliberately reopens decision 52, which had picked allocatable for the bar
+  too to keep the two surfaces in agreement, and the tradeoff is worth a
+  reviewer's second look.
 
 - **Node pane with live data** (2026-08-21) — the dashboard's "Overview" pane
   grows a real node list under the cluster summary: name, status, a CPU and a
