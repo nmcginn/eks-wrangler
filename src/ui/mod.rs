@@ -957,6 +957,8 @@ mod tests {
             kernel_version: "-".to_owned(),
             container_runtime: "-".to_owned(),
             devices: BTreeMap::new(),
+            ephemeral_storage: Capacity::default(),
+            hugepages: BTreeMap::new(),
         }
     }
 

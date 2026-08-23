@@ -315,6 +315,8 @@ mod tests {
             kernel_version: "6.1.148-172.265.amzn2023.x86_64".to_owned(),
             container_runtime: "containerd://1.7.28".to_owned(),
             devices: std::collections::BTreeMap::new(),
+            ephemeral_storage: Capacity::default(),
+            hugepages: std::collections::BTreeMap::new(),
         }
     }
 
