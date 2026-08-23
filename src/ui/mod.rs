@@ -18,16 +18,18 @@ use ratatui::{Frame, Terminal};
 
 use crate::cluster::ClusterView;
 use crate::commands::nodes::NodesFetch;
-use crate::commands::pods::PodsFetch;
+use crate::commands::pods::{ContainersFetch, PodsFetch};
 use crate::k8s::nodes as k8s_nodes;
 use crate::k8s::order::Direction as SortDirection;
 use crate::k8s::page::{Budget, ParseError};
 use crate::k8s::pods as k8s_pods;
 use crate::theme::Theme;
 
+mod containers;
 mod nodes;
 mod pods;
 
+use containers::ContainersState;
 use nodes::NodesState;
 use pods::PodsState;
 
@@ -45,6 +47,10 @@ pub type NodesFetcher = Box<dyn Fn(&str) -> mpsc::Receiver<Result<NodesFetch, St
 
 /// Starts a fetch of the pods on one node of one cluster.
 pub type PodsFetcher = Box<dyn Fn(&str, &str) -> mpsc::Receiver<Result<PodsFetch, String>>>;
+
+/// Starts a fetch of one pod's containers, given its namespace and name.
+pub type ContainersFetcher =
+    Box<dyn Fn(&str, &str, &str) -> mpsc::Receiver<Result<ContainersFetch, String>>>;
 
 /// How often the dashboard automatically starts a new node fetch, on top of
 /// pressing `r` to refresh on demand.
@@ -128,11 +134,12 @@ pub enum Focus {
 /// What the detail pane is showing, independent of which cluster is
 /// selected.
 ///
-/// A drill-down rather than a stack, because there is exactly one level of
-/// it today: a node's pods. A pod's containers — the next level the roadmap
-/// asks for — is the natural place this grows into a `Vec<View>` instead of
-/// gaining a third variant, but building that now would be guessing at a
-/// shape one more case cannot justify yet.
+/// Three variants rather than a `Vec<View>` stack: a pod's containers is the
+/// second and, for now, the last level this drills to, and a fixed enum says
+/// so in the type — `back_or_quit` and `draw_detail` are each one exhaustive
+/// `match` rather than a loop over a stack whose depth nothing bounds. A
+/// third drill-down level, if the roadmap ever asks for one, is the point at
+/// which a stack starts paying for itself; two is not.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum View {
     /// The selected cluster's node list.
@@ -140,6 +147,12 @@ pub enum View {
     Overview,
     /// The pods placed on one node of the selected cluster.
     NodePods { node: String },
+    /// The containers of one pod placed on `node`.
+    PodContainers {
+        node: String,
+        namespace: String,
+        pod: String,
+    },
 }
 
 /// Dashboard state.
@@ -150,13 +163,15 @@ pub struct App {
     theme: Theme,
     nodes: NodesState,
     pods: PodsState,
+    containers: ContainersState,
     focus: Focus,
     view: View,
     /// The highlighted row within whichever list [`View`] is currently
     /// showing in the detail pane — node rows under [`View::Overview`], pod
-    /// rows under [`View::NodePods`]. Reset to `0` on every view change and
-    /// every fresh load, so it can never point past the end of a shorter
-    /// list that just arrived.
+    /// rows under [`View::NodePods`], container rows under
+    /// [`View::PodContainers`]. Reset to `0` on every view change and every
+    /// fresh load, so it can never point past the end of a shorter list that
+    /// just arrived.
     detail_selected: usize,
     /// The node pane's ordering. `k8s::nodes::sort` and `k8s::order::note`
     /// are the same functions `eks nodes --sort` uses — a pane sorting its
@@ -183,6 +198,7 @@ impl App {
             theme: Theme::dark(),
             nodes: NodesState::default(),
             pods: PodsState::default(),
+            containers: ContainersState::default(),
             focus: Focus::default(),
             view: View::default(),
             detail_selected: 0,
@@ -223,6 +239,14 @@ impl App {
     #[must_use]
     pub fn pods(&self) -> &PodsState {
         &self.pods
+    }
+
+    /// What the pod-containers pane is showing. Only meaningful while
+    /// [`Self::view`] is [`View::PodContainers`], the same rule
+    /// [`Self::pods`] follows for [`View::NodePods`].
+    #[must_use]
+    pub fn containers(&self) -> &ContainersState {
+        &self.containers
     }
 
     /// Which pane `j`/`k`/`Home`/`End` currently move the highlight in.
@@ -335,6 +359,19 @@ impl App {
         };
     }
 
+    /// Apply the outcome of a fetch for one pod's containers.
+    ///
+    /// Like [`Self::apply_pods`] and unlike [`Self::apply_nodes`]: this pane
+    /// fetches once per pod it is asked to show rather than refreshing in the
+    /// background, so a failure always overwrites — there is no earlier good
+    /// listing for *this* pod worth keeping over a failed one.
+    pub fn apply_containers(&mut self, result: Result<ContainersFetch, String>) {
+        self.containers = match result {
+            Ok(fetch) => ContainersState::Loaded { rows: fetch.rows },
+            Err(message) => ContainersState::Error(message),
+        };
+    }
+
     /// `s`: cycle to the next ordering for whichever pane [`View`] is
     /// currently showing, and re-sort its already-fetched rows.
     ///
@@ -356,6 +393,11 @@ impl App {
                     k8s_pods::sort(rows, self.pod_order, self.pod_direction);
                 }
             }
+            // No ordering yet: a pod rarely has more than a handful of
+            // containers, already in the spec's own order, and `s` has
+            // nothing to do here rather than a third ordering invented for a
+            // list this short.
+            View::PodContainers { .. } => {}
         }
     }
 
@@ -376,6 +418,7 @@ impl App {
                     k8s_pods::sort(rows, self.pod_order, self.pod_direction);
                 }
             }
+            View::PodContainers { .. } => {}
         }
     }
 
@@ -387,51 +430,101 @@ impl App {
         };
     }
 
-    /// Return the detail pane to the node list, discarding any drill-down
-    /// into a node's pods.
+    /// Return the detail pane all the way to the node list, discarding any
+    /// drill-down into a node's pods or a pod's containers.
     ///
-    /// Called both when `Esc` backs out of [`View::NodePods`] and when the
-    /// sidebar selects a different cluster: a pods listing for a node in the
-    /// *previous* cluster is not an answer for the newly selected one.
-    pub fn leave_node_pods(&mut self) {
+    /// Called when the sidebar selects a different cluster: a pods or
+    /// containers listing that belongs to the *previous* cluster is not an
+    /// answer for the newly selected one, however many levels deep it was.
+    /// `Esc` does not call this — it backs out one level at a time instead,
+    /// through `on_key` — because leaving a drill-down on purpose and having
+    /// the ground move under it are different events with different answers
+    /// to "how far back".
+    pub fn leave_detail_view(&mut self) {
         self.view = View::Overview;
         self.detail_selected = 0;
         self.pods = PodsState::default();
+        self.containers = ContainersState::default();
     }
 
-    /// Drill into the highlighted node's pods, if the detail pane is focused
-    /// on the node list and a node is actually highlighted.
+    /// Drill one level into whatever the detail pane is currently showing —
+    /// a highlighted node's pods, or a highlighted pod's containers — if the
+    /// detail pane is focused and something is actually highlighted.
     ///
-    /// A no-op otherwise — pressing `Enter` with the sidebar focused, or
-    /// while a node fetch is still loading and there is nothing to
-    /// highlight yet, changes nothing. Starting the pod fetch itself is the
-    /// event loop's job, once it sees the view
-    /// change this causes; this method only decides *that* it happened.
-    pub fn drill_into_pods(&mut self) {
+    /// A no-op otherwise: pressing `Enter` with the sidebar focused, while a
+    /// fetch is still loading and there is nothing to highlight yet, or from
+    /// [`View::PodContainers`], where there is nowhere further to drill.
+    /// Starting the next fetch itself is the event loop's job, once it sees
+    /// the view change this causes; this method only decides *that* it
+    /// happened, and to what.
+    pub fn drill_in(&mut self) {
         if self.focus != Focus::Detail {
             return;
         }
-        if !matches!(self.view, View::Overview) {
-            return;
-        }
-        let Some(node) = self.nodes.rows().get(self.detail_selected) else {
+        let Some(next) = self.next_view() else {
             return;
         };
-        self.view = View::NodePods {
-            node: node.name.clone(),
-        };
+        self.view = next;
         self.detail_selected = 0;
-        self.pods = PodsState::Loading;
+        match &self.view {
+            View::Overview => {}
+            View::NodePods { .. } => self.pods = PodsState::Loading,
+            View::PodContainers { .. } => self.containers = ContainersState::Loading,
+        }
     }
 
-    /// `Esc`: back out of a drill-down, or quit if there is nowhere to back
-    /// out to.
+    /// What drilling in from the current view would show, or `None` when
+    /// there is nowhere to drill — the sidebar has nothing highlighted yet,
+    /// or [`View::PodContainers`] has no further level.
+    ///
+    /// Split out of [`Self::drill_in`] so the "what would this show" question
+    /// is answered before anything about `self` changes: reading
+    /// `self.detail_selected` against `self.pods.rows()` while also wanting
+    /// to reassign `self.view` in the same breath is exactly the borrow a
+    /// pure lookup avoids.
+    fn next_view(&self) -> Option<View> {
+        match &self.view {
+            View::Overview => {
+                let node = self.nodes.rows().get(self.detail_selected)?;
+                Some(View::NodePods {
+                    node: node.name.clone(),
+                })
+            }
+            View::NodePods { node } => {
+                let pod = self.pods.rows().get(self.detail_selected)?;
+                Some(View::PodContainers {
+                    node: node.clone(),
+                    namespace: pod.namespace.clone(),
+                    pod: pod.name.clone(),
+                })
+            }
+            View::PodContainers { .. } => None,
+        }
+    }
+
+    /// `Esc`: back out of a drill-down one level at a time, or quit once
+    /// there is nowhere left to back out to.
+    ///
+    /// A pod's containers back out to that pod's node's pods without a
+    /// fetch: [`Self::pods`] was not touched by drilling further in, so the
+    /// listing is still the one already on screen. Backing out of a node's
+    /// pods to the node list, by contrast, has always discarded that
+    /// listing outright — there is no cheaper "the node list is still
+    /// current" to fall back on, since it never stopped being fetched in
+    /// the background.
     fn back_or_quit(&mut self) -> Flow {
-        if matches!(self.view, View::NodePods { .. }) {
-            self.leave_node_pods();
-            Flow::Continue
-        } else {
-            Flow::Quit
+        match &self.view {
+            View::PodContainers { node, .. } => {
+                self.view = View::NodePods { node: node.clone() };
+                self.detail_selected = 0;
+                self.containers = ContainersState::default();
+                Flow::Continue
+            }
+            View::NodePods { .. } => {
+                self.leave_detail_view();
+                Flow::Continue
+            }
+            View::Overview => Flow::Quit,
         }
     }
 
@@ -440,6 +533,7 @@ impl App {
         match &self.view {
             View::Overview => self.nodes.rows().len(),
             View::NodePods { .. } => self.pods.rows().len(),
+            View::PodContainers { .. } => self.containers.rows().len(),
         }
     }
 
@@ -517,7 +611,7 @@ impl App {
             KeyCode::Char('q') => return Flow::Quit,
             KeyCode::Esc => return self.back_or_quit(),
             KeyCode::Tab => self.toggle_focus(),
-            KeyCode::Enter => self.drill_into_pods(),
+            KeyCode::Enter => self.drill_in(),
             KeyCode::Char('s') => self.cycle_sort(),
             KeyCode::Char('S') => self.reverse_sort(),
             KeyCode::Char('j') | KeyCode::Down => match self.focus {
@@ -558,7 +652,9 @@ impl App {
 /// [`commands::nodes::spawn_gather`](crate::commands::nodes::spawn_gather)).
 /// `spawn_pods` is the same idea for a node's pods, called with the selected
 /// cluster's context and the drilled-into node's name whenever the detail
-/// pane's view changes to [`View::NodePods`].
+/// pane's view changes to [`View::NodePods`]. `spawn_containers` is one level
+/// further in: the selected cluster's context, and the namespace and name of
+/// the drilled-into pod, whenever the view changes to [`View::PodContainers`].
 /// This function never awaits a fetch: each iteration only polls for a result
 /// that has already arrived, which is what keeps a hung request from blocking
 /// a keypress.
@@ -567,6 +663,7 @@ pub fn run(
     nodes_rx: Option<mpsc::Receiver<Result<NodesFetch, String>>>,
     spawn_nodes: &NodesFetcher,
     spawn_pods: &PodsFetcher,
+    spawn_containers: &ContainersFetcher,
     refresh: RefreshInterval,
 ) -> Result<()> {
     let mut terminal = ratatui::init();
@@ -576,6 +673,7 @@ pub fn run(
         nodes_rx,
         spawn_nodes,
         spawn_pods,
+        spawn_containers,
         refresh,
     );
     ratatui::restore();
@@ -588,6 +686,7 @@ fn event_loop<B>(
     mut nodes_rx: Option<mpsc::Receiver<Result<NodesFetch, String>>>,
     spawn_nodes: &NodesFetcher,
     spawn_pods: &PodsFetcher,
+    spawn_containers: &ContainersFetcher,
     refresh: RefreshInterval,
 ) -> Result<()>
 where
@@ -600,6 +699,7 @@ where
     let mut selected_context = app.selected_cluster().map(|c| c.context_name.clone());
     let mut next_refresh = schedule(refresh);
     let mut pods_rx: Option<mpsc::Receiver<Result<PodsFetch, String>>> = None;
+    let mut containers_rx: Option<mpsc::Receiver<Result<ContainersFetch, String>>> = None;
 
     loop {
         // Non-blocking: a fetch that has not finished yet leaves the pane
@@ -615,6 +715,11 @@ where
             && let Ok(result) = rx.try_recv()
         {
             app.apply_pods(result);
+        }
+        if let Some(rx) = &containers_rx
+            && let Ok(result) = rx.try_recv()
+        {
+            app.apply_containers(result);
         }
 
         terminal.draw(|frame| draw(frame, &app))?;
@@ -652,22 +757,41 @@ where
         if now_selected != selected_context {
             selected_context = now_selected;
             app.start_loading_nodes();
-            app.leave_node_pods();
+            app.leave_detail_view();
             pods_rx = None;
+            containers_rx = None;
             refetch(spawn_nodes, &mut nodes_rx, selected_context.as_deref());
             next_refresh = schedule(refresh);
         } else if *app.view() != view_before {
             // Not an `else if` on the selection check above by accident: a
             // cluster change already forces the view back to `Overview`
-            // through `leave_node_pods`, so re-deriving the same outcome
+            // through `leave_detail_view`, so re-deriving the same outcome
             // here would just repeat it.
             match app.view() {
                 View::NodePods { node } => {
-                    if let Some(context) = selected_context.as_deref() {
+                    containers_rx = None;
+                    // Only when drilling *forward* into this node — `Esc`
+                    // backing out of that node's `PodContainers` also lands
+                    // here, and the listing it left behind is still current,
+                    // so `apply_containers` cleared it rather than
+                    // `App::pods` moving to `Loading` the way it does here.
+                    if matches!(app.pods(), PodsState::Loading)
+                        && let Some(context) = selected_context.as_deref()
+                    {
                         pods_rx = Some(spawn_pods(context, node));
                     }
                 }
-                View::Overview => pods_rx = None,
+                View::PodContainers { namespace, pod, .. } => {
+                    if matches!(app.containers(), ContainersState::Loading)
+                        && let Some(context) = selected_context.as_deref()
+                    {
+                        containers_rx = Some(spawn_containers(context, namespace, pod));
+                    }
+                }
+                View::Overview => {
+                    pods_rx = None;
+                    containers_rx = None;
+                }
             }
         }
     }
@@ -806,6 +930,7 @@ fn draw_detail(frame: &mut Frame, area: Rect, app: &App) {
     let title = match app.view() {
         View::Overview => " Overview ".to_owned(),
         View::NodePods { node } => format!(" Overview › {node} "),
+        View::PodContainers { node, pod, .. } => format!(" Overview › {node} › {pod} "),
     };
     let block = Block::bordered()
         .title(title)
@@ -871,6 +996,9 @@ fn draw_detail(frame: &mut Frame, area: Rect, app: &App) {
             app.pod_direction(),
             theme,
         ),
+        View::PodContainers { .. } => {
+            containers::draw(frame, sections[1], app.containers(), highlighted, theme);
+        }
     }
 }
 
@@ -962,6 +1090,31 @@ mod tests {
         }
     }
 
+    fn pod_row(name: &str) -> crate::k8s::pods::PodRow {
+        use crate::k8s::quantity::Quantity;
+
+        crate::k8s::pods::PodRow {
+            namespace: "default".to_owned(),
+            name: name.to_owned(),
+            ready: "1/1".to_owned(),
+            status: "Running".to_owned(),
+            severity: crate::theme::Severity::Ok,
+            restarts: 0,
+            restart_age: None,
+            last_restart: None,
+            age: "3d".to_owned(),
+            created_at: None,
+            cpu_used: None,
+            memory_used: None,
+            cpu_requested: Quantity::default(),
+            memory_requested: Quantity::default(),
+            node: "worker-1".to_owned(),
+            ip: "-".to_owned(),
+            nominated_node: "-".to_owned(),
+            readiness_gates: None,
+        }
+    }
+
     /// A node with a measured CPU share, for the tests that sort on it.
     fn node_row_with_cpu(name: &str, used: &str, allocatable: &str) -> crate::k8s::nodes::NodeRow {
         use crate::k8s::nodes::Share;
@@ -985,6 +1138,19 @@ mod tests {
             usage_note: None,
         }));
         app.toggle_focus();
+        app
+    }
+
+    /// An app drilled one level further than [`app_with_node`]: one pod
+    /// already loaded under `worker-1`, highlighted, ready to drill into its
+    /// containers.
+    fn app_with_pod() -> App {
+        let mut app = app_with_node();
+        app.on_key(press(KeyCode::Enter));
+        app.apply_pods(Ok(PodsFetch {
+            rows: vec![pod_row("api-1")],
+            selector_note: None,
+        }));
         app
     }
 
@@ -1213,6 +1379,44 @@ mod tests {
     }
 
     #[test]
+    fn a_frame_drilled_into_a_pods_containers_carries_the_full_breadcrumb() {
+        let mut app = app_with_pod();
+        app.on_key(press(KeyCode::Enter));
+        app.apply_containers(Ok(ContainersFetch {
+            rows: vec![crate::k8s::pods::ContainerRow {
+                name: "app".to_owned(),
+                image: "app:1.0".to_owned(),
+                init: false,
+                ready: true,
+                restarts: 0,
+                state: "Running".to_owned(),
+                severity: crate::theme::Severity::Ok,
+            }],
+        }));
+
+        let mut terminal = Terminal::new(TestBackend::new(90, 20)).unwrap();
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+
+        let rendered = terminal.backend().to_string();
+        assert!(
+            rendered.contains("Overview › worker-1 › api-1"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("app:1.0"), "{rendered}");
+    }
+
+    #[test]
+    fn rendering_a_pods_containers_survives_a_tiny_terminal() {
+        for (width, height) in [(1, 1), (8, 3), (20, 2), (200, 60)] {
+            let mut app = app_with_pod();
+            app.on_key(press(KeyCode::Enter));
+
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            terminal.draw(|frame| draw(frame, &app)).unwrap();
+        }
+    }
+
+    #[test]
     fn rendering_an_empty_cluster_list_explains_itself() {
         let mut terminal = Terminal::new(TestBackend::new(90, 20)).unwrap();
         let app = App::new(Vec::new());
@@ -1372,14 +1576,176 @@ mod tests {
     }
 
     #[test]
-    fn leave_node_pods_resets_the_view_and_the_pods_pane() {
+    fn enter_drills_into_the_highlighted_pods_containers() {
+        let mut app = app_with_pod();
+
+        app.on_key(press(KeyCode::Enter));
+
+        assert_eq!(
+            app.view(),
+            &View::PodContainers {
+                node: "worker-1".to_owned(),
+                namespace: "default".to_owned(),
+                pod: "api-1".to_owned(),
+            }
+        );
+        assert_eq!(app.containers(), &ContainersState::Loading);
+        assert_eq!(
+            app.detail_selected(),
+            0,
+            "drilling in starts with nothing highlighted in the new list"
+        );
+    }
+
+    #[test]
+    fn enter_is_a_no_op_while_the_pod_list_is_still_loading() {
+        let mut app = app_with_node();
+        app.on_key(press(KeyCode::Enter));
+        assert_eq!(app.pods(), &PodsState::Loading);
+
+        app.on_key(press(KeyCode::Enter));
+
+        assert_eq!(
+            app.view(),
+            &View::NodePods {
+                node: "worker-1".to_owned()
+            }
+        );
+    }
+
+    #[test]
+    fn enter_does_nothing_further_once_drilled_into_containers() {
+        // There is nowhere left to go; `Enter` on a highlighted container is
+        // a no-op rather than a fourth level nothing built.
+        let mut app = app_with_pod();
+        app.on_key(press(KeyCode::Enter));
+        let view_before = app.view().clone();
+
+        app.on_key(press(KeyCode::Enter));
+
+        assert_eq!(app.view(), &view_before);
+    }
+
+    #[test]
+    fn esc_backs_out_of_a_container_drill_down_to_the_pod_list_not_the_overview() {
+        let mut app = app_with_pod();
+        app.on_key(press(KeyCode::Enter));
+        assert_eq!(app.containers(), &ContainersState::Loading);
+
+        let flow = app.on_key(press(KeyCode::Esc));
+
+        assert_eq!(flow, Flow::Continue);
+        assert_eq!(
+            app.view(),
+            &View::NodePods {
+                node: "worker-1".to_owned()
+            },
+            "esc backs out one level at a time, not straight to the overview"
+        );
+    }
+
+    #[test]
+    fn esc_from_the_pod_list_still_has_the_rows_it_fetched() {
+        // Backing out of a pod's containers must not discard the pod
+        // listing the reader was just looking at: there was no reason to
+        // refetch it, and it did not change underneath them.
+        let mut app = app_with_pod();
+        app.on_key(press(KeyCode::Enter));
+
+        app.on_key(press(KeyCode::Esc));
+
+        assert_eq!(
+            app.pods(),
+            &PodsState::Loaded {
+                rows: vec![pod_row("api-1")],
+                selector_note: None,
+            }
+        );
+    }
+
+    #[test]
+    fn esc_three_times_from_a_container_drill_down_reaches_quit() {
+        let mut app = app_with_pod();
+        app.on_key(press(KeyCode::Enter));
+
+        assert_eq!(app.on_key(press(KeyCode::Esc)), Flow::Continue);
+        assert_eq!(
+            app.view(),
+            &View::NodePods {
+                node: "worker-1".to_owned()
+            }
+        );
+
+        assert_eq!(app.on_key(press(KeyCode::Esc)), Flow::Continue);
+        assert_eq!(app.view(), &View::Overview);
+
+        assert_eq!(app.on_key(press(KeyCode::Esc)), Flow::Quit);
+    }
+
+    #[test]
+    fn q_always_quits_even_while_drilled_into_a_pods_containers() {
+        let mut app = app_with_pod();
+        app.on_key(press(KeyCode::Enter));
+
+        assert_eq!(app.on_key(press(KeyCode::Char('q'))), Flow::Quit);
+    }
+
+    #[test]
+    fn apply_containers_moves_a_success_into_the_loaded_state() {
+        let mut app = app();
+
+        app.apply_containers(Ok(ContainersFetch::default()));
+
+        assert_eq!(
+            app.containers(),
+            &ContainersState::Loaded { rows: Vec::new() }
+        );
+    }
+
+    #[test]
+    fn apply_containers_moves_a_failure_into_the_error_state_even_after_a_success() {
+        // Unlike the node pane, and like the pod pane: this fetches once per
+        // pod rather than refreshing in the background, so there is no
+        // earlier good listing for *this* pod worth keeping over a failed
+        // one.
+        let mut app = app();
+        app.apply_containers(Ok(ContainersFetch::default()));
+
+        app.apply_containers(Err("could not get pod".to_owned()));
+
+        assert_eq!(
+            app.containers(),
+            &ContainersState::Error("could not get pod".to_owned())
+        );
+    }
+
+    #[test]
+    fn leave_detail_view_resets_the_view_and_the_pods_pane() {
         let mut app = app_with_node();
         app.on_key(press(KeyCode::Enter));
 
-        app.leave_node_pods();
+        app.leave_detail_view();
 
         assert_eq!(app.view(), &View::Overview);
         assert_eq!(app.pods(), &PodsState::Loading);
+        assert_eq!(app.detail_selected(), 0);
+    }
+
+    #[test]
+    fn leave_detail_view_also_discards_a_deeper_drill_into_containers() {
+        let mut app = app_with_node();
+        app.on_key(press(KeyCode::Enter));
+        app.apply_pods(Ok(PodsFetch {
+            rows: vec![pod_row("api-1")],
+            selector_note: None,
+        }));
+        app.on_key(press(KeyCode::Enter));
+        assert_eq!(app.containers(), &ContainersState::Loading);
+
+        app.leave_detail_view();
+
+        assert_eq!(app.view(), &View::Overview);
+        assert_eq!(app.containers(), &ContainersState::Loading);
         assert_eq!(app.detail_selected(), 0);
     }
 
@@ -1570,6 +1936,21 @@ mod tests {
             k8s_nodes::Order::default(),
             "the node pane's ordering must not move while a different pane is showing"
         );
+    }
+
+    #[test]
+    fn sort_and_reverse_are_harmless_while_a_pods_containers_are_showing() {
+        // No ordering exists for this pane yet; `s`/`S` must not panic, and
+        // must not leak into the other two panes' orderings either.
+        let mut app = app_with_pod();
+        app.on_key(press(KeyCode::Enter));
+        assert!(matches!(app.view(), View::PodContainers { .. }));
+
+        app.on_key(press(KeyCode::Char('s')));
+        app.on_key(press(KeyCode::Char('S')));
+
+        assert_eq!(app.node_order(), k8s_nodes::Order::default());
+        assert_eq!(app.pod_order(), k8s_pods::Order::default());
     }
 
     #[test]

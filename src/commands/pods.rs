@@ -4,7 +4,9 @@ use std::path::PathBuf;
 use std::sync::mpsc;
 
 use anyhow::{Result, anyhow};
+use k8s_openapi::api::core::v1::Pod;
 use k8s_openapi::jiff::Timestamp;
+use kube::api::Api;
 
 use crate::cluster::ClusterView;
 use crate::commands::{self, nodes::target_cluster};
@@ -12,7 +14,7 @@ use crate::format::Width;
 use crate::k8s::metrics::{self as k8s_metrics};
 use crate::k8s::order::Direction;
 use crate::k8s::page;
-use crate::k8s::pods::{Order, PodRow, Scope, Selectors};
+use crate::k8s::pods::{ContainerRow, Order, PodRow, Scope, Selectors};
 use crate::k8s::{self, pods as k8s_pods, selector};
 use crate::kubeconfig::KubeConfig;
 use crate::theme::Palette;
@@ -302,6 +304,72 @@ fn scoped_to_node(node: &str, selectors: &Selectors) -> Selectors {
         label: selectors.label.clone(),
         field: Some(field),
     }
+}
+
+/// What the pod-containers pane's background fetch delivers.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ContainersFetch {
+    pub rows: Vec<ContainerRow>,
+}
+
+/// Fetch one pod's containers, on a background thread.
+///
+/// Unlike [`spawn_gather_for_node`], this asks for a single named object
+/// rather than a listing: the node-pods pane already has every field a
+/// container row needs sitting in the `Pod`s it fetched, but nothing keeps
+/// that `Pod` around once it has been reduced to a [`PodRow`] — a row that
+/// many other pods on the node share the shape of has no room for one pod's
+/// full container list. Asking again for the one pod the reader drilled into
+/// is simpler than carrying every pod's raw containers through a pane that
+/// almost never needs them.
+#[must_use]
+pub fn spawn_gather_containers(
+    config: KubeConfig,
+    paths: Vec<PathBuf>,
+    cluster: Option<String>,
+    namespace: String,
+    pod: String,
+    budget: page::Budget,
+) -> mpsc::Receiver<Result<ContainersFetch, String>> {
+    commands::spawn(async move {
+        gather_containers(
+            &config,
+            &paths,
+            cluster.as_deref(),
+            &namespace,
+            &pod,
+            budget,
+        )
+        .await
+        .map_err(|error| format!("{error:#}"))
+    })
+}
+
+/// The `spawn_gather_containers` future, kept separate for the same reason
+/// [`gather_for_node`] is: its early returns use `?` against one `Result`.
+async fn gather_containers(
+    config: &KubeConfig,
+    paths: &[PathBuf],
+    cluster: Option<&str>,
+    namespace: &str,
+    pod: &str,
+    budget: page::Budget,
+) -> Result<ContainersFetch> {
+    let target = target_cluster(config, cluster)?;
+    let label = target.label();
+    let client = k8s::connect(paths, &target, budget).await?;
+
+    let api: Api<Pod> = Api::namespaced(client, namespace);
+    // A single `get` rather than a paged listing — `budget.wrap` covers both,
+    // spending the same per-request timeout every other fetch does.
+    let fetched = budget
+        .wrap(api.get(pod))
+        .await
+        .map_err(|error| anyhow!(k8s::explain(&error, &label)))?;
+
+    Ok(ContainersFetch {
+        rows: ContainerRow::from_pod(&fetched),
+    })
 }
 
 /// Validate the label and field selectors, before any network call.

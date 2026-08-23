@@ -1766,3 +1766,57 @@ In `DROP_ORDER` they are the very first columns to go on a narrow terminal —
 ahead of even `VERSION` — because they are the newest facts on the row and
 were not visible at all before tonight; a reviewer resizing a terminal on an
 existing listing should see no difference until it is genuinely tight.
+
+### 60. `View` grew a third variant instead of becoming a stack
+
+The pod-browsing task that added `View::NodePods` left its own doc comment a
+prediction: a pod's containers, the next drill-down level, was "the natural
+place this grows into a `Vec<View>`". Building that here would have been
+guessing at a shape for a depth this tool still does not have — the roadmap's
+next drill-down candidate, a container's logs or its own detail view, is not
+scheduled, and nothing today asks how a third level backs out or what happens
+if a fetch fails partway down a stack two levels deep. A fixed three-variant
+enum answers the actual question — `Overview`, `NodePods { node }`,
+`PodContainers { node, namespace, pod }` — and keeps `back_or_quit` and
+`draw_detail` each one exhaustive `match`, so the compiler catches a missing
+arm the way an unbounded stack never would. A stack earns its keep once a
+third level is a real task rather than a hypothetical one; two known levels
+were not that point.
+
+The consequence worth a reviewer's attention: `App::leave_node_pods` split
+into two distinct operations that a `Vec<View>` would have collapsed into
+one. `App::leave_detail_view` (its new name) resets the detail pane all the
+way to `Overview` and discards both the pods and the containers panes in one
+call — the shape a cluster switch needs, since a stale drill-down at either
+depth is equally wrong under a newly selected cluster. `Esc`'s one-level-at-
+a-time backing out is a separate path in `back_or_quit`, and deliberately so:
+going from `PodContainers` back to `NodePods` does not refetch the pod
+listing, because nothing about it changed — it is exactly the pods pane that
+was already on screen a moment ago. Collapsing the two into a single "pop the
+stack" operation would have made that distinction one `if` statement's worth
+of ceremony instead of two clearly-named methods, at the cost of hiding the
+fact that they answer different questions: "the user asked to back up" and
+"the ground moved out from under them" are not the same event, and do not
+deserve the same amount of state thrown away.
+
+`ContainerRow` lives beside `PodRow` in `k8s::pods`, not inside `row.rs`
+itself: `row.rs`'s whole point is deriving one `STATUS` for a pod by picking
+which of several unhappy containers gets to speak for it, and a per-container
+state is the opposite operation — every container reports for itself, in
+spec order, nothing chosen on its behalf. The two modules share one thing,
+`exit_reason`, which moved from private to `pub(super)` so a `Terminated`
+container and an app-container's contribution to a pod's own `STATUS` are
+guaranteed to use the same word for the same termination rather than two
+independent spellings drifting apart over time.
+
+The fetch is a plain `kube::Api::get` on the one pod's name, not a second
+listing: the node-pods pane already read every field a container row needs
+out of the `Pod`s it fetched to build `PodRow`s, but keeps none of that
+around once reduced — a `PodRow` sized for a listing of many pods has no
+room for one pod's full container list, and carrying every pod's raw
+containers through a pane that almost never needs them would cost more than
+asking again for the one the reader actually drilled into. It goes through
+the same `Budget::wrap`/`k8s::explain` path every other fetch in the tool
+does, so a pod that was deleted between the listing and the drill-down reads
+as an ordinary API failure rather than a special case invented for this one
+pane.
