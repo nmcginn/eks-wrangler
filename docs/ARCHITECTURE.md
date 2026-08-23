@@ -196,6 +196,18 @@ canonical string, rejecting a malformed one — with the offending text quoted �
 before `eks pods` connects. It is another pure parser with no Kubernetes types
 in its signature, so the whole grammar is a fixture table; the command layer's
 `selectors_for` is where that validation is wired ahead of any request.
+`-l`/`--field-selector` are global flags rather than `eks pods`'s alone,
+exactly where `--namespace` already sits, so the dashboard's pod-drilldown
+pane reads the same `Selectors` — validated by the same `selectors_for`,
+before its terminal opens rather than after a fetch fails inside it. The
+pane's own `spec.nodeName` scoping is not optional, so it is composed with
+whatever the user typed rather than replaced by it:
+`commands::pods::scoped_to_node` ANDs a field selector onto the node filter
+with a comma, the same way two field requirements already AND against each
+other. Both surfaces also share the sentence for an empty answer:
+`k8s::pods::row::selector_note`, which the CLI table's `empty()` already
+used, is what lets the pane say a selector — not the node — is why a
+listing came back with nothing in it.
 
 Live usage is a fourth computation on that pipeline, and the one that needed a
 type the API does not give us. `metrics.k8s.io` is an aggregated API served by an

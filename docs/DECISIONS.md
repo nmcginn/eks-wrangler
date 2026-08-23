@@ -1616,3 +1616,61 @@ signature does not grow a type parameter every time a pane gains its own
 fetch trigger — a distinction (which closure a function happens to be)
 nothing outside `main` needs at the type level. The dynamic dispatch this
 costs is one call per keypress or refresh tick, not per frame.
+
+### 57. `-l`/`--field-selector` became global flags, and the dashboard combines
+them with its own scoping rather than replacing it
+
+"Carry the pod selectors into the dashboard" asked for one thing the
+pod-drilldown pane did not have: `Selectors` reused rather than the pane
+growing its own filter. The pane had no flags of its own to grow one from —
+`Command::Dashboard` carries no fields — and `Command::Pods` had the only
+`-l`/`--field-selector` definitions in the parser. Two ways to give the
+dashboard the same flags: a second, dashboard-only pair, or moving the
+existing pair up to `GlobalArgs`, beside `--namespace`, which already sits
+there accepted by every command and acted on by fewer than all of them. The
+second was the smaller change and the more honest one: `--namespace` had
+already established that a global flag some commands ignore is this
+project's answer to "a flag that means the same thing everywhere it applies,"
+rather than a design question this task needed to reopen. `eks pods -l
+app=api` still parses exactly as before — clap resolves a global arg from a
+subcommand the same way — and `eks nodes -l app=api` now parses too, doing
+nothing, which is what `eks nodes -n payments` already did.
+
+Validating them is `main::run`'s job, once, before either `dashboard` or
+`pods::list` is reached: `commands::pods::selectors_for` is the same function
+both call, so a malformed `-l` is rejected in the same words whichever
+surface it was typed for, and the dashboard's terminal never initialises on
+one that cannot parse — first paint stays free of a request `ratatui::init`
+would otherwise have to unwind out of.
+
+The pane's own `spec.nodeName` filter could not simply be replaced by the
+user's field selector, because it is not optional: it is the reason this is
+*this node's* pane and not the whole cluster's. `commands::pods::
+scoped_to_node` is the pure function that composes the two — a comma joins
+two field requirements as an `AND` the same way it already joins two label
+ones, so `--field-selector status.phase!=Running` narrows what a node's pane
+shows rather than being silently overridden by the node scoping, or silently
+dropped in favour of it. Pulling the combination out of the async
+`gather_for_node` and into its own function is what let the rule be a
+fixture — three cases, no cluster — instead of something only a live fetch
+could exercise.
+
+An empty pod list is ambiguous without knowing why it is empty, which the CLI
+table already had an answer for: `k8s::pods::row::selector_note`, private
+until now, phrases whichever of a label and a field selector are active. Made
+`pub` and re-exported, it is what lets the pane say "No pods here match label
+selector `app=api`." instead of "This node has no pods." — sharing the
+phrase itself, not just the shape of the fix, with the CLI's `empty()`. The
+note travels from the *user's* `Selectors`, computed once in `gather_for_node`
+before `scoped_to_node` folds in the node filter, because that filter is
+implicit in "this is the node's pane" and would be a strange thing to explain
+back to someone as a reason their list came up empty. `PodsFetch` and
+`PodsState::Loaded` both carry it as an `Option<String>`, the same shape
+`NodesFetch::usage_note` already established for a fact a fetch computes once
+and a pane reads without recomputing.
+
+Left for later, deliberately: editing the selector without restarting `eks`.
+The dashboard has no text-input mechanism yet — fuzzy search (`/`) is the
+first roadmap task that will need one — and guessing at its shape to serve
+this task alone would very likely guess wrong. Tracked in the roadmap as its
+own entry, to be built once there is an input mechanism to hang it on.

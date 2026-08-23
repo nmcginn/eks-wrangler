@@ -1098,7 +1098,12 @@ fn empty(cluster: &str, scope: &super::Scope, selectors: &super::Selectors) -> S
 }
 
 /// A phrase naming the active selectors, or `None` when none are set.
-fn selector_note(selectors: &super::Selectors) -> Option<String> {
+///
+/// Shared with the dashboard's pod-drilldown pane, which asks the same
+/// question of its own selectors when a node's pods come back empty — see
+/// [`crate::commands::pods::PodsFetch::selector_note`].
+#[must_use]
+pub fn selector_note(selectors: &super::Selectors) -> Option<String> {
     match (&selectors.label, &selectors.field) {
         (Some(label), Some(field)) => Some(format!(
             "label selector `{label}` and field selector `{field}`"
