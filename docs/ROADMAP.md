@@ -134,13 +134,16 @@ cluster.
   unchanged to the byte; the note is a pure function over the order and
   direction.
 
-- [ ] **Carry the sort note into the dashboard's panes.**
+- [x] **Carry the sort note into the dashboard's panes.**
   The note now sits in the footnote list of both CLI tables, and the dashboard
   panes will want the same line once they take `--sort` — but a pane has a title
   bar the CLI table does not, and a footnote under a scrolling list is a worse
   place for it than the header. Discovered while writing the CLI note.
   *Acceptance:* the note comes from `k8s::order::note`, not a second wording;
   the default order is as silent in a pane as it is on the command line.
+  Landed together with "Carry `--sort` into the dashboard" below, which this
+  task turned out to presuppose: a note about a pane's ordering has nothing
+  to say until the pane can be put in one. See decision 58.
 
 - [x] **An ordering that ranked nothing should say so.**
   `eks nodes --sort cpu` on a cluster with no metrics-server sorts by a column
@@ -186,7 +189,7 @@ cluster.
   `Cause::Explained` half needs a decision the CLI did not have to make, since a
   pane has nowhere obvious for "the reason above" to point.
 
-- [ ] **Carry `--sort` into the dashboard, alongside the selectors.**
+- [x] **Carry `--sort` into the dashboard, alongside the selectors.**
   `k8s::pods::order` is deliberately a function over rows rather than over pods,
   so the dashboard's pod views can sort the rows they already have without
   refetching — and should, rather than growing an ordering of their own. Pairs
@@ -196,6 +199,10 @@ cluster.
   *Acceptance:* the dashboard sorts through `k8s::pods::sort` and
   `k8s::nodes::sort`; a key press changes the order, and another reverses it,
   without a request.
+  Landed as `s`, cycling `Order::value_variants()` one press at a time, and
+  `S`, flipping `Direction` — `App` gained a `node_order`/`node_direction`
+  pair and a `pod_order`/`pod_direction` pair, since the two panes never
+  share a screen and hold different rows. See decision 58.
 
 - [x] **A `--wide` mode for `eks pods`.**
   Pod IP, and the nominated node for a preempting pod — the two columns
@@ -843,7 +850,31 @@ cluster.
   machine can give out"; both are the first to leave on a narrow terminal,
   ahead of even `VERSION`, since neither was visible at all before tonight and
   an existing listing should look unchanged until the terminal is genuinely
-  tight. See decision 58.
+  tight. See decision 59.
+
+- **Carry `--sort` into the dashboard, alongside the selectors**, **Carry
+  the sort note into the dashboard's panes** (2026-08-23) — `s` cycles the
+  node pane and the pod-drilldown pane through the same orderings `eks
+  nodes --sort`/`eks pods --sort` accept, and `S` reverses whichever one is
+  active; a `Sorted by cpu.`/`Sorted by cpu, reversed.` line appears under a
+  pane's rows exactly when the CLI table would print the same footnote,
+  through the same `k8s::order::note`. Two entries because the roadmap had
+  written them that way, and one PR because reading them together showed
+  the note task presupposed the sorting task: a pane cannot say which order
+  it is in before it can be put in one. No fetch is involved either way —
+  `App` gained `node_order`/`node_direction` and `pod_order`/`pod_direction`,
+  and `k8s_nodes::sort`/`k8s_pods::sort` re-order whatever rows are already
+  in `NodesState::Loaded`/`PodsState::Loaded`, on every fresh fetch and
+  again whenever `s`/`S` changes the ordering itself — the same rows
+  `commands::nodes::spawn_gather`/`commands::pods::spawn_gather_for_node`
+  already fetched, untouched by this change. The two panes hold independent
+  orderings rather than a shared one, since `View::Overview` and
+  `View::NodePods` are never both on screen, and `s`/`S` dispatch on
+  `App::view()` rather than on keyboard focus, matching `r`. The highlighted
+  row is deliberately left at its index across a reorder rather than reset
+  to the top, the same choice background refresh already made (decision 55)
+  for the same reason: a reorder changes what the same rows print in, not
+  which rows they are. See decision 58.
 
 - **Carry the pod selectors into the dashboard** (2026-08-23) — `-l`/
   `--field-selector` now filter every node's pods in the dashboard's

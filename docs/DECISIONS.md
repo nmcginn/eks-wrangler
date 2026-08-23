@@ -1675,7 +1675,65 @@ first roadmap task that will need one — and guessing at its shape to serve
 this task alone would very likely guess wrong. Tracked in the roadmap as its
 own entry, to be built once there is an input mechanism to hang it on.
 
-### 58. Huge-page columns are conditioned on being nonzero, not merely reported
+### 58. Two roadmap entries merged: a pane cannot say which order it is in
+before it can be put in one
+
+The roadmap carried "Carry `--sort` into the dashboard" and, listed as
+higher priority, "Carry the sort note into the dashboard's panes" as
+separate entries. Reading them together made the ordering an accident
+rather than a priority call: the note entry's own acceptance criterion —
+"the default order is as silent in a pane as it is on the command line" —
+presupposes a pane that has *an* order to be silent about, which is exactly
+what the other entry builds. Taking the note task first would have meant
+wiring `k8s::order::note` to a call site that could only ever hand it
+`Order::default()`, passing its own test by construction and proving
+nothing. This is decision 55's shape again — background refresh and the
+freshness note it dates were two entries with the same dependency — so the
+same answer applies: build the mechanism, and the note that explains it
+lands in the same PR rather than describing a flag that does not exist yet.
+
+Sorting is client-side and costs no request, same as `--sort` on the CLI
+costs no second listing: `App` gained `node_order`/`node_direction` and
+`pod_order`/`pod_direction`, and `k8s_nodes::sort`/`k8s_pods::sort` run
+over whatever rows are already in `NodesState::Loaded`/`PodsState::Loaded`
+— on a fresh fetch (`apply_nodes`/`apply_pods`), and again whenever the
+ordering itself changes. `commands::nodes::spawn_gather` and
+`commands::pods::spawn_gather_for_node` are untouched: the fetch closures
+main builds know nothing about ordering, exactly as the acceptance
+criterion asked, and a fetch already in flight when the user reorders is
+sorted by whatever is active the moment it lands rather than the moment it
+was requested.
+
+Two independent orderings, not one shared field, because the node pane and
+the pod-drilldown pane hold different rows and are never both on screen at
+once — `View::Overview` shows one, `View::NodePods` the other. `s` and `S`
+dispatch on `App::view()` rather than on which pane holds keyboard focus,
+matching `r`: refreshing and reordering are both about *what the detail
+pane is showing*, not about where `j`/`k` currently move a highlight.
+
+`s` cycles through `O::value_variants()` — the same list `--sort`'s
+`--help` prints, read as a ring instead of parsed from text — one key press
+at a time, wrapping back to the default; `S` flips `Direction`, mirroring
+`--sort-reverse`. A single key for "reverse" rather than a second flag: a
+pane has no argv to add one to, and `Shift+<letter>` beside a plain
+`<letter>` is the closest a keybinding gets to the same relationship
+`--sort-reverse` has to `--sort`. The footer hint reads `s/S  sort` rather
+than spelling both out — `sort` and `shift+s reverse` together overflowed
+an 80-column footer, clipping `quit` off the end of a 90-column test
+terminal, and the shorter form follows `j/k`'s own precedent for "two keys,
+one hint" already sitting beside it.
+
+The highlighted row in the detail pane is deliberately left where it is
+across a reorder, index and all, rather than reset to the top. That reads
+backwards next to `leave_node_pods` and `drill_into_pods`, which do reset
+it — but those change *which* rows are on screen; a reorder changes only
+what order the same rows print in, the same situation `apply_nodes` is
+already in on every background refresh, and that path was decided (see
+decision 55) to hold the index steady rather than jump the selection around
+under the user. Resetting only on a reorder would make the pane's own two
+list-changing operations disagree about which counts as "the same list."
+
+### 59. Huge-page columns are conditioned on being nonzero, not merely reported
 
 `ephemeral-storage` and `hugepages-*` sit in a node's `capacity`/`allocatable`
 maps beside `cpu` and `memory`, but they are not shaped alike. Every real

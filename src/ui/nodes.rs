@@ -9,7 +9,8 @@ use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Wrap};
 
-use crate::k8s::nodes::{Capacity, NodeRow, Share};
+use crate::k8s::nodes::{Capacity, NodeRow, Order, Share};
+use crate::k8s::order::{self, Direction};
 use crate::k8s::quantity::{self, Quantity};
 use crate::theme::{Severity, Theme};
 
@@ -62,12 +63,18 @@ impl NodesState {
 ///
 /// `selected` highlights a row — `None` when the pane does not currently
 /// hold keyboard focus, so the highlight disappears the moment `Tab` moves
-/// it back to the sidebar.
+/// it back to the sidebar. `order` and `direction` are the pane's own
+/// ordering, `s`/`S` in [`super::App`] rather than a request — the note they
+/// produce is silent on the default order, exactly as it is under the CLI
+/// table, and it disappears along with the rest of the pane's chrome when
+/// there are no rows to be sorted.
 pub(super) fn draw(
     frame: &mut Frame,
     area: Rect,
     state: &NodesState,
     selected: Option<usize>,
+    order: Order,
+    direction: Direction,
     theme: Theme,
 ) {
     let lines: Vec<Line> = match state {
@@ -99,6 +106,9 @@ pub(super) fn draw(
                     note.lines()
                         .map(|line| Line::styled(line.to_owned(), theme.dim())),
                 );
+            }
+            if let Some(note) = order::note(order, direction) {
+                lines.push(Line::styled(note, theme.dim()));
             }
             lines.extend(
                 rows.iter()
@@ -259,11 +269,15 @@ mod tests {
     }
 
     fn render(state: &NodesState) -> String {
+        render_ordered(state, Order::default(), Direction::default())
+    }
+
+    fn render_ordered(state: &NodesState, order: Order, direction: Direction) -> String {
         let mut terminal = Terminal::new(TestBackend::new(90, 20)).unwrap();
         terminal
             .draw(|frame| {
                 let area = frame.area();
-                draw(frame, area, state, None, Theme::dark());
+                draw(frame, area, state, None, order, direction, Theme::dark());
             })
             .unwrap();
         terminal.backend().to_string()
@@ -346,7 +360,15 @@ mod tests {
             terminal
                 .draw(|frame| {
                     let area = frame.area();
-                    draw(frame, area, &state, None, Theme::dark());
+                    draw(
+                        frame,
+                        area,
+                        &state,
+                        None,
+                        Order::default(),
+                        Direction::default(),
+                        Theme::dark(),
+                    );
                 })
                 .unwrap();
         }
@@ -389,13 +411,56 @@ mod tests {
         terminal
             .draw(|frame| {
                 let area = frame.area();
-                draw(frame, area, &state, None, Theme::dark());
+                draw(
+                    frame,
+                    area,
+                    &state,
+                    None,
+                    Order::default(),
+                    Direction::default(),
+                    Theme::dark(),
+                );
             })
             .unwrap();
         let rendered = terminal.backend().to_string();
 
         assert!(rendered.contains("these figures are stale"), "{rendered}");
         assert!(rendered.contains("kube-system"), "{rendered}");
+    }
+
+    #[test]
+    fn the_default_order_says_nothing_about_sorting() {
+        let rendered = render(&loaded(vec![node("worker-1")]));
+        assert!(!rendered.contains("Sorted by"), "{rendered}");
+    }
+
+    #[test]
+    fn a_reordered_pane_names_the_ordering_under_its_rows() {
+        let rendered = render_ordered(
+            &loaded(vec![node("worker-1")]),
+            Order::Cpu,
+            Direction::Natural,
+        );
+        assert!(rendered.contains("Sorted by cpu."), "{rendered}");
+    }
+
+    #[test]
+    fn a_reversed_pane_says_which_way_round_it_ran() {
+        let rendered = render_ordered(
+            &loaded(vec![node("worker-1")]),
+            Order::Cpu,
+            Direction::Reversed,
+        );
+        assert!(rendered.contains("Sorted by cpu, reversed."), "{rendered}");
+    }
+
+    #[test]
+    fn an_empty_pane_says_nothing_about_the_ordering_it_was_asked_for() {
+        // "This cluster has no nodes." is the whole answer; naming an
+        // ordering over zero rows would be noise under it, exactly as the
+        // CLI table drops every footnote over an empty listing.
+        let rendered = render_ordered(&loaded(Vec::new()), Order::Cpu, Direction::Natural);
+        assert!(!rendered.contains("Sorted by"), "{rendered}");
     }
 
     #[test]
@@ -460,7 +525,15 @@ mod tests {
         terminal
             .draw(|frame| {
                 let area = frame.area();
-                draw(frame, area, &state, Some(0), Theme::dark());
+                draw(
+                    frame,
+                    area,
+                    &state,
+                    Some(0),
+                    Order::default(),
+                    Direction::default(),
+                    Theme::dark(),
+                );
             })
             .unwrap();
     }
