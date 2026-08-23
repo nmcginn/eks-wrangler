@@ -9,7 +9,8 @@ use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Wrap};
 
-use crate::k8s::pods::PodRow;
+use crate::k8s::order::{self, Direction};
+use crate::k8s::pods::{Order, PodRow};
 use crate::theme::{Severity, Theme};
 
 /// What the pod-drilldown pane is showing, independent of how it is drawn.
@@ -50,12 +51,16 @@ impl PodsState {
 ///
 /// `selected` highlights a row — `None` when the pane does not currently
 /// hold keyboard focus, so the highlight disappears the moment `Tab` moves
-/// it back to the sidebar.
+/// it back to the sidebar. `order` and `direction` are the pane's own
+/// ordering, changed by `s`/`S` in [`super::App`] rather than by a request —
+/// see [`super::nodes::draw`], whose node-pane counterpart this mirrors.
 pub(super) fn draw(
     frame: &mut Frame,
     area: Rect,
     state: &PodsState,
     selected: Option<usize>,
+    order: Order,
+    direction: Direction,
     theme: Theme,
 ) {
     let lines: Vec<Line> = match state {
@@ -80,6 +85,9 @@ pub(super) fn draw(
         }
         PodsState::Loaded { rows, .. } => {
             let mut lines = vec![Line::styled("PODS", theme.heading())];
+            if let Some(note) = order::note(order, direction) {
+                lines.push(Line::styled(note, theme.dim()));
+            }
             lines.extend(
                 rows.iter()
                     .enumerate()
@@ -153,11 +161,28 @@ mod tests {
     }
 
     fn render(state: &PodsState, selected: Option<usize>) -> String {
+        render_ordered(state, selected, Order::default(), Direction::default())
+    }
+
+    fn render_ordered(
+        state: &PodsState,
+        selected: Option<usize>,
+        order: Order,
+        direction: Direction,
+    ) -> String {
         let mut terminal = Terminal::new(TestBackend::new(90, 20)).unwrap();
         terminal
             .draw(|frame| {
                 let area = frame.area();
-                draw(frame, area, state, selected, Theme::dark());
+                draw(
+                    frame,
+                    area,
+                    state,
+                    selected,
+                    order,
+                    direction,
+                    Theme::dark(),
+                );
             })
             .unwrap();
         terminal.backend().to_string()
@@ -190,6 +215,39 @@ mod tests {
         };
         let rendered = render(&state, None);
         assert!(rendered.contains("no pods"), "{rendered}");
+    }
+
+    #[test]
+    fn the_default_order_says_nothing_about_sorting() {
+        let state = PodsState::Loaded {
+            rows: vec![pod("api-1")],
+            selector_note: None,
+        };
+        let rendered = render(&state, None);
+        assert!(!rendered.contains("Sorted by"), "{rendered}");
+    }
+
+    #[test]
+    fn a_reordered_pane_names_the_ordering_under_its_rows() {
+        let state = PodsState::Loaded {
+            rows: vec![pod("api-1")],
+            selector_note: None,
+        };
+        let rendered = render_ordered(&state, None, Order::Restarts, Direction::Reversed);
+        assert!(
+            rendered.contains("Sorted by restarts, reversed."),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn an_empty_pane_says_nothing_about_the_ordering_it_was_asked_for() {
+        let state = PodsState::Loaded {
+            rows: Vec::new(),
+            selector_note: None,
+        };
+        let rendered = render_ordered(&state, None, Order::Restarts, Direction::Natural);
+        assert!(!rendered.contains("Sorted by"), "{rendered}");
     }
 
     #[test]
@@ -243,7 +301,15 @@ mod tests {
             terminal
                 .draw(|frame| {
                     let area = frame.area();
-                    draw(frame, area, &state, Some(0), Theme::dark());
+                    draw(
+                        frame,
+                        area,
+                        &state,
+                        Some(0),
+                        Order::default(),
+                        Direction::default(),
+                        Theme::dark(),
+                    );
                 })
                 .unwrap();
         }

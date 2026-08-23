@@ -9,6 +9,7 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
+use clap::ValueEnum;
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::text::{Line, Span};
@@ -18,7 +19,10 @@ use ratatui::{Frame, Terminal};
 use crate::cluster::ClusterView;
 use crate::commands::nodes::NodesFetch;
 use crate::commands::pods::PodsFetch;
+use crate::k8s::nodes as k8s_nodes;
+use crate::k8s::order::Direction as SortDirection;
 use crate::k8s::page::{Budget, ParseError};
+use crate::k8s::pods as k8s_pods;
 use crate::theme::Theme;
 
 mod nodes;
@@ -154,6 +158,17 @@ pub struct App {
     /// every fresh load, so it can never point past the end of a shorter
     /// list that just arrived.
     detail_selected: usize,
+    /// The node pane's ordering. `k8s::nodes::sort` and `k8s::order::note`
+    /// are the same functions `eks nodes --sort` uses — a pane sorting its
+    /// own rows differently from the table would mean `cpu` sorts a listing
+    /// two ways depending on which screen printed it.
+    node_order: k8s_nodes::Order,
+    node_direction: SortDirection,
+    /// The pod-drilldown pane's ordering, independent of the node pane's:
+    /// the two panes hold different rows and `s`/`S` act on whichever one
+    /// [`View`] is currently showing.
+    pod_order: k8s_pods::Order,
+    pod_direction: SortDirection,
 }
 
 impl App {
@@ -171,6 +186,10 @@ impl App {
             focus: Focus::default(),
             view: View::default(),
             detail_selected: 0,
+            node_order: k8s_nodes::Order::default(),
+            node_direction: SortDirection::default(),
+            pod_order: k8s_pods::Order::default(),
+            pod_direction: SortDirection::default(),
         }
     }
 
@@ -225,6 +244,30 @@ impl App {
         self.detail_selected
     }
 
+    /// The node pane's current ordering.
+    #[must_use]
+    pub fn node_order(&self) -> k8s_nodes::Order {
+        self.node_order
+    }
+
+    /// The node pane's current direction.
+    #[must_use]
+    pub fn node_direction(&self) -> SortDirection {
+        self.node_direction
+    }
+
+    /// The pod-drilldown pane's current ordering.
+    #[must_use]
+    pub fn pod_order(&self) -> k8s_pods::Order {
+        self.pod_order
+    }
+
+    /// The pod-drilldown pane's current direction.
+    #[must_use]
+    pub fn pod_direction(&self) -> SortDirection {
+        self.pod_direction
+    }
+
     /// Apply the outcome of a node fetch.
     ///
     /// One of the two state transitions the background channel can cause,
@@ -236,12 +279,17 @@ impl App {
     /// the pane should not read as "the cluster lost every node" over one
     /// missed poll.
     pub fn apply_nodes(&mut self, result: Result<NodesFetch, String>) {
+        let (order, direction) = (self.node_order, self.node_direction);
         self.nodes = match (result, std::mem::take(&mut self.nodes)) {
-            (Ok(fetch), _) => NodesState::Loaded {
-                rows: fetch.rows,
-                usage_note: fetch.usage_note,
-                refresh_error: None,
-            },
+            (Ok(fetch), _) => {
+                let mut rows = fetch.rows;
+                k8s_nodes::sort(&mut rows, order, direction);
+                NodesState::Loaded {
+                    rows,
+                    usage_note: fetch.usage_note,
+                    refresh_error: None,
+                }
+            }
             (
                 Err(message),
                 NodesState::Loaded {
@@ -275,12 +323,60 @@ impl App {
     /// listing for this node worth keeping over a failed one.
     pub fn apply_pods(&mut self, result: Result<PodsFetch, String>) {
         self.pods = match result {
-            Ok(fetch) => PodsState::Loaded {
-                rows: fetch.rows,
-                selector_note: fetch.selector_note,
-            },
+            Ok(fetch) => {
+                let mut rows = fetch.rows;
+                k8s_pods::sort(&mut rows, self.pod_order, self.pod_direction);
+                PodsState::Loaded {
+                    rows,
+                    selector_note: fetch.selector_note,
+                }
+            }
             Err(message) => PodsState::Error(message),
         };
+    }
+
+    /// `s`: cycle to the next ordering for whichever pane [`View`] is
+    /// currently showing, and re-sort its already-fetched rows.
+    ///
+    /// No fetch: the rows are already on screen, and `--sort` never refetches
+    /// a listing either — it only changes how the answer already in hand is
+    /// read back. Like `r`, this acts on the pane's data regardless of which
+    /// pane currently holds keyboard focus.
+    pub fn cycle_sort(&mut self) {
+        match &self.view {
+            View::Overview => {
+                self.node_order = next_variant(self.node_order);
+                if let NodesState::Loaded { rows, .. } = &mut self.nodes {
+                    k8s_nodes::sort(rows, self.node_order, self.node_direction);
+                }
+            }
+            View::NodePods { .. } => {
+                self.pod_order = next_variant(self.pod_order);
+                if let PodsState::Loaded { rows, .. } = &mut self.pods {
+                    k8s_pods::sort(rows, self.pod_order, self.pod_direction);
+                }
+            }
+        }
+    }
+
+    /// `S`: flip the direction of whichever ordering is currently active,
+    /// leaving the rows it cannot rank in the tail either way — the same
+    /// rule `--sort-reverse` follows.
+    pub fn reverse_sort(&mut self) {
+        match &self.view {
+            View::Overview => {
+                self.node_direction = reverse(self.node_direction);
+                if let NodesState::Loaded { rows, .. } = &mut self.nodes {
+                    k8s_nodes::sort(rows, self.node_order, self.node_direction);
+                }
+            }
+            View::NodePods { .. } => {
+                self.pod_direction = reverse(self.pod_direction);
+                if let PodsState::Loaded { rows, .. } = &mut self.pods {
+                    k8s_pods::sort(rows, self.pod_order, self.pod_direction);
+                }
+            }
+        }
     }
 
     /// Toggle which pane `j`/`k`/`Home`/`End` move the highlight in.
@@ -422,6 +518,8 @@ impl App {
             KeyCode::Esc => return self.back_or_quit(),
             KeyCode::Tab => self.toggle_focus(),
             KeyCode::Enter => self.drill_into_pods(),
+            KeyCode::Char('s') => self.cycle_sort(),
+            KeyCode::Char('S') => self.reverse_sort(),
             KeyCode::Char('j') | KeyCode::Down => match self.focus {
                 Focus::Sidebar => self.select_next(),
                 Focus::Detail => self.select_next_detail_row(),
@@ -601,6 +699,27 @@ fn is_refresh_key(key: KeyEvent) -> bool {
     key.kind != KeyEventKind::Release && key.code == KeyCode::Char('r')
 }
 
+/// The next value after `current` in `O`'s declaration order, wrapping back
+/// to the first. `--sort` takes a value; a pane cycles through the same set
+/// one key press at a time, so this is the flag's value list read as a ring
+/// rather than parsed from text.
+fn next_variant<O: ValueEnum + Copy + PartialEq>(current: O) -> O {
+    let variants = O::value_variants();
+    let index = variants
+        .iter()
+        .position(|value| *value == current)
+        .unwrap_or(0);
+    variants[(index + 1) % variants.len()]
+}
+
+/// Flip a [`SortDirection`], the pane's counterpart to `--sort-reverse`.
+fn reverse(direction: SortDirection) -> SortDirection {
+    match direction {
+        SortDirection::Natural => SortDirection::Reversed,
+        SortDirection::Reversed => SortDirection::Natural,
+    }
+}
+
 /// Draw one frame.
 pub fn draw(frame: &mut Frame, app: &App) {
     let theme = app.theme;
@@ -734,8 +853,24 @@ fn draw_detail(frame: &mut Frame, area: Rect, app: &App) {
     // cannot reach right now, and showing it anyway would suggest otherwise.
     let highlighted = (app.focus() == Focus::Detail).then_some(app.detail_selected());
     match app.view() {
-        View::Overview => nodes::draw(frame, sections[1], app.nodes(), highlighted, theme),
-        View::NodePods { .. } => pods::draw(frame, sections[1], app.pods(), highlighted, theme),
+        View::Overview => nodes::draw(
+            frame,
+            sections[1],
+            app.nodes(),
+            highlighted,
+            app.node_order(),
+            app.node_direction(),
+            theme,
+        ),
+        View::NodePods { .. } => pods::draw(
+            frame,
+            sections[1],
+            app.pods(),
+            highlighted,
+            app.pod_order(),
+            app.pod_direction(),
+            theme,
+        ),
     }
 }
 
@@ -753,6 +888,7 @@ fn draw_footer(frame: &mut Frame, area: Rect, theme: Theme) {
         ("enter", "open"),
         ("esc", "back"),
         ("r", "refresh"),
+        ("s/S", "sort"),
         ("q", "quit"),
     ];
 
@@ -821,6 +957,20 @@ mod tests {
             kernel_version: "-".to_owned(),
             container_runtime: "-".to_owned(),
             devices: BTreeMap::new(),
+        }
+    }
+
+    /// A node with a measured CPU share, for the tests that sort on it.
+    fn node_row_with_cpu(name: &str, used: &str, allocatable: &str) -> crate::k8s::nodes::NodeRow {
+        use crate::k8s::nodes::Share;
+        use crate::k8s::quantity::Quantity;
+
+        crate::k8s::nodes::NodeRow {
+            cpu_used: Share {
+                amount: Some(Quantity::parse(used).unwrap()),
+                allocatable: Some(Quantity::parse(allocatable).unwrap()),
+            },
+            ..node_row(name)
         }
     }
 
@@ -1310,5 +1460,134 @@ mod tests {
 
         app.on_key(press(KeyCode::Home));
         assert_eq!(app.detail_selected(), 0);
+    }
+
+    #[test]
+    fn a_new_app_opens_on_the_default_ordering_for_both_panes() {
+        let app = app();
+        assert_eq!(app.node_order(), k8s_nodes::Order::default());
+        assert_eq!(app.node_direction(), SortDirection::default());
+        assert_eq!(app.pod_order(), k8s_pods::Order::default());
+        assert_eq!(app.pod_direction(), SortDirection::default());
+    }
+
+    #[test]
+    fn s_cycles_the_node_panes_ordering() {
+        let mut app = app();
+
+        app.on_key(press(KeyCode::Char('s')));
+        assert_eq!(app.node_order(), k8s_nodes::Order::Status);
+
+        app.on_key(press(KeyCode::Char('s')));
+        assert_eq!(app.node_order(), k8s_nodes::Order::Cpu);
+    }
+
+    #[test]
+    fn cycling_sort_all_the_way_round_returns_to_the_default() {
+        let mut app = app();
+
+        for _ in 0..k8s_nodes::Order::value_variants().len() {
+            app.on_key(press(KeyCode::Char('s')));
+        }
+
+        assert_eq!(app.node_order(), k8s_nodes::Order::default());
+    }
+
+    #[test]
+    fn shift_s_reverses_the_active_direction() {
+        let mut app = app();
+
+        app.on_key(press(KeyCode::Char('S')));
+        assert_eq!(app.node_direction(), SortDirection::Reversed);
+
+        app.on_key(press(KeyCode::Char('S')));
+        assert_eq!(app.node_direction(), SortDirection::Natural);
+    }
+
+    #[test]
+    fn sorting_re_orders_already_loaded_rows_without_a_new_fetch() {
+        let mut app = app();
+        app.apply_nodes(Ok(NodesFetch {
+            rows: vec![
+                node_row_with_cpu("idle", "100m", "4"),
+                node_row_with_cpu("busy", "3800m", "4"),
+            ],
+            usage_note: None,
+        }));
+
+        app.on_key(press(KeyCode::Char('s'))); // Status
+        app.on_key(press(KeyCode::Char('s'))); // Cpu
+
+        let names: Vec<&str> = app
+            .nodes()
+            .rows()
+            .iter()
+            .map(|row| row.name.as_str())
+            .collect();
+        assert_eq!(
+            names,
+            ["busy", "idle"],
+            "no fetch happened; the rows already on screen were re-sorted in place"
+        );
+    }
+
+    #[test]
+    fn a_freshly_loaded_pane_opens_already_sorted_by_the_active_ordering() {
+        let mut app = app();
+        app.on_key(press(KeyCode::Char('s'))); // Status
+        app.on_key(press(KeyCode::Char('s'))); // Cpu
+
+        app.apply_nodes(Ok(NodesFetch {
+            rows: vec![
+                node_row_with_cpu("idle", "100m", "4"),
+                node_row_with_cpu("busy", "3800m", "4"),
+            ],
+            usage_note: None,
+        }));
+
+        let names: Vec<&str> = app
+            .nodes()
+            .rows()
+            .iter()
+            .map(|row| row.name.as_str())
+            .collect();
+        assert_eq!(names, ["busy", "idle"]);
+    }
+
+    #[test]
+    fn sort_and_reverse_act_on_whichever_pane_the_view_is_currently_showing() {
+        let mut app = app_with_node();
+        app.on_key(press(KeyCode::Enter));
+        assert!(matches!(app.view(), View::NodePods { .. }));
+
+        app.on_key(press(KeyCode::Char('s')));
+
+        assert_eq!(app.pod_order(), k8s_pods::Order::Restarts);
+        assert_eq!(
+            app.node_order(),
+            k8s_nodes::Order::default(),
+            "the node pane's ordering must not move while a different pane is showing"
+        );
+    }
+
+    #[test]
+    fn changing_the_node_panes_order_is_visible_in_the_rendered_frame() {
+        let mut app = app();
+        app.apply_nodes(Ok(NodesFetch {
+            rows: vec![node_row("worker-1")],
+            usage_note: None,
+        }));
+
+        app.on_key(press(KeyCode::Char('s'))); // Status
+        app.on_key(press(KeyCode::Char('s'))); // Cpu
+
+        let mut terminal = Terminal::new(TestBackend::new(90, 20)).unwrap();
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+
+        assert!(
+            terminal.backend().to_string().contains("Sorted by cpu."),
+            "{}",
+            terminal.backend().to_string()
+        );
     }
 }
