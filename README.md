@@ -303,9 +303,10 @@ order here beat matching a different tool on one of them; `--sort-reverse` gives
 you `kubectl`'s reading.
 
 Narrow the listing with `-l` (labels) and `--field-selector` (fields), the same
-selectors `kubectl` takes. The filtering happens on the API server, and a
-selector that will not parse is rejected before anything connects, with the part
-that is wrong quoted back:
+selectors `kubectl` takes — and the same ones the dashboard's pod-drilldown
+pane reads, so a selector means one thing across the tool. The filtering
+happens on the API server, and a selector that will not parse is rejected
+before anything connects, with the part that is wrong quoted back:
 
 ```sh
 eks pods -l app=api,tier notin (canary)     # by label
@@ -380,8 +381,8 @@ more columns, not for a table that gets out of the way.
 | `-c, --context <NAME>` | Use a specific context for this invocation |
 | `-n, --namespace <NS>` | Scope resources to a namespace |
 | `-A, --all-namespaces` | List pods across every namespace (`eks pods`) |
-| `-l, --selector <SEL>` | Filter pods by label selector (`eks pods`) |
-| `--field-selector <SEL>` | Filter pods by field selector (`eks pods`) |
+| `-l, --selector <SEL>` | Filter pods by label selector (`eks pods`, and the dashboard's pod-drilldown pane) |
+| `--field-selector <SEL>` | Filter pods by field selector (`eks pods`, and the dashboard's pod-drilldown pane) |
 | `--sort <ORDER>` | Order the listing. Pods: `name` (default), `restarts`, `age`, `cpu`, `memory`. Nodes: `name` (default), `status`, `cpu`, `memory`, `cpu-requested`, `memory-requested`, `pods`, `age` |
 | `--sort-reverse` | Reverse `--sort`; unrankable rows stay at the end. Either flag adds a line under the table naming the order |
 | `--wide` | Add the extra columns `kubectl -o wide` shows. Pods: `IP`, `NOMINATED NODE`, `READINESS GATES`. Nodes: `INTERNAL-IP`, `EXTERNAL-IP`, `OS-IMAGE`, `KERNEL-VERSION`, `CONTAINER-RUNTIME` |
@@ -467,6 +468,17 @@ Focus starts on the cluster list; the focused pane's border is highlighted.
 `Enter` on a node in the detail pane opens the pods placed on it, with a
 breadcrumb in the pane's own title (` Overview › <node> `); `Esc` returns to
 the node list.
+
+`-l`/`--field-selector` narrow the pods shown for every node you drill into,
+the same selectors `eks pods` takes and validated the same way — a malformed
+one is rejected before the dashboard opens, naming the part that is wrong:
+
+```sh
+eks --field-selector status.phase!=Running   # only the ones that are not Running, everywhere you drill in
+```
+
+A node whose pods are all filtered out reads as "no pods match", not as "this
+node has none" — the selector is why the list is empty, and the pane says so.
 
 ## Development
 

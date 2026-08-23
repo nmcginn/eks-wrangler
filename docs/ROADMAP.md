@@ -71,12 +71,24 @@ cluster.
   client-side; an unparseable selector is rejected with the offending text
   quoted, before any request is made.
 
-- [ ] **Carry the pod selectors into the dashboard.**
+- [x] **Carry the pod selectors into the dashboard.**
   `k8s::selector` and `k8s::pods::Selectors` now filter `eks pods`; the dashboard
   pod views (Milestone 2) should take the same `-l`/`--field-selector` filters
   rather than growing their own, so a selector means one thing across the tool.
   *Acceptance:* the dashboard's pod fetch reuses `Selectors`; the parse-and-quote
   rejection path is shared, not duplicated.
+  Landed with `-l`/`--field-selector` promoted from `eks pods`-only flags to
+  global ones — the same position `--namespace` already holds, accepted by
+  every command and acted on by the ones that need it. `main::run` validates
+  them through `commands::pods::selectors_for` before the dashboard's terminal
+  ever opens, so a malformed selector is the same sentence `eks pods` gives,
+  before anything is drawn. `commands::pods::scoped_to_node` is the pure
+  function that combines them with the pane's own `spec.nodeName` filter — a
+  comma ANDs a `--field-selector` onto it rather than one replacing the
+  other — and the pane now says "No pods here match …" instead of "This node
+  has no pods" when a selector, not the node, is why the list is empty,
+  through the CLI table's own `k8s::pods::row::selector_note`. See decision
+  57.
 
 - [x] **How long ago the last restart was.**
   `kubectl` shows `9 (5m ago)`, taking the newest `lastState.terminated
@@ -744,6 +756,23 @@ cluster.
   and `severity` already are; a node reporting none of the four pressure
   conditions is not distinguished from one that has not reported at all.
 
+### Follow-ups from the dashboard's selectors
+
+- [ ] **Edit the dashboard's selector without restarting it.**
+  `-l`/`--field-selector` now filter every node's pods in the dashboard, but
+  only as flags read once at startup — changing what you are looking for
+  means quitting and retyping the command. Separate because it is a surface
+  this change did not need to build: the dashboard has no text-input
+  mechanism at all yet, and `/` (fuzzy search, above) is the first thing that
+  will need one. Whether a selector belongs behind the same key, and whether
+  it re-fetches immediately or waits for the pane's own refresh, are
+  questions worth answering once there is an input mechanism to hang them on
+  rather than guessed at building the first one.
+  *Acceptance:* whichever shape it takes, editing the selector goes through
+  `commands::pods::selectors_for` — the same validation and rejection
+  wording `eks pods` and dashboard startup already share — rather than a
+  second parser for text typed live.
+
 ## Milestone 3 — Polish
 
 - [ ] **Config file.**
@@ -796,6 +825,30 @@ cluster.
 ---
 
 ## Done
+
+- **Carry the pod selectors into the dashboard** (2026-08-23) — `-l`/
+  `--field-selector` now filter every node's pods in the dashboard's
+  pod-drilldown pane, the same selectors `eks pods` already read. They moved
+  from flags `Command::Pods` alone declared to `GlobalArgs`, next to
+  `--namespace`, which already sat there unused by most commands — so `eks
+  -l app=api` and `eks pods -l app=api` parse through one definition rather
+  than two, and every other command accepts the flag without acting on it,
+  exactly as `--namespace` already did. `main::run` validates them with
+  `commands::pods::selectors_for` before `dashboard` is ever called, so a
+  malformed `-l` is the same rejected sentence `eks pods` gives and the
+  dashboard's terminal never opens on a selector that cannot parse.
+  `commands::pods::spawn_gather_for_node` takes the validated `Selectors`
+  and threads them into `gather_for_node`, which combines them with the
+  pane's own `spec.nodeName` scoping through a new pure function,
+  `scoped_to_node`: a comma ANDs a `--field-selector` onto the node filter
+  the same way it ANDs two label requirements, rather than one replacing the
+  other. `PodsFetch` and `PodsState::Loaded` both gained a `selector_note`,
+  computed from the user's own selectors rather than the combined ones — the
+  node filter is implicit in "this is the node's pane" and never something
+  to explain back — so a node whose pods are all filtered out reads "No
+  pods here match label selector `app=api`." instead of "This node has no
+  pods.", through `k8s::pods::row::selector_note` made `pub` for the pane to
+  share rather than re-deriving the same phrase. See decision 57.
 
 - **Pod browsing: drill from a node into its pods** (2026-08-22) — `Enter` on
   a highlighted node in the `Overview` pane opens the pods placed on it;

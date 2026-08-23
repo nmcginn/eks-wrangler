@@ -17,6 +17,7 @@ use eks::commands::{self, contexts, nodes, pods};
 use eks::format::Width;
 use eks::k8s::order::Direction;
 use eks::k8s::page::Budget;
+use eks::k8s::pods::Selectors;
 use eks::kubeconfig::KubeConfig;
 use eks::theme::{ColourChoice, Palette};
 use eks::ui::{self, App, RefreshInterval};
@@ -41,13 +42,24 @@ fn run(cli: Cli) -> Result<()> {
     let config = KubeConfig::load_from(&paths)?;
 
     match cli.command.unwrap_or(Command::Dashboard) {
-        Command::Dashboard => dashboard(
-            &config,
-            &paths,
-            cli.global.context.as_deref(),
-            cli.global.timeout,
-            cli.global.refresh,
-        ),
+        Command::Dashboard => {
+            // Validated here, before the terminal takes over, exactly as
+            // `pods::list` validates the same flags: a malformed `-l` should be
+            // a sentence naming the bad text, not a dashboard that opens and
+            // then can never load a node's pods.
+            let selectors = pods::selectors_for(
+                cli.global.selector.as_deref(),
+                cli.global.field_selector.as_deref(),
+            )?;
+            dashboard(
+                &config,
+                &paths,
+                cli.global.context.as_deref(),
+                cli.global.timeout,
+                cli.global.refresh,
+                &selectors,
+            )
+        }
         Command::Contexts { quiet } => {
             print_line(&contexts::list(&config, quiet));
             Ok(())
@@ -76,8 +88,6 @@ fn run(cli: Cli) -> Result<()> {
         }
         Command::Pods {
             all_namespaces,
-            selector,
-            field_selector,
             sort,
             sort_reverse,
             wide,
@@ -89,8 +99,8 @@ fn run(cli: Cli) -> Result<()> {
                 pods::Request {
                     namespace: cli.global.namespace.as_deref(),
                     all_namespaces,
-                    label_selector: selector.as_deref(),
-                    field_selector: field_selector.as_deref(),
+                    label_selector: cli.global.selector.as_deref(),
+                    field_selector: cli.global.field_selector.as_deref(),
                     order: sort,
                     direction: Direction::reversed(sort_reverse),
                     width: Width::for_terminal(wide, stdout_terminal_cols()),
@@ -118,6 +128,7 @@ fn dashboard(
     requested_context: Option<&str>,
     budget: Budget,
     refresh: RefreshInterval,
+    selectors: &Selectors,
 ) -> Result<()> {
     let views = contexts::views(config);
     let mut app = App::new(views);
@@ -150,16 +161,21 @@ fn dashboard(
     };
 
     // The pod-browsing pane's counterpart: called once each time drilling
-    // into a node changes which one the detail pane is showing.
+    // into a node changes which one the detail pane is showing. `selectors`
+    // is fixed for the life of the session — set from `-l`/`--field-selector`
+    // at startup, the same flags `eks pods` reads — so every node's pods are
+    // filtered by the one the user typed rather than the pane growing its own.
     let spawn_pods: ui::PodsFetcher = {
         let config = config.clone();
         let paths = paths.to_vec();
+        let selectors = selectors.clone();
         Box::new(move |context: &str, node: &str| {
             pods::spawn_gather_for_node(
                 config.clone(),
                 paths.clone(),
                 Some(context.to_owned()),
                 node.to_owned(),
+                selectors.clone(),
                 budget,
             )
         })

@@ -42,6 +42,17 @@ pub struct GlobalArgs {
     #[arg(long, short = 'n', global = true, value_name = "NAMESPACE")]
     pub namespace: Option<String>,
 
+    /// Select pods by label, e.g. `-l app=api,tier notin (canary)`. Used by
+    /// `eks pods` and the dashboard's pod-drilldown pane, so a selector filters
+    /// the same pods whichever surface reads it; other commands accept the flag
+    /// without acting on it, the same as `--namespace`.
+    #[arg(long, short = 'l', global = true, value_name = "SELECTOR")]
+    pub selector: Option<String>,
+
+    /// Select pods by field, e.g. `--field-selector status.phase!=Running`.
+    #[arg(long, global = true, value_name = "SELECTOR")]
+    pub field_selector: Option<String>,
+
     /// Path to a kubeconfig file (overrides KUBECONFIG).
     #[arg(long, global = true, value_name = "PATH", env = "KUBECONFIG")]
     pub kubeconfig: Option<PathBuf>,
@@ -145,14 +156,6 @@ pub enum Command {
         /// List pods in every namespace, adding a NAMESPACE column.
         #[arg(long, short = 'A')]
         all_namespaces: bool,
-
-        /// Select by label, e.g. `-l app=api,tier notin (canary)`.
-        #[arg(long, short = 'l', value_name = "SELECTOR")]
-        selector: Option<String>,
-
-        /// Select by field, e.g. `--field-selector status.phase!=Running`.
-        #[arg(long, value_name = "SELECTOR")]
-        field_selector: Option<String>,
 
         /// Order the listing. Every order but `name` puts the most
         /// interesting row first: the newest restart, the youngest pod, the
@@ -296,6 +299,9 @@ mod tests {
 
     #[test]
     fn pods_accepts_label_and_field_selectors() {
+        // The selectors are global flags now — shared with the dashboard's
+        // pod-drilldown pane — but they still parse in `eks pods` exactly as
+        // before.
         let cli = parse(&[
             "eks",
             "pods",
@@ -306,19 +312,16 @@ mod tests {
             "-A",
         ]);
 
-        let Some(Command::Pods {
-            all_namespaces,
-            selector,
-            field_selector,
-            ..
-        }) = cli.command
-        else {
+        let Some(Command::Pods { all_namespaces, .. }) = cli.command else {
             panic!("expected a Pods command");
         };
 
         assert!(all_namespaces);
-        assert_eq!(selector.as_deref(), Some("app=api"));
-        assert_eq!(field_selector.as_deref(), Some("status.phase!=Running"));
+        assert_eq!(cli.global.selector.as_deref(), Some("app=api"));
+        assert_eq!(
+            cli.global.field_selector.as_deref(),
+            Some("status.phase!=Running")
+        );
     }
 
     #[test]
@@ -396,17 +399,23 @@ mod tests {
 
     #[test]
     fn pods_selectors_default_to_absent() {
-        let Some(Command::Pods {
-            selector,
-            field_selector,
-            ..
-        }) = parse(&["eks", "pods"]).command
-        else {
-            panic!("expected a Pods command");
-        };
+        let cli = parse(&["eks", "pods"]);
 
-        assert!(selector.is_none());
-        assert!(field_selector.is_none());
+        assert!(cli.global.selector.is_none());
+        assert!(cli.global.field_selector.is_none());
+    }
+
+    #[test]
+    fn a_selector_parses_before_the_subcommand_too() {
+        // Global flags must work on either side — the same rule every other
+        // global flag follows, and the dashboard has no subcommand at all to
+        // put one after.
+        let cli = parse(&["eks", "-l", "app=api", "dashboard"]);
+        assert_eq!(cli.global.selector.as_deref(), Some("app=api"));
+
+        let cli = parse(&["eks", "-l", "app=api"]);
+        assert_eq!(cli.global.selector.as_deref(), Some("app=api"));
+        assert!(cli.command.is_none());
     }
 
     #[test]
@@ -453,6 +462,17 @@ mod tests {
         let (before, after) = both_ways(&["-n", "payments"]);
         assert_eq!(before.global.namespace, after.global.namespace);
         assert_eq!(before.global.namespace.as_deref(), Some("payments"));
+
+        let (before, after) = both_ways(&["-l", "app=api"]);
+        assert_eq!(before.global.selector, after.global.selector);
+        assert_eq!(before.global.selector.as_deref(), Some("app=api"));
+
+        let (before, after) = both_ways(&["--field-selector", "status.phase!=Running"]);
+        assert_eq!(before.global.field_selector, after.global.field_selector);
+        assert_eq!(
+            before.global.field_selector.as_deref(),
+            Some("status.phase!=Running")
+        );
 
         let (before, after) = both_ways(&["--timeout", "5s"]);
         assert_eq!(before.global.timeout, after.global.timeout);
@@ -628,14 +648,7 @@ mod tests {
     fn wide_composes_with_the_other_listing_flags() {
         // Nothing about `--wide` is exclusive with a scope, a selector, or an
         // ordering — they answer different questions about the same listing.
-        let Some(Command::Pods {
-            all_namespaces,
-            selector,
-            sort,
-            sort_reverse,
-            wide,
-            ..
-        }) = parse(&[
+        let cli = parse(&[
             "eks",
             "pods",
             "-A",
@@ -645,14 +658,19 @@ mod tests {
             "cpu",
             "--sort-reverse",
             "--wide",
-        ])
-        .command
+        ]);
+        let Some(Command::Pods {
+            all_namespaces,
+            sort,
+            sort_reverse,
+            wide,
+        }) = cli.command
         else {
             panic!("expected a Pods command");
         };
 
         assert!(all_namespaces);
-        assert_eq!(selector.as_deref(), Some("app=api"));
+        assert_eq!(cli.global.selector.as_deref(), Some("app=api"));
         assert_eq!(sort, PodOrder::Cpu);
         assert!(sort_reverse);
         assert!(wide);

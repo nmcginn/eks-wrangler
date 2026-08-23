@@ -275,7 +275,10 @@ impl App {
     /// listing for this node worth keeping over a failed one.
     pub fn apply_pods(&mut self, result: Result<PodsFetch, String>) {
         self.pods = match result {
-            Ok(fetch) => PodsState::Loaded { rows: fetch.rows },
+            Ok(fetch) => PodsState::Loaded {
+                rows: fetch.rows,
+                selector_note: fetch.selector_note,
+            },
             Err(message) => PodsState::Error(message),
         };
     }
@@ -1234,7 +1237,31 @@ mod tests {
 
         app.apply_pods(Ok(PodsFetch::default()));
 
-        assert_eq!(app.pods(), &PodsState::Loaded { rows: Vec::new() });
+        assert_eq!(
+            app.pods(),
+            &PodsState::Loaded {
+                rows: Vec::new(),
+                selector_note: None,
+            }
+        );
+    }
+
+    #[test]
+    fn apply_pods_carries_the_selector_note_into_the_loaded_state() {
+        let mut app = app();
+
+        app.apply_pods(Ok(PodsFetch {
+            rows: Vec::new(),
+            selector_note: Some("label selector `app=api`".to_owned()),
+        }));
+
+        assert_eq!(
+            app.pods(),
+            &PodsState::Loaded {
+                rows: Vec::new(),
+                selector_note: Some("label selector `app=api`".to_owned()),
+            }
+        );
     }
 
     #[test]

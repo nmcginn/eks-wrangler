@@ -20,7 +20,13 @@ pub enum PodsState {
     Loading,
     /// The cluster answered — possibly with zero pods, a real answer for a
     /// node that is cordoned or has just joined.
-    Loaded { rows: Vec<PodRow> },
+    Loaded {
+        rows: Vec<PodRow>,
+        /// What to say instead of "this node has no pods" when a `-l`/
+        /// `--field-selector` the user typed is why the list is empty. See
+        /// [`crate::commands::pods::PodsFetch::selector_note`].
+        selector_note: Option<String>,
+    },
     /// The fetch failed; the message is already a full sentence, via
     /// `k8s::explain`.
     Error(String),
@@ -34,7 +40,7 @@ impl PodsState {
     #[must_use]
     pub fn rows(&self) -> &[PodRow] {
         match self {
-            Self::Loaded { rows } => rows,
+            Self::Loaded { rows, .. } => rows,
             Self::Loading | Self::Error(_) => &[],
         }
     }
@@ -58,10 +64,21 @@ pub(super) fn draw(
             message.clone(),
             theme.severity(Severity::Critical),
         )],
-        PodsState::Loaded { rows } if rows.is_empty() => {
-            vec![Line::styled("This node has no pods.", theme.dim())]
+        PodsState::Loaded {
+            rows,
+            selector_note,
+        } if rows.is_empty() => {
+            // A selector that matched nothing must not read like an empty
+            // node, or the user goes looking for pods that are there but
+            // filtered out — the same reasoning `k8s::pods::row::empty`
+            // follows for the CLI table.
+            let message = selector_note.as_ref().map_or_else(
+                || "This node has no pods.".to_owned(),
+                |note| format!("No pods here match {note}."),
+            );
+            vec![Line::styled(message, theme.dim())]
         }
-        PodsState::Loaded { rows } => {
+        PodsState::Loaded { rows, .. } => {
             let mut lines = vec![Line::styled("PODS", theme.heading())];
             lines.extend(
                 rows.iter()
@@ -156,6 +173,7 @@ mod tests {
     fn loaded_state_shows_each_pods_name_and_status() {
         let state = PodsState::Loaded {
             rows: vec![pod("api-1"), pod("api-2")],
+            selector_note: None,
         };
         let rendered = render(&state, None);
 
@@ -166,8 +184,28 @@ mod tests {
 
     #[test]
     fn an_empty_pod_list_says_so_rather_than_rendering_nothing() {
-        let rendered = render(&PodsState::Loaded { rows: Vec::new() }, None);
+        let state = PodsState::Loaded {
+            rows: Vec::new(),
+            selector_note: None,
+        };
+        let rendered = render(&state, None);
         assert!(rendered.contains("no pods"), "{rendered}");
+    }
+
+    #[test]
+    fn an_empty_listing_under_a_selector_blames_the_selector_not_the_node() {
+        // The same reasoning `k8s::pods::row::empty` uses for the CLI table:
+        // a filter that matched nothing must not read like a node with
+        // nothing on it, or the user goes looking for pods that are there
+        // but filtered out.
+        let state = PodsState::Loaded {
+            rows: Vec::new(),
+            selector_note: Some("label selector `app=api`".to_owned()),
+        };
+        let rendered = render(&state, None);
+
+        assert!(rendered.contains("label selector `app=api`"), "{rendered}");
+        assert!(!rendered.contains("has no pods."), "{rendered}");
     }
 
     #[test]
@@ -189,6 +227,7 @@ mod tests {
     fn rows_returns_the_loaded_rows() {
         let state = PodsState::Loaded {
             rows: vec![pod("api-1")],
+            selector_note: None,
         };
         assert_eq!(state.rows().len(), 1);
     }
@@ -197,6 +236,7 @@ mod tests {
     fn rendering_the_pod_pane_survives_a_tiny_terminal() {
         let state = PodsState::Loaded {
             rows: vec![pod("api-1")],
+            selector_note: None,
         };
         for (width, height) in [(1, 1), (8, 3), (20, 2), (200, 60)] {
             let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();

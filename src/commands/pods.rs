@@ -199,6 +199,12 @@ pub async fn list(
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PodsFetch {
     pub rows: Vec<PodRow>,
+    /// What to say instead of "this node has no pods" when an empty listing
+    /// is a selector's doing rather than the node's — the pane's counterpart
+    /// to [`k8s::pods::row::selector_note`](crate::k8s::pods::selector_note),
+    /// which answers the same question for the CLI table. `None` when no
+    /// selector is active, so the pane keeps its plainer wording.
+    pub selector_note: Option<String>,
 }
 
 /// Fetch the pods placed on one node, on a background thread.
@@ -209,18 +215,32 @@ pub struct PodsFetch {
 /// No usage figures are fetched either: a node's pods are already a full
 /// round trip of their own, and wiring `metrics.k8s.io` into a third pane
 /// reads better as a considered addition than as a rider on this one.
+///
+/// `selectors` is whatever the user typed with `-l`/`--field-selector`,
+/// already validated by [`selectors_for`] — the same function and the same
+/// rejection path `eks pods` uses, so a selector means one thing across the
+/// tool. It is combined with the pane's own `spec.nodeName` filter rather
+/// than replacing it.
 #[must_use]
 pub fn spawn_gather_for_node(
     config: KubeConfig,
     paths: Vec<PathBuf>,
     cluster: Option<String>,
     node: String,
+    selectors: Selectors,
     budget: page::Budget,
 ) -> mpsc::Receiver<Result<PodsFetch, String>> {
     commands::spawn(async move {
-        gather_for_node(&config, &paths, cluster.as_deref(), &node, budget)
-            .await
-            .map_err(|error| format!("{error:#}"))
+        gather_for_node(
+            &config,
+            &paths,
+            cluster.as_deref(),
+            &node,
+            &selectors,
+            budget,
+        )
+        .await
+        .map_err(|error| format!("{error:#}"))
     })
 }
 
@@ -229,25 +249,17 @@ pub fn spawn_gather_for_node(
 async fn gather_for_node(
     config: &KubeConfig,
     paths: &[PathBuf],
-    selector: Option<&str>,
+    cluster: Option<&str>,
     node: &str,
+    selectors: &Selectors,
     budget: page::Budget,
 ) -> Result<PodsFetch> {
-    let target = target_cluster(config, selector)?;
+    let target = target_cluster(config, cluster)?;
     let label = target.label();
     let client = k8s::connect(paths, &target, budget).await?;
 
-    // Every namespace: a node's pods are not scoped to one, and the pane
-    // answers "what is running here", not "what is running in this
-    // namespace". `spec.nodeName` is safe to interpolate unquoted — it comes
-    // from a `NodeRow` the API server itself named, never from what a user
-    // typed, and a Kubernetes node name cannot contain the characters the
-    // field-selector grammar treats specially.
-    let selectors = Selectors {
-        label: None,
-        field: Some(format!("spec.nodeName={node}")),
-    };
-    let pods = k8s_pods::fetch_scope(client, &Scope::All, &selectors, budget)
+    let scoped = scoped_to_node(node, selectors);
+    let pods = k8s_pods::fetch_scope(client, &Scope::All, &scoped, budget)
         .await
         .map_err(|error| anyhow!(k8s::explain(&error, &label)))?;
 
@@ -257,7 +269,39 @@ async fn gather_for_node(
         .map(|pod| PodRow::from_pod(pod, None, now))
         .collect();
 
-    Ok(PodsFetch { rows })
+    Ok(PodsFetch {
+        rows,
+        // From the user's own selectors, not `scoped` — the node filter is
+        // implicit in "this is the node's pane", never something to explain
+        // back to the user as a reason the list came back empty.
+        selector_note: k8s_pods::selector_note(selectors),
+    })
+}
+
+/// Combine the pane's own `spec.nodeName` scope with whatever selectors the
+/// user typed, kept as a pure function so the combining rule — the node
+/// filter and the user's are `AND`ed, never one replacing the other — is a
+/// fixture rather than something only a live fetch exercises.
+///
+/// Every namespace: a node's pods are not scoped to one, and the pane answers
+/// "what is running here", not "what is running in this namespace".
+/// `spec.nodeName` is safe to interpolate unquoted — it comes from a
+/// `NodeRow` the API server itself named, never from what a user typed, and a
+/// Kubernetes node name cannot contain the characters the field-selector
+/// grammar treats specially. A comma joins two field requirements the same
+/// way it joins two label ones, so `--field-selector status.phase!=Running`
+/// narrows this node's pods rather than being silently dropped by the pane's
+/// own filter.
+fn scoped_to_node(node: &str, selectors: &Selectors) -> Selectors {
+    let mut field = format!("spec.nodeName={node}");
+    if let Some(user_field) = &selectors.field {
+        field.push(',');
+        field.push_str(user_field);
+    }
+    Selectors {
+        label: selectors.label.clone(),
+        field: Some(field),
+    }
 }
 
 /// Validate the label and field selectors, before any network call.
@@ -472,5 +516,46 @@ contexts:
 
         assert!(message.contains("\"status.phase\""), "{message}");
         assert!(message.contains("operator"), "{message}");
+    }
+
+    #[test]
+    fn scoping_to_a_node_adds_nothing_else_when_no_selector_is_active() {
+        let scoped = scoped_to_node("ip-10-0-1-9.ec2.internal", &Selectors::default());
+
+        assert_eq!(scoped.label, None);
+        assert_eq!(
+            scoped.field.as_deref(),
+            Some("spec.nodeName=ip-10-0-1-9.ec2.internal")
+        );
+    }
+
+    #[test]
+    fn scoping_to_a_node_carries_the_users_label_selector_through_unchanged() {
+        let selectors = Selectors {
+            label: Some("app=api".to_owned()),
+            field: None,
+        };
+
+        let scoped = scoped_to_node("worker-1", &selectors);
+
+        assert_eq!(scoped.label.as_deref(), Some("app=api"));
+        assert_eq!(scoped.field.as_deref(), Some("spec.nodeName=worker-1"));
+    }
+
+    #[test]
+    fn scoping_to_a_node_ands_the_users_field_selector_onto_the_node_filter() {
+        // A comma joins two field requirements, so both must hold: this is
+        // the node's pods *and* not-Running, not either on its own.
+        let selectors = Selectors {
+            label: None,
+            field: Some("status.phase!=Running".to_owned()),
+        };
+
+        let scoped = scoped_to_node("worker-1", &selectors);
+
+        assert_eq!(
+            scoped.field.as_deref(),
+            Some("spec.nodeName=worker-1,status.phase!=Running")
+        );
     }
 }
