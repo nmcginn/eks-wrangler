@@ -366,7 +366,7 @@ cluster.
   other node orders do, and a node that does not report the resource sorts into
   the unrankable tail under `k8s::order`'s existing rule rather than as a zero.
 
-- [ ] **Native resources that still have no column: `ephemeral-storage` and
+- [x] **Native resources that still have no column: `ephemeral-storage` and
   `hugepages-*`.**
   `is_extended` names them explicitly as the things a device column is *not*,
   which makes their absence a decision rather than an oversight. `pods` has left
@@ -825,6 +825,25 @@ cluster.
 ---
 
 ## Done
+
+- **Native resources that still have no column: `ephemeral-storage` and
+  `hugepages-*`** (2026-08-23) — `eks nodes` gains an `EPHEMERAL-STORAGE`
+  column, shaped like `MEMORY` (`allocatable/capacity`), shown whenever any
+  node in the listing reports it — which on a real cluster is every node. A
+  `HUGEPAGES-2Mi`-style column appears per size, but only for a size some node
+  has actually reserved: the kernel reports every size it was built with, at
+  `0`, on almost every node, and a column of zeroes headed `HUGEPAGES-2MI` on
+  every EKS listing would be exactly the noise `resource::is_extended` already
+  keeps `hugepages-*` out of the device treatment to avoid. `NodeRow` carries
+  the raw per-node facts (`ephemeral_storage: Capacity`, `hugepages:
+  BTreeMap<String, Capacity>`); `hugepage_names` is the *nonzero*-in-any-row
+  filter that turns those facts into columns, one level past the `any`-not-
+  `all` rule the usage and device columns already follow. Both columns sit
+  after `PODS` and before `AGE`, grouped with the device columns as "what this
+  machine can give out"; both are the first to leave on a narrow terminal,
+  ahead of even `VERSION`, since neither was visible at all before tonight and
+  an existing listing should look unchanged until the terminal is genuinely
+  tight. See decision 58.
 
 - **Carry the pod selectors into the dashboard** (2026-08-23) — `-l`/
   `--field-selector` now filter every node's pods in the dashboard's

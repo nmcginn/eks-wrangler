@@ -1674,3 +1674,37 @@ The dashboard has no text-input mechanism yet — fuzzy search (`/`) is the
 first roadmap task that will need one — and guessing at its shape to serve
 this task alone would very likely guess wrong. Tracked in the roadmap as its
 own entry, to be built once there is an input mechanism to hang it on.
+
+### 58. Huge-page columns are conditioned on being nonzero, not merely reported
+
+`ephemeral-storage` and `hugepages-*` sit in a node's `capacity`/`allocatable`
+maps beside `cpu` and `memory`, but they are not shaped alike. Every real
+node reports `ephemeral-storage`, so its column follows the same `any`-row
+condition [`shows_usage`] already uses — the ordinary case gains it, and a
+node still registering does not cost everyone else the column. `hugepages-*`
+is different: the kernel reports an entry for every size it was built with,
+almost always at `0`, whether or not an administrator ever reserved a pool.
+Conditioning the column on *presence*, the way a device column is, would put
+`HUGEPAGES-2MI` on every EKS listing, full of zeroes — exactly the noise
+`resource::is_extended` already excludes `hugepages-*` from the device
+treatment to avoid. So `hugepage_names` conditions on the pair being
+*nonzero* in at least one row instead: the same `any`-not-`all` shape, one
+level further in.
+
+Both columns are shaped like `Capacity` — an `allocatable/capacity` pair
+formatted with `quantity::memory` — rather than like `Device`'s
+`booked/offered` count. Neither resource has a request tracked against it
+yet, so there is no numerator to pair a capacity against; a `REQ` column for
+either is the same undecided question the roadmap already leaves open for a
+device's own request ("What a pod asked for, when nothing has measured it"),
+not one this change answers by inventing a shape for it.
+
+Placement: both sit after `PODS` and before `AGE`, ephemeral storage first as
+the one every node has, then the device columns, then whichever huge-page
+sizes qualified — grouped with `PODS` and the devices as "what this machine
+can give out" rather than spliced between `MEMORY` and its `REQ` column, so
+the existing pairing of a capacity with the share beside it is undisturbed.
+In `DROP_ORDER` they are the very first columns to go on a narrow terminal —
+ahead of even `VERSION` — because they are the newest facts on the row and
+were not visible at all before tonight; a reviewer resizing a terminal on an
+existing listing should see no difference until it is genuinely tight.

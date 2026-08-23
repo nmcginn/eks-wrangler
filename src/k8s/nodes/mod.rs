@@ -106,6 +106,22 @@ pub struct NodeRow {
     /// does is simply absent from this map rather than carrying a zero: it has
     /// no GPUs, which is a different fact from having zero of them free.
     pub devices: BTreeMap<String, Device>,
+    /// The node's ephemeral storage — the disk pods' writable layers, `emptyDir`
+    /// volumes, and logs share — read the same way `cpu` and `memory` are.
+    ///
+    /// Unlike a device, every node reports this; there is simply no request
+    /// tracked against it yet, so it gets a capacity pair and no `REQ` column
+    /// beside it, the same shape [`cpu`](Self::cpu) had before pod requests were
+    /// summed.
+    pub ephemeral_storage: Capacity,
+    /// Huge-page pools by size, e.g. `hugepages-2Mi`, keyed by their bare name.
+    ///
+    /// Every node reports every size the kernel supports, at `0` unless an
+    /// administrator reserved some — so unlike [`devices`](Self::devices), which
+    /// is absent for hardware a node does not have, this map can hold an entry
+    /// that is honestly zero. What decides whether a size becomes a column is
+    /// the *table's* business, not the row's — see `hugepage_names` below.
+    pub hugepages: BTreeMap<String, Capacity>,
 }
 
 /// One extended resource on one node: how many of them it will hand out, and
@@ -428,9 +444,15 @@ impl NodeRow {
             kernel_version: system_field(info, |info| &info.kernel_version),
             container_runtime: system_field(info, |info| &info.container_runtime_version),
             devices: devices(node, requested),
+            ephemeral_storage: Capacity::read(node, "ephemeral-storage"),
+            hugepages: hugepages(node),
         }
     }
 }
+
+/// The prefix every huge-page resource name carries: `hugepages-2Mi`,
+/// `hugepages-1Gi`. Kubernetes' own naming, not one this tool invented.
+const HUGEPAGE_PREFIX: &str = "hugepages-";
 
 /// The extended resources one node advertises, and what is booked of each.
 ///
@@ -468,6 +490,41 @@ fn devices(node: &Node, requested: Option<&Requests>) -> BTreeMap<String, Device
             (name.to_owned(), device)
         })
         .collect()
+}
+
+/// A node's huge-page pools, by size.
+///
+/// The union of `capacity` and `allocatable`, exactly as [`devices`] reads
+/// them, and for the same mid-registration reason. Unlike `devices`, this is
+/// not filtered to a rare condition — every node in a real cluster reports
+/// every size the kernel was built with, almost always at `0` — so the
+/// question of which sizes are worth a column is answered later, by
+/// [`hugepage_names`], over the rows rather than here per node.
+fn hugepages(node: &Node) -> BTreeMap<String, Capacity> {
+    let status = node.status.as_ref();
+    let names: BTreeSet<&str> = [
+        status.and_then(|status| status.capacity.as_ref()),
+        status.and_then(|status| status.allocatable.as_ref()),
+    ]
+    .into_iter()
+    .flatten()
+    .flat_map(|map| map.keys().map(String::as_str))
+    .filter(|name| name.starts_with(HUGEPAGE_PREFIX))
+    .collect();
+
+    names
+        .into_iter()
+        .map(|name| (name.to_owned(), Capacity::read(node, name)))
+        .collect()
+}
+
+/// Whether a capacity pair is worth a reader's attention: some huge-page pool
+/// actually reserved, rather than the kernel merely supporting the size.
+///
+/// `false` when neither half is known, same as an unset pool.
+fn is_nonzero(capacity: Capacity) -> bool {
+    capacity.allocatable.is_some_and(|q| q.units() > 0)
+        || capacity.capacity.is_some_and(|q| q.units() > 0)
 }
 
 /// One of a node's reported addresses, by type, or `-` if it has none of it.
@@ -619,6 +676,14 @@ pub(crate) enum Column<'a> {
     /// it borrows the name from the rows it was computed from rather than
     /// owning a copy per column.
     Device(&'a str),
+    EphemeralStorage,
+    /// One huge-page size, by its bare name (`hugepages-2Mi`).
+    ///
+    /// Named like [`Device`](Self::Device) for the same reason — the sizes a
+    /// cluster reports are not known until the nodes arrive — but shaped like
+    /// [`Memory`](Self::Memory) rather than like a device count: a huge-page
+    /// pool is bytes reserved, not hardware offered.
+    Hugepage(&'a str),
     Age,
     InternalIp,
     ExternalIp,
@@ -646,7 +711,8 @@ impl Column<'_> {
             Self::MemoryRequested => "MEM REQ".to_owned(),
             Self::MemoryUsed => "MEM USE".to_owned(),
             Self::Pods => "PODS".to_owned(),
-            Self::Device(name) => resource::heading(name),
+            Self::Device(name) | Self::Hugepage(name) => resource::heading(name),
+            Self::EphemeralStorage => resource::heading("ephemeral-storage"),
             Self::Age => "AGE".to_owned(),
             Self::InternalIp => "INTERNAL-IP".to_owned(),
             Self::ExternalIp => "EXTERNAL-IP".to_owned(),
@@ -689,6 +755,14 @@ impl Column<'_> {
                 .devices
                 .get(name)
                 .map_or_else(|| UNKNOWN.to_owned(), |device| device.cell()),
+            Self::EphemeralStorage => row.ephemeral_storage.cell(quantity::memory),
+            // A pool this row does not report at all — the union across the
+            // listing found it on a different node — reads `-`, the same
+            // answer a node without a device gets; found but empty is `0/…`.
+            Self::Hugepage(name) => row.hugepages.get(name).map_or_else(
+                || UNKNOWN.to_owned(),
+                |capacity| capacity.cell(quantity::memory),
+            ),
             Self::Age => row.age.clone(),
             Self::InternalIp => row.internal_ip.clone(),
             Self::ExternalIp => row.external_ip.clone(),
@@ -736,6 +810,8 @@ impl Column<'_> {
             | Self::Version
             | Self::Cpu
             | Self::Memory
+            | Self::EphemeralStorage
+            | Self::Hugepage(_)
             | Self::Age
             | Self::InternalIp
             | Self::ExternalIp
@@ -756,6 +832,34 @@ impl Column<'_> {
 fn device_names(rows: &[NodeRow]) -> BTreeSet<&str> {
     rows.iter()
         .flat_map(|row| row.devices.keys().map(String::as_str))
+        .collect()
+}
+
+/// Whether any row has a figure for ephemeral storage worth a column.
+///
+/// The same `any`-not-`all` rule as [`shows_usage`]: a node still registering,
+/// mid-listing, must not cost everyone else the column.
+fn shows_ephemeral_storage(rows: &[NodeRow]) -> bool {
+    rows.iter().any(|row| {
+        row.ephemeral_storage.allocatable.is_some() || row.ephemeral_storage.capacity.is_some()
+    })
+}
+
+/// Every huge-page size worth a column: one some row in this listing has
+/// actually reserved.
+///
+/// Not the union of every size any row *reports* — [`hugepages`] puts an entry
+/// on almost every node, at `0`, because the kernel supports the size whether
+/// or not anyone asked for a pool of it. A column of zeroes headed
+/// `HUGEPAGES-2MI` on every listing would be exactly the noise
+/// [`resource::is_extended`] excludes `hugepages-*` from the device treatment
+/// to avoid; this is the same condition applied one level up, at the column
+/// rather than the resource name.
+fn hugepage_names(rows: &[NodeRow]) -> BTreeSet<&str> {
+    rows.iter()
+        .flat_map(|row| row.hugepages.iter())
+        .filter(|&(_, &capacity)| is_nonzero(capacity))
+        .map(|(name, _)| name.as_str())
         .collect()
 }
 
@@ -801,10 +905,17 @@ pub(crate) fn columns(rows: &[NodeRow], width: format::Width) -> Vec<Column<'_>>
     // — what will still fit here — and the one that is true of every node
     // rather than only of the ones somebody put hardware in.
     columns.push(Column::Pods);
-    // Devices sit after the resources every node has and before AGE, so the
-    // block of "what this machine can give out" stays together and AGE stays
-    // last of the default columns, where every `kubectl get` puts it.
+    // Ephemeral storage, devices, and huge pages sit after the resources every
+    // node is measured against and before AGE, so the block of "what this
+    // machine can give out" stays together and AGE stays last of the default
+    // columns, where every `kubectl get` puts it. Ephemeral storage goes
+    // first of the three: it is a capacity pair like CPU and MEMORY, and the
+    // other two are conditional, rarer facts about the same machine.
+    if shows_ephemeral_storage(rows) {
+        columns.push(Column::EphemeralStorage);
+    }
     columns.extend(device_names(rows).into_iter().map(Column::Device));
+    columns.extend(hugepage_names(rows).into_iter().map(Column::Hugepage));
     columns.push(Column::Age);
     match width {
         format::Width::Default => columns,
@@ -839,30 +950,35 @@ pub(crate) fn columns(rows: &[NodeRow], width: format::Width) -> Vec<Column<'_>>
 ///
 /// The steps:
 ///
-/// 1. `VERSION` — the same string on every node in a node group, easy to get
+/// 1. `EPHEMERAL-STORAGE` and every `HUGEPAGES-*` column, together — the
+///    newest and least asked-for facts on the row, and neither was ever
+///    visible before tonight. On the overwhelming majority of listings, which
+///    have no huge pages reserved, this step drops nothing and the next runs
+///    in the same pass.
+/// 2. `VERSION` — the same string on every node in a node group, easy to get
 ///    from `kubectl` on the day it matters.
-/// 2. `AGE` — a standard column but rarely the one people came for.
-/// 3. `PODS` — the first of the three booked figures to go, and deliberately
+/// 3. `AGE` — a standard column but rarely the one people came for.
+/// 4. `PODS` — the first of the three booked figures to go, and deliberately
 ///    ahead of the other two. It is a third answer to "what will still fit
 ///    here", and the least often the binding one: a node runs out of CPU or
 ///    memory long before it runs out of pod slots, unless the CNI's address
 ///    budget is what is short. It also arrived last, and a column added later
 ///    should not be the thing that evicts `CPU REQ` and `MEM REQ` from every
 ///    80-column listing that has been keeping them.
-/// 4. `CPU REQ` and `MEM REQ` — dropping the pair leaves capacity and usage
+/// 5. `CPU REQ` and `MEM REQ` — dropping the pair leaves capacity and usage
 ///    side-by-side, which is the "how busy is this machine" question.
-/// 5. `CPU USE` and `MEM USE` — the pair the tool exists for, so late.
-/// 6. `CPU` and `MEMORY` — the machine's own specs, dropped before the device
+/// 6. `CPU USE` and `MEM USE` — the pair the tool exists for, so late.
+/// 7. `CPU` and `MEMORY` — the machine's own specs, dropped before the device
 ///    columns rather than after them: a device column only exists because
 ///    somebody installed the plugin that surfaces it, and a GPU cluster
 ///    surviving a narrow terminal with `GPU` intact and `CPU` gone is the
 ///    right trade — every listing has `CPU`, and only the interesting one has
 ///    the card.
-/// 7. Every device column, together — a GPU cluster wants them all or none,
+/// 8. Every device column, together — a GPU cluster wants them all or none,
 ///    and the alphabet is a bad rule for "which card is important". On a
 ///    cluster with no devices this step is a no-op and the next runs in the
 ///    same pass.
-/// 8. `STATUS` — the last thing to go before `NAME` is alone.
+/// 9. `STATUS` — the last thing to go before `NAME` is alone.
 ///
 /// `NAME` never drops. A row we cannot fit at all is still a row with a name;
 /// the terminal wraps it, and dropping the name would leave a row that no
@@ -870,6 +986,7 @@ pub(crate) fn columns(rows: &[NodeRow], width: format::Width) -> Vec<Column<'_>>
 ///
 /// [`Width::Narrow`]: format::Width::Narrow
 const DROP_ORDER: &[fn(&Column<'_>) -> bool] = &[
+    |c| matches!(c, Column::EphemeralStorage | Column::Hugepage(_)),
     |c| matches!(c, Column::Version),
     |c| matches!(c, Column::Age),
     |c| matches!(c, Column::Pods),
@@ -2969,6 +3086,196 @@ mod tests {
             "CPU REQ, MEM REQ, and the booked half of PODS are empty \
              because the pods could not be listed.\nwhy"
         );
+    }
+
+    // --- Ephemeral storage and huge pages ------------------------------------
+
+    /// A node with ephemeral storage reported and one huge-page size actually
+    /// reserved, beside the `hugepages-1Gi` entry every real node carries at
+    /// zero regardless.
+    fn storage_node() -> Node {
+        let mut node = healthy_node();
+        if let Some(status) = node.status.as_mut() {
+            status.capacity = Some(quantities(&[
+                ("cpu", "4"),
+                ("memory", "16374624Ki"),
+                ("pods", "58"),
+                ("ephemeral-storage", "104857600Ki"),
+                ("hugepages-1Gi", "0"),
+                ("hugepages-2Mi", "20Mi"),
+            ]));
+            status.allocatable = Some(quantities(&[
+                ("cpu", "3920m"),
+                ("memory", "15525152Ki"),
+                ("pods", "58"),
+                ("ephemeral-storage", "94371840Ki"),
+                ("hugepages-1Gi", "0"),
+                ("hugepages-2Mi", "20Mi"),
+            ]));
+        }
+        node
+    }
+
+    #[test]
+    fn ephemeral_storage_earns_a_capacity_column_like_memorys() {
+        let rows = [NodeRow::from_node(
+            &storage_node(),
+            Some(&idle()),
+            None,
+            now(),
+        )];
+
+        assert!(
+            headings(&rows, Width::Default).contains(&"EPHEMERAL-STORAGE".to_owned()),
+            "{:?}",
+            headings(&rows, Width::Default)
+        );
+        // 94371840Ki is exactly 90Gi, 104857600Ki exactly 100Gi — allocatable
+        // over capacity, the same order the CPU and MEMORY cells use.
+        assert_eq!(
+            Column::EphemeralStorage.text(&rows[0]),
+            "90Gi/100Gi".to_owned()
+        );
+    }
+
+    #[test]
+    fn a_node_with_no_ephemeral_storage_gains_no_column() {
+        // The overwhelmingly common cluster must read exactly as it did.
+        let rows = [NodeRow::from_node(
+            &healthy_node(),
+            Some(&idle()),
+            None,
+            now(),
+        )];
+
+        assert!(
+            !headings(&rows, Width::Default).contains(&"EPHEMERAL-STORAGE".to_owned()),
+            "{:?}",
+            headings(&rows, Width::Default)
+        );
+        assert_eq!(rows[0].ephemeral_storage, Capacity::default());
+    }
+
+    #[test]
+    fn only_a_reserved_hugepage_pool_earns_a_column() {
+        // `hugepages-1Gi` is on this node's own capacity map, at zero, exactly
+        // like `hugepages-2Mi` was on `gpu_node` — and stays as invisible as
+        // that one did. Only the size somebody actually reserved gets a
+        // column.
+        let rows = [NodeRow::from_node(
+            &storage_node(),
+            Some(&idle()),
+            None,
+            now(),
+        )];
+        let headings = headings(&rows, Width::Default);
+
+        assert!(
+            headings.contains(&"HUGEPAGES-2MI".to_owned()),
+            "{headings:?}"
+        );
+        assert!(
+            !headings.contains(&"HUGEPAGES-1GI".to_owned()),
+            "{headings:?}"
+        );
+        assert_eq!(rows[0].hugepages.len(), 2, "{:?}", rows[0].hugepages);
+    }
+
+    #[test]
+    fn a_hugepages_cell_reads_as_a_capacity_pair_not_a_device_count() {
+        let rows = [NodeRow::from_node(
+            &storage_node(),
+            Some(&idle()),
+            None,
+            now(),
+        )];
+
+        // 20Mi reserved and fully handed out — the pool's own shape, not
+        // `nvidia.com/gpu`'s `booked/offered` one.
+        assert_eq!(
+            Column::Hugepage("hugepages-2Mi").text(&rows[0]),
+            "20Mi/20Mi"
+        );
+    }
+
+    #[test]
+    fn a_node_reporting_none_of_a_size_reads_a_dash_not_a_real_zero() {
+        // Mirrors the device table's own rule: a size this node never listed
+        // at all is different from a pool it listed and reserved nothing of.
+        let rows = [
+            NodeRow::from_node(
+                &renamed(&storage_node(), "gpu-storage"),
+                Some(&idle()),
+                None,
+                now(),
+            ),
+            NodeRow::from_node(
+                &renamed(&healthy_node(), "plain-node"),
+                Some(&idle()),
+                None,
+                now(),
+            ),
+        ];
+
+        assert_eq!(Column::Hugepage("hugepages-2Mi").text(&rows[1]), "-");
+        assert_eq!(Column::Hugepage("hugepages-2Mi").severity(&rows[1]), None);
+    }
+
+    #[test]
+    fn ephemeral_storage_and_hugepages_sit_between_pods_and_age() {
+        let rows = [NodeRow::from_node(
+            &storage_node(),
+            Some(&idle()),
+            None,
+            now(),
+        )];
+
+        assert_eq!(
+            headings(&rows, Width::Default),
+            [
+                "NAME",
+                "STATUS",
+                "VERSION",
+                "CPU",
+                "CPU REQ",
+                "MEMORY",
+                "MEM REQ",
+                "PODS",
+                "EPHEMERAL-STORAGE",
+                "HUGEPAGES-2MI",
+                "AGE",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_narrow_terminal_drops_ephemeral_storage_and_hugepages_before_version() {
+        // The newest and least essential facts on the row go first, ahead of
+        // even VERSION — they were never visible before tonight, and a
+        // reviewer used to the old table should see it unchanged until the
+        // terminal is genuinely tight.
+        let rows = [NodeRow::from_node(
+            &storage_node(),
+            Some(&idle()),
+            None,
+            now(),
+        )];
+        let wide_enough = headings(&rows, Width::Narrow(200));
+        assert!(wide_enough.contains(&"EPHEMERAL-STORAGE".to_owned()));
+        assert!(wide_enough.contains(&"HUGEPAGES-2MI".to_owned()));
+
+        // Narrow enough to force exactly one drop step; VERSION is still here
+        // and the two new columns are already gone.
+        let target = u16::try_from(format::row_width(&widths(
+            &columns(&rows, Width::Default),
+            &rows,
+        )))
+        .unwrap_or(u16::MAX)
+            - 1;
+        let cols = headings_at(&rows, target);
+        assert!(!cols.contains(&"EPHEMERAL-STORAGE".to_owned()), "{cols:?}");
+        assert!(!cols.contains(&"HUGEPAGES-2MI".to_owned()), "{cols:?}");
+        assert!(cols.contains(&"VERSION".to_owned()), "{cols:?}");
     }
 
     // --- Narrow mode --------------------------------------------------------
