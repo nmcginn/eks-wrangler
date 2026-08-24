@@ -1851,3 +1851,54 @@ dedup/count rule, and a decision about what "no events" should say next to a
 pod too young for the API server to have kept any — a night of its own
 rather than a fact to bolt onto a container's row. See `docs/ROADMAP.md`'s
 follow-up entry.
+
+### 62. Arrow keys joined `Tab`/`Esc`, and quitting at the top level needs two presses
+
+Live use against real clusters turned up two problems with the scheme
+decision 56 settled on: `Left`/`Right` did nothing at all, which reads as
+broken once `j`/`k` have already trained a user that arrow keys work here
+too, and a single `Esc` at `View::Overview` quit immediately, which is too
+easy to trigger by accident. Both were reported directly rather than found
+as a roadmap task, and the fix touches the same keys decision 56 chose, so
+it revises that decision's rule rather than adding beside it.
+
+`Right`/`Tab` are now two names for one motion (`App::advance`): switch
+focus from `Sidebar` to `Detail` if the sidebar has it, or drill in
+(`drill_in`) if the detail pane already does. `Left`/`Esc` are two names
+for the reverse (`App::retreat`), but not the exact mirror — drilling out
+of the current view wins over moving focus back to the sidebar, regardless
+of which pane is focused, so backing out of a two-level drill-down is still
+one press per level exactly as before. Only once the view is already back
+at `Overview` does a `Left`/`Esc` press move focus to the sidebar first,
+and only once focus is *also* already on the sidebar does it reach the quit
+step. Making focus-switching win first, the more literal reading of
+"`Left`/`Esc` do pane-switching too", was tried and rejected: `Focus`
+usually still points at `Detail` right after drilling in, since drilling
+never changes it, so that ordering would have cost a spare `Esc` on every
+"back out immediately" press — the exact interaction decision 56 was
+written to preserve — in exchange for a pane-switch nobody was reaching for
+in the same breath as backing out.
+
+The quit step itself changed too: decision 56's "`q` and `Ctrl-C` are
+unconditional either way" no longer holds for `q`. `Esc` and `q` at the top
+level now arm a pending quit (`App::quit_or_arm`, backed by one
+`Option<Instant>` field, `quit_armed_at`) rather than quitting outright, and
+only a second `Esc`/`q` within `QUIT_CONFIRM_WINDOW` (600ms) confirms it —
+either key confirms the other's arm, so a user reaching for whichever one
+comes to mind first does not have to remember which one they already
+pressed. `q` stays gated on `View::Overview` alone, unlike `Esc`, since `q`
+never had focus-aware behaviour to preserve; it is a no-op while drilled
+into anything, rather than the unconditional quit it used to be. Any key
+that is not `q`/`Esc`/`Left` clears a pending arm, so a navigation press in
+between two quit-family presses cancels it instead of letting a much later,
+unrelated `Esc` confirm a stale one. `Ctrl-C` is untouched and still
+unconditional — the one part of decision 56's rule this change keeps
+exactly, since an immediate, no-questions-asked way out was the point of
+having it at all.
+
+The footer (`draw_footer`, now taking `&App` instead of `Theme` so it can
+read the new `App::quit_pending`) replaces its hint line with "press esc/q
+again to quit" for as long as a quit stays armed, styled with
+`theme.severity(Severity::Warn)` rather than a new `Theme` method. Shipping
+the double-press rule without this would leave a user's first `Esc`/`q`
+looking like it did nothing.

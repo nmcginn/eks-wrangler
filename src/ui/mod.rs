@@ -38,6 +38,12 @@ use pods::PodsState;
 /// effectively zero CPU while idle.
 const TICK: Duration = Duration::from_millis(250);
 
+/// How long a second `Esc`/`q` has to land after the first before it counts
+/// as a confirming press rather than a fresh arm. Long enough that an
+/// intentional double-press doesn't feel twitchy, short enough that an
+/// unrelated later press doesn't quit by accident.
+const QUIT_CONFIRM_WINDOW: Duration = Duration::from_millis(600);
+
 /// Starts a node fetch for the named context. Boxed rather than a type
 /// parameter on [`run`] and the event loop it drives: a second pane wanting its own fetch
 /// trigger (this change adds one, for pods) would otherwise grow a type
@@ -184,6 +190,10 @@ pub struct App {
     /// [`View`] is currently showing.
     pod_order: k8s_pods::Order,
     pod_direction: SortDirection,
+    /// When the last unconfirmed `Esc`/`q` at the top level was pressed —
+    /// `None` when no quit is pending. A second press of either key within
+    /// [`QUIT_CONFIRM_WINDOW`] confirms it; any other key clears it.
+    quit_armed_at: Option<Instant>,
 }
 
 impl App {
@@ -206,6 +216,7 @@ impl App {
             node_direction: SortDirection::default(),
             pod_order: k8s_pods::Order::default(),
             pod_direction: SortDirection::default(),
+            quit_armed_at: None,
         }
     }
 
@@ -290,6 +301,15 @@ impl App {
     #[must_use]
     pub fn pod_direction(&self) -> SortDirection {
         self.pod_direction
+    }
+
+    /// Whether a quit is armed and awaiting its confirming `Esc`/`q` within
+    /// `QUIT_CONFIRM_WINDOW`, for the footer's hint.
+    #[must_use]
+    pub fn quit_pending(&self) -> bool {
+        self.quit_armed_at.is_some_and(|armed| {
+            Instant::now().saturating_duration_since(armed) <= QUIT_CONFIRM_WINDOW
+        })
     }
 
     /// Apply the outcome of a node fetch.
@@ -502,30 +522,80 @@ impl App {
         }
     }
 
-    /// `Esc`: back out of a drill-down one level at a time, or quit once
-    /// there is nowhere left to back out to.
+    /// `Right`/`Tab`: move toward the detail pane and deeper into it —
+    /// switch focus to [`Focus::Detail`] if the sidebar has it, or drill in
+    /// if the detail pane already does.
+    fn advance(&mut self) {
+        match self.focus {
+            Focus::Sidebar => self.toggle_focus(),
+            Focus::Detail => self.drill_in(),
+        }
+    }
+
+    /// `Left`/`Esc`: back out of a drill-down one level at a time; once
+    /// there is no view left to back out of, move focus back to the
+    /// sidebar; once that's already true too, arm or confirm a quit.
     ///
-    /// A pod's containers back out to that pod's node's pods without a
-    /// fetch: [`Self::pods`] was not touched by drilling further in, so the
-    /// listing is still the one already on screen. Backing out of a node's
-    /// pods to the node list, by contrast, has always discarded that
-    /// listing outright — there is no cheaper "the node list is still
-    /// current" to fall back on, since it never stopped being fetched in
-    /// the background.
-    fn back_or_quit(&mut self) -> Flow {
+    /// Backing out of the view always wins over moving focus, regardless of
+    /// which pane is focused — exactly like the single-purpose `Esc` this
+    /// replaces, so a user already mid-drill still backs out one level per
+    /// press. The pane-switch and quit-arming steps only appear once
+    /// there's no view depth left to unwind.
+    fn retreat(&mut self) -> Flow {
+        match &self.view {
+            View::NodePods { .. } | View::PodContainers { .. } => {
+                self.back_out_one_level();
+                Flow::Continue
+            }
+            View::Overview => match self.focus {
+                Focus::Detail => {
+                    self.toggle_focus();
+                    Flow::Continue
+                }
+                Focus::Sidebar => self.quit_or_arm(),
+            },
+        }
+    }
+
+    /// Back out of the current drill-down by one level. A pod's containers
+    /// back out to that pod's node's pods without a fetch: [`Self::pods`]
+    /// was not touched by drilling further in, so the listing is still the
+    /// one already on screen. Backing out of a node's pods to the node
+    /// list, by contrast, has always discarded that listing outright —
+    /// there is no cheaper "the node list is still current" to fall back
+    /// on, since it never stopped being fetched in the background.
+    ///
+    /// Only called from [`Self::retreat`], which has already matched the
+    /// view to one of the two non-[`View::Overview`] variants this expects.
+    fn back_out_one_level(&mut self) {
         match &self.view {
             View::PodContainers { node, .. } => {
                 self.view = View::NodePods { node: node.clone() };
                 self.detail_selected = 0;
                 self.containers = ContainersState::default();
-                Flow::Continue
             }
-            View::NodePods { .. } => {
-                self.leave_detail_view();
-                Flow::Continue
-            }
-            View::Overview => Flow::Quit,
+            View::NodePods { .. } => self.leave_detail_view(),
+            View::Overview => {}
         }
+    }
+
+    /// `Esc`/`q` at the top level: arm a pending quit on the first press,
+    /// confirm and quit on a second press of either key within
+    /// [`QUIT_CONFIRM_WINDOW`]. Any other key clears the pending arm (see
+    /// [`Self::on_key`]), so a stray press elsewhere doesn't leave a
+    /// dangling "press again" state for a later, unrelated `Esc`/`q` to
+    /// confirm.
+    fn quit_or_arm(&mut self) -> Flow {
+        let now = Instant::now();
+        if self
+            .quit_armed_at
+            .is_some_and(|armed| now.saturating_duration_since(armed) <= QUIT_CONFIRM_WINDOW)
+        {
+            self.quit_armed_at = None;
+            return Flow::Quit;
+        }
+        self.quit_armed_at = Some(now);
+        Flow::Continue
     }
 
     /// How many rows the detail pane's current view could highlight.
@@ -595,7 +665,12 @@ impl App {
     /// Handle a key press.
     ///
     /// Supports both arrow keys and vim-style `j`/`k`, because the people who
-    /// live in this kind of tool expect the latter.
+    /// live in this kind of tool expect the latter. `Right`/`Tab` and
+    /// `Left`/`Esc` are each two names for the same pane-switch-then-drill
+    /// motion, in opposite directions (see `advance`/`retreat` below).
+    /// `Esc`/`q` only quit once nothing is left to back out of, and only on
+    /// a second press within `QUIT_CONFIRM_WINDOW`; `Ctrl+C` always quits
+    /// immediately, checked before anything else below.
     pub fn on_key(&mut self, key: KeyEvent) -> Flow {
         // Key *release* events arrive on Windows and modern terminals; acting on
         // both would move the selection twice per press.
@@ -607,10 +682,22 @@ impl App {
             return Flow::Quit;
         }
 
+        // Any key other than the quit-family ones clears a pending quit arm,
+        // so a stray press elsewhere doesn't leave a dangling "press again"
+        // state for a much later, unrelated Esc/q to confirm.
         match key.code {
-            KeyCode::Char('q') => return Flow::Quit,
-            KeyCode::Esc => return self.back_or_quit(),
-            KeyCode::Tab => self.toggle_focus(),
+            KeyCode::Char('q') | KeyCode::Esc | KeyCode::Left => {}
+            _ => self.quit_armed_at = None,
+        }
+
+        match key.code {
+            KeyCode::Char('q') => {
+                if self.view == View::Overview {
+                    return self.quit_or_arm();
+                }
+            }
+            KeyCode::Esc | KeyCode::Left => return self.retreat(),
+            KeyCode::Tab | KeyCode::Right => self.advance(),
             KeyCode::Enter => self.drill_in(),
             KeyCode::Char('s') => self.cycle_sort(),
             KeyCode::Char('S') => self.reverse_sort(),
@@ -846,7 +933,6 @@ fn reverse(direction: SortDirection) -> SortDirection {
 
 /// Draw one frame.
 pub fn draw(frame: &mut Frame, app: &App) {
-    let theme = app.theme;
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -858,7 +944,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
 
     draw_header(frame, chunks[0], app);
     draw_body(frame, chunks[1], app);
-    draw_footer(frame, chunks[2], theme);
+    draw_footer(frame, chunks[2], app);
 }
 
 fn draw_header(frame: &mut Frame, area: Rect, app: &App) {
@@ -1009,12 +1095,26 @@ fn detail_row<'a>(label: &'a str, value: &'a str, theme: Theme) -> Line<'a> {
     ])
 }
 
-fn draw_footer(frame: &mut Frame, area: Rect, theme: Theme) {
+fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
+    let theme = app.theme;
+
+    if app.quit_pending() {
+        let warning = Line::from(vec![
+            Span::raw(" "),
+            Span::styled(
+                "press esc/q again to quit",
+                theme.severity(crate::theme::Severity::Warn),
+            ),
+        ]);
+        frame.render_widget(Paragraph::new(warning), area);
+        return;
+    }
+
     let hints = [
-        ("tab", "switch pane"),
+        ("tab/→", "switch/drill"),
         ("j/k", "move"),
         ("enter", "open"),
-        ("esc", "back"),
+        ("←/esc", "back"),
         ("r", "refresh"),
         ("s/S", "sort"),
         ("q", "quit"),
@@ -1226,12 +1326,73 @@ mod tests {
     }
 
     #[test]
-    fn q_esc_and_ctrl_c_quit() {
-        assert_eq!(app().on_key(press(KeyCode::Char('q'))), Flow::Quit);
-        assert_eq!(app().on_key(press(KeyCode::Esc)), Flow::Quit);
+    fn ctrl_c_quits_immediately() {
         assert_eq!(
             app().on_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
             Flow::Quit
+        );
+    }
+
+    #[test]
+    fn ctrl_c_quits_even_with_a_pending_quit_armed() {
+        let mut app = app();
+        app.on_key(press(KeyCode::Esc));
+
+        assert_eq!(
+            app.on_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+            Flow::Quit
+        );
+    }
+
+    #[test]
+    fn esc_or_q_at_the_top_level_arms_a_pending_quit_without_quitting() {
+        assert_eq!(app().on_key(press(KeyCode::Esc)), Flow::Continue);
+        assert_eq!(app().on_key(press(KeyCode::Char('q'))), Flow::Continue);
+    }
+
+    #[test]
+    fn esc_twice_in_rapid_succession_at_the_top_level_quits() {
+        let mut app = app();
+        assert_eq!(app.on_key(press(KeyCode::Esc)), Flow::Continue);
+        assert_eq!(app.on_key(press(KeyCode::Esc)), Flow::Quit);
+    }
+
+    #[test]
+    fn q_twice_in_rapid_succession_at_the_top_level_quits() {
+        let mut app = app();
+        assert_eq!(app.on_key(press(KeyCode::Char('q'))), Flow::Continue);
+        assert_eq!(app.on_key(press(KeyCode::Char('q'))), Flow::Quit);
+    }
+
+    #[test]
+    fn esc_then_q_in_rapid_succession_at_the_top_level_quits() {
+        let mut app = app();
+        assert_eq!(app.on_key(press(KeyCode::Esc)), Flow::Continue);
+        assert_eq!(app.on_key(press(KeyCode::Char('q'))), Flow::Quit);
+    }
+
+    #[test]
+    fn an_unrelated_key_between_two_quit_presses_cancels_the_arm() {
+        let mut app = app();
+        assert_eq!(app.on_key(press(KeyCode::Esc)), Flow::Continue);
+        app.on_key(press(KeyCode::Char('j')));
+        assert_eq!(
+            app.on_key(press(KeyCode::Esc)),
+            Flow::Continue,
+            "a navigation key in between must cancel the pending quit"
+        );
+    }
+
+    #[test]
+    fn a_stale_quit_arm_past_the_window_does_not_quit() {
+        let mut app = app();
+        app.on_key(press(KeyCode::Esc));
+        app.quit_armed_at = Instant::now().checked_sub(Duration::from_millis(700));
+
+        assert_eq!(
+            app.on_key(press(KeyCode::Esc)),
+            Flow::Continue,
+            "a press outside the confirm window must re-arm rather than quit"
         );
     }
 
@@ -1349,6 +1510,18 @@ mod tests {
         assert!(rendered.contains("beta"), "{rendered}");
         assert!(rendered.contains("us-east-1"), "{rendered}");
         assert!(rendered.contains("quit"), "{rendered}");
+    }
+
+    #[test]
+    fn footer_shows_a_press_again_hint_once_a_quit_is_armed() {
+        let mut terminal = Terminal::new(TestBackend::new(90, 20)).unwrap();
+        let mut app = app();
+
+        app.on_key(press(KeyCode::Esc));
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+
+        let rendered = terminal.backend().to_string();
+        assert!(rendered.contains("press esc/q again to quit"), "{rendered}");
     }
 
     #[test]
@@ -1474,15 +1647,95 @@ mod tests {
     }
 
     #[test]
-    fn tab_toggles_focus_between_sidebar_and_detail() {
+    fn tab_switches_focus_to_detail_then_a_second_tab_finds_nothing_to_drill_into() {
         let mut app = app();
         assert_eq!(app.focus(), Focus::Sidebar);
 
         app.on_key(press(KeyCode::Tab));
         assert_eq!(app.focus(), Focus::Detail);
 
+        // The node list is still `Loading`, so there's nothing to drill
+        // into yet — `Tab` stays on `Detail` rather than toggling back.
         app.on_key(press(KeyCode::Tab));
-        assert_eq!(app.focus(), Focus::Sidebar);
+        assert_eq!(app.focus(), Focus::Detail);
+        assert_eq!(app.view(), &View::Overview);
+    }
+
+    #[test]
+    fn tab_drills_in_once_focus_is_already_on_the_detail_pane() {
+        let mut app = app();
+        app.apply_nodes(Ok(NodesFetch {
+            rows: vec![node_row("worker-1")],
+            usage_note: None,
+        }));
+
+        app.on_key(press(KeyCode::Tab));
+        assert_eq!(app.focus(), Focus::Detail);
+
+        app.on_key(press(KeyCode::Tab));
+        assert_eq!(
+            app.view(),
+            &View::NodePods {
+                node: "worker-1".to_owned()
+            },
+            "a second Tab drills in once focus is already on the detail pane"
+        );
+    }
+
+    #[test]
+    fn right_switches_focus_to_detail_then_drills_in() {
+        let mut app = app();
+        app.apply_nodes(Ok(NodesFetch {
+            rows: vec![node_row("worker-1")],
+            usage_note: None,
+        }));
+
+        app.on_key(press(KeyCode::Right));
+        assert_eq!(app.focus(), Focus::Detail);
+        assert_eq!(app.view(), &View::Overview);
+
+        app.on_key(press(KeyCode::Right));
+        assert_eq!(
+            app.view(),
+            &View::NodePods {
+                node: "worker-1".to_owned()
+            }
+        );
+    }
+
+    #[test]
+    fn right_and_tab_advance_the_same_way() {
+        let mut via_right = app();
+        let mut via_tab = app();
+        for app in [&mut via_right, &mut via_tab] {
+            app.apply_nodes(Ok(NodesFetch {
+                rows: vec![node_row("worker-1")],
+                usage_note: None,
+            }));
+        }
+
+        via_right.on_key(press(KeyCode::Right));
+        via_tab.on_key(press(KeyCode::Tab));
+        via_right.on_key(press(KeyCode::Right));
+        via_tab.on_key(press(KeyCode::Tab));
+
+        assert_eq!(via_right.focus(), via_tab.focus());
+        assert_eq!(via_right.view(), via_tab.view());
+    }
+
+    #[test]
+    fn left_and_esc_retreat_the_same_way() {
+        let mut via_left = app_with_node();
+        let mut via_esc = app_with_node();
+
+        via_left.on_key(press(KeyCode::Enter));
+        via_esc.on_key(press(KeyCode::Enter));
+
+        via_left.on_key(press(KeyCode::Left));
+        via_esc.on_key(press(KeyCode::Esc));
+
+        assert_eq!(via_left.focus(), via_esc.focus());
+        assert_eq!(via_left.view(), via_esc.view());
     }
 
     #[test]
@@ -1562,20 +1815,40 @@ mod tests {
     }
 
     #[test]
-    fn esc_quits_once_there_is_nowhere_left_to_back_out_to() {
+    fn esc_backs_out_then_returns_focus_to_the_sidebar_before_arming_quit() {
+        // `app_with_node` leaves `Focus::Detail`, so backing all the way out
+        // to a confirmed quit takes: back out of the view (1), move focus
+        // to the sidebar (1), arm (1), confirm (1).
         let mut app = app_with_node();
         app.on_key(press(KeyCode::Enter));
-        app.on_key(press(KeyCode::Esc));
+
+        assert_eq!(app.on_key(press(KeyCode::Esc)), Flow::Continue);
+        assert_eq!(app.view(), &View::Overview);
+
+        assert_eq!(
+            app.on_key(press(KeyCode::Esc)),
+            Flow::Continue,
+            "the first Esc at Overview returns focus to the sidebar rather than quitting"
+        );
+        assert_eq!(app.focus(), Focus::Sidebar);
+
+        assert_eq!(
+            app.on_key(press(KeyCode::Esc)),
+            Flow::Continue,
+            "the next Esc arms a pending quit"
+        );
 
         assert_eq!(app.on_key(press(KeyCode::Esc)), Flow::Quit);
     }
 
     #[test]
-    fn q_always_quits_even_while_drilled_into_a_node() {
+    fn q_is_a_no_op_while_drilled_into_a_node() {
         let mut app = app_with_node();
         app.on_key(press(KeyCode::Enter));
+        let view_before = app.view().clone();
 
-        assert_eq!(app.on_key(press(KeyCode::Char('q'))), Flow::Quit);
+        assert_eq!(app.on_key(press(KeyCode::Char('q'))), Flow::Continue);
+        assert_eq!(app.view(), &view_before);
     }
 
     #[test]
@@ -1667,7 +1940,10 @@ mod tests {
     }
 
     #[test]
-    fn esc_three_times_from_a_container_drill_down_reaches_quit() {
+    fn esc_from_a_container_drill_down_needs_five_presses_to_reach_quit() {
+        // Two levels of view to back out of, then the same
+        // focus-then-arm-then-confirm sequence as backing out of a single
+        // level (see `esc_backs_out_then_returns_focus_to_the_sidebar_before_arming_quit`).
         let mut app = app_with_pod();
         app.on_key(press(KeyCode::Enter));
 
@@ -1682,15 +1958,22 @@ mod tests {
         assert_eq!(app.on_key(press(KeyCode::Esc)), Flow::Continue);
         assert_eq!(app.view(), &View::Overview);
 
+        assert_eq!(app.on_key(press(KeyCode::Esc)), Flow::Continue);
+        assert_eq!(app.focus(), Focus::Sidebar);
+
+        assert_eq!(app.on_key(press(KeyCode::Esc)), Flow::Continue);
+
         assert_eq!(app.on_key(press(KeyCode::Esc)), Flow::Quit);
     }
 
     #[test]
-    fn q_always_quits_even_while_drilled_into_a_pods_containers() {
+    fn q_is_a_no_op_while_drilled_into_a_pods_containers() {
         let mut app = app_with_pod();
         app.on_key(press(KeyCode::Enter));
+        let view_before = app.view().clone();
 
-        assert_eq!(app.on_key(press(KeyCode::Char('q'))), Flow::Quit);
+        assert_eq!(app.on_key(press(KeyCode::Char('q'))), Flow::Continue);
+        assert_eq!(app.view(), &view_before);
     }
 
     #[test]
