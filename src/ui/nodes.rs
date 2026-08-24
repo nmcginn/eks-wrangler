@@ -9,7 +9,9 @@ use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Wrap};
 
-use crate::k8s::nodes::{Capacity, NodeRow, Order, Share};
+use crate::k8s::nodes::{
+    Capacity, Missing, NodeRow, Order, Share, cause, ranks_any, usage_missing_explained,
+};
 use crate::k8s::order::{self, Direction};
 use crate::k8s::quantity::{self, Quantity};
 use crate::theme::{Severity, Theme};
@@ -109,6 +111,24 @@ pub(super) fn draw(
             }
             if let Some(note) = order::note(order, direction) {
                 lines.push(Line::styled(note, theme.dim()));
+            }
+            // The case where that line on its own misleads: an ordering that
+            // ranked nothing at all describes a listing the alphabet
+            // arranged. `Missing::requests` stays `false` deliberately — the
+            // CLI's `requests_unavailable` footnote has nowhere to live in
+            // this pane yet, so the booked orderings never claim to be
+            // explained by a note that was never printed.
+            let missing = Missing {
+                requests: false,
+                usage: usage_missing_explained(rows, usage_note.as_deref()),
+            };
+            if let Some(note) = order::unranked_note(order, cause(order, missing), |candidate| {
+                ranks_any(rows, candidate)
+            }) {
+                lines.extend(
+                    note.lines()
+                        .map(|line| Line::styled(line.to_owned(), theme.dim())),
+                );
             }
             lines.extend(
                 rows.iter()
@@ -461,6 +481,83 @@ mod tests {
         // CLI table drops every footnote over an empty listing.
         let rendered = render_ordered(&loaded(Vec::new()), Order::Cpu, Direction::Natural);
         assert!(!rendered.contains("Sorted by"), "{rendered}");
+    }
+
+    #[test]
+    fn a_pane_ordering_that_ranked_something_says_nothing_extra() {
+        // `node("worker-1")` carries a real `cpu_used` figure, so `--sort cpu`
+        // (`s` in the pane) ranks it and the diagnosis has nothing to add.
+        let rendered = render_ordered(
+            &loaded(vec![node("worker-1")]),
+            Order::Cpu,
+            Direction::Natural,
+        );
+        assert!(!rendered.contains("Nothing here"), "{rendered}");
+    }
+
+    #[test]
+    fn a_pane_ordering_that_ranked_nothing_says_so() {
+        let mut unsampled = node("worker-1");
+        unsampled.cpu_used = Share::default();
+        let state = NodesState::Loaded {
+            rows: vec![unsampled],
+            usage_note: None,
+            refresh_error: None,
+        };
+
+        let rendered = render_ordered(&state, Order::Cpu, Direction::Natural);
+
+        assert!(
+            rendered.contains("Nothing here has cpu to sort by."),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn an_unsampled_pane_ordering_points_at_the_usage_note_above_it() {
+        // The pane's own usage note already explains why `CPU`/`MEM` are
+        // blank, so the diagnosis points at it instead of repeating itself.
+        // Both columns unsampled, not just `cpu_used`: `shows_usage` is `any`
+        // over the two, so a row with a memory figure still counts as shown
+        // and this fixture would otherwise land on `Cause::Unexplained`.
+        let mut unsampled = node("worker-1");
+        unsampled.cpu_used = Share::default();
+        unsampled.memory_used = Share::default();
+        let state = NodesState::Loaded {
+            rows: vec![unsampled],
+            usage_note: Some("metrics-server has not sampled anything here yet.".to_owned()),
+            refresh_error: None,
+        };
+
+        let rendered = render_ordered(&state, Order::Cpu, Direction::Natural);
+
+        assert!(
+            rendered.contains("Nothing here has cpu to sort by, for the reason above."),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn a_booked_ordering_never_points_at_the_usage_note() {
+        // Unlike the CLI table, this pane has no footnote explaining a
+        // failed pod listing, so `cpu-requested`/`memory-requested`/`pods`
+        // must never claim one exists — even when a usage note happens to be
+        // on screen for an unrelated reason.
+        let mut unbooked = node("worker-1");
+        unbooked.cpu_requested = Share::default();
+        let state = NodesState::Loaded {
+            rows: vec![unbooked],
+            usage_note: Some("metrics-server has not sampled anything here yet.".to_owned()),
+            refresh_error: None,
+        };
+
+        let rendered = render_ordered(&state, Order::CpuRequested, Direction::Natural);
+
+        assert!(
+            rendered.contains("Nothing here has cpu-requested to sort by.")
+                && !rendered.contains("for the reason above"),
+            "{rendered}"
+        );
     }
 
     #[test]

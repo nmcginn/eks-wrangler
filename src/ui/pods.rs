@@ -10,7 +10,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Wrap};
 
 use crate::k8s::order::{self, Direction};
-use crate::k8s::pods::{Order, PodRow};
+use crate::k8s::pods::{Missing, Order, PodRow, cause, ranks_any};
 use crate::theme::{Severity, Theme};
 
 /// What the pod-drilldown pane is showing, independent of how it is drawn.
@@ -87,6 +87,21 @@ pub(super) fn draw(
             let mut lines = vec![Line::styled("PODS", theme.heading())];
             if let Some(note) = order::note(order, direction) {
                 lines.push(Line::styled(note, theme.dim()));
+            }
+            // This pane never samples usage for its own rows yet (see
+            // `spawn_gather_for_node`), so `Missing::default()` — `usage:
+            // false` — is always the honest reading: nothing above these
+            // rows explains why `cpu`/`memory` ranked nothing, because
+            // nothing is printed about metrics here at all.
+            if let Some(note) =
+                order::unranked_note(order, cause(order, Missing::default()), |candidate| {
+                    ranks_any(rows, candidate)
+                })
+            {
+                lines.extend(
+                    note.lines()
+                        .map(|line| Line::styled(line.to_owned(), theme.dim())),
+                );
             }
             lines.extend(
                 rows.iter()
@@ -248,6 +263,54 @@ mod tests {
         };
         let rendered = render_ordered(&state, None, Order::Restarts, Direction::Natural);
         assert!(!rendered.contains("Sorted by"), "{rendered}");
+    }
+
+    #[test]
+    fn a_pane_ordering_that_ranked_nothing_says_so() {
+        // `pod("api-1")` has never restarted and carries no usage sample, so
+        // every ordering but `Name` ranks nothing on it.
+        let state = PodsState::Loaded {
+            rows: vec![pod("api-1")],
+            selector_note: None,
+        };
+
+        let rendered = render_ordered(&state, None, Order::Cpu, Direction::Natural);
+
+        assert!(
+            rendered.contains("Nothing here has cpu to sort by."),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn a_pane_ordering_that_ranked_something_says_nothing_extra() {
+        let sampled = PodRow {
+            cpu_used: Some(Quantity::parse("250m").unwrap()),
+            ..pod("api-1")
+        };
+        let state = PodsState::Loaded {
+            rows: vec![sampled],
+            selector_note: None,
+        };
+
+        let rendered = render_ordered(&state, None, Order::Cpu, Direction::Natural);
+
+        assert!(!rendered.contains("Nothing here"), "{rendered}");
+    }
+
+    #[test]
+    fn this_pane_never_points_an_unranked_ordering_at_a_usage_note() {
+        // Unlike the node pane, this one has no usage note above its rows at
+        // all yet (see `spawn_gather_for_node`), so the diagnosis must never
+        // claim one explains the empty column.
+        let state = PodsState::Loaded {
+            rows: vec![pod("api-1")],
+            selector_note: None,
+        };
+
+        let rendered = render_ordered(&state, None, Order::Memory, Direction::Natural);
+
+        assert!(!rendered.contains("for the reason above"), "{rendered}");
     }
 
     #[test]

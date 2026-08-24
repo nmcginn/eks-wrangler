@@ -178,7 +178,7 @@ cluster.
   puts every row in one group is really saying nothing — "everything here is
   Ready" is an answer too.
 
-- [ ] **Carry the "nothing ranked" note into the dashboard's panes.**
+- [x] **Carry the "nothing ranked" note into the dashboard's panes.**
   Pairs with the sort-note task above, and has the same shape: a pane that takes
   `--sort` can sort by a column its cluster does not populate, and the pane's
   header is the place to say so rather than a footnote under a scrolling list.
@@ -188,6 +188,22 @@ cluster.
   predicate over its own rows and a `k8s::nodes::cause`/`k8s::pods::cause`. The
   `Cause::Explained` half needs a decision the CLI did not have to make, since a
   pane has nowhere obvious for "the reason above" to point.
+  Landed on both panes, through `order::unranked_note` and each listing's own
+  `cause`/`ranks_any` exactly as the CLI table uses them — the pane-specific
+  half was only ever `Cause`, and both panes now settle it honestly rather
+  than guessing. The node pane gets a new `k8s_nodes::usage_missing_explained`,
+  recovered from `rows` and its own existing `usage_note` rather than a new
+  field: `usage_note` is `Some` in exactly the case its `usage` is genuinely
+  missing *and* already explained (metrics-server sampled nothing here), so no
+  channel plumbing was needed to ask the question. `Missing::requests` stays
+  `false` unconditionally there, because the pane has no footnote at all for a
+  failed pod-requests listing — unlike the CLI's `requests_unavailable` — so
+  `cpu-requested`/`memory-requested`/`pods` never claim an explanation that was
+  never printed; see decision 63 and the follow-up below. The pod-drilldown
+  pane always passes `Missing::default()`, for the same reason one level
+  further: it does not sample usage for its rows at all yet, so `cpu`/`memory`
+  there are permanently `Cause::Unexplained` until the follow-up below wires
+  metrics in.
 
 - [x] **Carry `--sort` into the dashboard, alongside the selectors.**
   `k8s::pods::order` is deliberately a function over rows rather than over pods,
@@ -808,6 +824,44 @@ cluster.
   and `severity` already are; a node reporting none of the four pressure
   conditions is not distinguished from one that has not reported at all.
 
+### Follow-ups from the panes' "nothing ranked" note
+
+- [ ] **Explain a failed pod listing in the node pane, so the booked
+  orderings can point at it.**
+  `cpu-requested`, `memory-requested`, and `pods` always compute
+  `Cause::Unexplained` in the node pane tonight, because the pane has no
+  footnote list for a failed pod-requests listing at all — unlike the CLI
+  table's `requests_unavailable`, which is exactly what `Cause::Explained`
+  points those three orderings at there. The same gap is wider than the sort
+  note: a failed pod listing today leaves the pane's `PODS` cell reading `-
+  pods` with nothing said about why. Separate because it is a footnote
+  surface this pane has never had, for either purpose, and building one is a
+  decision about where it lives beside `usage_note` and `refresh_error`
+  rather than an extension of tonight's change.
+  *Acceptance:* the note comes from a pure function beside
+  `k8s_nodes::requests_unavailable`, not a second wording; once it exists,
+  `Missing::requests` in `ui::nodes::draw` reads it instead of the `false`
+  this PR left there; a node pane that has never failed a pod listing is
+  unchanged.
+
+- [ ] **Wire `metrics.k8s.io` into the pod-drilldown pane.**
+  `commands::pods::spawn_gather_for_node` builds every row with `PodRow::
+  from_pod(pod, None, now)` — no usage sample, ever — so `--sort cpu`/`--sort
+  memory` in that pane can only ever rank nothing, and the diagnosis this PR
+  added there is permanently "Nothing here has cpu to sort by." with no
+  chance of the alternative. `gather_for_node`'s own doc comment already
+  named this as a considered addition rather than a rider on an earlier
+  night's change. Separate because it is a new fetch and, per that same
+  comment, the design question the node pane's background refresh already
+  had to answer for its own metrics call — whether this pane refreshes on an
+  interval too, or only once per drill-in as it does today.
+  *Acceptance:* once usage reaches this pane's rows, `Missing::usage` in
+  `ui::pods::draw` reflects it — following the node pane's
+  `usage_missing_explained` split between a failed read and one that
+  answered with nothing — rather than the `Missing::default()` this PR left
+  there; a pane that has not sampled a container's usage keeps reading `-`
+  wherever it does today.
+
 ### Follow-ups from the dashboard's selectors
 
 - [ ] **Edit the dashboard's selector without restarting it.**
@@ -877,6 +931,36 @@ cluster.
 ---
 
 ## Done
+
+- **Carry the "nothing ranked" note into the dashboard's panes** (2026-08-24)
+  — `--sort cpu`/`s` in either pane now says so when the ordering it landed
+  on has nothing to rank, exactly as `eks nodes --sort cpu`/`eks pods --sort
+  cpu` already do: `Nothing here has cpu to sort by.` under the `Sorted by
+  cpu.` line, with a second line suggesting an ordering that would have
+  ranked something where one exists. Both panes go through the same
+  `order::unranked_note` and each listing's own `cause`/`ranks_any` the CLI
+  uses — no second wording, and the alphabet-arranged listing this note
+  exists to explain looks identical in the pane whether the flag is typed at
+  a prompt or cycled with `s`.
+  The task's own wording flagged the one thing the CLI did not have to
+  decide: whether a pane can ever say "for the reason above". The node pane
+  can, for exactly one column pair: `k8s_nodes::usage_missing_explained`
+  reads `rows` and the pane's own `usage_note` and asks whether the note
+  already printed is the *unsampled* explanation — the one case the pane
+  already says something about — rather than a new field carrying the raw
+  metrics `Result`, because `usage_note`'s existing three-way split makes
+  that answer recoverable from what it already returns: unsampled and
+  unreadable both leave every row's `shows_usage` false, and only the
+  unsampled branch of `usage_note` is ever `Some`. `Missing::requests` stays
+  `false` unconditionally, because the node pane has no footnote for a
+  failed pod-requests listing at all — the CLI's `requests_unavailable` has
+  nowhere to live here yet — so `cpu-requested`/`memory-requested`/`pods`
+  never claim an explanation nothing printed. The pod-drilldown pane passes
+  `Missing::default()` outright: it does not sample usage for its rows at
+  all, so `cpu`/`memory` there stay honestly `Cause::Unexplained` until a
+  follow-up wires metrics into that pane. Both gaps are their own roadmap
+  entries now, under "Follow-ups from the panes' 'nothing ranked' note". See
+  decision 63.
 
 - **Drill from a pod into its containers** (2026-08-23) — `Enter` on a
   highlighted pod in the `NodePods` pane opens its containers; `Esc` backs out

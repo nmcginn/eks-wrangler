@@ -1902,3 +1902,46 @@ again to quit" for as long as a quit stays armed, styled with
 `theme.severity(Severity::Warn)` rather than a new `Theme` method. Shipping
 the double-press rule without this would leave a user's first `Esc`/`q`
 looking like it did nothing.
+
+---
+
+### 63. A pane's `Cause::Explained` is narrower than the CLI's, and honestly so
+
+The roadmap task for carrying the "nothing ranked" note into the dashboard's
+panes flagged one thing the CLI never had to decide: what `order::Cause::
+Explained` means when the thing it points at — "the reason above" — is a
+footnote list the pane does not have.
+
+The CLI table has two footnotes that can explain an empty usage column (a
+failed read, and one that answered with nothing) and one that explains a
+failed pod-requests listing, and `k8s_nodes::cause`/`k8s_pods::cause` point
+the relevant orderings at whichever applies. Both dashboard panes have far
+less to point at. The node pane has exactly one note, `usage_note`, and it is
+only ever printed for the *unsampled* case — its own doc comment already
+left a failed read silent, out of an earlier task's scope, because there was
+no footnote list yet to add `usage_unavailable`'s explanation to. The
+pod-drilldown pane has no usage note of any kind, because it does not sample
+usage for its rows at all yet.
+
+Rather than widen either pane tonight to make more of `Cause::Explained`
+true, this change makes it true only where a note the reader can already see
+actually says why: `k8s_nodes::usage_missing_explained(rows, usage_note)` is
+`true` only in the unsampled case, `Missing::requests` is unconditionally
+`false` in the node pane (no note there explains a failed pod listing), and
+the pod pane passes `Missing::default()` outright. A pane that has not
+explained something must not claim it has — the module's own docs call this
+out as the whole point of `Cause::Unexplained` being the default — so the
+narrower reading was the only honest one available without inventing a new
+footnote surface neither pane has earned yet. Both gaps are now their own
+roadmap entries, so the two Missing.requests being uniformly `false` and the
+pod pane's uniform `Missing::default()` are not left looking like a wrong
+answer: they are today's honest one, waiting on surface that has not been
+built.
+
+`usage_missing_explained` reads `rows` and `usage_note` rather than
+threading a new field through `NodesFetch`/`NodesState` end to end: `usage_
+note`'s own three-way match already makes the answer recoverable — the
+unsampled and unreadable cases both leave every row's `shows_usage` false,
+and only the unsampled branch of `usage_note` is ever `Some` — so the
+existing field carries enough information without a second one duplicating
+it.
