@@ -652,6 +652,30 @@ pub fn usage_note(
     }
 }
 
+/// Whether the pane's own [`usage_note`] already accounts for the `Cpu`/
+/// `Memory` orderings ranking nothing — the one fact
+/// [`order::cause`](crate::k8s::order::Cause) needs that the pane does not
+/// keep as its own field.
+///
+/// The CLI table has two footnotes for a missing `CPU USE`/`MEM USE` column —
+/// one for a failed read, one for a read that answered with nothing — and
+/// [`cause`] points the usage orderings at either. The pane has only the
+/// second: `usage_note` says nothing when the read failed outright (see its
+/// own doc comment), so a failed read stays honestly unexplained here too.
+///
+/// Recovered from what the pane already has rather than a field carrying the
+/// raw `Result`, because [`usage_note`]'s own three-way match makes the
+/// answer a fact about its *output*: [`shows_usage`] is false in both the
+/// unsampled and the unreadable case (neither put a figure on any row), and
+/// among those two `usage_note` is `Some` in exactly the unsampled one. A
+/// listing where [`shows_usage`] is true never reaches this — a `Cpu`/
+/// `Memory` ordering has already ranked something there, and [`order::cause`]
+/// is only ever asked about an ordering that ranked nothing.
+#[must_use]
+pub fn usage_missing_explained(rows: &[NodeRow], usage_note: Option<&str>) -> bool {
+    !shows_usage(rows) && usage_note.is_some()
+}
+
 /// One column of the node table.
 ///
 /// A value rather than two parallel lists of headers and cells, for the reason
@@ -1918,6 +1942,63 @@ mod tests {
         );
 
         assert_eq!(note, None);
+    }
+
+    // --- `usage_missing_explained`, the pane's reading of `order::Cause` ---
+
+    #[test]
+    fn a_shown_usage_column_is_not_missing() {
+        let rows = [NodeRow::from_node(
+            &healthy_node(),
+            Some(&idle()),
+            Some(used("392m", "1552515Ki")),
+            now(),
+        )];
+        let note = usage_note(
+            &rows,
+            &Ok(()),
+            &[Some(sampled("392m", "1552515Ki", 8))],
+            now(),
+            "prod (us-east-1)",
+        );
+
+        assert!(!usage_missing_explained(&rows, note.as_deref()));
+    }
+
+    #[test]
+    fn an_unsampled_usage_column_is_missing_and_the_note_explains_it() {
+        let rows = [NodeRow::from_node(
+            &healthy_node(),
+            Some(&idle()),
+            None,
+            now(),
+        )];
+        let note = usage_note(&rows, &Ok(()), &[None], now(), "prod (us-east-1)");
+
+        assert!(usage_missing_explained(&rows, note.as_deref()));
+    }
+
+    #[test]
+    fn a_failed_usage_read_is_missing_but_the_pane_says_nothing_about_it() {
+        // The case the doc comment calls out: the pane has no footnote for a
+        // failed read, so this must stay honestly `Unexplained` rather than
+        // claiming a note that was never printed.
+        let rows = [NodeRow::from_node(
+            &healthy_node(),
+            Some(&idle()),
+            None,
+            now(),
+        )];
+        let note = usage_note(
+            &rows,
+            &Err("no metrics.k8s.io API".to_owned()),
+            &[None],
+            now(),
+            "prod (us-east-1)",
+        );
+
+        assert_eq!(note, None);
+        assert!(!usage_missing_explained(&rows, note.as_deref()));
     }
 
     #[test]
