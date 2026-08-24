@@ -327,6 +327,13 @@ way it already watched the selected cluster, and starts a
 than generics on `run`/`event_loop`, so a third pane's fetch trigger does
 not add a third type parameter. See decision 56.
 
+`Right`/`Tab` and `Left`/`Esc` later became two names each for the same
+pane-switch-then-drill motion in opposite directions (`App::advance`/
+`App::retreat`), and `Esc`/`q` stopped quitting on a single press at the top
+level — a second press within a short window, tracked by one
+`Option<Instant>` field on `App`, now confirms it, with `Ctrl+C` staying an
+unconditional, immediate quit throughout. See decision 62.
+
 ## Testing
 
 Run `make test`. The suite needs no cluster, no credentials, and no network, and
