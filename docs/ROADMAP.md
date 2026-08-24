@@ -735,9 +735,25 @@ cluster.
   listing, since nothing kept that listing's raw `Pod`s around once they were
   reduced to rows.
 
-- [ ] **Pod detail view.**
-  Containers, images, resource requests/limits, restart reasons, recent events.
+- [x] **Pod detail view.**
+  Containers, images, resource requests/limits, restart reasons.
   *Acceptance:* long values wrap rather than truncate; tested at 80 columns.
+  Landed as a second line under each container in the existing `PodContainers`
+  pane rather than a new view: `Enter`, `Esc`, and the pane's own drill-down
+  already answer "how do I get here", and a container's requests and limits
+  are one more fact about the row `ContainerRow` already carries, not a
+  reason to invent a fourth `View`. Images, restart reasons (via `state`),
+  and the identity line were already there from the containers drill-down;
+  what was missing was `requests: cpu 250m, memory 512Mi` and `limits: cpu
+  500m, memory unlimited`, read from the container's own spec rather than
+  `effective_requests`'s scheduling total — a container's own numbers, not
+  the pod-wide sidecar/init/overhead arithmetic nobody is asking for here.
+  `unlimited` is deliberately its own word: a request nobody made is a real
+  zero, the same reading every other request figure in this tool gives an
+  absent entry, but an absent *limit* means nothing bounds the container,
+  which Kubernetes does not even let a manifest spell as a limit of zero —
+  collapsing the two onto one word would have lost that difference. Recent
+  events was cut from this task's original wording; see the follow-up below.
 
 - [ ] **Log viewing.**
   Stream logs for a container, with follow, scrollback, and wrap toggle.
@@ -748,6 +764,29 @@ cluster.
   `/` filters the current view. Fuzzy, case-insensitive, ranked.
   *Acceptance:* the matcher is a pure, tested function; filtering 10k rows stays
   under one frame — cover it with a benchmark.
+
+### Follow-ups from the pod-detail view
+
+- [ ] **Recent events in the pod-detail view.**
+  `kubectl describe pod` ends with the events the API server recorded against
+  it — `FailedScheduling`, `BackOff`, `Pulled` — and they are frequently the
+  only account of *why* a pod is in the state the rest of the view already
+  describes. Separate from "Pod detail view" above because it is a genuinely
+  new surface that change did not need to touch: nothing in this tool reads
+  the `Event`/`events.k8s.io` API yet, and an event is not scoped to a pod the
+  way everything else in `k8s::pods` is — it is fetched by listing every
+  event in the namespace and filtering by `involvedObject`, repeated
+  occurrences collapse into one entry with a count and a last-seen time
+  rather than one row each, and the API server only keeps them for about an
+  hour, so "no events" and "nothing has happened for an hour" read the same
+  and the view has to say which. That is a fetch, a reduction, and a wording
+  question of its own — a night's work, not a fact this PR could have bolted
+  onto a container's row.
+  *Acceptance:* events are grouped by reason with a count and a last-seen
+  time, matching `kubectl`'s own collapsing; a pod younger than the API
+  server's retention window with no events says so rather than reading like
+  a fetch that failed; the fetch goes through the same `Budget`/`k8s::explain`
+  path every other one in this tool does.
 
 ### Follow-ups from the node pane
 

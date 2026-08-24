@@ -11,6 +11,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Wrap};
 
 use crate::k8s::pods::ContainerRow;
+use crate::k8s::pods::containers::resources_summary;
 use crate::theme::{Severity, Theme};
 
 /// What the pod-containers pane is showing, independent of how it is drawn.
@@ -71,7 +72,7 @@ pub(super) fn draw(
             lines.extend(
                 rows.iter()
                     .enumerate()
-                    .map(|(index, row)| container_line(row, Some(index) == selected, theme)),
+                    .flat_map(|(index, row)| container_lines(row, Some(index) == selected, theme)),
             );
             lines
         }
@@ -80,7 +81,13 @@ pub(super) fn draw(
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), area);
 }
 
-fn container_line(row: &ContainerRow, selected: bool, theme: Theme) -> Line<'static> {
+/// The two lines one container occupies: its identity and state, then its
+/// requests and limits underneath. A second line rather than more columns on
+/// the first — `resources_summary` already produces two full sentences, and
+/// a row this wide would either truncate on any real terminal or force every
+/// other row's columns to make room for a detail most of them will not need
+/// to read closely.
+fn container_lines(row: &ContainerRow, selected: bool, theme: Theme) -> Vec<Line<'static>> {
     let name = if row.init {
         format!("{} (init)", row.name)
     } else {
@@ -100,12 +107,17 @@ fn container_line(row: &ContainerRow, selected: bool, theme: Theme) -> Line<'sta
         Span::styled(row.image.clone(), theme.dim()),
     ];
 
-    let line = Line::from(spans);
-    if selected {
-        line.style(theme.selected())
+    let identity = Line::from(spans);
+    let identity = if selected {
+        identity.style(theme.selected())
     } else {
-        line
-    }
+        identity
+    };
+
+    let (requests, limits) = resources_summary(row);
+    let resources = Line::styled(format!("  {requests}  {limits}"), theme.dim());
+
+    vec![identity, resources]
 }
 
 #[cfg(test)]
@@ -114,6 +126,9 @@ mod tests {
 
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
+
+    use crate::k8s::pods::Requests;
+    use crate::k8s::quantity::Quantity;
 
     use super::*;
 
@@ -126,6 +141,9 @@ mod tests {
             restarts: 0,
             state: "Running".to_owned(),
             severity: Severity::Ok,
+            requests: Requests::default(),
+            cpu_limit: None,
+            memory_limit: None,
         }
     }
 
@@ -215,5 +233,68 @@ mod tests {
                 })
                 .unwrap();
         }
+    }
+
+    #[test]
+    fn a_containers_requests_and_limits_appear_under_its_identity_line() {
+        let row = ContainerRow {
+            requests: Requests {
+                cpu: Quantity::parse("250m").unwrap(),
+                memory: Quantity::parse("512Mi").unwrap(),
+                ..Default::default()
+            },
+            cpu_limit: Some(Quantity::parse("500m").unwrap()),
+            memory_limit: None,
+            ..container("app")
+        };
+        let state = ContainersState::Loaded { rows: vec![row] };
+        let rendered = render(&state, None);
+
+        assert!(
+            rendered.contains("requests: cpu 250m, memory 512Mi"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("limits: cpu 500m, memory unlimited"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn a_long_resources_line_wraps_at_80_columns_instead_of_truncating() {
+        let row = ContainerRow {
+            requests: Requests {
+                cpu: Quantity::parse("250m").unwrap(),
+                memory: Quantity::parse("512Mi").unwrap(),
+                extended: [(
+                    "example.com/a-very-long-extended-resource-name".to_owned(),
+                    Quantity::parse("4").unwrap(),
+                )]
+                .into_iter()
+                .collect(),
+            },
+            cpu_limit: Some(Quantity::parse("500m").unwrap()),
+            memory_limit: Some(Quantity::parse("1Gi").unwrap()),
+            ..container("app")
+        };
+        let state = ContainersState::Loaded { rows: vec![row] };
+
+        let mut terminal = Terminal::new(TestBackend::new(80, 20)).unwrap();
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                draw(frame, area, &state, None, Theme::dark());
+            })
+            .unwrap();
+        let rendered = terminal.backend().to_string();
+
+        // No line is long enough to have been cut, and the whole resource
+        // name survives somewhere in the wrapped output rather than being
+        // replaced by an ellipsis.
+        assert!(
+            rendered.contains("example.com/a-very-long-extended-resource-name"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains('…'), "{rendered}");
     }
 }
