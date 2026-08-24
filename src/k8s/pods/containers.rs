@@ -9,8 +9,10 @@
 
 use k8s_openapi::api::core::v1::{Container, ContainerStatus, Pod};
 
+use crate::k8s::quantity::{self, Quantity};
 use crate::theme::Severity;
 
+use super::Requests;
 use super::row::exit_reason;
 
 /// Shown wherever the API server has not resolved an image yet, as elsewhere
@@ -39,6 +41,20 @@ pub struct ContainerRow {
     /// speaks for itself.
     pub state: String,
     pub severity: Severity,
+    /// What this container itself asked for — not [`super::effective_requests`]'s
+    /// pod-wide total, which folds in sidecars, the init peak, and pod
+    /// overhead to answer a scheduling question nobody is asking here. A
+    /// container that declared no request asked for nothing, which is a real
+    /// zero rather than an unknown, the same reading every other request
+    /// figure in this tool gives an absent entry.
+    pub requests: Requests,
+    /// This container's CPU limit, or `None` when the manifest set none — a
+    /// different fact from a limit of zero, which Kubernetes does not even
+    /// allow: nothing bounds the container rather than nothing being asked
+    /// for.
+    pub cpu_limit: Option<Quantity>,
+    /// This container's memory limit, on the same terms as [`Self::cpu_limit`].
+    pub memory_limit: Option<Quantity>,
 }
 
 impl ContainerRow {
@@ -76,6 +92,18 @@ impl ContainerRow {
     }
 
     fn build(spec: &Container, status: Option<&ContainerStatus>, init: bool) -> Self {
+        let requests = Requests::read(
+            spec.resources
+                .as_ref()
+                .and_then(|resources| resources.requests.as_ref()),
+        );
+        let limits = spec
+            .resources
+            .as_ref()
+            .and_then(|resources| resources.limits.as_ref());
+        let cpu_limit = Quantity::lookup(limits, "cpu");
+        let memory_limit = Quantity::lookup(limits, "memory");
+
         let Some(status) = status else {
             // The kubelet has not reported on this container yet — a pod
             // still `Pending`, or an init container whose turn has not come.
@@ -88,6 +116,9 @@ impl ContainerRow {
                 restarts: 0,
                 state: "Waiting".to_owned(),
                 severity: Severity::Warn,
+                requests,
+                cpu_limit,
+                memory_limit,
             };
         };
 
@@ -100,8 +131,51 @@ impl ContainerRow {
             restarts: status.restart_count,
             state,
             severity,
+            requests,
+            cpu_limit,
+            memory_limit,
         }
     }
+}
+
+/// The `requests: …` and `limits: …` sentences for one container.
+///
+/// Two sentences rather than one row of figures: a container's limits are
+/// frequently absent while its requests are not, and `cpu 250m, memory 512Mi`
+/// beside `cpu -, memory -` reads like data nobody filled in rather than a
+/// container nothing bounds. `unlimited` says that plainly, and does not
+/// share a spelling with the zero a request that was never made already
+/// prints — the two are different facts about a container, and collapsing
+/// them onto the same word would lose the difference between "asked for
+/// nothing" and "nothing stops it".
+#[must_use]
+pub fn resources_summary(row: &ContainerRow) -> (String, String) {
+    let mut requested = vec![
+        format!("cpu {}", quantity::cpu(row.requests.cpu)),
+        format!("memory {}", quantity::memory(row.requests.memory)),
+    ];
+    requested.extend(
+        row.requests
+            .extended
+            .iter()
+            .map(|(name, amount)| format!("{name} {}", quantity::count(*amount))),
+    );
+
+    let limits = format!(
+        "cpu {}, memory {}",
+        limit_text(row.cpu_limit, quantity::cpu),
+        limit_text(row.memory_limit, quantity::memory)
+    );
+
+    (
+        format!("requests: {}", requested.join(", ")),
+        format!("limits: {limits}"),
+    )
+}
+
+/// A limit's text, or `unlimited` for a resource the manifest left unbounded.
+fn limit_text(limit: Option<Quantity>, show: fn(Quantity) -> String) -> String {
+    limit.map_or_else(|| "unlimited".to_owned(), show)
 }
 
 /// The status the API server reported for one named container, if any.
@@ -184,8 +258,9 @@ mod tests {
 
     use k8s_openapi::api::core::v1::{
         ContainerState, ContainerStateRunning, ContainerStateTerminated, ContainerStateWaiting,
-        PodSpec, PodStatus,
+        PodSpec, PodStatus, ResourceRequirements,
     };
+    use k8s_openapi::apimachinery::pkg::api::resource::Quantity as ApiQuantity;
 
     use super::*;
 
@@ -507,5 +582,139 @@ mod tests {
         );
 
         assert_eq!(ContainerRow::from_pod(&pod)[0].image, "app@sha256:abcd1234");
+    }
+
+    fn resourced_container(
+        name: &str,
+        requests: &[(&str, &str)],
+        limits: &[(&str, &str)],
+    ) -> Container {
+        let map = |pairs: &[(&str, &str)]| {
+            pairs
+                .iter()
+                .map(|(name, value)| ((*name).to_owned(), ApiQuantity((*value).to_owned())))
+                .collect()
+        };
+        Container {
+            resources: Some(ResourceRequirements {
+                requests: Some(map(requests)),
+                limits: Some(map(limits)),
+                ..Default::default()
+            }),
+            ..spec_container(name, "app:1.0")
+        }
+    }
+
+    #[test]
+    fn a_containers_own_requests_and_limits_are_read_from_its_spec() {
+        let pod = pod(
+            PodSpec {
+                containers: vec![resourced_container(
+                    "app",
+                    &[("cpu", "250m"), ("memory", "512Mi")],
+                    &[("cpu", "500m"), ("memory", "1Gi")],
+                )],
+                ..Default::default()
+            },
+            None,
+        );
+
+        let row = &ContainerRow::from_pod(&pod)[0];
+        assert_eq!(row.requests.cpu, Quantity::parse("250m").unwrap());
+        assert_eq!(row.requests.memory, Quantity::parse("512Mi").unwrap());
+        assert_eq!(row.cpu_limit, Some(Quantity::parse("500m").unwrap()));
+        assert_eq!(row.memory_limit, Some(Quantity::parse("1Gi").unwrap()));
+    }
+
+    #[test]
+    fn a_container_with_no_resources_block_asked_for_nothing_and_is_unbounded() {
+        let pod = pod(
+            PodSpec {
+                containers: vec![spec_container("app", "app:1.0")],
+                ..Default::default()
+            },
+            None,
+        );
+
+        let row = &ContainerRow::from_pod(&pod)[0];
+        assert_eq!(row.requests, Requests::default());
+        assert_eq!(row.cpu_limit, None);
+        assert_eq!(row.memory_limit, None);
+    }
+
+    #[test]
+    fn only_one_half_of_a_containers_limit_may_be_set() {
+        // Asking for a memory limit and leaving CPU unbounded is common, and
+        // the two must not be conflated: a missing limit is not a limit of
+        // zero.
+        let pod = pod(
+            PodSpec {
+                containers: vec![resourced_container("app", &[], &[("memory", "1Gi")])],
+                ..Default::default()
+            },
+            None,
+        );
+
+        let row = &ContainerRow::from_pod(&pod)[0];
+        assert_eq!(row.cpu_limit, None);
+        assert_eq!(row.memory_limit, Some(Quantity::parse("1Gi").unwrap()));
+    }
+
+    #[test]
+    fn resources_summary_names_every_resource_a_container_requested() {
+        let mut row = base_row();
+        row.requests = Requests {
+            cpu: Quantity::parse("250m").unwrap(),
+            memory: Quantity::parse("512Mi").unwrap(),
+            extended: [("nvidia.com/gpu".to_owned(), Quantity::parse("1").unwrap())]
+                .into_iter()
+                .collect(),
+        };
+        row.cpu_limit = Some(Quantity::parse("500m").unwrap());
+        row.memory_limit = Some(Quantity::parse("1Gi").unwrap());
+
+        let (requests, limits) = resources_summary(&row);
+        assert_eq!(
+            requests,
+            "requests: cpu 250m, memory 512Mi, nvidia.com/gpu 1"
+        );
+        assert_eq!(limits, "limits: cpu 500m, memory 1Gi");
+    }
+
+    #[test]
+    fn a_container_that_asked_for_nothing_and_is_unbounded_says_so_plainly() {
+        let row = base_row();
+
+        let (requests, limits) = resources_summary(&row);
+        assert_eq!(requests, "requests: cpu 0, memory 0");
+        assert_eq!(limits, "limits: cpu unlimited, memory unlimited");
+    }
+
+    #[test]
+    fn unlimited_never_reads_like_the_zero_a_missing_request_prints() {
+        // The whole point of the two wordings: a request nobody made is a real
+        // zero, and a limit nobody set is not a limit at all. One sentence
+        // must never accidentally borrow the other's word.
+        let mut row = base_row();
+        row.cpu_limit = Some(Quantity::default());
+
+        let (_, limits) = resources_summary(&row);
+        assert!(limits.contains("cpu 0"), "{limits}");
+        assert!(!limits.contains("unlimited, memory unlimited"), "{limits}");
+    }
+
+    fn base_row() -> ContainerRow {
+        ContainerRow {
+            name: "app".to_owned(),
+            image: "app:1.0".to_owned(),
+            init: false,
+            ready: true,
+            restarts: 0,
+            state: "Running".to_owned(),
+            severity: Severity::Ok,
+            requests: Requests::default(),
+            cpu_limit: None,
+            memory_limit: None,
+        }
     }
 }

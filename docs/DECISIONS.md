@@ -1820,3 +1820,34 @@ the same `Budget::wrap`/`k8s::explain` path every other fetch in the tool
 does, so a pod that was deleted between the listing and the drill-down reads
 as an ordinary API failure rather than a special case invented for this one
 pane.
+
+### 61. A container's requests and limits are its own spec, not `effective_requests`
+
+The pod-detail task asked for "resource requests/limits" per container, and
+`k8s::pods::effective_requests` already turns a pod's containers into
+numbers — but it answers a scheduling question (what does this *pod* have
+booked, sidecars and the init peak and pod overhead folded in) that nobody is
+asking of one row in a container list. `ContainerRow` reads each container's
+own `resources.requests`/`limits` directly instead, reusing `Requests::read`
+for the request half so a container that declared none reads the same real
+zero every other request figure in this tool gives an absent entry.
+
+Limits do not get the same treatment, on purpose. `Requests::read` defaults
+an absent entry to zero because that is the right reading for a request — the
+scheduler reserves nothing for one nobody made — but a limit nobody set means
+nothing bounds the container, which is a different fact and one Kubernetes
+does not even let a manifest spell as "limit: 0". `cpu_limit` and
+`memory_limit` are `Option<Quantity>`, and the sentence built from them says
+`unlimited` for `None` rather than `0`, so the two absences read as the two
+different things they are. `resources_summary` builds both sentences as
+plain text in `k8s::pods::containers` — computation, not rendering — and the
+pod-containers pane prints them as a second, dimmed line under each
+container's identity, wrapped by the pane's existing `Paragraph` rather than
+a new widget.
+
+"Recent events", the other half of the task's original wording, is not here:
+nothing in this tool reads the `Event` API yet, and it wants its own fetch, a
+dedup/count rule, and a decision about what "no events" should say next to a
+pod too young for the API server to have kept any — a night of its own
+rather than a fact to bolt onto a container's row. See `docs/ROADMAP.md`'s
+follow-up entry.

@@ -1391,6 +1391,9 @@ mod tests {
                 restarts: 0,
                 state: "Running".to_owned(),
                 severity: crate::theme::Severity::Ok,
+                requests: crate::k8s::pods::Requests::default(),
+                cpu_limit: None,
+                memory_limit: None,
             }],
         }));
 
