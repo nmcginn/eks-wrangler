@@ -181,6 +181,25 @@ fn dashboard(
         })
     };
 
+    // One level further in: called once each time drilling into a pod
+    // changes which one the detail pane is showing. No selectors to carry
+    // through here — a single named `get` is not a listing, so there is
+    // nothing for `-l`/`--field-selector` to filter.
+    let spawn_containers: ui::ContainersFetcher = {
+        let config = config.clone();
+        let paths = paths.to_vec();
+        Box::new(move |context: &str, namespace: &str, pod: &str| {
+            pods::spawn_gather_containers(
+                config.clone(),
+                paths.clone(),
+                Some(context.to_owned()),
+                namespace.to_owned(),
+                pod.to_owned(),
+                budget,
+            )
+        })
+    };
+
     // Kicked off before the terminal takes over, so the fetch is already in
     // flight for the first frame — the loading state a bare `eks` shows is
     // real, not simulated. No cluster selected, nothing to fetch: the empty
@@ -189,7 +208,14 @@ fn dashboard(
         .selected_cluster()
         .map(|cluster| spawn_nodes(&cluster.context_name));
 
-    ui::run(app, nodes_rx, &spawn_nodes, &spawn_pods, refresh)
+    ui::run(
+        app,
+        nodes_rx,
+        &spawn_nodes,
+        &spawn_pods,
+        &spawn_containers,
+        refresh,
+    )
 }
 
 /// Print a command's output, skipping the newline for empty results so

@@ -718,7 +718,7 @@ cluster.
   both a second fetch this change did not need to build, so they are their own
   entries below rather than a guess at their shape.
 
-- [ ] **Drill from a pod into its containers.**
+- [x] **Drill from a pod into its containers.**
   The other half of "Pod browsing", split out because it needs a second fetch
   the node-drilldown pane does not: containers, images, and restart reasons
   live nowhere in `PodRow` yet, which is also what "Pod detail view" below is
@@ -728,6 +728,12 @@ cluster.
   *Acceptance:* `Esc` backs out one level at a time rather than straight to
   `Overview`; the same focus model drills in and out without a second
   mechanism.
+  Landed as a third `View` variant rather than a stack — see decision 60 for
+  why two known levels did not earn one. `k8s::pods::containers::ContainerRow`
+  is the new data `PodRow` never carried; `commands::pods::spawn_gather_containers`
+  fetches the one drilled-into pod by name rather than reusing the node's
+  listing, since nothing kept that listing's raw `Pod`s around once they were
+  reduced to rows.
 
 - [ ] **Pod detail view.**
   Containers, images, resource requests/limits, restart reasons, recent events.
@@ -832,6 +838,51 @@ cluster.
 ---
 
 ## Done
+
+- **Drill from a pod into its containers** (2026-08-23) — `Enter` on a
+  highlighted pod in the `NodePods` pane opens its containers; `Esc` backs out
+  to that pod's node's pod list, and only quits once there is nowhere left to
+  back out to — three levels deep now, one `Esc` at a time. `View` gained a
+  third variant, `PodContainers { node, namespace, pod }`, rather than growing
+  into the `Vec<View>` stack its own doc comment had flagged as the next
+  step: two known levels is not the point a stack starts paying for itself,
+  and a fixed enum keeps `back_or_quit` and `draw_detail` each one exhaustive
+  `match` instead of a loop over a depth nothing bounds. See decision 60.
+  `App::drill_into_pods` became `App::drill_in`, dispatching on `self.view`
+  through a new pure `next_view` lookup — Overview to NodePods, or NodePods to
+  PodContainers — so reading "what would `Enter` show" stays separate from
+  the assignment that acts on it, the same split `apply_nodes` already kept
+  between deciding and mutating. `App::leave_node_pods` became
+  `App::leave_detail_view` and now discards both the pods and the containers
+  panes in one call, since a cluster switch has to reach past either
+  drill-down depth; `Esc`'s own one-level-at-a-time backing out stayed a
+  separate path in `back_or_quit`; the two were never the same operation
+  wearing one name.
+  `k8s::pods::containers::ContainerRow` is the data `PodRow` was never asked
+  to carry: name, image, readiness, restart count, and a state sentence
+  (`Running`, `Waiting: CrashLoopBackOff`, `Terminated: OOMKilled (137)`) per
+  container, init containers first in spec order and marked as such — the
+  same grouping `kubectl describe pod` uses, and deliberately not
+  `k8s::pods::row`'s pod-level derivation, which picks one container's story
+  to tell on behalf of a whole listing. `exit_reason` moved from `private` to
+  `pub(super)` in `row.rs` so both modules name the same termination the same
+  word rather than keeping two.
+  `commands::pods::spawn_gather_containers` fetches the one pod by a plain
+  `get`, not a listing: the node-pods pane's fetch already read every field a
+  container row needs, but reduces each `Pod` to a `PodRow` and keeps nothing
+  else, so asking again for the one pod a reader drilled into is simpler than
+  carrying every node's raw pods through a pane that almost never needs them.
+  It goes through `budget.wrap` and `k8s::explain` exactly as every other
+  fetch does, so a deleted-out-from-under-you pod or an expired credential
+  reads as the same kind of sentence here as anywhere else in the tool.
+  The event loop only starts a containers fetch when `App::containers` is
+  actually `Loading` — backing out of `PodContainers` with `Esc` changes the
+  view to `NodePods` too, and without that guard the existing "a view change
+  starts a fetch" rule would have re-fetched a pod listing that never stopped
+  being current. No ordering was built for the new pane: a pod rarely has
+  more than a handful of containers, already in spec order, and `s`/`S` are a
+  deliberate no-op on it rather than a third `Order` enum invented for a list
+  that short.
 
 - **Native resources that still have no column: `ephemeral-storage` and
   `hugepages-*`** (2026-08-23) — `eks nodes` gains an `EPHEMERAL-STORAGE`

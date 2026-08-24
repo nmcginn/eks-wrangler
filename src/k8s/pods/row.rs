@@ -502,7 +502,11 @@ fn deletion_reason(pod: &Pod, phase: &str) -> Option<String> {
 /// The reason is usually filled in (`Error`, `OOMKilled`, `Completed`); when it
 /// is not, the exit code or signal is all there is to go on, and it still beats
 /// an empty cell.
-fn exit_reason(terminated: &ContainerStateTerminated) -> String {
+///
+/// `pub(super)` rather than private: [`super::containers`] words a
+/// container's *current* state the same way, and a `Completed` this function
+/// names must be the same word that module names for the same termination.
+pub(super) fn exit_reason(terminated: &ContainerStateTerminated) -> String {
     match terminated
         .reason
         .as_deref()

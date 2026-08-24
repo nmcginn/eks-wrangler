@@ -33,9 +33,11 @@ use crate::k8s::page;
 use crate::k8s::quantity::Quantity;
 use crate::k8s::resource;
 
+pub mod containers;
 pub mod order;
 pub mod row;
 
+pub use containers::ContainerRow;
 pub use order::{Missing, Order, cause, ranks_any, sort};
 pub use row::{PodRow, render, selector_note, shows_usage, usage_unavailable, usage_unsampled};
 
