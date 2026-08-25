@@ -182,6 +182,50 @@ pub enum View {
     },
 }
 
+/// The `/` fuzzy filter over the detail pane's current row list.
+///
+/// A pane's rows never leave the state they were fetched into — filtering is
+/// a display-time reduction through [`crate::fuzzy::rank`], the same
+/// function whichever pane is showing decides its search key for. `Editing`
+/// captures every subsequent keystroke as query text rather than a
+/// navigation key, mirrored in the footer's hints; `Applied` is what typing
+/// keys go back to meaning once `Enter` commits it, with the filter still in
+/// effect until `Esc` clears it.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+enum Filter {
+    /// No filter is active; every row shows, in whatever order the pane's own
+    /// sort already put them in. The common case, and the one this must cost
+    /// nothing extra to draw: `crate::fuzzy::rank` returns its rows unchanged
+    /// for an empty query, so a dashboard nobody has searched in renders
+    /// exactly as it always has.
+    #[default]
+    Inactive,
+    /// The query is being typed.
+    Editing(String),
+    /// The query was committed with `Enter`; typing keys resume their usual
+    /// meaning while the filter it named stays applied.
+    Applied(String),
+}
+
+impl Filter {
+    /// The text a row is currently being matched against — empty when no
+    /// filter is active, whether or not one is being typed.
+    fn query(&self) -> &str {
+        match self {
+            Self::Inactive => "",
+            Self::Editing(query) | Self::Applied(query) => query,
+        }
+    }
+
+    fn is_editing(&self) -> bool {
+        matches!(self, Self::Editing(_))
+    }
+
+    fn is_applied(&self) -> bool {
+        matches!(self, Self::Applied(_))
+    }
+}
+
 /// Dashboard state.
 #[derive(Debug, Clone)]
 pub struct App {
@@ -197,10 +241,15 @@ pub struct App {
     /// The highlighted row within whichever list [`View`] is currently
     /// showing in the detail pane — node rows under [`View::Overview`], pod
     /// rows under [`View::NodePods`], container rows under
-    /// [`View::PodContainers`]. Reset to `0` on every view change and every
-    /// fresh load, so it can never point past the end of a shorter list that
-    /// just arrived.
+    /// [`View::PodContainers`]. Reset to `0` on every view change, every
+    /// fresh load, and every change to `filter`, so it can never point past
+    /// the end of a shorter list that just arrived or was just narrowed.
     detail_selected: usize,
+    /// The fuzzy filter over whichever row list the detail pane is currently
+    /// showing. Reset to [`Filter::Inactive`] on every view change — a query
+    /// typed against one node's pods has nothing to say about the next one
+    /// drilled into.
+    filter: Filter,
     /// The node pane's ordering. `k8s::nodes::sort` and `k8s::order::note`
     /// are the same functions `eks nodes --sort` uses — a pane sorting its
     /// own rows differently from the table would mean `cpu` sorts a listing
@@ -235,6 +284,7 @@ impl App {
             focus: Focus::default(),
             view: View::default(),
             detail_selected: 0,
+            filter: Filter::default(),
             node_order: k8s_nodes::Order::default(),
             node_direction: SortDirection::default(),
             pod_order: k8s_pods::Order::default(),
@@ -308,6 +358,21 @@ impl App {
     #[must_use]
     pub fn detail_selected(&self) -> usize {
         self.detail_selected
+    }
+
+    /// The `/` filter's current query text, or the empty string when no
+    /// filter is active — the same reading a pane's `draw` takes it under to
+    /// decide what it is showing.
+    #[must_use]
+    pub fn filter_query(&self) -> &str {
+        self.filter.query()
+    }
+
+    /// Whether the `/` filter is currently capturing keystrokes as query
+    /// text, for the footer's hints.
+    #[must_use]
+    pub fn is_filtering(&self) -> bool {
+        self.filter.is_editing()
     }
 
     /// The node pane's current ordering.
@@ -486,6 +551,69 @@ impl App {
         }
     }
 
+    /// `/`: open the fuzzy filter over whichever pane [`View`] is currently
+    /// showing a row list, seeded with whatever query was already applied so
+    /// a second press refines it rather than starting over.
+    ///
+    /// A no-op on [`View::ContainerLogs`], which has no rows to filter — the
+    /// same exception `cycle_sort`/`reverse_sort` make. Switches focus to the
+    /// detail pane regardless of which pane held it: once this returns, every
+    /// following keystroke is filter text belonging to that pane, so it
+    /// should be the one drawing the focus border.
+    fn start_filter(&mut self) {
+        if matches!(self.view, View::ContainerLogs { .. }) {
+            return;
+        }
+        self.focus = Focus::Detail;
+        self.filter = Filter::Editing(self.filter.query().to_owned());
+        self.detail_selected = 0;
+    }
+
+    /// `Esc`/`Left` while a filter is applied and not being edited: clear it,
+    /// rather than backing out a drill-down level — the same "unwind the
+    /// newest thing first" rule the quit-arm and the drill-down already
+    /// follow. A second `Esc` then backs out as usual.
+    fn clear_filter(&mut self) {
+        self.filter = Filter::Inactive;
+        self.detail_selected = 0;
+    }
+
+    /// Handle a key press while [`Filter::Editing`] is capturing text —
+    /// split out of [`Self::on_key`] so every other key's handling does not
+    /// have to share a function with this one. `Enter` commits the query
+    /// (collapsing an empty one back to [`Filter::Inactive`] rather than
+    /// leaving an `Applied("")` with nothing to show for it); `Esc` cancels
+    /// outright; `Backspace` and any other character edit the text. Every
+    /// other key — including the ones that would otherwise navigate or
+    /// quit — is simply not one of those and does nothing.
+    fn edit_filter(&mut self, key: KeyEvent) -> Flow {
+        let Filter::Editing(query) = &self.filter else {
+            return Flow::Continue;
+        };
+        let mut query = query.clone();
+        match key.code {
+            KeyCode::Enter => {
+                self.filter = if query.is_empty() {
+                    Filter::Inactive
+                } else {
+                    Filter::Applied(query)
+                };
+            }
+            KeyCode::Esc => self.filter = Filter::Inactive,
+            KeyCode::Backspace => {
+                query.pop();
+                self.filter = Filter::Editing(query);
+            }
+            KeyCode::Char(c) => {
+                query.push(c);
+                self.filter = Filter::Editing(query);
+            }
+            _ => {}
+        }
+        self.detail_selected = 0;
+        Flow::Continue
+    }
+
     /// Toggle which pane `j`/`k`/`Home`/`End` move the highlight in.
     pub fn toggle_focus(&mut self) {
         self.focus = match self.focus {
@@ -507,6 +635,7 @@ impl App {
     pub fn leave_detail_view(&mut self) {
         self.view = View::Overview;
         self.detail_selected = 0;
+        self.filter = Filter::Inactive;
         self.pods = PodsState::default();
         self.containers = ContainersState::default();
         self.logs = LogsState::default();
@@ -531,6 +660,7 @@ impl App {
         };
         self.view = next;
         self.detail_selected = 0;
+        self.filter = Filter::Inactive;
         match &self.view {
             View::Overview => {}
             View::NodePods { .. } => self.pods = PodsState::Loading,
@@ -551,13 +681,13 @@ impl App {
     fn next_view(&self) -> Option<View> {
         match &self.view {
             View::Overview => {
-                let node = self.nodes.rows().get(self.detail_selected)?;
+                let node = self.visible_nodes().get(self.detail_selected).copied()?;
                 Some(View::NodePods {
                     node: node.name.clone(),
                 })
             }
             View::NodePods { node } => {
-                let pod = self.pods.rows().get(self.detail_selected)?;
+                let pod = self.visible_pods().get(self.detail_selected).copied()?;
                 Some(View::PodContainers {
                     node: node.clone(),
                     namespace: pod.namespace.clone(),
@@ -569,7 +699,10 @@ impl App {
                 namespace,
                 pod,
             } => {
-                let container = self.containers.rows().get(self.detail_selected)?;
+                let container = self
+                    .visible_containers()
+                    .get(self.detail_selected)
+                    .copied()?;
                 Some(View::ContainerLogs {
                     node: node.clone(),
                     namespace: namespace.clone(),
@@ -579,6 +712,31 @@ impl App {
             }
             View::ContainerLogs { .. } => None,
         }
+    }
+
+    /// The node pane's rows in the order shown right now: every row, in the
+    /// pane's own sorted order, when no filter is active — or the
+    /// fuzzy-ranked matches for the current query when one is. The same
+    /// function [`super::nodes::draw`] uses to decide what it draws, so a
+    /// highlighted row and the one `Enter` drills into can never disagree.
+    fn visible_nodes(&self) -> Vec<&k8s_nodes::NodeRow> {
+        crate::fuzzy::rank(self.filter.query(), self.nodes.rows(), |row| {
+            row.name.as_str()
+        })
+    }
+
+    /// The pod-drilldown pane's counterpart to [`Self::visible_nodes`].
+    fn visible_pods(&self) -> Vec<&k8s_pods::PodRow> {
+        crate::fuzzy::rank(self.filter.query(), self.pods.rows(), |row| {
+            row.name.as_str()
+        })
+    }
+
+    /// The pod-containers pane's counterpart to [`Self::visible_nodes`].
+    fn visible_containers(&self) -> Vec<&k8s_pods::ContainerRow> {
+        crate::fuzzy::rank(self.filter.query(), self.containers.rows(), |row| {
+            row.name.as_str()
+        })
     }
 
     /// `Right`/`Tab`: move toward the detail pane and deeper into it —
@@ -640,11 +798,13 @@ impl App {
                     pod: pod.clone(),
                 };
                 self.detail_selected = 0;
+                self.filter = Filter::Inactive;
                 self.logs = LogsState::default();
             }
             View::PodContainers { node, .. } => {
                 self.view = View::NodePods { node: node.clone() };
                 self.detail_selected = 0;
+                self.filter = Filter::Inactive;
                 self.containers = ContainersState::default();
             }
             View::NodePods { .. } => self.leave_detail_view(),
@@ -671,12 +831,14 @@ impl App {
         Flow::Continue
     }
 
-    /// How many rows the detail pane's current view could highlight.
+    /// How many rows the detail pane's current view could highlight — after
+    /// the `/` filter, so a highlight can never point past the end of a
+    /// narrowed list.
     fn detail_row_count(&self) -> usize {
         match &self.view {
-            View::Overview => self.nodes.rows().len(),
-            View::NodePods { .. } => self.pods.rows().len(),
-            View::PodContainers { .. } => self.containers.rows().len(),
+            View::Overview => self.visible_nodes().len(),
+            View::NodePods { .. } => self.visible_pods().len(),
+            View::PodContainers { .. } => self.visible_containers().len(),
             // Not a row list: `j`/`k`/`Home`/`End` scroll the log itself in
             // this view rather than moving a highlight, so there is no count
             // for them to be bounded against.
@@ -793,7 +955,9 @@ impl App {
     /// motion, in opposite directions (see `advance`/`retreat` below).
     /// `Esc`/`q` only quit once nothing is left to back out of, and only on
     /// a second press within `QUIT_CONFIRM_WINDOW`; `Ctrl+C` always quits
-    /// immediately, checked before anything else below.
+    /// immediately, checked before anything else below. `/` opens the fuzzy
+    /// filter, and while it is capturing text every other key below —
+    /// including `q` and `Esc` — is filter text instead of its usual meaning.
     pub fn on_key(&mut self, key: KeyEvent) -> Flow {
         // Key *release* events arrive on Windows and modern terminals; acting on
         // both would move the selection twice per press.
@@ -803,6 +967,13 @@ impl App {
 
         if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('c')) {
             return Flow::Quit;
+        }
+
+        // While the `/` filter is capturing text, every key below — `j`,
+        // `k`, `s`, `q`, the lot — is a character in the query rather than a
+        // navigation key, so this returns before any of it is reached.
+        if self.filter.is_editing() {
+            return self.edit_filter(key);
         }
 
         // Any key other than the quit-family ones clears a pending quit arm,
@@ -819,6 +990,12 @@ impl App {
                     return self.quit_or_arm();
                 }
             }
+            KeyCode::Char('/') => self.start_filter(),
+            // A filter clears before a drill-down backs out, the same
+            // "unwind the newest thing first" order the quit arm already
+            // follows — so leaving a search behind takes one extra press,
+            // not zero.
+            KeyCode::Esc | KeyCode::Left if self.filter.is_applied() => self.clear_filter(),
             KeyCode::Esc | KeyCode::Left => return self.retreat(),
             KeyCode::Tab | KeyCode::Right => self.advance(),
             KeyCode::Enter => self.drill_in(),
@@ -1333,6 +1510,7 @@ fn draw_detail(frame: &mut Frame, area: Rect, app: &App) {
             highlighted,
             app.node_order(),
             app.node_direction(),
+            app.filter_query(),
             theme,
         ),
         View::NodePods { .. } => pods::draw(
@@ -1342,10 +1520,18 @@ fn draw_detail(frame: &mut Frame, area: Rect, app: &App) {
             highlighted,
             app.pod_order(),
             app.pod_direction(),
+            app.filter_query(),
             theme,
         ),
         View::PodContainers { .. } => {
-            containers::draw(frame, sections[1], app.containers(), highlighted, theme);
+            containers::draw(
+                frame,
+                sections[1],
+                app.containers(),
+                highlighted,
+                app.filter_query(),
+                theme,
+            );
         }
         View::ContainerLogs { .. } => {
             logs::draw(frame, sections[1], app.logs(), theme);
@@ -1375,7 +1561,12 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
         return;
     }
 
-    let hints: &[(&str, &str)] = if matches!(app.view(), View::ContainerLogs { .. }) {
+    let hints: &[(&str, &str)] = if app.is_filtering() {
+        // Every other key below is filter text while this is showing — see
+        // `App::on_key` — so the hints say that instead of listing keys that
+        // do not mean what they usually do right now.
+        &[("type", "filter"), ("enter", "apply"), ("esc", "cancel")]
+    } else if matches!(app.view(), View::ContainerLogs { .. }) {
         // A log has nothing to `enter` further into and no ordering `s`/`S`
         // could apply to — `f`/`w` take their place, the two things this
         // pane's own keys change.
@@ -1396,6 +1587,10 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
             ("r", "refresh"),
             ("s/S", "sort"),
             ("q", "quit"),
+            // Last, not because it matters least, but so a narrow terminal
+            // clips the newest hint before it clips `q quit` — the one this
+            // tool can least afford to hide.
+            ("/", "filter"),
         ]
     };
 
@@ -1525,6 +1720,18 @@ mod tests {
         let mut app = app();
         app.apply_nodes(Ok(NodesFetch {
             rows: vec![node_row("worker-1")],
+            usage_note: None,
+        }));
+        app.toggle_focus();
+        app
+    }
+
+    /// An app with two distinctly-named nodes loaded, for the filter tests
+    /// that need more than one row to narrow between.
+    fn app_with_two_nodes() -> App {
+        let mut app = app();
+        app.apply_nodes(Ok(NodesFetch {
+            rows: vec![node_row("worker-1"), node_row("worker-2")],
             usage_note: None,
         }));
         app.toggle_focus();
@@ -2729,6 +2936,209 @@ mod tests {
             terminal.backend().to_string().contains("Sorted by cpu."),
             "{}",
             terminal.backend().to_string()
+        );
+    }
+
+    #[test]
+    fn slash_opens_the_filter_and_switches_focus_to_the_detail_pane() {
+        let mut app = app();
+        assert_eq!(app.focus(), Focus::Sidebar);
+
+        app.on_key(press(KeyCode::Char('/')));
+
+        assert_eq!(app.focus(), Focus::Detail);
+        assert!(app.is_filtering());
+    }
+
+    #[test]
+    fn typing_while_editing_captures_navigation_letters_as_query_text() {
+        let mut app = app_with_two_nodes();
+
+        app.on_key(press(KeyCode::Char('/')));
+        app.on_key(press(KeyCode::Char('j'))); // would otherwise move the highlight
+
+        assert_eq!(app.filter_query(), "j");
+        assert_eq!(
+            app.detail_selected(),
+            0,
+            "a keystroke while editing resets the highlight rather than moving it"
+        );
+    }
+
+    #[test]
+    fn backspace_removes_the_last_character_of_the_query() {
+        let mut app = app_with_two_nodes();
+
+        app.on_key(press(KeyCode::Char('/')));
+        app.on_key(press(KeyCode::Char('w')));
+        app.on_key(press(KeyCode::Char('x')));
+        app.on_key(press(KeyCode::Backspace));
+
+        assert_eq!(app.filter_query(), "w");
+    }
+
+    #[test]
+    fn esc_while_editing_cancels_the_filter_entirely() {
+        let mut app = app_with_two_nodes();
+
+        app.on_key(press(KeyCode::Char('/')));
+        app.on_key(press(KeyCode::Char('w')));
+        app.on_key(press(KeyCode::Esc));
+
+        assert!(!app.is_filtering());
+        assert_eq!(app.filter_query(), "");
+    }
+
+    #[test]
+    fn committing_an_empty_query_leaves_the_filter_inactive() {
+        let mut app = app_with_two_nodes();
+
+        app.on_key(press(KeyCode::Char('/')));
+        app.on_key(press(KeyCode::Enter));
+
+        assert!(!app.is_filtering());
+        assert_eq!(app.filter_query(), "");
+    }
+
+    #[test]
+    fn after_committing_a_filter_normal_keys_resume_their_usual_meaning() {
+        let mut app = app_with_two_nodes();
+
+        app.on_key(press(KeyCode::Char('/')));
+        app.on_key(press(KeyCode::Char('w'))); // matches both rows
+        app.on_key(press(KeyCode::Enter));
+        assert!(!app.is_filtering());
+
+        app.on_key(press(KeyCode::Char('j')));
+
+        assert_eq!(
+            app.detail_selected(),
+            1,
+            "j moves the highlight again rather than editing the query"
+        );
+    }
+
+    #[test]
+    fn pressing_slash_again_reopens_editing_with_the_existing_query() {
+        let mut app = app_with_two_nodes();
+        app.on_key(press(KeyCode::Char('/')));
+        app.on_key(press(KeyCode::Char('w')));
+        app.on_key(press(KeyCode::Enter));
+
+        app.on_key(press(KeyCode::Char('/')));
+
+        assert!(app.is_filtering());
+        assert_eq!(app.filter_query(), "w");
+    }
+
+    #[test]
+    fn the_filter_narrows_which_row_enter_drills_into() {
+        let mut app = app_with_two_nodes();
+
+        app.on_key(press(KeyCode::Char('/')));
+        for c in "worker-2".chars() {
+            app.on_key(press(KeyCode::Char(c)));
+        }
+        app.on_key(press(KeyCode::Enter)); // commits the filter
+        app.on_key(press(KeyCode::Enter)); // drills into the sole match
+
+        assert_eq!(
+            app.view(),
+            &View::NodePods {
+                node: "worker-2".to_owned()
+            }
+        );
+    }
+
+    #[test]
+    fn drilling_in_resets_the_filter() {
+        let mut app = app_with_two_nodes();
+        app.on_key(press(KeyCode::Char('/')));
+        app.on_key(press(KeyCode::Char('w')));
+        app.on_key(press(KeyCode::Enter));
+        assert_eq!(app.filter_query(), "w");
+
+        app.on_key(press(KeyCode::Enter)); // drills in
+
+        assert_eq!(
+            app.filter_query(),
+            "",
+            "a freshly drilled-into view starts with no filter"
+        );
+    }
+
+    #[test]
+    fn leaving_the_detail_view_clears_the_filter() {
+        let mut app = app_with_two_nodes();
+        app.on_key(press(KeyCode::Char('/')));
+        app.on_key(press(KeyCode::Char('w')));
+        app.on_key(press(KeyCode::Enter));
+        assert_eq!(app.filter_query(), "w");
+
+        app.leave_detail_view();
+
+        assert_eq!(app.filter_query(), "");
+    }
+
+    #[test]
+    fn slash_is_a_no_op_on_the_container_logs_pane() {
+        let mut app = app_with_container();
+        app.on_key(press(KeyCode::Enter)); // drills into the container's log
+        assert!(matches!(app.view(), View::ContainerLogs { .. }));
+
+        app.on_key(press(KeyCode::Char('/')));
+
+        assert!(!app.is_filtering());
+        assert_eq!(app.filter_query(), "");
+    }
+
+    #[test]
+    fn esc_clears_an_applied_filter_before_backing_out_of_a_drill_down() {
+        let mut app = app_with_two_nodes();
+        app.on_key(press(KeyCode::Enter)); // drills into a node's pods
+        assert!(matches!(app.view(), View::NodePods { .. }));
+
+        app.on_key(press(KeyCode::Char('/')));
+        app.on_key(press(KeyCode::Char('a')));
+        app.on_key(press(KeyCode::Enter));
+        assert_eq!(app.filter_query(), "a");
+
+        app.on_key(press(KeyCode::Esc));
+
+        assert_eq!(app.filter_query(), "", "the first Esc clears the filter");
+        assert!(
+            matches!(app.view(), View::NodePods { .. }),
+            "the drill-down must still be showing after only clearing the filter"
+        );
+
+        app.on_key(press(KeyCode::Esc));
+
+        assert_eq!(
+            app.view(),
+            &View::Overview,
+            "the second Esc backs out as usual"
+        );
+    }
+
+    #[test]
+    fn a_quit_key_while_editing_the_filter_is_added_to_the_query_instead_of_arming_a_quit() {
+        let mut app = app_with_two_nodes();
+
+        app.on_key(press(KeyCode::Char('/')));
+        app.on_key(press(KeyCode::Char('q')));
+
+        assert_eq!(app.filter_query(), "q");
+        assert!(!app.quit_pending());
+    }
+
+    #[test]
+    fn ctrl_c_still_quits_immediately_while_editing_the_filter() {
+        let mut app = app_with_two_nodes();
+        app.on_key(press(KeyCode::Char('/')));
+
+        assert_eq!(
+            app.on_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+            Flow::Quit
         );
     }
 }

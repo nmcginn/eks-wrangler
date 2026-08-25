@@ -69,7 +69,13 @@ impl NodesState {
 /// ordering, `s`/`S` in [`super::App`] rather than a request — the note they
 /// produce is silent on the default order, exactly as it is under the CLI
 /// table, and it disappears along with the rest of the pane's chrome when
-/// there are no rows to be sorted.
+/// there are no rows to be sorted. `filter` is the `/` query, empty when no
+/// filter is active — every footnote above still reads off the full `rows`,
+/// since what a listing's ordering could and could not rank is a fact about
+/// the whole pane rather than about whatever it is narrowed to right now;
+/// only which rows are actually drawn, through
+/// [`crate::fuzzy::rank`], changes with it.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn draw(
     frame: &mut Frame,
     area: Rect,
@@ -77,6 +83,7 @@ pub(super) fn draw(
     selected: Option<usize>,
     order: Order,
     direction: Direction,
+    filter: &str,
     theme: Theme,
 ) {
     let lines: Vec<Line> = match state {
@@ -99,6 +106,9 @@ pub(super) fn draw(
                     format!("Last refresh failed: {error}"),
                     theme.severity(Severity::Warn),
                 ));
+            }
+            if !filter.is_empty() {
+                lines.push(Line::styled(format!("Filter: \"{filter}\""), theme.dim()));
             }
             // Split rather than handed straight to one `Line`: a stale sample
             // earns a second sentence of advice, and `ratatui` does not treat
@@ -130,11 +140,20 @@ pub(super) fn draw(
                         .map(|line| Line::styled(line.to_owned(), theme.dim())),
                 );
             }
-            lines.extend(
-                rows.iter()
-                    .enumerate()
-                    .map(|(index, row)| node_line(row, Some(index) == selected, theme)),
-            );
+            let visible = crate::fuzzy::rank(filter, rows, |row| row.name.as_str());
+            if !filter.is_empty() && visible.is_empty() {
+                lines.push(Line::styled(
+                    format!("No nodes match \"{filter}\"."),
+                    theme.dim(),
+                ));
+            } else {
+                lines.extend(
+                    visible
+                        .into_iter()
+                        .enumerate()
+                        .map(|(index, row)| node_line(row, Some(index) == selected, theme)),
+                );
+            }
             lines
         }
     };
@@ -293,11 +312,29 @@ mod tests {
     }
 
     fn render_ordered(state: &NodesState, order: Order, direction: Direction) -> String {
+        render_filtered(state, order, direction, "")
+    }
+
+    fn render_filtered(
+        state: &NodesState,
+        order: Order,
+        direction: Direction,
+        filter: &str,
+    ) -> String {
         let mut terminal = Terminal::new(TestBackend::new(90, 20)).unwrap();
         terminal
             .draw(|frame| {
                 let area = frame.area();
-                draw(frame, area, state, None, order, direction, Theme::dark());
+                draw(
+                    frame,
+                    area,
+                    state,
+                    None,
+                    order,
+                    direction,
+                    filter,
+                    Theme::dark(),
+                );
             })
             .unwrap();
         terminal.backend().to_string()
@@ -387,6 +424,7 @@ mod tests {
                         None,
                         Order::default(),
                         Direction::default(),
+                        "",
                         Theme::dark(),
                     );
                 })
@@ -438,6 +476,7 @@ mod tests {
                     None,
                     Order::default(),
                     Direction::default(),
+                    "",
                     Theme::dark(),
                 );
             })
@@ -629,9 +668,54 @@ mod tests {
                     Some(0),
                     Order::default(),
                     Direction::default(),
+                    "",
                     Theme::dark(),
                 );
             })
             .unwrap();
+    }
+
+    #[test]
+    fn an_empty_filter_renders_exactly_as_no_filter_does() {
+        let state = loaded(vec![node("worker-1"), node("worker-2")]);
+        assert_eq!(
+            render_filtered(&state, Order::default(), Direction::default(), ""),
+            render(&state)
+        );
+    }
+
+    #[test]
+    fn a_filter_narrows_the_rows_shown() {
+        let state = loaded(vec![node("worker-1"), node("worker-2")]);
+        let rendered = render_filtered(&state, Order::default(), Direction::default(), "worker-2");
+
+        assert!(rendered.contains("worker-2"), "{rendered}");
+        assert!(!rendered.contains("worker-1"), "{rendered}");
+    }
+
+    #[test]
+    fn a_filter_with_no_match_says_so_rather_than_this_cluster_has_no_nodes() {
+        let state = loaded(vec![node("worker-1")]);
+        let rendered = render_filtered(&state, Order::default(), Direction::default(), "nope");
+
+        assert!(rendered.contains("No nodes match \"nope\"."), "{rendered}");
+        assert!(
+            !rendered.contains("This cluster has no nodes"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn an_active_filter_names_itself_above_the_rows() {
+        let state = loaded(vec![node("worker-1")]);
+        let rendered = render_filtered(&state, Order::default(), Direction::default(), "work");
+
+        assert!(rendered.contains("Filter: \"work\""), "{rendered}");
+    }
+
+    #[test]
+    fn no_filter_line_is_shown_when_the_filter_is_empty() {
+        let rendered = render(&loaded(vec![node("worker-1")]));
+        assert!(!rendered.contains("Filter:"), "{rendered}");
     }
 }

@@ -791,10 +791,47 @@ cluster.
   and wrap, all new keys this pane needed since it is the first detail view
   with no rows to highlight.
 
-- [ ] **Fuzzy search.**
+- [x] **Fuzzy search.**
   `/` filters the current view. Fuzzy, case-insensitive, ranked.
   *Acceptance:* the matcher is a pure, tested function; filtering 10k rows stays
   under one frame — cover it with a benchmark.
+  Landed as `crate::fuzzy`, a case-insensitive subsequence matcher with a
+  score (`fuzzy::score`) and a rank-and-filter function over any row type
+  (`fuzzy::rank`), shared by the node, pod-drilldown, and pod-containers
+  panes rather than each growing its own. `/` opens `Filter::Editing`,
+  seeded with whatever query was already applied so a second press refines
+  rather than restarts; every keystroke below it — including `j`, `s`, and
+  `q` — is query text rather than its usual meaning, through a new
+  `App::edit_filter` split out of `on_key` to keep the latter under
+  clippy's line limit. `Enter` commits to `Filter::Applied` (collapsing an
+  empty query back to `Inactive` rather than leaving a no-op filter
+  applied); `Esc` cancels outright while editing, and clears an *applied*
+  filter on its own first press once committed — one more instance of the
+  "unwind the newest thing first" rule the quit-arm and the drill-down
+  already followed, so leaving a search behind costs one extra `Esc`, not
+  zero. The filter resets to `Inactive` on every view change — drilling in,
+  backing out, or a cluster switch — since a query typed against one node's
+  pods has nothing to say about the next one drilled into.
+  `App::visible_nodes`/`visible_pods`/`visible_containers` are the one
+  place `fuzzy::rank` is called against each pane's rows, read by both
+  `detail_row_count`/`next_view` (so a highlight and the row `Enter` drills
+  into can never disagree with what is on screen) and by the panes'
+  `draw`, which now take the query as a plain `&str`. Deliberately not
+  reflected into `order::unranked_note`/`cause`/`usage_note`: those still
+  read a pane's full, unfiltered rows, because what an ordering could or
+  could not rank is a fact about the whole listing, not about whatever it
+  is narrowed to this keystroke — only the drawn rows themselves narrow,
+  through the same `rank` call the highlight logic uses. An empty query is
+  the identity mapping, so a dashboard nobody has searched in renders
+  exactly as it always has, byte for byte. A filter that matches nothing
+  gets its own message (`No nodes match "x".`, distinct from "This cluster
+  has no nodes." and, on the pod pane, from the existing `-l`/
+  `--field-selector` empty-listing wording) rather than reading like an
+  empty pane. `criterion` and `make bench` are their own roadmap task
+  below ("Startup budget and benchmarks"); until that infrastructure
+  exists, `fuzzy`'s ten-thousand-row acceptance test is a wall-clock
+  assertion with a generous ceiling rather than a real benchmark — see
+  that test's own comment.
 
 ### Follow-ups from log viewing
 
@@ -903,16 +940,38 @@ cluster.
   `-l`/`--field-selector` now filter every node's pods in the dashboard, but
   only as flags read once at startup — changing what you are looking for
   means quitting and retyping the command. Separate because it is a surface
-  this change did not need to build: the dashboard has no text-input
-  mechanism at all yet, and `/` (fuzzy search, above) is the first thing that
-  will need one. Whether a selector belongs behind the same key, and whether
-  it re-fetches immediately or waits for the pane's own refresh, are
-  questions worth answering once there is an input mechanism to hang them on
-  rather than guessed at building the first one.
+  this change did not need to build: the dashboard now has one text-input
+  mechanism, `App::edit_filter` behind `/` (fuzzy search, above), but it is
+  a plain string editor built for one purpose, over rows already in hand —
+  a selector is validated grammar sent to the API server, not a client-side
+  ranking, and reusing the same keystroke-capture machinery for the two is
+  a decision rather than a given. Whether a selector belongs behind the
+  same key, and whether it re-fetches immediately or waits for the pane's
+  own refresh, are still open.
   *Acceptance:* whichever shape it takes, editing the selector goes through
   `commands::pods::selectors_for` — the same validation and rejection
   wording `eks pods` and dashboard startup already share — rather than a
   second parser for text typed live.
+
+### Follow-ups from fuzzy search
+
+- [ ] **Search the container-logs pane.**
+  `/` now filters every pane that shows a list of rows, and the one detail
+  view left out is the one made of text rather than rows: `View::
+  ContainerLogs` has no highlight to narrow, only `ui::logs::Log`'s bounded
+  scrollback, so `fuzzy::rank`'s "keep the matching rows, in order" has
+  nothing to apply to here. The question this pane wants is a different one
+  besides — not "which lines match" as a filtered view (a log's order is
+  the one thing about it nobody wants re-ranked or thinned), but "jump to
+  the next line that matches", the way a pager's own `/` behaves. That is a
+  new piece of `Log` state (a current match position, `n`/`N` to step
+  through it) rather than a second caller of `fuzzy::rank`, and it is the
+  reviewer's call whether it wants fuzzy ranking at all or a plain
+  substring search, which is the more familiar reading for "search inside
+  this text" than it is for "find this row".
+  *Acceptance:* whichever shape it takes, a match highlights without
+  removing the lines around it — a log's context is often the point — and
+  a search with no match says so rather than silently going nowhere.
 
 ## Milestone 3 — Polish
 
