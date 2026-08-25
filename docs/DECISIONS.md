@@ -2031,3 +2031,50 @@ since a highlight-based pane never needed a "move by more than one" key. The
 footer hints branch on the same distinction, showing `f`/`w` in place of
 `enter`/`s`/`S`, which have nothing to do in a view with no rows to open
 further and no ordering to change.
+
+### 67. The `/` filter narrows what a pane draws, not what its footnotes reason about
+
+`fuzzy::rank` reduces a pane's rows to the ones the query matches, and the
+question it raised was whether `order::unranked_note`, `cause`, and the node
+pane's `usage_note` should read that same narrowed set or the full listing
+each pane already had in `NodesState`/`PodsState`. They read the full
+listing. `--sort cpu` on a node pane filtered down to two nodes still says
+"Nothing here has cpu to sort by" on the strength of the other eight the
+filter is hiding, which can look wrong at a glance — the note is answering
+"could this ordering ever rank anything here", not "did it rank one of the
+rows currently on screen", and those are different questions once a filter
+exists to ask the second one.
+
+The alternative — threading the filtered subset into `ranks_any`/`cause` too
+— was rejected for the same reason `ranks_any`/`cause` take `&[NodeRow]`/
+`&[PodRow]` today: changing that to accept whatever shape a filtered `Vec<&
+NodeRow>` is would touch the CLI table's call sites for a question the CLI
+table does not have, since `eks nodes`/`eks pods` have no live filter to
+narrow by. Keeping the footnotes over the whole pane means one clear rule —
+"this note is about the listing, the rows below it are about what you
+typed" — rather than a note whose meaning silently changes depending on
+whether a filter happens to be active. Worth a second look if it reads as
+confusing in practice; the fix, if so, is `ranks_any`/`cause` taking an
+iterator rather than a slice, which the CLI callers already satisfy for
+free (`&[T]` is `IntoIterator<Item = &T>`) without changing their call
+sites at all.
+
+### 68. Clearing an applied filter is its own `Esc` press, ahead of backing out
+
+Decision 62 made `Esc` at the top level a two-press confirm, and mid-drill an
+`Esc` already backs out one level rather than jumping straight to `Overview`
+— both readings of the same rule, that one press should undo the single
+most recent thing rather than everything at once. A filter is one more thing
+that can be "the most recent" state a press should undo first: `Esc` while
+`Filter::Applied` clears the filter and leaves the view exactly where it
+was, and only a second `Esc` — with no filter left to clear — backs out of
+the drill-down. Making the two presses do both at once (clear and retreat
+together) was the other option, and was rejected because it makes `Esc`'s
+meaning depend on whether a filter happens to be set, which is exactly the
+kind of surprise decision 62 was written to avoid: a user mid-search who
+presses `Esc` expecting to leave the search box, and instead finds
+themselves a level shallower in the dashboard too, has no way to tell the
+two apart afterwards. `Filter::Editing` — text still being typed — is
+different again: `Esc` there cancels outright rather than clearing-then-
+backing-out, since there is nothing committed yet to "back out of" one step
+at a time.

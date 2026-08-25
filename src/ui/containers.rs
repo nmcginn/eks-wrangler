@@ -50,33 +50,47 @@ impl ContainersState {
 /// hold keyboard focus, matching [`super::pods::draw`]'s own rule. There is
 /// no ordering here yet, unlike the node and pod panes: a pod rarely has more
 /// than a handful of containers, in spec order already, and reading them out
-/// of order would cost more than it answered.
+/// of order would cost more than it answered. `filter` is the `/` query,
+/// empty when no filter is active — see [`super::nodes::draw`]'s doc comment
+/// for the same split between what stays over the full `rows` and what
+/// narrows.
 pub(super) fn draw(
     frame: &mut Frame,
     area: Rect,
     state: &ContainersState,
     selected: Option<usize>,
+    filter: &str,
     theme: Theme,
 ) {
-    let lines: Vec<Line> = match state {
-        ContainersState::Loading => vec![Line::styled("Loading containers…", theme.dim())],
-        ContainersState::Error(message) => vec![Line::styled(
-            message.clone(),
-            theme.severity(Severity::Critical),
-        )],
-        ContainersState::Loaded { rows } if rows.is_empty() => {
-            vec![Line::styled("This pod has no containers.", theme.dim())]
-        }
-        ContainersState::Loaded { rows } => {
-            let mut lines = vec![Line::styled("CONTAINERS", theme.heading())];
-            lines.extend(
-                rows.iter()
-                    .enumerate()
-                    .flat_map(|(index, row)| container_lines(row, Some(index) == selected, theme)),
-            );
-            lines
-        }
-    };
+    let lines: Vec<Line> =
+        match state {
+            ContainersState::Loading => vec![Line::styled("Loading containers…", theme.dim())],
+            ContainersState::Error(message) => vec![Line::styled(
+                message.clone(),
+                theme.severity(Severity::Critical),
+            )],
+            ContainersState::Loaded { rows } if rows.is_empty() => {
+                vec![Line::styled("This pod has no containers.", theme.dim())]
+            }
+            ContainersState::Loaded { rows } => {
+                let mut lines = vec![Line::styled("CONTAINERS", theme.heading())];
+                if !filter.is_empty() {
+                    lines.push(Line::styled(format!("Filter: \"{filter}\""), theme.dim()));
+                }
+                let visible = crate::fuzzy::rank(filter, rows, |row| row.name.as_str());
+                if !filter.is_empty() && visible.is_empty() {
+                    lines.push(Line::styled(
+                        format!("No containers match \"{filter}\"."),
+                        theme.dim(),
+                    ));
+                } else {
+                    lines.extend(visible.into_iter().enumerate().flat_map(|(index, row)| {
+                        container_lines(row, Some(index) == selected, theme)
+                    }));
+                }
+                lines
+            }
+        };
 
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), area);
 }
@@ -148,11 +162,15 @@ mod tests {
     }
 
     fn render(state: &ContainersState, selected: Option<usize>) -> String {
+        render_filtered(state, selected, "")
+    }
+
+    fn render_filtered(state: &ContainersState, selected: Option<usize>, filter: &str) -> String {
         let mut terminal = Terminal::new(TestBackend::new(90, 20)).unwrap();
         terminal
             .draw(|frame| {
                 let area = frame.area();
-                draw(frame, area, state, selected, Theme::dark());
+                draw(frame, area, state, selected, filter, Theme::dark());
             })
             .unwrap();
         terminal.backend().to_string()
@@ -229,7 +247,7 @@ mod tests {
             terminal
                 .draw(|frame| {
                     let area = frame.area();
-                    draw(frame, area, &state, Some(0), Theme::dark());
+                    draw(frame, area, &state, Some(0), "", Theme::dark());
                 })
                 .unwrap();
         }
@@ -283,7 +301,7 @@ mod tests {
         terminal
             .draw(|frame| {
                 let area = frame.area();
-                draw(frame, area, &state, None, Theme::dark());
+                draw(frame, area, &state, None, "", Theme::dark());
             })
             .unwrap();
         let rendered = terminal.backend().to_string();
@@ -296,5 +314,53 @@ mod tests {
             "{rendered}"
         );
         assert!(!rendered.contains('…'), "{rendered}");
+    }
+
+    #[test]
+    fn an_empty_filter_renders_exactly_as_no_filter_does() {
+        let state = ContainersState::Loaded {
+            rows: vec![container("app"), container("sidecar")],
+        };
+        assert_eq!(render_filtered(&state, None, ""), render(&state, None));
+    }
+
+    #[test]
+    fn a_filter_narrows_the_rows_shown() {
+        // Distinct images, not just distinct names: `container()` always
+        // gives every row the same `app:1.0` image, which would leave "app"
+        // in the rendered text of the row this filter is supposed to drop.
+        let state = ContainersState::Loaded {
+            rows: vec![
+                ContainerRow {
+                    image: "app-image:1.0".to_owned(),
+                    ..container("app")
+                },
+                ContainerRow {
+                    image: "sidecar-image:1.0".to_owned(),
+                    ..container("sidecar")
+                },
+            ],
+        };
+        let rendered = render_filtered(&state, None, "side");
+
+        assert!(rendered.contains("sidecar"), "{rendered}");
+        assert!(!rendered.contains("app-image"), "{rendered}");
+    }
+
+    #[test]
+    fn a_filter_with_no_match_says_so_rather_than_this_pod_has_no_containers() {
+        let state = ContainersState::Loaded {
+            rows: vec![container("app")],
+        };
+        let rendered = render_filtered(&state, None, "nope");
+
+        assert!(
+            rendered.contains("No containers match \"nope\"."),
+            "{rendered}"
+        );
+        assert!(
+            !rendered.contains("This pod has no containers"),
+            "{rendered}"
+        );
     }
 }

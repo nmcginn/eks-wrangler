@@ -54,6 +54,10 @@ impl PodsState {
 /// it back to the sidebar. `order` and `direction` are the pane's own
 /// ordering, changed by `s`/`S` in [`super::App`] rather than by a request —
 /// see [`super::nodes::draw`], whose node-pane counterpart this mirrors.
+/// `filter` is the `/` query, empty when no filter is active — see that same
+/// doc comment for why every footnote above still reads off the full `rows`
+/// and only the drawn rows themselves narrow.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn draw(
     frame: &mut Frame,
     area: Rect,
@@ -61,6 +65,7 @@ pub(super) fn draw(
     selected: Option<usize>,
     order: Order,
     direction: Direction,
+    filter: &str,
     theme: Theme,
 ) {
     let lines: Vec<Line> = match state {
@@ -85,6 +90,9 @@ pub(super) fn draw(
         }
         PodsState::Loaded { rows, .. } => {
             let mut lines = vec![Line::styled("PODS", theme.heading())];
+            if !filter.is_empty() {
+                lines.push(Line::styled(format!("Filter: \"{filter}\""), theme.dim()));
+            }
             if let Some(note) = order::note(order, direction) {
                 lines.push(Line::styled(note, theme.dim()));
             }
@@ -103,11 +111,20 @@ pub(super) fn draw(
                         .map(|line| Line::styled(line.to_owned(), theme.dim())),
                 );
             }
-            lines.extend(
-                rows.iter()
-                    .enumerate()
-                    .map(|(index, row)| pod_line(row, Some(index) == selected, theme)),
-            );
+            let visible = crate::fuzzy::rank(filter, rows, |row| row.name.as_str());
+            if !filter.is_empty() && visible.is_empty() {
+                lines.push(Line::styled(
+                    format!("No pods here match \"{filter}\"."),
+                    theme.dim(),
+                ));
+            } else {
+                lines.extend(
+                    visible
+                        .into_iter()
+                        .enumerate()
+                        .map(|(index, row)| pod_line(row, Some(index) == selected, theme)),
+                );
+            }
             lines
         }
     };
@@ -185,6 +202,16 @@ mod tests {
         order: Order,
         direction: Direction,
     ) -> String {
+        render_filtered(state, selected, order, direction, "")
+    }
+
+    fn render_filtered(
+        state: &PodsState,
+        selected: Option<usize>,
+        order: Order,
+        direction: Direction,
+        filter: &str,
+    ) -> String {
         let mut terminal = Terminal::new(TestBackend::new(90, 20)).unwrap();
         terminal
             .draw(|frame| {
@@ -196,6 +223,7 @@ mod tests {
                     selected,
                     order,
                     direction,
+                    filter,
                     Theme::dark(),
                 );
             })
@@ -371,10 +399,70 @@ mod tests {
                         Some(0),
                         Order::default(),
                         Direction::default(),
+                        "",
                         Theme::dark(),
                     );
                 })
                 .unwrap();
         }
+    }
+
+    #[test]
+    fn an_empty_filter_renders_exactly_as_no_filter_does() {
+        let state = PodsState::Loaded {
+            rows: vec![pod("api-1"), pod("api-2")],
+            selector_note: None,
+        };
+        assert_eq!(
+            render_filtered(&state, None, Order::default(), Direction::default(), ""),
+            render(&state, None)
+        );
+    }
+
+    #[test]
+    fn a_filter_narrows_the_rows_shown() {
+        let state = PodsState::Loaded {
+            rows: vec![pod("api-1"), pod("api-2")],
+            selector_note: None,
+        };
+        let rendered = render_filtered(&state, None, Order::default(), Direction::default(), "2");
+
+        assert!(rendered.contains("api-2"), "{rendered}");
+        assert!(!rendered.contains("api-1"), "{rendered}");
+    }
+
+    #[test]
+    fn a_filter_with_no_match_says_so_rather_than_this_node_has_no_pods() {
+        let state = PodsState::Loaded {
+            rows: vec![pod("api-1")],
+            selector_note: None,
+        };
+        let rendered =
+            render_filtered(&state, None, Order::default(), Direction::default(), "nope");
+
+        assert!(
+            rendered.contains("No pods here match \"nope\"."),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("This node has no pods"), "{rendered}");
+    }
+
+    #[test]
+    fn a_filter_with_no_match_is_distinguishable_from_an_empty_selector_result() {
+        // The selector-driven empty message names the selector, not the
+        // literal word "filter" — a `/` filter with no match must not be
+        // confused with it even though both read "no pods here match …".
+        let state = PodsState::Loaded {
+            rows: vec![pod("api-1")],
+            selector_note: Some("label selector `app=api`".to_owned()),
+        };
+        let rendered =
+            render_filtered(&state, None, Order::default(), Direction::default(), "nope");
+
+        assert!(
+            rendered.contains("No pods here match \"nope\"."),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("label selector"), "{rendered}");
     }
 }
