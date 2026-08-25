@@ -17,19 +17,23 @@ use ratatui::widgets::{Block, List, ListItem, ListState, Paragraph, Wrap};
 use ratatui::{Frame, Terminal};
 
 use crate::cluster::ClusterView;
+use crate::commands::StreamHandle;
 use crate::commands::nodes::NodesFetch;
 use crate::commands::pods::{ContainersFetch, PodsFetch};
 use crate::k8s::nodes as k8s_nodes;
 use crate::k8s::order::Direction as SortDirection;
 use crate::k8s::page::{Budget, ParseError};
 use crate::k8s::pods as k8s_pods;
+use crate::k8s::pods::LogEvent;
 use crate::theme::Theme;
 
 mod containers;
+mod logs;
 mod nodes;
 mod pods;
 
 use containers::ContainersState;
+use logs::LogsState;
 use nodes::NodesState;
 use pods::PodsState;
 
@@ -57,6 +61,13 @@ pub type PodsFetcher = Box<dyn Fn(&str, &str) -> mpsc::Receiver<Result<PodsFetch
 /// Starts a fetch of one pod's containers, given its namespace and name.
 pub type ContainersFetcher =
     Box<dyn Fn(&str, &str, &str) -> mpsc::Receiver<Result<ContainersFetch, String>>>;
+
+/// Starts streaming one container's log, given its pod's namespace and name
+/// and the container's own name. Unlike the other fetchers, the returned
+/// [`StreamHandle`] is not incidental — dropping it is the only way the
+/// stream this starts ever stops.
+pub type LogsFetcher =
+    Box<dyn Fn(&str, &str, &str, &str) -> (mpsc::Receiver<LogEvent>, StreamHandle)>;
 
 /// How often the dashboard automatically starts a new node fetch, on top of
 /// pressing `r` to refresh on demand.
@@ -140,12 +151,15 @@ pub enum Focus {
 /// What the detail pane is showing, independent of which cluster is
 /// selected.
 ///
-/// Three variants rather than a `Vec<View>` stack: a pod's containers is the
-/// second and, for now, the last level this drills to, and a fixed enum says
-/// so in the type — `back_or_quit` and `draw_detail` are each one exhaustive
-/// `match` rather than a loop over a stack whose depth nothing bounds. A
-/// third drill-down level, if the roadmap ever asks for one, is the point at
-/// which a stack starts paying for itself; two is not.
+/// A fixed enum rather than a `Vec<View>` stack: `back_or_quit` and
+/// `draw_detail` are each one exhaustive `match` over a set of levels this
+/// tool already knows about, rather than a loop over a stack whose depth
+/// nothing bounds. See decision 60 for why two known levels did not earn one;
+/// a container's log is the level that finally did — not because four
+/// variants is where a stack starts paying for itself either, but because
+/// nothing past it is on the roadmap yet, and growing the stack machinery on
+/// spec for a fifth level that may never arrive would be exactly the
+/// speculative generality `CLAUDE.md` asks this tool to avoid.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum View {
     /// The selected cluster's node list.
@@ -159,6 +173,13 @@ pub enum View {
         namespace: String,
         pod: String,
     },
+    /// One container's log, followed live.
+    ContainerLogs {
+        node: String,
+        namespace: String,
+        pod: String,
+        container: String,
+    },
 }
 
 /// Dashboard state.
@@ -170,6 +191,7 @@ pub struct App {
     nodes: NodesState,
     pods: PodsState,
     containers: ContainersState,
+    logs: LogsState,
     focus: Focus,
     view: View,
     /// The highlighted row within whichever list [`View`] is currently
@@ -209,6 +231,7 @@ impl App {
             nodes: NodesState::default(),
             pods: PodsState::default(),
             containers: ContainersState::default(),
+            logs: LogsState::default(),
             focus: Focus::default(),
             view: View::default(),
             detail_selected: 0,
@@ -258,6 +281,14 @@ impl App {
     #[must_use]
     pub fn containers(&self) -> &ContainersState {
         &self.containers
+    }
+
+    /// What the container-logs pane is showing. Only meaningful while
+    /// [`Self::view`] is [`View::ContainerLogs`], the same rule
+    /// [`Self::containers`] follows for [`View::PodContainers`].
+    #[must_use]
+    pub fn logs(&self) -> &LogsState {
+        &self.logs
     }
 
     /// Which pane `j`/`k`/`Home`/`End` currently move the highlight in.
@@ -392,6 +423,19 @@ impl App {
         };
     }
 
+    /// Apply one piece of a container's log stream.
+    ///
+    /// Unlike [`Self::apply_pods`] and [`Self::apply_containers`], this is
+    /// not "the fetch finished, here is the answer" — a log has no natural
+    /// end, so this is called once per line and again whenever the stream
+    /// stops. `LogsState::apply` is where the actual state machine lives,
+    /// for the same reason [`Self::cycle_sort`] delegates to `k8s_nodes::sort`
+    /// rather than reordering rows itself: the shape of "what does this event
+    /// do to what is already on screen" belongs beside the data it changes.
+    pub fn apply_log_event(&mut self, event: LogEvent) {
+        self.logs.apply(event);
+    }
+
     /// `s`: cycle to the next ordering for whichever pane [`View`] is
     /// currently showing, and re-sort its already-fetched rows.
     ///
@@ -417,7 +461,7 @@ impl App {
             // containers, already in the spec's own order, and `s` has
             // nothing to do here rather than a third ordering invented for a
             // list this short.
-            View::PodContainers { .. } => {}
+            View::PodContainers { .. } | View::ContainerLogs { .. } => {}
         }
     }
 
@@ -438,7 +482,7 @@ impl App {
                     k8s_pods::sort(rows, self.pod_order, self.pod_direction);
                 }
             }
-            View::PodContainers { .. } => {}
+            View::PodContainers { .. } | View::ContainerLogs { .. } => {}
         }
     }
 
@@ -465,6 +509,7 @@ impl App {
         self.detail_selected = 0;
         self.pods = PodsState::default();
         self.containers = ContainersState::default();
+        self.logs = LogsState::default();
     }
 
     /// Drill one level into whatever the detail pane is currently showing —
@@ -490,6 +535,7 @@ impl App {
             View::Overview => {}
             View::NodePods { .. } => self.pods = PodsState::Loading,
             View::PodContainers { .. } => self.containers = ContainersState::Loading,
+            View::ContainerLogs { .. } => self.logs = LogsState::Loading,
         }
     }
 
@@ -518,7 +564,20 @@ impl App {
                     pod: pod.name.clone(),
                 })
             }
-            View::PodContainers { .. } => None,
+            View::PodContainers {
+                node,
+                namespace,
+                pod,
+            } => {
+                let container = self.containers.rows().get(self.detail_selected)?;
+                Some(View::ContainerLogs {
+                    node: node.clone(),
+                    namespace: namespace.clone(),
+                    pod: pod.clone(),
+                    container: container.name.clone(),
+                })
+            }
+            View::ContainerLogs { .. } => None,
         }
     }
 
@@ -543,7 +602,7 @@ impl App {
     /// there's no view depth left to unwind.
     fn retreat(&mut self) -> Flow {
         match &self.view {
-            View::NodePods { .. } | View::PodContainers { .. } => {
+            View::NodePods { .. } | View::PodContainers { .. } | View::ContainerLogs { .. } => {
                 self.back_out_one_level();
                 Flow::Continue
             }
@@ -569,6 +628,20 @@ impl App {
     /// view to one of the two non-[`View::Overview`] variants this expects.
     fn back_out_one_level(&mut self) {
         match &self.view {
+            View::ContainerLogs {
+                node,
+                namespace,
+                pod,
+                ..
+            } => {
+                self.view = View::PodContainers {
+                    node: node.clone(),
+                    namespace: namespace.clone(),
+                    pod: pod.clone(),
+                };
+                self.detail_selected = 0;
+                self.logs = LogsState::default();
+            }
             View::PodContainers { node, .. } => {
                 self.view = View::NodePods { node: node.clone() };
                 self.detail_selected = 0;
@@ -604,6 +677,10 @@ impl App {
             View::Overview => self.nodes.rows().len(),
             View::NodePods { .. } => self.pods.rows().len(),
             View::PodContainers { .. } => self.containers.rows().len(),
+            // Not a row list: `j`/`k`/`Home`/`End` scroll the log itself in
+            // this view rather than moving a highlight, so there is no count
+            // for them to be bounded against.
+            View::ContainerLogs { .. } => 0,
         }
     }
 
@@ -662,6 +739,52 @@ impl App {
             .unwrap_or(self.clusters.len() - 1);
     }
 
+    /// Scroll the container-logs pane toward older lines, or do nothing
+    /// outside [`View::ContainerLogs`] — the same shape
+    /// [`Self::select_next_detail_row`] has for a pane with no rows loaded
+    /// yet.
+    fn scroll_logs_up(&mut self, amount: usize) {
+        if let LogsState::Streaming(log) = &mut self.logs {
+            log.scroll_up(amount);
+        }
+    }
+
+    /// The other direction of [`Self::scroll_logs_up`].
+    fn scroll_logs_down(&mut self, amount: usize) {
+        if let LogsState::Streaming(log) = &mut self.logs {
+            log.scroll_down(amount);
+        }
+    }
+
+    /// Jump the container-logs pane to its oldest line and stop following.
+    fn jump_logs_to_start(&mut self) {
+        if let LogsState::Streaming(log) = &mut self.logs {
+            log.jump_to_start();
+        }
+    }
+
+    /// Jump the container-logs pane to its newest line and resume following.
+    fn jump_logs_to_end(&mut self) {
+        if let LogsState::Streaming(log) = &mut self.logs {
+            log.jump_to_end();
+        }
+    }
+
+    /// `f`: jump the container-logs pane to the newest line and resume
+    /// following, or stop following if it already was.
+    fn toggle_log_follow(&mut self) {
+        if let LogsState::Streaming(log) = &mut self.logs {
+            log.toggle_follow();
+        }
+    }
+
+    /// `w`: toggle line wrap in the container-logs pane.
+    fn toggle_log_wrap(&mut self) {
+        if let LogsState::Streaming(log) = &mut self.logs {
+            log.toggle_wrap();
+        }
+    }
+
     /// Handle a key press.
     ///
     /// Supports both arrow keys and vim-style `j`/`k`, because the people who
@@ -701,6 +824,35 @@ impl App {
             KeyCode::Enter => self.drill_in(),
             KeyCode::Char('s') => self.cycle_sort(),
             KeyCode::Char('S') => self.reverse_sort(),
+            // The container-logs pane has no rows to move a highlight
+            // through — `j`/`k`/`Home`/`End`/`PageUp`/`PageDown` scroll its
+            // text instead, the same keys a pager uses.
+            KeyCode::Char('j') | KeyCode::Down
+                if self.focus == Focus::Detail
+                    && matches!(self.view, View::ContainerLogs { .. }) =>
+            {
+                self.scroll_logs_down(1);
+            }
+            KeyCode::Char('k') | KeyCode::Up
+                if self.focus == Focus::Detail
+                    && matches!(self.view, View::ContainerLogs { .. }) =>
+            {
+                self.scroll_logs_up(1);
+            }
+            KeyCode::PageDown
+                if self.focus == Focus::Detail
+                    && matches!(self.view, View::ContainerLogs { .. }) =>
+            {
+                self.scroll_logs_down(logs::PAGE);
+            }
+            KeyCode::PageUp
+                if self.focus == Focus::Detail
+                    && matches!(self.view, View::ContainerLogs { .. }) =>
+            {
+                self.scroll_logs_up(logs::PAGE);
+            }
+            KeyCode::Char('f') => self.toggle_log_follow(),
+            KeyCode::Char('w') => self.toggle_log_wrap(),
             KeyCode::Char('j') | KeyCode::Down => match self.focus {
                 Focus::Sidebar => self.select_next(),
                 Focus::Detail => self.select_next_detail_row(),
@@ -709,6 +861,18 @@ impl App {
                 Focus::Sidebar => self.select_previous(),
                 Focus::Detail => self.select_previous_detail_row(),
             },
+            KeyCode::Home
+                if self.focus == Focus::Detail
+                    && matches!(self.view, View::ContainerLogs { .. }) =>
+            {
+                self.jump_logs_to_start();
+            }
+            KeyCode::End
+                if self.focus == Focus::Detail
+                    && matches!(self.view, View::ContainerLogs { .. }) =>
+            {
+                self.jump_logs_to_end();
+            }
             KeyCode::Home => match self.focus {
                 Focus::Sidebar => self.selected = 0,
                 Focus::Detail => self.detail_selected = 0,
@@ -742,6 +906,18 @@ impl App {
 /// pane's view changes to [`View::NodePods`]. `spawn_containers` is one level
 /// further in: the selected cluster's context, and the namespace and name of
 /// the drilled-into pod, whenever the view changes to [`View::PodContainers`].
+/// `spawn_logs` is the last level: the selected cluster's context, the
+/// drilled-into pod's namespace and name, and the drilled-into container's
+/// name, whenever the view changes to [`View::ContainerLogs`]. Unlike the
+/// other three, the [`StreamHandle`] it hands back alongside the receiver has
+/// to be held onto for as long as the pane is showing that stream and
+/// dropped the moment it is not — see [`crate::commands::spawn_stream`]'s doc
+/// comment for why dropping it is what actually ends the connection, rather
+/// than merely this function losing interest in it. The three drill fetchers
+/// travel together as [`DrillFetchers`], the same reason `Inflight` bundles
+/// what they start: a fourth drill-down level should not have to grow every
+/// caller's argument list past `clippy::too_many_arguments`' limit again.
+///
 /// This function never awaits a fetch: each iteration only polls for a result
 /// that has already arrived, which is what keeps a hung request from blocking
 /// a keypress.
@@ -749,22 +925,61 @@ pub fn run(
     app: App,
     nodes_rx: Option<mpsc::Receiver<Result<NodesFetch, String>>>,
     spawn_nodes: &NodesFetcher,
-    spawn_pods: &PodsFetcher,
-    spawn_containers: &ContainersFetcher,
+    drill: &DrillFetchers<'_>,
     refresh: RefreshInterval,
 ) -> Result<()> {
     let mut terminal = ratatui::init();
-    let result = event_loop(
-        &mut terminal,
-        app,
-        nodes_rx,
-        spawn_nodes,
-        spawn_pods,
-        spawn_containers,
-        refresh,
-    );
+    let result = event_loop(&mut terminal, app, nodes_rx, spawn_nodes, drill, refresh);
     ratatui::restore();
     result
+}
+
+/// The fetchers for the detail pane's three drill-down levels, bundled into
+/// one parameter for the reason [`run`]'s doc comment gives.
+#[derive(Clone, Copy)]
+pub struct DrillFetchers<'a> {
+    pub spawn_pods: &'a PodsFetcher,
+    pub spawn_containers: &'a ContainersFetcher,
+    pub spawn_logs: &'a LogsFetcher,
+}
+
+// `Box<dyn Fn(..) -> ..>` has no `Debug` impl for `#[derive(Debug)]` to call,
+// so this satisfies `missing_debug_implementations` by hand rather than
+// printing three closures nobody could read anyway.
+impl std::fmt::Debug for DrillFetchers<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DrillFetchers").finish_non_exhaustive()
+    }
+}
+
+/// The background fetches currently in flight for whichever drill-down level
+/// the detail pane is showing.
+///
+/// Bundled into one type for the same reason [`DrillFetchers`] is: `event_loop`
+/// otherwise grows one more local and one more thing to clear per level
+/// `View` gains. `logs_handle` is held only so it is not dropped early and is
+/// never read directly — dropping it, via [`Self::clear`] or by being
+/// overwritten, is the cancellation itself (see
+/// [`crate::commands::spawn_stream`]).
+#[derive(Default)]
+struct Inflight {
+    pods: Option<mpsc::Receiver<Result<PodsFetch, String>>>,
+    containers: Option<mpsc::Receiver<Result<ContainersFetch, String>>>,
+    logs: Option<mpsc::Receiver<LogEvent>>,
+    logs_handle: Option<StreamHandle>,
+}
+
+impl Inflight {
+    /// Stop every drill-down fetch, whatever level it belongs to. Called on
+    /// a cluster switch, and when the detail pane returns to
+    /// [`View::Overview`], both of which drop every level at once rather
+    /// than one.
+    fn clear(&mut self) {
+        self.pods = None;
+        self.containers = None;
+        self.logs = None;
+        drop(self.logs_handle.take());
+    }
 }
 
 fn event_loop<B>(
@@ -772,8 +987,7 @@ fn event_loop<B>(
     mut app: App,
     mut nodes_rx: Option<mpsc::Receiver<Result<NodesFetch, String>>>,
     spawn_nodes: &NodesFetcher,
-    spawn_pods: &PodsFetcher,
-    spawn_containers: &ContainersFetcher,
+    drill: &DrillFetchers<'_>,
     refresh: RefreshInterval,
 ) -> Result<()>
 where
@@ -785,8 +999,7 @@ where
     // `App` only ever knows the cluster it is showing *now*.
     let mut selected_context = app.selected_cluster().map(|c| c.context_name.clone());
     let mut next_refresh = schedule(refresh);
-    let mut pods_rx: Option<mpsc::Receiver<Result<PodsFetch, String>>> = None;
-    let mut containers_rx: Option<mpsc::Receiver<Result<ContainersFetch, String>>> = None;
+    let mut inflight = Inflight::default();
 
     loop {
         // Non-blocking: a fetch that has not finished yet leaves the pane
@@ -798,15 +1011,26 @@ where
         {
             app.apply_nodes(result);
         }
-        if let Some(rx) = &pods_rx
+        if let Some(rx) = &inflight.pods
             && let Ok(result) = rx.try_recv()
         {
             app.apply_pods(result);
         }
-        if let Some(rx) = &containers_rx
+        if let Some(rx) = &inflight.containers
             && let Ok(result) = rx.try_recv()
         {
             app.apply_containers(result);
+        }
+        // Drained in a loop rather than one `try_recv` per frame: a log
+        // sends many events, not one, and a burst of them arriving between
+        // two frames must reach the buffer before the next paint rather than
+        // trickling in one line every `TICK` — the whole point of the
+        // acceptance criterion that a burst must not stall the UI is that it
+        // catches up immediately once control comes back here.
+        if let Some(rx) = &inflight.logs {
+            while let Ok(event) = rx.try_recv() {
+                app.apply_log_event(event);
+            }
         }
 
         terminal.draw(|frame| draw(frame, &app))?;
@@ -845,8 +1069,7 @@ where
             selected_context = now_selected;
             app.start_loading_nodes();
             app.leave_detail_view();
-            pods_rx = None;
-            containers_rx = None;
+            inflight.clear();
             refetch(spawn_nodes, &mut nodes_rx, selected_context.as_deref());
             next_refresh = schedule(refresh);
         } else if *app.view() != view_before {
@@ -854,33 +1077,66 @@ where
             // cluster change already forces the view back to `Overview`
             // through `leave_detail_view`, so re-deriving the same outcome
             // here would just repeat it.
-            match app.view() {
-                View::NodePods { node } => {
-                    containers_rx = None;
-                    // Only when drilling *forward* into this node — `Esc`
-                    // backing out of that node's `PodContainers` also lands
-                    // here, and the listing it left behind is still current,
-                    // so `apply_containers` cleared it rather than
-                    // `App::pods` moving to `Loading` the way it does here.
-                    if matches!(app.pods(), PodsState::Loading)
-                        && let Some(context) = selected_context.as_deref()
-                    {
-                        pods_rx = Some(spawn_pods(context, node));
-                    }
-                }
-                View::PodContainers { namespace, pod, .. } => {
-                    if matches!(app.containers(), ContainersState::Loading)
-                        && let Some(context) = selected_context.as_deref()
-                    {
-                        containers_rx = Some(spawn_containers(context, namespace, pod));
-                    }
-                }
-                View::Overview => {
-                    pods_rx = None;
-                    containers_rx = None;
-                }
+            start_drill_fetch(&app, drill, selected_context.as_deref(), &mut inflight);
+        }
+    }
+}
+
+/// Start whichever fetch the detail pane's new view needs, once
+/// [`App::view`] has just changed to it.
+///
+/// Every branch but [`View::Overview`]'s also stops the fetches for the
+/// levels this view is not — unconditionally, not only when backing out of
+/// one: drilling *forward* past a level that never had a fetch running finds
+/// nothing there to clear, and backing *out* of one is exactly the case that
+/// has to end its stream (`ContainerLogs`'s, in particular — see
+/// [`Inflight::logs_handle`]).
+fn start_drill_fetch(
+    app: &App,
+    drill: &DrillFetchers<'_>,
+    context: Option<&str>,
+    inflight: &mut Inflight,
+) {
+    match app.view() {
+        View::NodePods { node } => {
+            inflight.containers = None;
+            inflight.logs = None;
+            drop(inflight.logs_handle.take());
+            // Only when drilling *forward* into this node — `Esc` backing
+            // out of that node's `PodContainers` also lands here, and the
+            // listing it left behind is still current, so `apply_containers`
+            // cleared it rather than `App::pods` moving to `Loading` the way
+            // it does here.
+            if matches!(app.pods(), PodsState::Loading)
+                && let Some(context) = context
+            {
+                inflight.pods = Some((drill.spawn_pods)(context, node));
             }
         }
+        View::PodContainers { namespace, pod, .. } => {
+            inflight.logs = None;
+            drop(inflight.logs_handle.take());
+            if matches!(app.containers(), ContainersState::Loading)
+                && let Some(context) = context
+            {
+                inflight.containers = Some((drill.spawn_containers)(context, namespace, pod));
+            }
+        }
+        View::ContainerLogs {
+            namespace,
+            pod,
+            container,
+            ..
+        } => {
+            if matches!(app.logs(), LogsState::Loading)
+                && let Some(context) = context
+            {
+                let (rx, handle) = (drill.spawn_logs)(context, namespace, pod, container);
+                inflight.logs = Some(rx);
+                inflight.logs_handle = Some(handle);
+            }
+        }
+        View::Overview => inflight.clear(),
     }
 }
 
@@ -1017,6 +1273,12 @@ fn draw_detail(frame: &mut Frame, area: Rect, app: &App) {
         View::Overview => " Overview ".to_owned(),
         View::NodePods { node } => format!(" Overview › {node} "),
         View::PodContainers { node, pod, .. } => format!(" Overview › {node} › {pod} "),
+        View::ContainerLogs {
+            node,
+            pod,
+            container,
+            ..
+        } => format!(" Overview › {node} › {pod} › {container} "),
     };
     let block = Block::bordered()
         .title(title)
@@ -1085,6 +1347,9 @@ fn draw_detail(frame: &mut Frame, area: Rect, app: &App) {
         View::PodContainers { .. } => {
             containers::draw(frame, sections[1], app.containers(), highlighted, theme);
         }
+        View::ContainerLogs { .. } => {
+            logs::draw(frame, sections[1], app.logs(), theme);
+        }
     }
 }
 
@@ -1110,18 +1375,32 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
         return;
     }
 
-    let hints = [
-        ("tab/→", "switch/drill"),
-        ("j/k", "move"),
-        ("enter", "open"),
-        ("←/esc", "back"),
-        ("r", "refresh"),
-        ("s/S", "sort"),
-        ("q", "quit"),
-    ];
+    let hints: &[(&str, &str)] = if matches!(app.view(), View::ContainerLogs { .. }) {
+        // A log has nothing to `enter` further into and no ordering `s`/`S`
+        // could apply to — `f`/`w` take their place, the two things this
+        // pane's own keys change.
+        &[
+            ("tab/→", "switch"),
+            ("j/k", "scroll"),
+            ("f", "follow"),
+            ("w", "wrap"),
+            ("←/esc", "back"),
+            ("q", "quit"),
+        ]
+    } else {
+        &[
+            ("tab/→", "switch/drill"),
+            ("j/k", "move"),
+            ("enter", "open"),
+            ("←/esc", "back"),
+            ("r", "refresh"),
+            ("s/S", "sort"),
+            ("q", "quit"),
+        ]
+    };
 
     let mut spans = vec![Span::raw(" ")];
-    for (key, action) in hints {
+    for &(key, action) in hints {
         spans.push(Span::styled(key, theme.heading()));
         spans.push(Span::styled(format!(" {action}   "), theme.dim()));
     }
@@ -1158,6 +1437,17 @@ mod tests {
 
     fn press(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    /// Unwrap the `LogsState::Streaming` a test expects, via `expect` rather
+    /// than a bare `panic!` — `clippy::panic` is denied crate-wide and does
+    /// not carve out tests the way `unwrap_used`/`expect_used` do above.
+    fn streaming(state: &LogsState) -> &logs::Log {
+        match state {
+            LogsState::Streaming(log) => Some(log),
+            LogsState::Loading | LogsState::Error(_) => None,
+        }
+        .expect("expected Streaming")
     }
 
     fn node_row(name: &str) -> crate::k8s::nodes::NodeRow {
@@ -1250,6 +1540,33 @@ mod tests {
         app.apply_pods(Ok(PodsFetch {
             rows: vec![pod_row("api-1")],
             selector_note: None,
+        }));
+        app
+    }
+
+    fn container_row(name: &str) -> crate::k8s::pods::ContainerRow {
+        crate::k8s::pods::ContainerRow {
+            name: name.to_owned(),
+            image: "app:1.0".to_owned(),
+            init: false,
+            ready: true,
+            restarts: 0,
+            state: "Running".to_owned(),
+            severity: crate::theme::Severity::Ok,
+            requests: crate::k8s::pods::Requests::default(),
+            cpu_limit: None,
+            memory_limit: None,
+        }
+    }
+
+    /// An app drilled one level further than [`app_with_pod`]: one container
+    /// already loaded under `api-1`, highlighted, ready to drill into its
+    /// logs.
+    fn app_with_container() -> App {
+        let mut app = app_with_pod();
+        app.on_key(press(KeyCode::Enter));
+        app.apply_containers(Ok(ContainersFetch {
+            rows: vec![container_row("app")],
         }));
         app
     }
@@ -1974,6 +2291,161 @@ mod tests {
 
         assert_eq!(app.on_key(press(KeyCode::Char('q'))), Flow::Continue);
         assert_eq!(app.view(), &view_before);
+    }
+
+    // --- Drilling into a container's logs -----------------------------------
+
+    #[test]
+    fn enter_drills_into_the_highlighted_containers_logs() {
+        let mut app = app_with_container();
+
+        app.on_key(press(KeyCode::Enter));
+
+        assert_eq!(
+            app.view(),
+            &View::ContainerLogs {
+                node: "worker-1".to_owned(),
+                namespace: "default".to_owned(),
+                pod: "api-1".to_owned(),
+                container: "app".to_owned(),
+            }
+        );
+        assert_eq!(app.logs(), &LogsState::Loading);
+        assert_eq!(
+            app.detail_selected(),
+            0,
+            "drilling in starts with nothing highlighted in the new list"
+        );
+    }
+
+    #[test]
+    fn enter_does_nothing_further_once_drilled_into_a_containers_logs() {
+        // There is nowhere left to go; this is the deepest a reader can get.
+        let mut app = app_with_container();
+        app.on_key(press(KeyCode::Enter));
+        let view_before = app.view().clone();
+
+        app.on_key(press(KeyCode::Enter));
+
+        assert_eq!(app.view(), &view_before);
+    }
+
+    #[test]
+    fn esc_backs_out_of_a_logs_drill_down_to_the_container_list_not_the_pod_list() {
+        let mut app = app_with_container();
+        app.on_key(press(KeyCode::Enter));
+        assert_eq!(app.logs(), &LogsState::Loading);
+
+        let flow = app.on_key(press(KeyCode::Esc));
+
+        assert_eq!(flow, Flow::Continue);
+        assert_eq!(
+            app.view(),
+            &View::PodContainers {
+                node: "worker-1".to_owned(),
+                namespace: "default".to_owned(),
+                pod: "api-1".to_owned(),
+            },
+            "esc backs out one level at a time, not straight to the pod list"
+        );
+    }
+
+    #[test]
+    fn q_is_a_no_op_while_drilled_into_a_containers_logs() {
+        let mut app = app_with_container();
+        app.on_key(press(KeyCode::Enter));
+        let view_before = app.view().clone();
+
+        assert_eq!(app.on_key(press(KeyCode::Char('q'))), Flow::Continue);
+        assert_eq!(app.view(), &view_before);
+    }
+
+    #[test]
+    fn apply_log_event_moves_loading_into_streaming_on_the_first_line() {
+        let mut app = app();
+
+        app.apply_log_event(LogEvent::Line("starting up".to_owned()));
+
+        assert!(matches!(app.logs(), LogsState::Streaming(_)));
+    }
+
+    #[test]
+    fn j_and_k_scroll_the_log_rather_than_moving_a_highlight() {
+        let mut app = app_with_container();
+        app.on_key(press(KeyCode::Enter));
+        for line in 1..=5 {
+            app.apply_log_event(LogEvent::Line(line.to_string()));
+        }
+
+        app.on_key(press(KeyCode::Char('k')));
+
+        let log = streaming(app.logs());
+        assert!(!log.follow(), "k must scroll the log, not a row highlight");
+        assert_eq!(app.detail_selected(), 0);
+    }
+
+    #[test]
+    fn f_and_w_toggle_follow_and_wrap_through_on_key() {
+        let mut app = app_with_container();
+        app.on_key(press(KeyCode::Enter));
+        app.apply_log_event(LogEvent::Line("one".to_owned()));
+
+        app.on_key(press(KeyCode::Char('k'))); // stop following first
+        app.on_key(press(KeyCode::Char('f')));
+        app.on_key(press(KeyCode::Char('w')));
+
+        let log = streaming(app.logs());
+        assert!(log.follow(), "f resumes following");
+        assert!(log.wrap(), "w turns wrap on");
+    }
+
+    #[test]
+    fn f_and_w_are_harmless_outside_the_logs_view() {
+        let mut app = app_with_node();
+
+        assert_eq!(app.on_key(press(KeyCode::Char('f'))), Flow::Continue);
+        assert_eq!(app.on_key(press(KeyCode::Char('w'))), Flow::Continue);
+        assert_eq!(app.logs(), &LogsState::Loading);
+    }
+
+    #[test]
+    fn a_frame_drilled_into_a_containers_logs_carries_the_full_breadcrumb() {
+        let mut app = app_with_container();
+        app.on_key(press(KeyCode::Enter));
+        app.apply_log_event(LogEvent::Line("listening on :8080".to_owned()));
+
+        let mut terminal = Terminal::new(TestBackend::new(90, 20)).unwrap();
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+
+        let rendered = terminal.backend().to_string();
+        assert!(
+            rendered.contains("Overview › worker-1 › api-1 › app"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("listening on :8080"), "{rendered}");
+    }
+
+    #[test]
+    fn rendering_a_containers_logs_survives_a_tiny_terminal() {
+        for (width, height) in [(1, 1), (8, 3), (20, 2), (200, 60)] {
+            let mut app = app_with_container();
+            app.on_key(press(KeyCode::Enter));
+
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            terminal.draw(|frame| draw(frame, &app)).unwrap();
+        }
+    }
+
+    #[test]
+    fn leave_detail_view_also_discards_a_drill_into_logs() {
+        let mut app = app_with_container();
+        app.on_key(press(KeyCode::Enter));
+        app.apply_log_event(LogEvent::Line("hello".to_owned()));
+
+        app.leave_detail_view();
+
+        assert_eq!(app.view(), &View::Overview);
+        assert_eq!(app.logs(), &LogsState::Loading);
     }
 
     #[test]

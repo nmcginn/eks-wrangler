@@ -22,13 +22,21 @@ path = "src/main.rs"
 anyhow = "1.0.104"
 clap = { version = "4.6.6", features = ["derive", "env", "wrap_help"] }
 directories = "6.0.0"
+# `kube::Api::log_stream` hands back a bare `futures::AsyncBufRead`, and
+# reading it line by line needs the extension traits — `kube-client` already
+# pulls this crate in for its own async I/O, so enabling it here adds no new
+# code to the dependency tree, only the two traits `k8s::pods::logs` calls.
+futures-util = { version = "0.3.34", default-features = false, features = ["io", "std"] }
 k8s-openapi = { version = "0.28.0", features = ["latest"] }
 kube = { version = "4.2.0", default-features = false, features = ["client", "config", "http-proxy", "ring", "rustls-tls"] }
 ratatui = "0.30.2"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_yaml_ng = "0.10.0"
 thiserror = "2.0.20"
-tokio = { version = "1.53.1", default-features = false, features = ["rt", "macros", "net", "time"] }
+# `sync` adds `tokio::sync::oneshot`, which is what lets a dropped
+# `commands::StreamHandle` interrupt a live log stream's read rather than
+# merely abandoning it — see that module's doc comment.
+tokio = { version = "1.53.1", default-features = false, features = ["rt", "macros", "net", "sync", "time"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 

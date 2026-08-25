@@ -457,17 +457,21 @@ request and outside anything this flag can interrupt.
 | Key | Action |
 | --- | --- |
 | `Tab` | Switch focus between the cluster list and the detail pane |
-| `j` / `k`, `↓` / `↑` | Move the highlight in whichever pane has focus |
-| `Home` / `End` | Jump to first / last |
-| `Enter` | Drill in — open the highlighted node's pods |
+| `j` / `k`, `↓` / `↑` | Move the highlight — or scroll a container's log, once you are drilled in that far |
+| `Home` / `End` | Jump to first / last — or to the oldest / newest line of a log |
+| `PageUp` / `PageDown` | Scroll a container's log a page at a time |
+| `Enter` | Drill in — a node's pods, a pod's containers, a container's log |
 | `Esc` | Back out one level; quits once there is nowhere left to back out to |
 | `r` | Refresh the node pane now |
+| `f` | Toggle following a container's log |
+| `w` | Toggle line wrap in a container's log |
 | `q`, `Ctrl-C` | Quit |
 
 Focus starts on the cluster list; the focused pane's border is highlighted.
-`Enter` on a node in the detail pane opens the pods placed on it, with a
-breadcrumb in the pane's own title (` Overview › <node> `); `Esc` returns to
-the node list.
+`Enter` drills one level further into the detail pane each time: a node's
+pods, a pod's containers, and a container's own log, followed live — with a
+breadcrumb in the pane's own title all the way down (` Overview › <node> ›
+<pod> › <container> `). `Esc` backs out one level at a time.
 
 `-l`/`--field-selector` narrow the pods shown for every node you drill into,
 the same selectors `eks pods` takes and validated the same way — a malformed

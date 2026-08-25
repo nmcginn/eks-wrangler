@@ -771,15 +771,50 @@ cluster.
   collapsing the two onto one word would have lost that difference. Recent
   events was cut from this task's original wording; see the follow-up below.
 
-- [ ] **Log viewing.**
+- [x] **Log viewing.**
   Stream logs for a container, with follow, scrollback, and wrap toggle.
   *Acceptance:* streaming never blocks input; leaving the view cancels the
   request; a 10k-line burst does not stall the UI.
+  Landed as `View::ContainerLogs`, drilled into from a highlighted row in the
+  pod-containers pane — the fourth level `View` grows without becoming a
+  stack; see decision 66. Streaming goes through `kube::Api::log_stream`
+  (`follow: true`, a 200-line tail to open with) pumped by
+  `commands::spawn_stream`, a new sibling to `commands::spawn` that hands the
+  task a cancellation signal instead of only a sender — the first fetch in
+  this tool that needed real cancellation rather than the free "just drop the
+  receiver" every one-shot fetch gets away with, because an open log costs
+  the API server a request for as long as nobody says otherwise. See decision
+  64. `ui::logs::Log` is the pane's bounded (10,000-line) scrollback; decision
+  65 is the arithmetic that keeps a paused view pointed at the same lines
+  while the buffer both grows and, past its cap, evicts from the front.
+  `j`/`k`/`Home`/`End`/`PageUp`/`PageDown` scroll it and `f`/`w` toggle follow
+  and wrap, all new keys this pane needed since it is the first detail view
+  with no rows to highlight.
 
 - [ ] **Fuzzy search.**
   `/` filters the current view. Fuzzy, case-insensitive, ranked.
   *Acceptance:* the matcher is a pure, tested function; filtering 10k rows stays
   under one frame — cover it with a benchmark.
+
+### Follow-ups from log viewing
+
+- [ ] **A container's previous log, for one that has already restarted.**
+  `eks pods` already shows `9 (5m ago)` for a crashing pod, and the log view
+  it opens onto shows only the *current* attempt's output — which for
+  `CrashLoopBackOff` is often nothing at all, or a container barely a second
+  old. `kubectl logs -p` reads the terminated container's log instead, which
+  is exactly the one that explains the crash. Separate from tonight's task
+  because it is a second connection mode on the same pane rather than a gap
+  in follow/scrollback/wrap: `LogParams::previous` needs its own toggle key,
+  its own answer for a container that has never restarted (nothing to show,
+  worded so it does not read like a failed connection), and a decision on
+  whether opening it forces `follow: false` — a terminated container's log
+  has already stopped growing, so following it would wait forever for a line
+  that is never coming.
+  *Acceptance:* the toggle goes through the same `LogEvent`/`LogsState`
+  machinery as the current log, not a second pane; a container with no
+  previous instance says so rather than opening an empty stream that looks
+  like a slow connection.
 
 ### Follow-ups from the pod-detail view
 
@@ -931,6 +966,43 @@ cluster.
 ---
 
 ## Done
+
+- **Log viewing** (2026-08-25) — `Enter` on a highlighted container in the
+  pod-containers pane opens its log, followed live: `Overview › worker-3 ›
+  api-7c9f › app`, the same breadcrumb style every drill-down uses.
+  `View::ContainerLogs` is the dashboard's fourth level, still a fixed enum
+  rather than the `Vec<View>` stack decision 60 once predicted a third level
+  might force — decision 66 revisits that call and finds it still holds, with
+  one genuine wrinkle: this is the first detail view with no rows to
+  highlight, so `App::detail_row_count` reads `0` for it and
+  `j`/`k`/`Home`/`End` are re-purposed inside it to scroll the log rather
+  than move a selection that does not exist; `PageUp`/`PageDown` are new
+  keys, and so are `f` (toggle follow) and `w` (toggle wrap), all shown in
+  place of `enter`/`s`/`S` in the footer whenever this view is showing.
+  Fetching is a different shape from every other pane's: `kube::Api::log_stream`
+  with `follow: true` keeps its connection open rather than answering once,
+  opened with 200 lines of backlog (`k8s::pods::logs::TAIL_LINES`) so
+  opening a long-lived container's log does not mean downloading its whole
+  history first. `commands::spawn_stream` is the new sibling to
+  `commands::spawn` this needed: every other background fetch can be
+  abandoned for free by dropping its `Receiver` (decision 51), but a
+  `follow`ed log keeps costing the API server a request until something says
+  otherwise, so this one hands the task a `tokio::sync::oneshot::Receiver`
+  raced against each read inside a `tokio::select!` loop — dropping the
+  `StreamHandle` the caller gets back is what actually ends the connection.
+  See decision 64 for why that differs from every cancellation this tool has
+  avoided building until now, including the credential helper's, which
+  cannot be cancelled at all because it blocks a thread rather than awaiting.
+  `ui::logs::Log` holds the pane's own state: a `VecDeque` scrollback capped
+  at 10,000 lines, `follow`/`wrap` booleans, and `hidden_below` — a count,
+  not an index, of how many of the newest lines are scrolled past the bottom
+  of the view. Decision 65 is the reasoning: incrementing that count by one
+  on every arrival while paused, whether or not the arrival also evicted the
+  buffer's oldest line, is what keeps a paused reader looking at the same
+  lines through both a still-growing buffer and one that has hit its cap and
+  started evicting — two situations that shift the underlying deque in
+  opposite directions, handled by the one counter because it was never a
+  position to begin with.
 
 - **Carry the "nothing ranked" note into the dashboard's panes** (2026-08-24)
   — `--sort cpu`/`s` in either pane now says so when the ordering it landed

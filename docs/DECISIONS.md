@@ -1945,3 +1945,89 @@ unsampled and unreadable cases both leave every row's `shows_usage` false,
 and only the unsampled branch of `usage_note` is ever `Some` — so the
 existing field carries enough information without a second one duplicating
 it.
+
+### 64. Log streaming gets real cancellation; decision 51's "discard is free" does not apply
+
+Every other background fetch answers once, and stopping early is free: drop
+the `Receiver`, and the abandoned thread's `tx.send` on a disconnected
+channel fails silently (decision 51). A `follow`ed log is not that shape — it
+is a live connection that keeps costing the API server a request for as long
+as nobody tells it to stop, so leaving the pane has to actually end it, not
+merely stop listening to it.
+
+`commands::spawn_stream` is `spawn`'s counterpart for that: the task gets a
+`tokio::sync::oneshot::Receiver<()>` alongside the sender, and
+`commands::pods::stream_logs` races it against `lines.next()` inside a
+`tokio::select!` loop. Dropping the `StreamHandle` the caller is handed back
+fires the oneshot, the `select!` never polls the read again, and the
+underlying `AsyncBufRead` — and with it the HTTP request — drops on the spot.
+This works *because* a log stream is ordinary async I/O, unlike the one thing
+in this tool that genuinely cannot be cancelled: the credential helper `kube`
+runs as a blocking `std::process::Command` inside `Client::try_from`, which
+is why `--timeout` covering it (decision 50) could only ever abandon it
+rather than stop it. `stream_logs` has no such blocking step in its own read
+loop, so the oneshot signal has something to interrupt.
+
+`Inflight` in `ui::mod` is where the event loop keeps the handle alive —
+`logs_handle` is never read, only held and eventually dropped or overwritten,
+which is the cancellation. Every place a drill-down view changes away from
+`ContainerLogs` clears it unconditionally rather than only when backing out,
+because drilling *forward* past a level that never had a stream running
+finds nothing there to clear either way, and writing the two cases
+separately would be two chances for one of them to forget.
+
+### 65. A paused log view is pinned by a hidden-line count, not a remembered index
+
+The scrollback buffer is a bounded `VecDeque` (decision-adjacent to nothing
+before this — the first bounded buffer in the tool), and the awkward
+question is what "scrolled up two lines" should still mean once the buffer
+keeps moving underneath it: new lines keep arriving at the bottom while
+paused, and past `MAX_LINES` every arrival also evicts one from the front.
+An absolute index into `lines` survives neither: a `VecDeque` index means
+different content after either kind of change.
+
+`Log::hidden_below` is a *count* — how many of the newest lines are below the
+bottom of the view — rather than a position, and `Log::push` increments it by
+one on every arrival while the view is paused, regardless of whether that
+arrival also evicted the oldest line. That one rule is what makes both cases
+come out right: while the buffer is still growing, `len` and `hidden_below`
+grow together, so `len - hidden_below` — the window's bottom edge — stays put
+and a paused reader keeps looking at exactly the lines they were looking at.
+Once the buffer is at capacity, `len` stops growing but `hidden_below` still
+climbs, so the bottom edge retreats by one exactly when eviction has shifted
+every surviving line's true index back by one. Two situations that move the
+underlying deque in opposite senses are handled by the same increment,
+because the quantity being counted was never a position to begin with.
+
+`Log::visible` still has to decide what "there is nothing older to reveal"
+means, and that answer needs the pane's row count, which only the renderer
+has — so `hidden_below` is never clamped at scroll time. `scroll_up` and
+`jump_to_start` simply record how far the reader asked to go, including past
+the oldest line that exists; `visible(rows)` is where the window's bottom
+edge is floored at `len.min(rows)`, which is what stops a `PageUp` on a short
+log from blanking the pane and is exactly the reading `jump_to_start` relies
+on to show everything rather than one line clinging to the top.
+
+### 66. `View` grew a fourth variant, still not a stack
+
+Decision 60 picked a fixed enum over a `Vec<View>` because a third level was
+hypothetical at the time — "a container's logs or its own detail view" was
+named as the next candidate and explicitly not scheduled. Tonight scheduled
+it. The reasoning that decided against a stack was about the *cost* of one
+outrunning its benefit at a known, small depth, not about three being some
+natural ceiling, and nothing about a fourth `View::ContainerLogs { node,
+namespace, pod, container }` arm changes that trade: `back_out_one_level`,
+`next_view`, and `draw_detail` are still one exhaustive `match` apiece, and
+the compiler still catches a level added to one without the others. A stack
+starts paying for itself once a *fifth* level is a real task rather than a
+guess at one — nothing on the roadmap names one yet.
+
+The one new wrinkle a stack would not have had either: `View::ContainerLogs`
+is the first variant whose detail pane is not a list of selectable rows.
+`App::detail_row_count` reads `0` for it and `j`/`k`/`Home`/`End` are
+special-cased in `on_key` to scroll the log instead of moving a highlight
+that does not exist there — `PageUp`/`PageDown` are new for the same reason,
+since a highlight-based pane never needed a "move by more than one" key. The
+footer hints branch on the same distinction, showing `f`/`w` in place of
+`enter`/`s`/`S`, which have nothing to do in a view with no rows to open
+further and no ordering to change.

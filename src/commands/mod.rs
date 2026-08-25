@@ -84,6 +84,62 @@ pub fn spawn<T: Send + 'static>(
     rx
 }
 
+/// A handle to a background stream, cancelled when this is dropped.
+///
+/// [`spawn`] has no way to say "stop" — its future runs once and the receiver
+/// is the whole contract. A live log tail is a different shape: it has no
+/// natural end a caller waits for, and the moment that matters is the reader
+/// leaving the view that was watching it. Cancellation here can reach
+/// *inside* the running task, unlike the credential helper `block_on`/`spawn`
+/// abandon rather than stop (see their own doc comments): a log stream is
+/// ordinary async I/O, so a signal the task is `select!`-ing against actually
+/// interrupts an idle read instead of a wait nothing can end.
+#[derive(Debug)]
+pub struct StreamHandle(Option<tokio::sync::oneshot::Sender<()>>);
+
+impl Drop for StreamHandle {
+    fn drop(&mut self) {
+        if let Some(stop) = self.0.take() {
+            // The receiving end is gone once the task has already finished on
+            // its own — nothing to tell it, and nothing wrong either.
+            let _ = stop.send(());
+        }
+    }
+}
+
+/// Run a task that sends zero or more values back over a channel, until it
+/// either finishes on its own or the returned [`StreamHandle`] is dropped.
+///
+/// `task` is handed the sender to push results into and a `stop` future that
+/// resolves the instant the handle is dropped; racing it against a read
+/// inside a `tokio::select!` loop is what lets a caller end a live connection
+/// rather than only stop waiting for one. Like [`spawn`], this runs on its
+/// own OS thread with a fresh current-thread runtime, shut down rather than
+/// dropped once the task returns — see that function's doc comment for why.
+pub fn spawn_stream<T, F, Fut>(task: F) -> (mpsc::Receiver<T>, StreamHandle)
+where
+    T: Send + 'static,
+    F: FnOnce(mpsc::Sender<T>, tokio::sync::oneshot::Receiver<()>) -> Fut + Send + 'static,
+    Fut: Future<Output = ()> + Send + 'static,
+{
+    let (tx, rx) = mpsc::channel();
+    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
+
+    std::thread::spawn(move || {
+        let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        else {
+            return;
+        };
+
+        runtime.block_on(task(tx, stop_rx));
+        runtime.shutdown_background();
+    });
+
+    (rx, StreamHandle(Some(stop_tx)))
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
@@ -168,5 +224,59 @@ mod tests {
             elapsed < Duration::from_secs(5),
             "waited {elapsed:?} for a task that had already been given up on"
         );
+    }
+
+    #[test]
+    fn spawn_stream_delivers_every_value_the_task_sends() {
+        let (rx, _handle) = spawn_stream(|tx, _stop| async move {
+            for value in [1, 2, 3] {
+                let _ = tx.send(value);
+            }
+        });
+
+        assert_eq!(rx.iter().collect::<Vec<_>>(), vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn dropping_the_handle_ends_a_task_that_would_otherwise_run_forever() {
+        // The whole reason this exists rather than `spawn`: a log tail has no
+        // natural end, and the only way out is a signal the task itself can
+        // notice — proven here by racing it against a future that never
+        // resolves on its own.
+        let started = std::time::Instant::now();
+
+        let (rx, handle) = spawn_stream(|tx, mut stop| async move {
+            let _ = tx.send("first");
+            // Blocks until either the stop signal fires or the sleep ends —
+            // the sleep is the "forever" this test must not wait out.
+            tokio::select! {
+                _ = &mut stop => {}
+                () = tokio::time::sleep(Duration::from_secs(3600)) => {}
+            }
+            let _ = tx.send("after select");
+        });
+
+        assert_eq!(rx.recv().unwrap(), "first");
+        drop(handle);
+        // The task's second send only happens once `select!` returns, so
+        // receiving it here proves the drop actually interrupted the sleep
+        // rather than merely stopping this test from waiting on it.
+        assert_eq!(rx.recv().unwrap(), "after select");
+
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "waited {elapsed:?} for a stream that should have been cancelled"
+        );
+    }
+
+    #[test]
+    fn a_task_that_finishes_on_its_own_needs_no_cancellation() {
+        let (rx, handle) = spawn_stream(|tx, _stop| async move {
+            let _ = tx.send("done");
+        });
+
+        assert_eq!(rx.recv().unwrap(), "done");
+        drop(handle);
     }
 }
