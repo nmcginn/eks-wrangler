@@ -23,12 +23,20 @@ use kube::api::LogParams;
 pub const TAIL_LINES: i64 = 200;
 
 /// The parameters one container's log is opened with: this container by
-/// name, followed live, starting from [`TAIL_LINES`] lines of backlog.
+/// name, starting from [`TAIL_LINES`] lines of backlog.
+///
+/// `previous` asks for the log of the instance before the one currently
+/// running — `kubectl logs -p` — which forces `follow` off regardless of
+/// what the caller might otherwise want: a terminated container's log has
+/// already stopped growing, so following it would wait forever for a line
+/// that is never coming. The current instance's log is still followed live,
+/// as it always was.
 #[must_use]
-pub fn params(container: &str) -> LogParams {
+pub fn params(container: &str, previous: bool) -> LogParams {
     LogParams {
         container: Some(container.to_owned()),
-        follow: true,
+        follow: !previous,
+        previous,
         tail_lines: Some(TAIL_LINES),
         ..LogParams::default()
     }
@@ -56,7 +64,7 @@ mod tests {
 
     #[test]
     fn params_name_the_container_and_ask_to_follow_from_a_tail() {
-        let lp = params("app");
+        let lp = params("app", false);
 
         assert_eq!(lp.container.as_deref(), Some("app"));
         assert!(lp.follow);
@@ -65,11 +73,23 @@ mod tests {
 
     #[test]
     fn params_leave_everything_else_at_the_grammars_default() {
-        let lp = params("app");
+        let lp = params("app", false);
 
         assert!(!lp.previous);
         assert_eq!(lp.since_seconds, None);
         assert_eq!(lp.limit_bytes, None);
         assert!(!lp.timestamps);
+    }
+
+    #[test]
+    fn previous_asks_for_the_prior_instance_and_never_follows() {
+        let lp = params("app", true);
+
+        assert!(lp.previous);
+        assert!(
+            !lp.follow,
+            "a terminated container's log has stopped growing; following it would hang"
+        );
+        assert_eq!(lp.tail_lines, Some(TAIL_LINES));
     }
 }

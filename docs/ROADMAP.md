@@ -835,23 +835,34 @@ cluster.
 
 ### Follow-ups from log viewing
 
-- [ ] **A container's previous log, for one that has already restarted.**
+- [x] **A container's previous log, for one that has already restarted.**
   `eks pods` already shows `9 (5m ago)` for a crashing pod, and the log view
   it opens onto shows only the *current* attempt's output — which for
   `CrashLoopBackOff` is often nothing at all, or a container barely a second
   old. `kubectl logs -p` reads the terminated container's log instead, which
-  is exactly the one that explains the crash. Separate from tonight's task
-  because it is a second connection mode on the same pane rather than a gap
-  in follow/scrollback/wrap: `LogParams::previous` needs its own toggle key,
-  its own answer for a container that has never restarted (nothing to show,
-  worded so it does not read like a failed connection), and a decision on
-  whether opening it forces `follow: false` — a terminated container's log
-  has already stopped growing, so following it would wait forever for a line
-  that is never coming.
+  is exactly the one that explains the crash.
   *Acceptance:* the toggle goes through the same `LogEvent`/`LogsState`
   machinery as the current log, not a second pane; a container with no
   previous instance says so rather than opening an empty stream that looks
   like a slow connection.
+  Landed as `p`, added to `View::ContainerLogs` itself rather than a
+  separate field on `App` — flipping it is a view change like drilling in or
+  backing out, so it reuses `event_loop`'s existing "the view just changed,
+  (re)fetch" wiring instead of a second trigger, and `start_drill_fetch`'s
+  `ContainerLogs` arm now unconditionally drops the previous fetch before
+  deciding whether to start a new one, so switching modes can never leave
+  the old stream running alongside the new one. The restart count comes
+  from `App::containers` — the listing this pane's own drill-down already
+  left in place — rather than a second copy carried on `View`. Refusing to
+  open a previous log a container has never had needed its own state,
+  `LogsState::Unavailable`, worded and coloured as information rather than
+  as `Error`'s failure; `p` still flips `previous` even on that refusal, so
+  a second press is always the way back to whatever was showing before,
+  rather than a dead end. `logs::params`'s answer to "does opening a
+  previous log force `follow: false`" was yes: a terminated container's log
+  has already stopped growing, so following it would wait forever for a
+  line that is never coming — the current log is unaffected and still
+  follows exactly as it always has.
 
 ### Follow-ups from the pod-detail view
 

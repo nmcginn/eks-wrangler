@@ -465,6 +465,7 @@ request and outside anything this flag can interrupt.
 | `r` | Refresh the node pane now |
 | `f` | Toggle following a container's log |
 | `w` | Toggle line wrap in a container's log |
+| `p` | Switch a container's log between its current instance and its previous one |
 | `q`, `Ctrl-C` | Quit |
 
 Focus starts on the cluster list; the focused pane's border is highlighted.

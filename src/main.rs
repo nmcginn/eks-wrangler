@@ -201,21 +201,25 @@ fn dashboard(
     };
 
     // The deepest level: called once each time drilling into a container
-    // changes which one the detail pane is showing. `budget` still bounds
-    // connecting and opening the log, but not the `follow`ed read after
-    // that — see `commands::pods::stream_logs`.
+    // changes which one the detail pane is showing, and again whenever `p`
+    // switches it between that container's current log and its previous
+    // instance's. `budget` still bounds connecting and opening the log, but
+    // not the `follow`ed read after that — see `commands::pods::stream_logs`.
     let spawn_logs: ui::LogsFetcher = {
         let config = config.clone();
         let paths = paths.to_vec();
         Box::new(
-            move |context: &str, namespace: &str, pod: &str, container: &str| {
+            move |context: &str, namespace: &str, pod: &str, container: &str, previous: bool| {
                 pods::spawn_stream_logs(
                     config.clone(),
                     paths.clone(),
                     Some(context.to_owned()),
-                    namespace.to_owned(),
-                    pod.to_owned(),
-                    container.to_owned(),
+                    pods::LogRequest {
+                        namespace: namespace.to_owned(),
+                        pod: pod.to_owned(),
+                        container: container.to_owned(),
+                        previous,
+                    },
                     budget,
                 )
             },

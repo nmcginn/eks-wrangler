@@ -62,12 +62,13 @@ pub type PodsFetcher = Box<dyn Fn(&str, &str) -> mpsc::Receiver<Result<PodsFetch
 pub type ContainersFetcher =
     Box<dyn Fn(&str, &str, &str) -> mpsc::Receiver<Result<ContainersFetch, String>>>;
 
-/// Starts streaming one container's log, given its pod's namespace and name
-/// and the container's own name. Unlike the other fetchers, the returned
-/// [`StreamHandle`] is not incidental — dropping it is the only way the
-/// stream this starts ever stops.
+/// Starts streaming one container's log, given its pod's namespace and name,
+/// the container's own name, and whether to open its previous instance's log
+/// (`kubectl logs -p`) rather than its current one. Unlike the other
+/// fetchers, the returned [`StreamHandle`] is not incidental — dropping it is
+/// the only way the stream this starts ever stops.
 pub type LogsFetcher =
-    Box<dyn Fn(&str, &str, &str, &str) -> (mpsc::Receiver<LogEvent>, StreamHandle)>;
+    Box<dyn Fn(&str, &str, &str, &str, bool) -> (mpsc::Receiver<LogEvent>, StreamHandle)>;
 
 /// How often the dashboard automatically starts a new node fetch, on top of
 /// pressing `r` to refresh on demand.
@@ -179,6 +180,13 @@ pub enum View {
         namespace: String,
         pod: String,
         container: String,
+        /// Whether this is the container's previous instance's log —
+        /// `kubectl logs -p` — rather than its current one. Part of `View`
+        /// rather than a separate field on `App`, so toggling it is a view
+        /// change like drilling in or backing out, and reuses the same
+        /// "view changed, so (re)fetch" wiring in `event_loop` instead of a
+        /// second trigger.
+        previous: bool,
     },
 }
 
@@ -708,6 +716,7 @@ impl App {
                     namespace: namespace.clone(),
                     pod: pod.clone(),
                     container: container.name.clone(),
+                    previous: false,
                 })
             }
             View::ContainerLogs { .. } => None,
@@ -792,6 +801,10 @@ impl App {
                 pod,
                 ..
             } => {
+                // `previous` does not survive backing out — the container
+                // list is not carrying a "which mode was it in" question of
+                // its own, and re-entering later should start from the
+                // current log, the same default a fresh drill-in gets.
                 self.view = View::PodContainers {
                     node: node.clone(),
                     namespace: namespace.clone(),
@@ -947,6 +960,49 @@ impl App {
         }
     }
 
+    /// `p`: switch the container-logs pane between a container's current log
+    /// and its previous instance's — `kubectl logs -p`'s connection mode, for
+    /// the container that crashed and is worth reading the log of the
+    /// attempt *before* the one currently running.
+    ///
+    /// A no-op outside [`View::ContainerLogs`], the same shape every other
+    /// key this pane owns has. `previous` always flips, both directions, so
+    /// a second press of `p` always undoes the first — including out of the
+    /// refusal below, which would otherwise be a dead end with no key back to
+    /// the log that was showing before it. A container that has never
+    /// restarted has no previous instance to open, so switching *to*
+    /// `previous` on one is refused: rather than starting a fetch that could
+    /// only ever answer "not found" — which reads exactly like a slow
+    /// connection until it does — [`LogsState::Unavailable`] says so
+    /// immediately, and still ends the current log's stream the ordinary
+    /// "view just changed" way, through `start_drill_fetch`'s unconditional
+    /// drop. The restart count comes from [`Self::containers`], the listing
+    /// this pane's own drill-down already left in place, rather than a
+    /// second copy carried on `View` itself.
+    fn toggle_log_previous(&mut self) {
+        let View::ContainerLogs { container, .. } = &self.view else {
+            return;
+        };
+        let has_previous = self
+            .containers
+            .rows()
+            .iter()
+            .any(|row| row.name == *container && row.restarts > 0);
+
+        let View::ContainerLogs { previous, .. } = &mut self.view else {
+            return;
+        };
+        *previous = !*previous;
+
+        self.logs = if *previous && !has_previous {
+            LogsState::Unavailable(
+                "This container has never restarted, so it has no previous log.".to_owned(),
+            )
+        } else {
+            LogsState::Loading
+        };
+    }
+
     /// Handle a key press.
     ///
     /// Supports both arrow keys and vim-style `j`/`k`, because the people who
@@ -1030,6 +1086,7 @@ impl App {
             }
             KeyCode::Char('f') => self.toggle_log_follow(),
             KeyCode::Char('w') => self.toggle_log_wrap(),
+            KeyCode::Char('p') => self.toggle_log_previous(),
             KeyCode::Char('j') | KeyCode::Down => match self.focus {
                 Focus::Sidebar => self.select_next(),
                 Focus::Detail => self.select_next_detail_row(),
@@ -1084,9 +1141,12 @@ impl App {
 /// further in: the selected cluster's context, and the namespace and name of
 /// the drilled-into pod, whenever the view changes to [`View::PodContainers`].
 /// `spawn_logs` is the last level: the selected cluster's context, the
-/// drilled-into pod's namespace and name, and the drilled-into container's
-/// name, whenever the view changes to [`View::ContainerLogs`]. Unlike the
-/// other three, the [`StreamHandle`] it hands back alongside the receiver has
+/// drilled-into pod's namespace and name, the drilled-into container's name,
+/// and whether to open its previous instance's log rather than its current
+/// one, whenever the view changes to or within [`View::ContainerLogs`] — `p`
+/// flipping that last flag counts as "within" the same way drilling in the
+/// first time counts as "to". Unlike the other three, the [`StreamHandle`] it
+/// hands back alongside the receiver has
 /// to be held onto for as long as the pane is showing that stream and
 /// dropped the moment it is not — see [`crate::commands::spawn_stream`]'s doc
 /// comment for why dropping it is what actually ends the connection, rather
@@ -1303,12 +1363,22 @@ fn start_drill_fetch(
             namespace,
             pod,
             container,
+            previous,
             ..
         } => {
+            // Unconditional, unlike the fetch itself below: this view can
+            // change *within* itself — `p` flips `previous` without leaving
+            // `ContainerLogs` — and the stream that answers is only ever
+            // cancelled by dropping its `StreamHandle`, so switching modes
+            // without dropping the old one first would leave it running
+            // uselessly alongside the new one.
+            inflight.logs = None;
+            drop(inflight.logs_handle.take());
             if matches!(app.logs(), LogsState::Loading)
                 && let Some(context) = context
             {
-                let (rx, handle) = (drill.spawn_logs)(context, namespace, pod, container);
+                let (rx, handle) =
+                    (drill.spawn_logs)(context, namespace, pod, container, *previous);
                 inflight.logs = Some(rx);
                 inflight.logs_handle = Some(handle);
             }
@@ -1533,8 +1603,8 @@ fn draw_detail(frame: &mut Frame, area: Rect, app: &App) {
                 theme,
             );
         }
-        View::ContainerLogs { .. } => {
-            logs::draw(frame, sections[1], app.logs(), theme);
+        View::ContainerLogs { previous, .. } => {
+            logs::draw(frame, sections[1], app.logs(), *previous, theme);
         }
     }
 }
@@ -1568,13 +1638,14 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
         &[("type", "filter"), ("enter", "apply"), ("esc", "cancel")]
     } else if matches!(app.view(), View::ContainerLogs { .. }) {
         // A log has nothing to `enter` further into and no ordering `s`/`S`
-        // could apply to — `f`/`w` take their place, the two things this
-        // pane's own keys change.
+        // could apply to — `f`/`w`/`p` take their place, the three things
+        // this pane's own keys change.
         &[
             ("tab/→", "switch"),
             ("j/k", "scroll"),
             ("f", "follow"),
             ("w", "wrap"),
+            ("p", "previous"),
             ("←/esc", "back"),
             ("q", "quit"),
         ]
@@ -1640,7 +1711,7 @@ mod tests {
     fn streaming(state: &LogsState) -> &logs::Log {
         match state {
             LogsState::Streaming(log) => Some(log),
-            LogsState::Loading | LogsState::Error(_) => None,
+            LogsState::Loading | LogsState::Error(_) | LogsState::Unavailable(_) => None,
         }
         .expect("expected Streaming")
     }
@@ -1774,6 +1845,21 @@ mod tests {
         app.on_key(press(KeyCode::Enter));
         app.apply_containers(Ok(ContainersFetch {
             rows: vec![container_row("app")],
+        }));
+        app
+    }
+
+    /// [`app_with_container`]'s counterpart for the `p` (previous log) tests:
+    /// a container that has restarted, so it has a previous instance to
+    /// switch to.
+    fn app_with_crashed_container() -> App {
+        let mut app = app_with_pod();
+        app.on_key(press(KeyCode::Enter));
+        app.apply_containers(Ok(ContainersFetch {
+            rows: vec![crate::k8s::pods::ContainerRow {
+                restarts: 3,
+                ..container_row("app")
+            }],
         }));
         app
     }
@@ -2515,6 +2601,7 @@ mod tests {
                 namespace: "default".to_owned(),
                 pod: "api-1".to_owned(),
                 container: "app".to_owned(),
+                previous: false,
             }
         );
         assert_eq!(app.logs(), &LogsState::Loading);
@@ -2613,6 +2700,87 @@ mod tests {
         assert_eq!(app.on_key(press(KeyCode::Char('f'))), Flow::Continue);
         assert_eq!(app.on_key(press(KeyCode::Char('w'))), Flow::Continue);
         assert_eq!(app.logs(), &LogsState::Loading);
+    }
+
+    #[test]
+    fn p_switches_a_restarted_containers_log_to_its_previous_instance() {
+        let mut app = app_with_crashed_container();
+        app.on_key(press(KeyCode::Enter));
+        app.apply_log_event(LogEvent::Line("current instance's output".to_owned()));
+
+        app.on_key(press(KeyCode::Char('p')));
+
+        assert!(matches!(
+            app.view(),
+            View::ContainerLogs { previous: true, .. }
+        ));
+        assert_eq!(
+            app.logs(),
+            &LogsState::Loading,
+            "switching modes starts a fresh fetch rather than keeping the old lines"
+        );
+    }
+
+    #[test]
+    fn p_switches_back_to_the_current_log_on_a_second_press() {
+        let mut app = app_with_crashed_container();
+        app.on_key(press(KeyCode::Enter));
+        app.on_key(press(KeyCode::Char('p')));
+
+        app.on_key(press(KeyCode::Char('p')));
+
+        assert!(matches!(
+            app.view(),
+            View::ContainerLogs {
+                previous: false,
+                ..
+            }
+        ));
+        assert_eq!(app.logs(), &LogsState::Loading);
+    }
+
+    #[test]
+    fn p_on_a_never_restarted_container_says_so_rather_than_fetching() {
+        let mut app = app_with_container(); // restarts: 0
+        app.on_key(press(KeyCode::Enter));
+
+        app.on_key(press(KeyCode::Char('p')));
+
+        assert!(
+            matches!(app.logs(), LogsState::Unavailable(message) if message.contains("never restarted")),
+            "{:?}",
+            app.logs()
+        );
+    }
+
+    #[test]
+    fn p_recovers_from_the_no_previous_log_message_on_a_second_press() {
+        // The refusal must not be a dead end: a second `p` has to be able to
+        // undo the first, the same as it does when there was a previous log
+        // to switch to.
+        let mut app = app_with_container();
+        app.on_key(press(KeyCode::Enter));
+        app.on_key(press(KeyCode::Char('p')));
+        assert!(matches!(app.logs(), LogsState::Unavailable(_)));
+
+        app.on_key(press(KeyCode::Char('p')));
+
+        assert!(matches!(
+            app.view(),
+            View::ContainerLogs {
+                previous: false,
+                ..
+            }
+        ));
+        assert_eq!(app.logs(), &LogsState::Loading);
+    }
+
+    #[test]
+    fn p_is_harmless_outside_the_logs_view() {
+        let mut app = app_with_node();
+
+        assert_eq!(app.on_key(press(KeyCode::Char('p'))), Flow::Continue);
+        assert_eq!(app.view(), &View::Overview);
     }
 
     #[test]
