@@ -43,6 +43,13 @@ pub enum LogsState {
     /// apart from one that simply has not printed anything yet. Already a
     /// full sentence, via `k8s::explain`.
     Error(String),
+    /// There is nothing to connect for — `super::App::toggle_log_previous`
+    /// refused to open a previous-instance log a container has never had,
+    /// before starting a fetch that could only ever answer "not found."
+    /// Distinct from [`Self::Error`], which is a connection that was
+    /// attempted and failed: this is not a failure, so it is worded and
+    /// coloured as information rather than as one.
+    Unavailable(String),
 }
 
 impl LogsState {
@@ -77,7 +84,13 @@ impl LogsState {
                 // Already told apart from every other case: an `Error` never
                 // had a `Log` to keep streaming into, and a second `Ended`
                 // for one connection is not a shape the stream produces.
-                (Self::Error(_), _) => {}
+                // `Unavailable` never had one either, for a different
+                // reason — no connection was ever opened for this to answer;
+                // `App` always drops the fetch that would otherwise deliver
+                // this event before setting that state, so it should not
+                // arise in practice, and ignoring it here is the same choice
+                // as `Error`'s.
+                (Self::Error(_) | Self::Unavailable(_), _) => {}
             },
         }
     }
@@ -241,15 +254,23 @@ impl Log {
     }
 }
 
-/// Draw whatever the container-logs pane currently knows.
-pub(super) fn draw(frame: &mut Frame, area: Rect, state: &LogsState, theme: Theme) {
+/// Draw whatever the container-logs pane currently knows. `previous` is
+/// [`super::View::ContainerLogs`]'s own flag, threaded down here rather than
+/// read off `state` — a loading connection and an unavailable one both need
+/// to say which log they are (or were) asking for, and neither carries a
+/// [`Log`] of its own to hold it.
+pub(super) fn draw(frame: &mut Frame, area: Rect, state: &LogsState, previous: bool, theme: Theme) {
     let lines = match state {
+        LogsState::Loading if previous => {
+            vec![Line::styled("Loading previous logs…", theme.dim())]
+        }
         LogsState::Loading => vec![Line::styled("Loading logs…", theme.dim())],
+        LogsState::Unavailable(message) => vec![Line::styled(message.clone(), theme.dim())],
         LogsState::Error(message) => vec![Line::styled(
             message.clone(),
             theme.severity(Severity::Critical),
         )],
-        LogsState::Streaming(log) => log_lines(log, area, theme),
+        LogsState::Streaming(log) => log_lines(log, previous, area, theme),
     };
 
     let mut paragraph = Paragraph::new(lines);
@@ -259,8 +280,8 @@ pub(super) fn draw(frame: &mut Frame, area: Rect, state: &LogsState, theme: Them
     frame.render_widget(paragraph, area);
 }
 
-fn log_lines(log: &Log, area: Rect, theme: Theme) -> Vec<Line<'_>> {
-    let mut lines = vec![heading(log, theme)];
+fn log_lines(log: &Log, previous: bool, area: Rect, theme: Theme) -> Vec<Line<'_>> {
+    let mut lines = vec![heading(log, previous, theme)];
     if let Status::Failed(message) = log.status() {
         lines.push(Line::styled(
             format!("Stream ended: {message}"),
@@ -285,7 +306,7 @@ fn log_lines(log: &Log, area: Rect, theme: Theme) -> Vec<Line<'_>> {
     lines
 }
 
-fn heading(log: &Log, theme: Theme) -> Line<'static> {
+fn heading(log: &Log, previous: bool, theme: Theme) -> Line<'static> {
     let follow = if log.follow() {
         "following"
     } else {
@@ -297,9 +318,13 @@ fn heading(log: &Log, theme: Theme) -> Line<'static> {
         Status::Finished => "  · stream ended",
         Status::Failed(_) => "  · stream failed",
     };
+    // Silent for the common case — the current log — the same rule
+    // `k8s::order::note` follows for the default ordering: only the
+    // unusual reading says anything about itself.
+    let title = if previous { "LOGS · previous" } else { "LOGS" };
 
     Line::from(vec![
-        Span::styled("LOGS", theme.heading()),
+        Span::styled(title, theme.heading()),
         Span::styled(format!("  {follow} · {wrap}{ended}"), theme.dim()),
     ])
 }
@@ -320,9 +345,13 @@ mod tests {
     }
 
     fn render(state: &LogsState) -> String {
+        render_with(state, false)
+    }
+
+    fn render_with(state: &LogsState, previous: bool) -> String {
         let mut terminal = Terminal::new(TestBackend::new(90, 20)).unwrap();
         terminal
-            .draw(|frame| draw(frame, frame.area(), state, Theme::dark()))
+            .draw(|frame| draw(frame, frame.area(), state, previous, Theme::dark()))
             .unwrap();
         terminal.backend().to_string()
     }
@@ -333,7 +362,7 @@ mod tests {
     fn streaming(state: &LogsState) -> &Log {
         match state {
             LogsState::Streaming(log) => Some(log),
-            LogsState::Loading | LogsState::Error(_) => None,
+            LogsState::Loading | LogsState::Error(_) | LogsState::Unavailable(_) => None,
         }
         .expect("expected Streaming")
     }
@@ -565,6 +594,38 @@ mod tests {
     }
 
     #[test]
+    fn loading_a_previous_log_says_so_rather_than_reading_like_the_current_one() {
+        let rendered = render_with(&LogsState::Loading, true);
+        assert!(rendered.contains("Loading previous logs"), "{rendered}");
+    }
+
+    #[test]
+    fn a_streaming_previous_log_names_itself_in_the_heading() {
+        let mut state = LogsState::default();
+        lines(&mut state, &["one"]);
+
+        let rendered = render_with(&state, true);
+        assert!(rendered.contains("LOGS · previous"), "{rendered}");
+    }
+
+    #[test]
+    fn the_current_log_heading_says_nothing_extra() {
+        let mut state = LogsState::default();
+        lines(&mut state, &["one"]);
+
+        let rendered = render(&state);
+        assert!(!rendered.contains("previous"), "{rendered}");
+    }
+
+    #[test]
+    fn an_unavailable_previous_log_says_so_rather_than_reading_like_a_failure() {
+        let rendered = render(&LogsState::Unavailable(
+            "This container has never restarted, so it has no previous log.".to_owned(),
+        ));
+        assert!(rendered.contains("has never restarted"), "{rendered}");
+    }
+
+    #[test]
     fn an_empty_stream_says_so_rather_than_rendering_nothing() {
         let mut state = LogsState::default();
         state.apply(LogEvent::Ended(None));
@@ -610,7 +671,7 @@ mod tests {
         for (width, height) in [(1, 1), (8, 3), (20, 2), (200, 60)] {
             let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
             terminal
-                .draw(|frame| draw(frame, frame.area(), &state, Theme::dark()))
+                .draw(|frame| draw(frame, frame.area(), &state, false, Theme::dark()))
                 .unwrap();
         }
     }

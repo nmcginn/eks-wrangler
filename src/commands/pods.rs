@@ -384,34 +384,54 @@ struct LogTarget<'a> {
     namespace: &'a str,
     pod: &'a str,
     container: &'a str,
+    /// Whether to open the container's previous instance's log —
+    /// `kubectl logs -p` — rather than the one currently running.
+    previous: bool,
 }
 
-/// Stream one container's log, live, on a background thread.
+/// [`spawn_stream_logs`]'s counterpart to `LogTarget`, for the same
+/// too-many-arguments reason: owning its strings, rather than borrowing them
+/// the way `LogTarget` does, because it has to outlive the async block
+/// `spawn_stream_logs` moves it into.
+#[derive(Debug)]
+pub struct LogRequest {
+    pub namespace: String,
+    pub pod: String,
+    pub container: String,
+    /// Whether to open the container's previous instance's log —
+    /// `kubectl logs -p` — rather than the one currently running.
+    pub previous: bool,
+}
+
+/// Stream one container's log on a background thread — its current instance,
+/// live, or its previous one, per `target.previous`.
 ///
-/// Unlike every other fetch in this module, this never finishes on its own —
-/// `LogParams::follow` keeps the connection open for as long as the container
-/// keeps printing, so the [`StreamHandle`] this returns alongside the
-/// receiver is not bookkeeping, it is the only way the pane ever stops
-/// reading. Dropping it — which the event loop does the moment the
-/// dashboard's log pane backs out — is what ends the connection; see
-/// [`commands::spawn_stream`]'s doc comment for how a signal reaches inside
-/// the read loop below.
+/// Unlike every other fetch in this module, a current-instance stream never
+/// finishes on its own — `LogParams::follow` keeps the connection open for as
+/// long as the container keeps printing, so the [`StreamHandle`] this returns
+/// alongside the receiver is not bookkeeping, it is the only way the pane
+/// ever stops reading. Dropping it — which the event loop does the moment the
+/// dashboard's log pane backs out, or switches to the other instance — is
+/// what ends the connection; see [`commands::spawn_stream`]'s doc comment for
+/// how a signal reaches inside the read loop below. A previous-instance
+/// stream has already stopped growing by the time it is opened (see
+/// [`logs::params`]), so it ends on its own once read, the same as it would
+/// if `stop` fired first.
 #[must_use]
 pub fn spawn_stream_logs(
     config: KubeConfig,
     paths: Vec<PathBuf>,
     cluster: Option<String>,
-    namespace: String,
-    pod: String,
-    container: String,
+    request: LogRequest,
     budget: page::Budget,
 ) -> (mpsc::Receiver<LogEvent>, StreamHandle) {
     commands::spawn_stream(move |tx, stop| async move {
         let target = LogTarget {
             cluster: cluster.as_deref(),
-            namespace: &namespace,
-            pod: &pod,
-            container: &container,
+            namespace: &request.namespace,
+            pod: &request.pod,
+            container: &request.container,
+            previous: request.previous,
         };
         stream_logs(&config, &paths, target, budget, &tx, stop).await;
     })
@@ -456,7 +476,7 @@ async fn stream_logs(
     };
 
     let api: Api<Pod> = Api::namespaced(client, target.namespace);
-    let lp = logs::params(target.container);
+    let lp = logs::params(target.container, target.previous);
     let stream = match budget.wrap(api.log_stream(target.pod, &lp)).await {
         Ok(stream) => stream,
         Err(error) => {

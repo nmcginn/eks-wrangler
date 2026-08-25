@@ -363,6 +363,15 @@ one real wrinkle a stack would not have had either: a pane with no rows to
 highlight, which is why `j`/`k`/`Home`/`End` mean something different inside
 it than everywhere else in the dashboard.
 
+`ContainerLogs` carries a `previous` flag alongside its identity fields,
+`p`'s toggle between a container's current log and its terminated instance's
+(`kubectl logs -p`). A previous-instance stream does not `follow` — see
+`k8s::pods::logs::params` — so it answers once and ends on its own, the same
+as any other fetch; only the current instance keeps its connection open the
+way the paragraph above describes. See decision 69 for why the flag lives on
+`View` rather than beside `App`'s other pane state, and for how a container
+that has never restarted is refused without ever opening a connection.
+
 ## Testing
 
 Run `make test`. The suite needs no cluster, no credentials, and no network, and

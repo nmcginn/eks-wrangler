@@ -2078,3 +2078,43 @@ two apart afterwards. `Filter::Editing` — text still being typed — is
 different again: `Esc` there cancels outright rather than clearing-then-
 backing-out, since there is nothing committed yet to "back out of" one step
 at a time.
+
+### 69. The previous-log toggle lives on `View`, and always flips
+
+`p` switches the container-logs pane between a container's current log and
+its previous instance's (`kubectl logs -p`). The obvious place to keep
+"which one" is a field on `App`, the way `Filter` and the sort orders are —
+but every one of those is read by a `draw` function and nothing else decides
+whether to fetch on its account. A log's mode decides *what gets fetched*,
+and `event_loop` already has exactly one trigger for that: "the view just
+changed, so ask `start_drill_fetch` what it needs now." Putting `previous`
+on `View::ContainerLogs` itself means flipping it is a view change like
+drilling in or backing out, and reuses that wiring outright rather than
+teaching `event_loop` a second reason to refetch.
+
+The harder call was what happens when there is nothing to switch to. A
+container that has never restarted has no previous instance, and opening a
+connection that could only ever answer "not found" would read as a hung
+fetch until it did — so `toggle_log_previous` checks the restart count
+(read from `App::containers`, the listing this pane's own drill-down already
+left in place, rather than a second copy carried on `View`) and refuses
+before anything is sent. The first version of that refusal left `previous`
+unchanged and only overwrote `self.logs` with a message — which meant a
+second `p` re-ran the identical refusal forever, because nothing about the
+state that decides "am I trying to switch" had moved. `p` now always flips
+`previous`, refusal or not; a switch that lands on "previous" with nothing
+there sets `LogsState::Unavailable` instead of fetching, and a second press
+flips back to `false` and fetches the current log exactly as it would from
+any other starting point. `Unavailable` is deliberately not `Error`: an
+`Error` is a connection that was attempted and failed, styled to match, and
+this is neither — the connection was never opened, and the message is
+information, not a fault. Flipping `previous` unconditionally also means the
+refusal is a real view change, so `start_drill_fetch`'s unconditional drop
+of the previous fetch still runs and the stream that was showing the current
+log is not left running unread behind the message.
+
+`k8s::pods::logs::params` answers the one question the roadmap entry left
+open, whether opening a previous log should force `follow: false`: yes,
+unconditionally, because a terminated container's log has already stopped
+growing and a `follow`ed read of one would sit open waiting for a line that
+is never coming. The current log's own `follow: true` is untouched.
