@@ -551,6 +551,7 @@ dependencies = [
  "anyhow",
  "clap",
  "directories",
+ "futures-util",
  "insta",
  "k8s-openapi",
  "kube",

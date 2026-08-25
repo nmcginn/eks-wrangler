@@ -334,6 +334,35 @@ level — a second press within a short window, tracked by one
 `Option<Instant>` field on `App`, now confirms it, with `Ctrl+C` staying an
 unconditional, immediate quit throughout. See decision 62.
 
+The dashboard's fourth drill-down level, a container's log, is a different
+shape of fetch from the three above it: those answer once, and a log
+`follow`s — `kube::Api::log_stream` keeps its HTTP response open and the API
+server writes a new line onto it for as long as anybody is reading.
+`k8s::pods::logs::LogEvent` is what the connection hands back a piece at a
+time (`Line`, or `Ended` once it stops, cleanly or not), and
+`commands::spawn_stream` is the pump behind it: unlike `commands::spawn`,
+which only ever delivers once and lets a caller lose interest by dropping the
+receiver, this hands the task a `tokio::sync::oneshot::Receiver` too, raced
+inside a `tokio::select!` against the next line. Dropping the
+`commands::StreamHandle` the caller gets back fires that oneshot, and the
+connection ends there rather than merely being ignored — the distinction
+matters because an open log costs the API server a request for as long as
+nobody says otherwise, unlike a one-shot fetch's result, which is free to
+discard (decision 51 explains why that one never needed real cancellation;
+decision 64 is this one's answer to the same question, and why it differs).
+
+`ui::logs::Log` is the pane's side of it: a bounded scrollback buffer rather
+than a `Vec` of finished rows, since a log has no end to finish gathering.
+Scrolling has to survive both the buffer growing and, past its cap, evicting
+from the front as new lines arrive — decision 65 is the arithmetic that keeps
+a paused view pointed at the same lines through either. `View` gained a
+fourth variant, `ContainerLogs`, for this rather than finally becoming the
+`Vec<View>` stack decision 60 predicted might happen at a third; see decision
+66 for why the same reasoning still holds one level further in, and for the
+one real wrinkle a stack would not have had either: a pane with no rows to
+highlight, which is why `j`/`k`/`Home`/`End` mean something different inside
+it than everywhere else in the dashboard.
+
 ## Testing
 
 Run `make test`. The suite needs no cluster, no credentials, and no network, and

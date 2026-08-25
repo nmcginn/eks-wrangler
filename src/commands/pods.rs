@@ -4,16 +4,19 @@ use std::path::PathBuf;
 use std::sync::mpsc;
 
 use anyhow::{Result, anyhow};
+use futures_util::io::AsyncBufReadExt;
+use futures_util::stream::StreamExt;
 use k8s_openapi::api::core::v1::Pod;
 use k8s_openapi::jiff::Timestamp;
 use kube::api::Api;
 
 use crate::cluster::ClusterView;
-use crate::commands::{self, nodes::target_cluster};
+use crate::commands::{self, StreamHandle, nodes::target_cluster};
 use crate::format::Width;
 use crate::k8s::metrics::{self as k8s_metrics};
 use crate::k8s::order::Direction;
 use crate::k8s::page;
+use crate::k8s::pods::logs::{self, LogEvent};
 use crate::k8s::pods::{ContainerRow, Order, PodRow, Scope, Selectors};
 use crate::k8s::{self, pods as k8s_pods, selector};
 use crate::kubeconfig::KubeConfig;
@@ -370,6 +373,129 @@ async fn gather_containers(
     Ok(ContainersFetch {
         rows: ContainerRow::from_pod(&fetched),
     })
+}
+
+/// The pod and container one log stream is for, and the cluster to reach it
+/// through — bundled the way [`Request`] bundles `eks pods`'s flags, past
+/// `clippy::too_many_arguments`' limit for the same reason: past seven, a
+/// mistake that swaps two same-typed strings type-checks (decision 29).
+struct LogTarget<'a> {
+    cluster: Option<&'a str>,
+    namespace: &'a str,
+    pod: &'a str,
+    container: &'a str,
+}
+
+/// Stream one container's log, live, on a background thread.
+///
+/// Unlike every other fetch in this module, this never finishes on its own —
+/// `LogParams::follow` keeps the connection open for as long as the container
+/// keeps printing, so the [`StreamHandle`] this returns alongside the
+/// receiver is not bookkeeping, it is the only way the pane ever stops
+/// reading. Dropping it — which the event loop does the moment the
+/// dashboard's log pane backs out — is what ends the connection; see
+/// [`commands::spawn_stream`]'s doc comment for how a signal reaches inside
+/// the read loop below.
+#[must_use]
+pub fn spawn_stream_logs(
+    config: KubeConfig,
+    paths: Vec<PathBuf>,
+    cluster: Option<String>,
+    namespace: String,
+    pod: String,
+    container: String,
+    budget: page::Budget,
+) -> (mpsc::Receiver<LogEvent>, StreamHandle) {
+    commands::spawn_stream(move |tx, stop| async move {
+        let target = LogTarget {
+            cluster: cluster.as_deref(),
+            namespace: &namespace,
+            pod: &pod,
+            container: &container,
+        };
+        stream_logs(&config, &paths, target, budget, &tx, stop).await;
+    })
+}
+
+/// The `spawn_stream_logs` task body, kept separate for the same reason
+/// [`gather_containers`] is: every early return here is "stop streaming"
+/// rather than "propagate a `?`", so it reads better as its own function than
+/// folded into the closure above.
+///
+/// `budget` bounds connecting and opening the log — the same per-step
+/// timeout every other fetch spends — but not the read loop that follows: a
+/// `follow`ed log is supposed to sit open, and the only thing meant to end it
+/// is `stop` firing.
+async fn stream_logs(
+    config: &KubeConfig,
+    paths: &[PathBuf],
+    target: LogTarget<'_>,
+    budget: page::Budget,
+    tx: &mpsc::Sender<LogEvent>,
+    mut stop: tokio::sync::oneshot::Receiver<()>,
+) {
+    let cluster = match target_cluster(config, target.cluster) {
+        Ok(cluster) => cluster,
+        Err(error) => {
+            let _ = tx.send(LogEvent::Ended(Some(error.to_string())));
+            return;
+        }
+    };
+    let label = cluster.label();
+
+    // `connect`'s own `Error` already carries a full, user-facing sentence in
+    // every variant — including a cluster failure, which it has already run
+    // through `explain` internally — so this is a message, not a second
+    // classification of one.
+    let client = match k8s::connect(paths, &cluster, budget).await {
+        Ok(client) => client,
+        Err(error) => {
+            let _ = tx.send(LogEvent::Ended(Some(error.to_string())));
+            return;
+        }
+    };
+
+    let api: Api<Pod> = Api::namespaced(client, target.namespace);
+    let lp = logs::params(target.container);
+    let stream = match budget.wrap(api.log_stream(target.pod, &lp)).await {
+        Ok(stream) => stream,
+        Err(error) => {
+            let _ = tx.send(LogEvent::Ended(Some(k8s::explain(&error, &label))));
+            return;
+        }
+    };
+
+    let mut lines = stream.lines();
+    loop {
+        tokio::select! {
+            // Dropping the `StreamHandle` fires this and ends the connection
+            // — the `lines.next()` arm below is simply never polled again,
+            // which drops the stream and, with it, the HTTP request.
+            _ = &mut stop => return,
+            next = lines.next() => match next {
+                Some(Ok(line)) => {
+                    // Nobody is listening any more — the pane moved on before
+                    // its `StreamHandle` was dropped, which the event loop
+                    // never actually does out of order, but a send that
+                    // fails here has nowhere else to go either way.
+                    if tx.send(LogEvent::Line(line)).is_err() {
+                        return;
+                    }
+                }
+                Some(Err(error)) => {
+                    let _ = tx.send(LogEvent::Ended(Some(format!(
+                        "the log stream for {} broke: {error}",
+                        target.container
+                    ))));
+                    return;
+                }
+                None => {
+                    let _ = tx.send(LogEvent::Ended(None));
+                    return;
+                }
+            },
+        }
+    }
 }
 
 /// Validate the label and field selectors, before any network call.

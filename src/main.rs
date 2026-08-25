@@ -200,6 +200,28 @@ fn dashboard(
         })
     };
 
+    // The deepest level: called once each time drilling into a container
+    // changes which one the detail pane is showing. `budget` still bounds
+    // connecting and opening the log, but not the `follow`ed read after
+    // that — see `commands::pods::stream_logs`.
+    let spawn_logs: ui::LogsFetcher = {
+        let config = config.clone();
+        let paths = paths.to_vec();
+        Box::new(
+            move |context: &str, namespace: &str, pod: &str, container: &str| {
+                pods::spawn_stream_logs(
+                    config.clone(),
+                    paths.clone(),
+                    Some(context.to_owned()),
+                    namespace.to_owned(),
+                    pod.to_owned(),
+                    container.to_owned(),
+                    budget,
+                )
+            },
+        )
+    };
+
     // Kicked off before the terminal takes over, so the fetch is already in
     // flight for the first frame — the loading state a bare `eks` shows is
     // real, not simulated. No cluster selected, nothing to fetch: the empty
@@ -208,14 +230,13 @@ fn dashboard(
         .selected_cluster()
         .map(|cluster| spawn_nodes(&cluster.context_name));
 
-    ui::run(
-        app,
-        nodes_rx,
-        &spawn_nodes,
-        &spawn_pods,
-        &spawn_containers,
-        refresh,
-    )
+    let drill = ui::DrillFetchers {
+        spawn_pods: &spawn_pods,
+        spawn_containers: &spawn_containers,
+        spawn_logs: &spawn_logs,
+    };
+
+    ui::run(app, nodes_rx, &spawn_nodes, &drill, refresh)
 }
 
 /// Print a command's output, skipping the newline for empty results so
