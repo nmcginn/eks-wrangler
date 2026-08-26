@@ -129,11 +129,18 @@ listings, because `eks nodes --sort` follows exactly the same rules and a second
 copy of them would be a second chance to drift. The notes are generic over the
 `Order` enums and take their spelling from `clap::ValueEnum`, so an ordering is
 always called what the flag calls it. What they cannot know is the rows, so each
-listing hands in the two facts they turn on: a `ranks_any` predicate — asked
-about every ordering, not just the one that failed, since the answers for the
-others are the "sort by … instead" advice — and a `cause`, which is that
-listing's own map from an ordering to the footnote that would already have
-explained an empty column. What is *not* shared is the keys: `k8s::nodes::order` ranks by the share of
+listing hands in the facts they turn on: a `ranks_any` predicate — asked about
+every ordering, not just the one that failed, since the answers for the others
+are the "sort by … instead" advice — a stricter `distinguishes`, asked of the
+same orderings, for whether ranking them would actually rearrange these rows
+rather than merely give every one of them a place (a node's `status` ranks
+every row on a cluster where they are all `Ready`, and rearranges none of
+them); and a `cause`, which is that listing's own map from an ordering to the
+footnote that would already have explained an empty column. `distinguishes`
+decides two things: which orderings the advice can name, and — the newer of
+the two — whether the ordering the user actually typed gets a "this changed
+nothing" diagnosis of its own rather than only the honest but silent `Sorted
+by status.`. What is *not* shared is the keys: `k8s::nodes::order` ranks by the share of
 allocatable a node's figures represent, where `k8s::pods::order` ranks by the
 figure itself. That was once for want of a denominator; now that a pod's usage
 has one, it is a choice — a node's denominator is the machine, so 95% of a small

@@ -2416,9 +2416,39 @@ mod tests {
     }
 
     #[test]
-    fn a_listing_the_ordering_did_rank_gets_only_the_line_naming_it() {
-        // One sampled node is enough: the busiest node the cluster knows about
-        // is at the top, so there is nothing to apologise for.
+    fn a_listing_the_ordering_did_rank_and_distinguish_gets_only_the_line_naming_it() {
+        // Two sampled nodes with different usage: the busiest one is at the
+        // top, and the ordering actually rearranged this listing, so there is
+        // nothing to apologise for. A single sampled row would not prove
+        // this — see the pair of tests below for why.
+        let rows = [
+            NodeRow::from_node(
+                &healthy_node(),
+                Some(&idle()),
+                Some(used("392m", "1552515Ki")),
+                now(),
+            ),
+            NodeRow::from_node(
+                &contrasting_node(),
+                Some(&idle()),
+                Some(used("100m", "256Mi")),
+                now(),
+            ),
+        ];
+
+        assert_eq!(
+            sort_notes(&rows, Order::Cpu, Missing::default()),
+            ["Sorted by cpu."]
+        );
+    }
+
+    #[test]
+    fn a_single_ranked_row_has_nothing_else_to_compare_itself_against() {
+        // A single sampled node ranks under `cpu` — there is a real figure —
+        // but a listing of one row can never be *distinguished* by anything:
+        // sorting it is always a no-op. The old rule asked only `ranks_any`
+        // here and stayed silent; asking `distinguishes` too is what this
+        // test is for.
         let rows = [NodeRow::from_node(
             &healthy_node(),
             Some(&idle()),
@@ -2428,7 +2458,43 @@ mod tests {
 
         assert_eq!(
             sort_notes(&rows, Order::Cpu, Missing::default()),
-            ["Sorted by cpu."]
+            [
+                "Sorted by cpu.",
+                "Every row here ranks the same under cpu, so sorting by it changed nothing."
+            ]
+        );
+    }
+
+    #[test]
+    fn an_ordering_that_ranks_two_rows_but_ties_them_says_so_and_what_to_sort_by_instead() {
+        // Two nodes, contrasting in status and age but sampled at the same
+        // CPU share: `--sort cpu` ranks both — real samples, real
+        // allocatable — but rearranges neither. `Sorted by cpu.` alone would
+        // say nothing about that; the note below it does, and points at the
+        // orderings that would actually reorder this listing instead.
+        let rows = [
+            NodeRow::from_node(
+                &healthy_node(),
+                Some(&idle()),
+                Some(used("392m", "1552515Ki")),
+                now(),
+            ),
+            NodeRow::from_node(
+                &contrasting_node(),
+                Some(&idle()),
+                Some(used("392m", "1552515Ki")),
+                now(),
+            ),
+        ];
+
+        assert_eq!(
+            sort_notes(&rows, Order::Cpu, Missing::default()),
+            [
+                "Sorted by cpu.",
+                "Every row here ranks the same under cpu, so sorting by it changed \
+                 nothing.\n\
+                 Sort by status or age instead.",
+            ]
         );
     }
 

@@ -197,24 +197,6 @@ cluster.
   always a no-op, but a real behaviour change beyond the roadmap's own
   example. See decision 70.
 
-- [ ] **Say when the ordering a user actually typed ranked everything and changed
-  nothing.**
-  `distinguishes` now keeps a vacuous ordering out of the *advice* list, but a
-  user who types `--sort status` on a cluster where every node is `Ready`
-  never sees it: `ranks_any(status)` is true, so `unranked_note` returns
-  `None` and the table prints `Sorted by status.` over a listing that is
-  identical to the unsorted one. Separate because it is a different gate —
-  whether the diagnosis fires at all for the order the user *chose*, not which
-  orders get suggested as alternatives to a failing one — and a new design
-  question of its own: whether a working-but-vacuous ordering deserves a note
-  at all, given `note` already prints `Sorted by status.` honestly (the table
-  is sorted by status; status just has one value here), and what such a note
-  would say that is not simply `unranked_note`'s wording reused for a
-  different reason.
-  *Acceptance:* whichever shape it takes, it reads `k8s::nodes::distinguishes`/
-  `k8s::pods::distinguishes` rather than a second predicate; a listing where
-  the chosen ordering does separate at least two rows says nothing extra.
-
 - [x] **Carry the "nothing ranked" note into the dashboard's panes.**
   Pairs with the sort-note task above, and has the same shape: a pane that takes
   `--sort` can sort by a column its cluster does not populate, and the pane's
@@ -1073,6 +1055,24 @@ cluster.
 ---
 
 ## Done
+
+- **Say when the ordering a user actually typed ranked everything and changed
+  nothing** (2026-08-26) — `--sort status` on a cluster where every node is
+  `Ready` used to print only `Sorted by status.`, true and silent about the
+  fact that the table looks exactly like it did before the flag.
+  `k8s::order::unranked_note` now also fires on this case, worded
+  differently from "found nothing to rank" because it is a different
+  failure — the column is right there, filled in, and simply the same on
+  every row: `Every row here ranks the same under status, so sorting by it
+  changed nothing.`, with the same "sort by X instead" advice the other
+  diagnosis already builds from `distinguishes`. No call site changed:
+  `commands::nodes`, `commands::pods`, `ui::nodes`, and `ui::pods` already
+  passed `distinguishes` as `unranked_note`'s fourth argument, so the new
+  case reaches the CLI tables and both dashboard panes in one change. See
+  decision 71 for the consequence worth flagging — a single-row listing can
+  never be *distinguished* by anything, so it now earns this diagnosis too
+  for any non-default ordering it ranks under, where it used to print only
+  the bare `Sorted by …` line.
 
 - **Log viewing** (2026-08-25) — `Enter` on a highlighted container in the
   pod-containers pane opens its log, followed live: `Overview › worker-3 ›

@@ -527,15 +527,59 @@ mod tests {
     }
 
     #[test]
-    fn a_pane_ordering_that_ranked_something_says_nothing_extra() {
-        // `node("worker-1")` carries a real `cpu_used` figure, so `--sort cpu`
-        // (`s` in the pane) ranks it and the diagnosis has nothing to add.
+    fn a_pane_ordering_that_ranked_and_distinguished_something_says_nothing_extra() {
+        // Two rows with different `cpu_used` figures: `--sort cpu` (`s` in the
+        // pane) both ranks and rearranges them, so the diagnosis has nothing
+        // to add. A single row would not prove this — see the tests below.
+        let busy = NodeRow {
+            cpu_used: share("100m", "4"),
+            ..node("worker-2")
+        };
+        let rendered = render_ordered(
+            &loaded(vec![node("worker-1"), busy]),
+            Order::Cpu,
+            Direction::Natural,
+        );
+        assert!(!rendered.contains("Nothing here"), "{rendered}");
+        assert!(!rendered.contains("ranks the same"), "{rendered}");
+    }
+
+    #[test]
+    fn a_pane_with_one_row_never_calls_its_own_ordering_useful() {
+        // `node("worker-1")` carries a real `cpu_used` figure, so `ranks_any`
+        // says yes — but a pane with one row can never be *rearranged* by
+        // anything, so the diagnosis fires anyway: sorting it was a no-op.
         let rendered = render_ordered(
             &loaded(vec![node("worker-1")]),
             Order::Cpu,
             Direction::Natural,
         );
-        assert!(!rendered.contains("Nothing here"), "{rendered}");
+        assert!(
+            rendered.contains(
+                "Every row here ranks the same under cpu, so sorting by it \
+                                changed nothing."
+            ),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn a_pane_ordering_that_ranks_two_tied_rows_says_so() {
+        // Two rows with the *same* `cpu_used` figure: `ranks_any` says yes for
+        // both, but sorting between them changes nothing, and the pane says
+        // so exactly as the CLI table does.
+        let rendered = render_ordered(
+            &loaded(vec![node("worker-1"), node("worker-2")]),
+            Order::Cpu,
+            Direction::Natural,
+        );
+        assert!(
+            rendered.contains(
+                "Every row here ranks the same under cpu, so sorting by it \
+                                changed nothing."
+            ),
+            "{rendered}"
+        );
     }
 
     #[test]
