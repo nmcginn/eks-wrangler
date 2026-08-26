@@ -56,6 +56,16 @@
 //! the fix, and [`Cause::Explained`] points at it rather than repeating it a
 //! line later.
 //!
+//! Ranking something is not the same as being worth suggesting. `--sort
+//! status` on a cluster where every node is `Ready` ranks every row — a node
+//! always has a status — so the old rule offered it as the fix for an ordering
+//! that ranked nothing, and `--sort status` there reorders nothing at all: the
+//! reader is sent to a second listing identical to the first. The advice list
+//! is filtered by a stricter question than the diagnosis is: not just "does
+//! this ordering rank a row" but "would it put two of these rows in a
+//! different arrangement than they are already in". [`unranked_note`] takes
+//! both answers from the listing, because only the listing's own rows can say.
+//!
 //! Both notes are blind to the rows on purpose — the keys are the part of an
 //! ordering this module does not know — so the listing hands in what it alone
 //! can answer: which orderings its rows can be ranked by, and which of its own
@@ -230,6 +240,14 @@ impl Cause {
 /// ordering rather than only the one the user typed, because the answer for the
 /// others is exactly the advice this note owes them.
 ///
+/// `distinguishes` is the second question, asked only of the orderings `ranks`
+/// already said yes to: would sorting by this one actually rearrange these
+/// rows, or would every row land back where it started? [`crate::k8s::nodes::
+/// distinguishes`] and [`crate::k8s::pods::distinguishes`] answer it. An
+/// ordering can rank every row and still distinguish none of them — a cluster
+/// where every node is `Ready` ranks every row under `status`, and reorders
+/// none of them — so the advice list needs both answers, not just the first.
+///
 /// `eks nodes --sort cpu` against a cluster with no metrics-server is the case
 /// this exists for. There is no `CPU USE` column, every row is unranked, and the
 /// alphabet decides the whole listing — and [`note`] then prints `Sorted by
@@ -258,7 +276,12 @@ impl Cause {
 /// of them is grouped by something even when nothing in it ranked, so "this is
 /// in name order" would be a guess dressed as an explanation.
 #[must_use]
-pub fn unranked_note<O>(order: O, cause: Cause, ranks: impl Fn(O) -> bool) -> Option<String>
+pub fn unranked_note<O>(
+    order: O,
+    cause: Cause,
+    ranks: impl Fn(O) -> bool,
+    distinguishes: impl Fn(O) -> bool,
+) -> Option<String>
 where
     O: ValueEnum + Copy + Default + PartialEq,
 {
@@ -278,18 +301,28 @@ where
         Cause::Unexplained => format!("Nothing here has {name} to sort by."),
     };
 
-    Some(match alternatives(&ranks) {
+    Some(match alternatives(&ranks, &distinguishes) {
         Some(alternatives) => format!("{diagnosis}\nSort by {alternatives} instead."),
         None => diagnosis,
     })
 }
 
-/// The orderings that would have ranked at least one of these rows, written out
-/// as `a`, `a or b`, or `a, b, or c`.
+/// The orderings that would both rank and actually rearrange at least one pair
+/// of these rows, written out as `a`, `a or b`, or `a, b, or c`.
 ///
 /// Computed from the rows rather than from the `Order` enum alone, so the advice
 /// cannot name an ordering that would have failed the same way the one the user
 /// typed did. `None` when there is nothing to suggest.
+///
+/// Two filters, not one. `ranks` is the existing bar — the one that also
+/// decides whether an ordering counts as unranked in the first place — and it
+/// is not enough on its own here: a node's `status` ranks every row (every
+/// node has one), but on a cluster where they are all `Ready` it sorts nothing
+/// relative to anything else, and suggesting it sends the reader to a listing
+/// identical to the one that just told them nothing worked. `distinguishes`
+/// is that second, stricter question, so a candidate has to both have
+/// something to rank a row by *and* actually put two rows in a different
+/// order before it earns a place in the advice.
 ///
 /// The default ordering is left out on purpose. It is what dropping `--sort`
 /// altogether gives you, so "sort by name instead" is advice to type a flag in
@@ -304,7 +337,7 @@ where
 /// not even a parameter: it is being advised about precisely because `ranks`
 /// said no to it, and `ranks` is a pure function over the rows, so the same
 /// question gets the same answer here.
-fn alternatives<O>(ranks: &impl Fn(O) -> bool) -> Option<String>
+fn alternatives<O>(ranks: &impl Fn(O) -> bool, distinguishes: &impl Fn(O) -> bool) -> Option<String>
 where
     O: ValueEnum + Copy + Default + PartialEq,
 {
@@ -313,6 +346,7 @@ where
         .copied()
         .filter(|&candidate| candidate != O::default())
         .filter(|&candidate| ranks(candidate))
+        .filter(|&candidate| distinguishes(candidate))
         .filter_map(|candidate| candidate.to_possible_value())
         .filter(|value| !value.is_hide_set())
         .map(|value| value.get_name().to_owned())
@@ -353,12 +387,16 @@ mod tests {
         Secret,
     }
 
-    /// A `ranks` predicate for a listing where exactly these orderings found
-    /// something to rank.
+    /// A `ranks` or `distinguishes` predicate for a listing where exactly these
+    /// orderings found something to rank, or actually rearranged a row.
     ///
-    /// The real one closes over the rows and asks `ranks_any`; what the generic
-    /// function needs from it is only the answer, so the fixture is the answer.
-    fn ranking(ranked: &[TestOrder]) -> impl Fn(TestOrder) -> bool + '_ {
+    /// The real ones close over the rows and ask `ranks_any`/`distinguishes`;
+    /// what the generic function needs from either is only the answer, so the
+    /// fixture is the answer. Shared between the two parameters because most
+    /// tests below are not about the difference between them — an ordering
+    /// that ranks a row in these fixtures also rearranges it, which is the
+    /// ordinary case the split exists to be an exception to.
+    fn ranking(ranked: &[TestOrder]) -> impl Fn(TestOrder) -> bool + Copy + '_ {
         move |order| ranked.contains(&order)
     }
 
@@ -450,13 +488,9 @@ mod tests {
         // line above this one is about a column the table does not have, and a
         // user who has just been told their flag did nothing is owed the flag
         // that would do something.
+        let ranks = ranking(&[TestOrder::Memory]);
         assert_eq!(
-            unranked_note(
-                TestOrder::CpuRequested,
-                Cause::Unexplained,
-                ranking(&[TestOrder::Memory]),
-            )
-            .as_deref(),
+            unranked_note(TestOrder::CpuRequested, Cause::Unexplained, ranks, ranks).as_deref(),
             Some("Nothing here has cpu-requested to sort by.\nSort by memory instead.")
         );
     }
@@ -466,13 +500,9 @@ mod tests {
         // The metrics footnote two paragraphs up has already named the cause and
         // linked to the fix. Restating it here would be the same paragraph
         // twice, a line apart.
+        let ranks = ranking(&[TestOrder::Memory]);
         assert_eq!(
-            unranked_note(
-                TestOrder::CpuRequested,
-                Cause::Explained,
-                ranking(&[TestOrder::Memory]),
-            )
-            .as_deref(),
+            unranked_note(TestOrder::CpuRequested, Cause::Explained, ranks, ranks).as_deref(),
             Some(
                 "Nothing here has cpu-requested to sort by, for the reason above.\n\
                  Sort by memory instead."
@@ -483,16 +513,47 @@ mod tests {
     #[test]
     fn the_advice_is_the_same_whether_or_not_the_cause_is_explained() {
         // The two causes change the diagnosis, never what to type next.
+        let ranks = ranking(&[TestOrder::Memory]);
         let advice = |cause| {
-            unranked_note(
-                TestOrder::CpuRequested,
-                cause,
-                ranking(&[TestOrder::Memory]),
-            )
-            .and_then(|note| Some(note.lines().nth(1)?.to_owned()))
+            unranked_note(TestOrder::CpuRequested, cause, ranks, ranks)
+                .and_then(|note| Some(note.lines().nth(1)?.to_owned()))
         };
 
         assert_eq!(advice(Cause::Explained), advice(Cause::Unexplained));
+    }
+
+    #[test]
+    fn an_ordering_that_ranks_but_never_rearranges_a_row_is_not_suggested() {
+        // `--sort status` on a cluster where every node is `Ready`: every row
+        // has a status, so `ranks` says yes, but the ordering puts none of
+        // them anywhere different — the case this split exists for.
+        assert_eq!(
+            unranked_note(
+                TestOrder::CpuRequested,
+                Cause::Unexplained,
+                ranking(&[TestOrder::Memory, TestOrder::Restarts]),
+                ranking(&[TestOrder::Restarts]),
+            )
+            .as_deref(),
+            Some("Nothing here has cpu-requested to sort by.\nSort by restarts instead.")
+        );
+    }
+
+    #[test]
+    fn distinguishing_a_row_is_not_enough_without_something_to_rank_it_by() {
+        // The reverse gap, stated for completeness: `distinguishes` alone does
+        // not earn a suggestion either. An ordering the advice offers has to
+        // clear both bars, not swap one for the other.
+        assert_eq!(
+            unranked_note(
+                TestOrder::CpuRequested,
+                Cause::Unexplained,
+                ranks_nothing,
+                ranking(&[TestOrder::Memory]),
+            )
+            .as_deref(),
+            Some("Nothing here has cpu-requested to sort by.")
+        );
     }
 
     #[test]
@@ -500,16 +561,13 @@ mod tests {
         // Declaration order, which is `--help`'s order, whatever order the rows
         // happened to answer in. And an Oxford comma, so a three-item list does
         // not read as a two-item one ending in an odd pair.
+        let everything = ranking(&[
+            TestOrder::Memory,
+            TestOrder::Restarts,
+            TestOrder::CpuRequested,
+        ]);
         assert_eq!(
-            unranked_note(
-                TestOrder::Name,
-                Cause::Unexplained,
-                ranking(&[
-                    TestOrder::Memory,
-                    TestOrder::Restarts,
-                    TestOrder::CpuRequested
-                ]),
-            ),
+            unranked_note(TestOrder::Name, Cause::Unexplained, everything, everything),
             None,
             "the default ordering has nothing to explain"
         );
@@ -517,11 +575,8 @@ mod tests {
             unranked_note(
                 TestOrder::Secret,
                 Cause::Unexplained,
-                ranking(&[
-                    TestOrder::Memory,
-                    TestOrder::Restarts,
-                    TestOrder::CpuRequested
-                ]),
+                everything,
+                everything
             )
             .as_deref(),
             Some(
@@ -533,13 +588,9 @@ mod tests {
 
     #[test]
     fn two_alternatives_are_joined_without_a_comma() {
+        let ranks = ranking(&[TestOrder::Restarts, TestOrder::Memory]);
         assert_eq!(
-            unranked_note(
-                TestOrder::CpuRequested,
-                Cause::Unexplained,
-                ranking(&[TestOrder::Restarts, TestOrder::Memory]),
-            )
-            .as_deref(),
+            unranked_note(TestOrder::CpuRequested, Cause::Unexplained, ranks, ranks).as_deref(),
             Some("Nothing here has cpu-requested to sort by.\nSort by restarts or memory instead.")
         );
     }
@@ -549,13 +600,9 @@ mod tests {
         // Every listing can be sorted by name, and `--sort name` is what you get
         // by typing nothing at all. Advice to type a flag for the listing you
         // would have had anyway is not advice.
+        let ranks = ranking(&[TestOrder::Name]);
         assert_eq!(
-            unranked_note(
-                TestOrder::CpuRequested,
-                Cause::Unexplained,
-                ranking(&[TestOrder::Name]),
-            )
-            .as_deref(),
+            unranked_note(TestOrder::CpuRequested, Cause::Unexplained, ranks, ranks).as_deref(),
             Some("Nothing here has cpu-requested to sort by.")
         );
     }
@@ -564,13 +611,9 @@ mod tests {
     fn an_ordering_hidden_from_help_is_never_suggested() {
         // A flag value the user cannot find any other way is a worse answer
         // than no suggestion at all.
+        let ranks = ranking(&[TestOrder::Secret]);
         assert_eq!(
-            unranked_note(
-                TestOrder::CpuRequested,
-                Cause::Unexplained,
-                ranking(&[TestOrder::Secret]),
-            )
-            .as_deref(),
+            unranked_note(TestOrder::CpuRequested, Cause::Unexplained, ranks, ranks).as_deref(),
             Some("Nothing here has cpu-requested to sort by.")
         );
     }
@@ -581,7 +624,13 @@ mod tests {
         // is just as blank. Silence says "there is nothing else here" better
         // than a suggestion that would fail the same way.
         assert_eq!(
-            unranked_note(TestOrder::CpuRequested, Cause::Explained, ranks_nothing).as_deref(),
+            unranked_note(
+                TestOrder::CpuRequested,
+                Cause::Explained,
+                ranks_nothing,
+                ranks_nothing,
+            )
+            .as_deref(),
             Some("Nothing here has cpu-requested to sort by, for the reason above.")
         );
     }
@@ -591,12 +640,9 @@ mod tests {
         // One ranked row puts the row somebody went looking for at an end of
         // the table, which is the whole job. Saying anything here would be
         // noise under a listing that worked.
+        let ranks = ranking(&[TestOrder::CpuRequested]);
         assert_eq!(
-            unranked_note(
-                TestOrder::CpuRequested,
-                Cause::Unexplained,
-                ranking(&[TestOrder::CpuRequested]),
-            ),
+            unranked_note(TestOrder::CpuRequested, Cause::Unexplained, ranks, ranks),
             None
         );
     }
@@ -606,7 +652,12 @@ mod tests {
         // Nobody typed a flag, so there is no flag to explain — and the default
         // output of every command has to stay unchanged to the byte.
         assert_eq!(
-            unranked_note(TestOrder::Name, Cause::Unexplained, ranks_nothing),
+            unranked_note(
+                TestOrder::Name,
+                Cause::Unexplained,
+                ranks_nothing,
+                ranks_nothing
+            ),
             None
         );
     }
@@ -617,8 +668,13 @@ mod tests {
         // two adjacent lines reads as two different orderings.
         let named = note(TestOrder::CpuRequested, Direction::Reversed)
             .expect("a reordered listing should say so");
-        let unranked = unranked_note(TestOrder::CpuRequested, Cause::Unexplained, ranks_nothing)
-            .expect("an ordering that ranked nothing should say so");
+        let unranked = unranked_note(
+            TestOrder::CpuRequested,
+            Cause::Unexplained,
+            ranks_nothing,
+            ranks_nothing,
+        )
+        .expect("an ordering that ranked nothing should say so");
 
         assert!(named.contains("cpu-requested"), "{named}");
         assert!(unranked.contains("cpu-requested"), "{unranked}");

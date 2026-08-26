@@ -2786,6 +2786,7 @@ mod tests {
                     order,
                     crate::k8s::pods::cause(order, missing),
                     |candidate| crate::k8s::pods::ranks_any(&rows(), candidate),
+                    |candidate| crate::k8s::pods::distinguishes(&rows(), candidate),
                 ))
                 .collect();
 
@@ -2820,6 +2821,7 @@ mod tests {
             order,
             crate::k8s::pods::cause(order, crate::k8s::pods::Missing::default()),
             |candidate| crate::k8s::pods::ranks_any(&sampled_rows(), candidate),
+            |candidate| crate::k8s::pods::distinguishes(&sampled_rows(), candidate),
         );
 
         assert_eq!(
@@ -2840,6 +2842,7 @@ mod tests {
             order,
             crate::k8s::pods::cause(order, crate::k8s::pods::Missing { usage: true }),
             |candidate| crate::k8s::pods::ranks_any(&[], candidate),
+            |candidate| crate::k8s::pods::distinguishes(&[], candidate),
         )
         .expect("an ordering with no rows to rank ranked nothing");
 

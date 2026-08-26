@@ -166,7 +166,7 @@ cluster.
   sentence per ordering; a listing where the fixable cause is already explained
   above does not explain it twice.
 
-- [ ] **Suggest orderings that tell the rows apart, not merely rank them.**
+- [x] **Suggest orderings that tell the rows apart, not merely rank them.**
   The advice under an unranked listing suggests every ordering that can rank a
   row, which is the `any`-not-`all` rule the rest of `--sort` follows. On a
   cluster where every node is `Ready`, that suggests `status`, and `--sort
@@ -177,6 +177,43 @@ cluster.
   ranked" is deliberately the bar everywhere else, and whether an ordering that
   puts every row in one group is really saying nothing — "everything here is
   Ready" is an answer too.
+  *Acceptance:* the advice list is filtered by whether an ordering would
+  actually rearrange these particular rows, not merely rank one of them; the
+  bar everywhere else — whether the flag itself is honoured, and whether the
+  diagnosis fires at all — is unchanged.
+  Landed as `k8s::nodes::distinguishes`/`k8s::pods::distinguishes`, a second,
+  stricter predicate beside each listing's existing `ranks_any`, both handed to
+  `k8s::order::unranked_note` — which now requires an alternative to clear both
+  before naming it. The decision: "the rows differ" is the right bar for
+  *this* list specifically (nowhere else `ranks_any` is used changes), and an
+  ordering that groups every row together is not offering the reader anything
+  to do next, so it is left out rather than kept in as its own kind of answer —
+  the advice line exists to point at a flag worth typing, and one that
+  provably changes nothing on screen is not that. One consequence worth a
+  second look: a listing of exactly one row can never be *distinguished* by
+  anything, so a single-node or single-pod cluster now gets the diagnosis with
+  no suggestion at all, where before it got whatever `ranks_any` allowed
+  regardless of row count — arguably more honest, since sorting one row was
+  always a no-op, but a real behaviour change beyond the roadmap's own
+  example. See decision 70.
+
+- [ ] **Say when the ordering a user actually typed ranked everything and changed
+  nothing.**
+  `distinguishes` now keeps a vacuous ordering out of the *advice* list, but a
+  user who types `--sort status` on a cluster where every node is `Ready`
+  never sees it: `ranks_any(status)` is true, so `unranked_note` returns
+  `None` and the table prints `Sorted by status.` over a listing that is
+  identical to the unsorted one. Separate because it is a different gate —
+  whether the diagnosis fires at all for the order the user *chose*, not which
+  orders get suggested as alternatives to a failing one — and a new design
+  question of its own: whether a working-but-vacuous ordering deserves a note
+  at all, given `note` already prints `Sorted by status.` honestly (the table
+  is sorted by status; status just has one value here), and what such a note
+  would say that is not simply `unranked_note`'s wording reused for a
+  different reason.
+  *Acceptance:* whichever shape it takes, it reads `k8s::nodes::distinguishes`/
+  `k8s::pods::distinguishes` rather than a second predicate; a listing where
+  the chosen ordering does separate at least two rows says nothing extra.
 
 - [x] **Carry the "nothing ranked" note into the dashboard's panes.**
   Pairs with the sort-note task above, and has the same shape: a pane that takes

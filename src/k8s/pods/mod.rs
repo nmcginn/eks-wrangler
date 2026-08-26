@@ -40,7 +40,7 @@ pub mod row;
 
 pub use containers::ContainerRow;
 pub use logs::LogEvent;
-pub use order::{Missing, Order, cause, ranks_any, sort};
+pub use order::{Missing, Order, cause, distinguishes, ranks_any, sort};
 pub use row::{PodRow, render, selector_note, shows_usage, usage_unavailable, usage_unsampled};
 
 /// Pods that have finished linger in the API server until something collects

@@ -109,6 +109,28 @@ pub fn ranks_any(rows: &[NodeRow], order: Order) -> bool {
     rows.iter().any(|row| ranked(row, order))
 }
 
+/// Whether this ordering would put two of these rows in a different
+/// arrangement than they are already in.
+///
+/// The question behind the *advice* half of the note under the table, and a
+/// stricter one than [`ranks_any`]: `--sort status` on a cluster where every
+/// node is `Ready` ranks every row — every node has a status — so `ranks_any`
+/// says yes, and offering it as something to try instead sends the reader to
+/// a listing identical to the one that just told them nothing worked.
+///
+/// Compared against the first row rather than every pair, which is enough
+/// because `rank` is a total order: if every row compares equal to the
+/// first, they compare equal to each other, and sorting leaves the listing
+/// exactly as it was.
+#[must_use]
+pub fn distinguishes(rows: &[NodeRow], order: Order) -> bool {
+    let mut rows = rows.iter();
+    let Some(first) = rows.next() else {
+        return false;
+    };
+    rows.any(|row| rank(first, row, order, Direction::Natural) != Ordering::Equal)
+}
+
 /// Whether one row carries what an ordering sorts on.
 ///
 /// A second exhaustive match over `Order` beside [`rank`], on purpose: adding an
@@ -437,6 +459,57 @@ mod tests {
 
         assert!(ranks_any(&rows, Order::Name));
         assert!(ranks_any(&rows, Order::Status));
+    }
+
+    #[test]
+    fn a_cluster_where_every_node_is_ready_distinguishes_nothing_under_status() {
+        // The case this function exists for: `--sort status` ranks every row —
+        // every node has one — but on a cluster with nothing to report, sorting
+        // by it reorders nothing at all, and suggesting it as the fix for a
+        // failed ordering would send the reader to an identical listing.
+        let rows = [row("a"), row("b"), row("c")];
+
+        assert!(ranks_any(&rows, Order::Status));
+        assert!(!distinguishes(&rows, Order::Status));
+    }
+
+    #[test]
+    fn one_unhealthy_node_is_enough_to_distinguish_status() {
+        let rows = [row("a"), unhealthy("b", Severity::Critical)];
+
+        assert!(distinguishes(&rows, Order::Status));
+    }
+
+    #[test]
+    fn a_single_row_listing_distinguishes_nothing_under_any_ordering() {
+        // Sorting one row is a no-op whatever the key, so nothing here can ever
+        // put it anywhere it was not already — unlike `ranks_any`, which only
+        // asks whether the row has a key at all.
+        let rows = [row("only")];
+
+        for order in ORDERS {
+            assert!(!distinguishes(&rows, order), "{order:?}");
+        }
+    }
+
+    #[test]
+    fn an_empty_listing_distinguishes_nothing_under_any_ordering() {
+        for order in ORDERS {
+            assert!(!distinguishes(&[], order), "{order:?}");
+        }
+    }
+
+    #[test]
+    fn rows_tied_on_a_figure_distinguish_nothing_even_though_both_ranked() {
+        // Two nodes at exactly the same share of allocatable: `ranks_any` says
+        // yes for both, and sorting between them changes nothing either way.
+        let rows = [
+            burning("a", Some("2"), Some("4")),
+            burning("b", Some("1"), Some("2")),
+        ];
+
+        assert!(ranks_any(&rows, Order::Cpu));
+        assert!(!distinguishes(&rows, Order::Cpu));
     }
 
     #[test]
