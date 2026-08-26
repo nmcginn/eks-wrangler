@@ -2182,3 +2182,58 @@ nothing said about the fact that it changed nothing. That is a different
 question — whether a working-but-vacuous ordering deserves a note at all,
 given the line is not lying — and answering it was not this decision's to
 make.
+
+### 71. A vacuous ordering the user actually typed gets its own diagnosis, in
+`unranked_note` rather than a second function
+
+Decision 70 left one gap on purpose: `unranked_note`'s gate on the order the
+user typed was still `ranks_any` alone, so `--sort status` against a cluster
+where every node is `Ready` printed only `Sorted by status.` — true, and
+silent about the fact that the table looks exactly like it did before the
+flag. This decision closes it.
+
+The two questions worth separating were whether a working-but-vacuous
+ordering deserves a note at all, given `note`'s line is not lying, and — if
+so — what it should say that is not `unranked_note`'s existing wording
+reused for a different reason. Both are answered yes and "something
+different": `note` stays honest about *what was asked for*, and a second
+line, alongside the one that already exists for "nothing to rank", answers
+the question `note` cannot — *whether it mattered*. Silence there reads as
+success, and for a vacuous ordering it is not one.
+
+The mechanical choice was whether that second line is a new function or a
+second branch on `unranked_note`. It is the latter. `unranked_note` already
+takes `ranks` and `distinguishes` as closures — `distinguishes` was, before
+this decision, read only inside `alternatives`, to build the advice — so the
+guard `if order == O::default() || ranks(order) { return None; }` became `if
+order == O::default() { return None; }` followed by a diagnosis chosen from
+three cases: nothing to rank (unchanged, `Cause` still applies), ranked but
+`!distinguishes(order)` (new; `Cause` does not apply — the column is not
+missing, so nothing above the table could be pointing at it), and both
+(silent, unchanged). A second function would have needed its own copy of
+`alternatives`'s advice-building, for advice that is identical either way —
+an ordering has to clear `ranks` and `distinguishes` to be offered whichever
+diagnosis is asking. The four call sites (`commands::nodes`,
+`commands::pods`, `ui::nodes`, `ui::pods`) needed no changes at all: they
+already pass `distinguishes` as the fourth argument, so the new case reaches
+every listing and every dashboard pane in one change rather than four.
+
+The wording is deliberately not `unranked_note`'s existing "nothing here has
+X to sort by" reused: that sentence is false when `ranks(order)` is true —
+there *is* something to sort by, and every row has it. The new line —
+`Every row here ranks the same under {name}, so sorting by it changed
+nothing.` — names the actual fact: not an absent column, but one where
+every value ties.
+
+The consequence worth flagging, an extension of the one decision 70 already
+named: a listing of exactly one row can never be *distinguished* by
+anything, so a single-row cluster now gets the "changed nothing" diagnosis
+for any non-default ordering it ranks under, where before it printed only
+`Sorted by cpu.` and stopped. `k8s::nodes::mod` and `ui::nodes`/`ui::pods`
+each had one existing test built on a single ranked row that asserted
+silence beyond the "Sorted by" line; each needed a second, contrasting row
+to keep testing what it was written to test — the same shape of fix decision
+70 needed for `k8s::nodes`'s own single-row fixtures — plus a new test
+against the single-row case to cover what actually changed. Sorting one row
+was always a no-op, so the new line is the honest one, and it is now said in
+the one place `--sort` speaks rather than left to the reader to notice.

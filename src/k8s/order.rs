@@ -66,6 +66,15 @@
 //! different arrangement than they are already in". [`unranked_note`] takes
 //! both answers from the listing, because only the listing's own rows can say.
 //!
+//! The same stricter question is also the diagnosis for the ordering the user
+//! actually *typed*, not only for what gets suggested in its place. `--sort
+//! status` on that all-`Ready` cluster used to print only `Sorted by
+//! status.` — true, and silent about the fact that the table looks exactly
+//! like it did before the flag. [`unranked_note`] now fires on this case too,
+//! worded differently from "found nothing to rank" because it is a different
+//! failure: the column is right there, filled in, and simply the same on
+//! every row.
+//!
 //! Both notes are blind to the rows on purpose — the keys are the part of an
 //! ordering this module does not know — so the listing hands in what it alone
 //! can answer: which orderings its rows can be ranked by, and which of its own
@@ -196,6 +205,10 @@ where
 /// same paragraph twice, a line apart. `eks pods --sort restarts` in a namespace
 /// where nothing has ever crashed has nothing above it at all.
 ///
+/// Only the "found nothing to rank" diagnosis reads this: an ordering that
+/// ranked every row and distinguished none of them is not a missing column,
+/// so there is nothing above the table that could be pointing at it.
+///
 /// Which of a table's own footnotes covers which column is the listing's
 /// knowledge rather than this module's, so the listing decides and this module
 /// only chooses the wording. A value rather than a `bool` parameter, for the
@@ -230,51 +243,66 @@ impl Cause {
     }
 }
 
-/// A line saying an ordering found nothing at all to rank, and what to sort by
-/// instead — or `None` when the ordering ranked something.
+/// A line saying an ordering the user typed did not do anything useful, and
+/// what to sort by instead — or `None` when it did.
 ///
-/// `ranks` is the one thing this module cannot work out for itself: whether any
-/// row in the listing carries the figure a given ordering sorts on.
-/// [`crate::k8s::nodes::ranks_any`] and [`crate::k8s::pods::ranks_any`] answer
-/// it, as pure functions over the finished rows. It is asked about every
-/// ordering rather than only the one the user typed, because the answer for the
-/// others is exactly the advice this note owes them.
+/// "Did not do anything useful" is two different failures:
 ///
-/// `distinguishes` is the second question, asked only of the orderings `ranks`
-/// already said yes to: would sorting by this one actually rearrange these
-/// rows, or would every row land back where it started? [`crate::k8s::nodes::
-/// distinguishes`] and [`crate::k8s::pods::distinguishes`] answer it. An
-/// ordering can rank every row and still distinguish none of them — a cluster
-/// where every node is `Ready` ranks every row under `status`, and reorders
-/// none of them — so the advice list needs both answers, not just the first.
+/// - Nothing to rank at all: `--sort cpu` against a cluster with no
+///   metrics-server ranks no row, and the alphabet decides the whole listing.
+/// - Ranked everything and changed nothing: `--sort status` on a cluster
+///   where every node is `Ready` ranks every row — a node always has a
+///   status — but sorting by it rearranges none of them, and the table looks
+///   exactly like it did before the flag.
+///
+/// `ranks` answers the first: whether any row in the listing carries the
+/// figure a given ordering sorts on. [`crate::k8s::nodes::ranks_any`] and
+/// [`crate::k8s::pods::ranks_any`] answer it, as pure functions over the
+/// finished rows.
+///
+/// `distinguishes` answers the second: would sorting by this one actually
+/// rearrange these rows, or would every row land back where it started?
+/// [`crate::k8s::nodes::distinguishes`] and [`crate::k8s::pods::distinguishes`]
+/// answer it. Both closures are asked about every ordering rather than only
+/// the one the user typed, because the answer for the others is exactly the
+/// advice this note owes them.
 ///
 /// `eks nodes --sort cpu` against a cluster with no metrics-server is the case
-/// this exists for. There is no `CPU USE` column, every row is unranked, and the
-/// alphabet decides the whole listing — and [`note`] then prints `Sorted by
-/// cpu.` underneath, naming an ordering that did nothing.
-///
-/// So the note says two things:
+/// the first failure exists for. There is no `CPU USE` column, every row is
+/// unranked, and the alphabet decides the whole listing — and [`note`] then
+/// prints `Sorted by cpu.` underneath, naming an ordering that did nothing:
 ///
 /// ```text
 /// Nothing here has cpu to sort by, for the reason above.
 /// Sort by status, cpu-requested, memory-requested, or age instead.
 /// ```
 ///
-/// The first line is the diagnosis, and [`Cause`] decides whether it points at
-/// an explanation that is already on screen. The second is the advice, and it
-/// is dropped entirely rather than invented when there is nothing left to
-/// suggest — a listing where no ordering can rank a row has no next command to
-/// offer, and `Sort by nothing instead.` would be worse than silence.
+/// `eks nodes --sort status` on an all-`Ready` cluster is the case the second
+/// exists for, worded differently because it is a different failure — the
+/// column is right there, filled in, and simply the same on every row, so
+/// [`Cause`] has nothing to point at:
+///
+/// ```text
+/// Every row here ranks the same under status, so sorting by it changed nothing.
+/// Sort by cpu-requested, memory-requested, or age instead.
+/// ```
+///
+/// Either way the second line is the advice, worked out the same way for both
+/// — an ordering has to clear both `ranks` and `distinguishes` to be offered,
+/// which is what keeps the advice from naming a fix that would fail the same
+/// way — and it is dropped entirely rather than invented when there is
+/// nothing left to suggest.
 ///
 /// Silent when the user asked for no ordering, so a command nobody passed
-/// `--sort` to prints what it always printed. The direction is not a parameter:
-/// reversing an ordering that ranked nothing is still an ordering that ranked
-/// nothing, and the advice is the same either way.
+/// `--sort` to prints what it always printed. The direction is not a
+/// parameter: reversing an ordering that did nothing useful is still an
+/// ordering that did nothing useful, and the advice is the same either way.
 ///
-/// It deliberately stops short of saying what order the rows came out in
-/// instead. Unranked rows keep their tail tiers, and a listing split across two
-/// of them is grouped by something even when nothing in it ranked, so "this is
-/// in name order" would be a guess dressed as an explanation.
+/// The first failure's diagnosis deliberately stops short of saying what
+/// order the rows came out in instead. Unranked rows keep their tail tiers,
+/// and a listing split across two of them is grouped by something even when
+/// nothing in it ranked, so "this is in name order" would be a guess dressed
+/// as an explanation.
 #[must_use]
 pub fn unranked_note<O>(
     order: O,
@@ -285,7 +313,7 @@ pub fn unranked_note<O>(
 where
     O: ValueEnum + Copy + Default + PartialEq,
 {
-    if order == O::default() || ranks(order) {
+    if order == O::default() {
         return None;
     }
 
@@ -296,9 +324,19 @@ where
     let name = order.to_possible_value()?;
     let name = name.get_name();
 
-    let diagnosis = match cause {
-        Cause::Explained => format!("Nothing here has {name} to sort by, for the reason above."),
-        Cause::Unexplained => format!("Nothing here has {name} to sort by."),
+    let diagnosis = if !ranks(order) {
+        match cause {
+            Cause::Explained => {
+                format!("Nothing here has {name} to sort by, for the reason above.")
+            }
+            Cause::Unexplained => format!("Nothing here has {name} to sort by."),
+        }
+    } else if !distinguishes(order) {
+        // `cause` has nothing to say here: the column is not missing, so no
+        // footnote above the table could be explaining its absence.
+        format!("Every row here ranks the same under {name}, so sorting by it changed nothing.")
+    } else {
+        return None;
     };
 
     Some(match alternatives(&ranks, &distinguishes) {
@@ -643,6 +681,81 @@ mod tests {
         let ranks = ranking(&[TestOrder::CpuRequested]);
         assert_eq!(
             unranked_note(TestOrder::CpuRequested, Cause::Unexplained, ranks, ranks),
+            None
+        );
+    }
+
+    #[test]
+    fn an_ordering_that_ranks_everything_but_distinguishes_nothing_says_so_and_what_to_sort_by_instead()
+     {
+        // `--sort status` on a cluster where every node is `Ready`: every row
+        // has a status, so `ranks` says yes, but sorting by it rearranges
+        // nothing — the table looks exactly like it did before the flag. A
+        // different diagnosis from "nothing to rank", because the column is
+        // right there and filled in.
+        let ranks = ranking(&[TestOrder::CpuRequested, TestOrder::Memory]);
+        let distinguishes = ranking(&[TestOrder::Memory]);
+        assert_eq!(
+            unranked_note(
+                TestOrder::CpuRequested,
+                Cause::Unexplained,
+                ranks,
+                distinguishes
+            )
+            .as_deref(),
+            Some(
+                "Every row here ranks the same under cpu-requested, so sorting by it \
+                 changed nothing.\n\
+                 Sort by memory instead."
+            )
+        );
+    }
+
+    #[test]
+    fn the_cause_is_irrelevant_once_the_ordering_ranked_something() {
+        // `Cause` explains a missing column. Once `ranks` says the column is
+        // there and every row agrees, nothing above the table could be
+        // pointing at it, so the diagnosis is the same whichever `Cause` is
+        // passed in.
+        let ranks = ranking(&[TestOrder::CpuRequested]);
+        let explained = unranked_note(
+            TestOrder::CpuRequested,
+            Cause::Explained,
+            ranks,
+            ranks_nothing,
+        );
+        let unexplained = unranked_note(
+            TestOrder::CpuRequested,
+            Cause::Unexplained,
+            ranks,
+            ranks_nothing,
+        );
+
+        assert_eq!(explained, unexplained);
+        assert_eq!(
+            explained.as_deref(),
+            Some(
+                "Every row here ranks the same under cpu-requested, so sorting by it \
+                 changed nothing."
+            )
+        );
+    }
+
+    #[test]
+    fn an_ordering_that_both_ranks_and_distinguishes_says_nothing_extra() {
+        // The genuinely useful case, proven with `ranks` and `distinguishes`
+        // as two different closures rather than one shared one, so the two
+        // checks cannot be silently collapsing into a single question.
+        let ranks = ranking(&[TestOrder::CpuRequested, TestOrder::Memory]);
+        let distinguishes = ranking(&[TestOrder::CpuRequested, TestOrder::Restarts]);
+
+        assert_eq!(
+            unranked_note(
+                TestOrder::CpuRequested,
+                Cause::Unexplained,
+                ranks,
+                distinguishes
+            ),
             None
         );
     }

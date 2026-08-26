@@ -312,7 +312,35 @@ mod tests {
     }
 
     #[test]
-    fn a_pane_ordering_that_ranked_something_says_nothing_extra() {
+    fn a_pane_ordering_that_ranked_and_distinguished_something_says_nothing_extra() {
+        // Two rows with different `cpu_used` figures: `--sort cpu` (`s` in the
+        // pane) both ranks and rearranges them, so the diagnosis has nothing
+        // to add. A single row would not prove this — see the tests below.
+        let state = PodsState::Loaded {
+            rows: vec![
+                PodRow {
+                    cpu_used: Some(Quantity::parse("250m").unwrap()),
+                    ..pod("api-1")
+                },
+                PodRow {
+                    cpu_used: Some(Quantity::parse("50m").unwrap()),
+                    ..pod("api-2")
+                },
+            ],
+            selector_note: None,
+        };
+
+        let rendered = render_ordered(&state, None, Order::Cpu, Direction::Natural);
+
+        assert!(!rendered.contains("Nothing here"), "{rendered}");
+        assert!(!rendered.contains("ranks the same"), "{rendered}");
+    }
+
+    #[test]
+    fn a_pane_with_one_row_never_calls_its_own_ordering_useful() {
+        // A single sampled pod ranks under `cpu` — there is a real figure —
+        // but a pane with one row can never be *rearranged* by anything, so
+        // the diagnosis fires anyway: sorting it was a no-op.
         let sampled = PodRow {
             cpu_used: Some(Quantity::parse("250m").unwrap()),
             ..pod("api-1")
@@ -324,7 +352,41 @@ mod tests {
 
         let rendered = render_ordered(&state, None, Order::Cpu, Direction::Natural);
 
-        assert!(!rendered.contains("Nothing here"), "{rendered}");
+        assert!(
+            rendered.contains(
+                "Every row here ranks the same under cpu, so sorting by it changed nothing."
+            ),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn a_pane_ordering_that_ranks_two_tied_rows_says_so() {
+        // Two rows with the *same* `cpu_used` figure: `ranks_any` says yes for
+        // both, but sorting between them changes nothing, and the pane says
+        // so exactly as the CLI table does.
+        let state = PodsState::Loaded {
+            rows: vec![
+                PodRow {
+                    cpu_used: Some(Quantity::parse("250m").unwrap()),
+                    ..pod("api-1")
+                },
+                PodRow {
+                    cpu_used: Some(Quantity::parse("250m").unwrap()),
+                    ..pod("api-2")
+                },
+            ],
+            selector_note: None,
+        };
+
+        let rendered = render_ordered(&state, None, Order::Cpu, Direction::Natural);
+
+        assert!(
+            rendered.contains(
+                "Every row here ranks the same under cpu, so sorting by it changed nothing."
+            ),
+            "{rendered}"
+        );
     }
 
     #[test]
