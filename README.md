@@ -340,7 +340,52 @@ did nothing.
 
 Credentials come from the kubeconfig context itself, so whatever works for
 `kubectl` works here. When they have expired, `eks` says so and tells you how to
-refresh them instead of printing an HTTP status code.
+refresh them instead of printing an HTTP status code — and, if the session it
+needs is an IAM Identity Center one, offers to refresh it for you.
+
+### Logging in
+
+An EKS context authenticates by running `aws eks get-token`, and that command
+fails the moment your IAM Identity Center session runs out — which for most
+people is once a morning. `eks` checks before it asks the cluster for anything:
+
+```
+$ eks nodes
+prod (us-east-1) needs a fresh login: profile "corp" signed out of IAM Identity Center 9h ago.
+Log in now with `aws sso login --profile corp`? [Y/n]
+```
+
+Say yes and it runs that command, waits for the browser, and carries on with the
+listing you asked for. Say no and it tells you the command to run yourself.
+
+The check costs nothing: it reads `~/.aws/config` to find which profile the
+context uses and which Identity Center session that profile authenticates
+through, then reads the AWS CLI's own token cache under `~/.aws/sso/cache/` to
+see when it expires. No network call, no subprocess, and nothing that runs
+before the dashboard's first frame. A token with under a minute left counts as
+expired — it would die partway through a paged listing otherwise.
+
+Some rules worth knowing, because they are what stops this being annoying:
+
+- **A browser never opens without a yes.** The question is only asked when both
+  stdin and stderr are terminals. `eks nodes > nodes.txt` in a cron job gets the
+  message it always got, never a prompt nobody is there to answer.
+- **The question and the answer go to stderr.** `eks nodes | column -t` prints
+  the same bytes on stdout it printed before.
+- **Only Identity Center profiles are offered anything.** Static keys, a
+  `credential_process`, an instance role: there is nothing to log in to, and you
+  get the old message.
+- **You are asked at most once per command.** If the cluster then refuses
+  credentials the cache thought were live — a token revoked centrally still
+  reads as valid locally — `eks` offers a login once more, but never after you
+  have already said no.
+- **`--login never` is exactly the old behaviour**, down to the error text. It
+  does not even read `~/.aws`.
+
+In the dashboard, the question is put once before the terminal is taken over. A
+session that dies while it is open shows up as a failed refresh over the rows
+you already had, with `L` on the footer: pressing it hands the terminal back,
+logs in, takes it again, and refetches.
 
 ### Narrow terminals
 
@@ -390,6 +435,7 @@ more columns, not for a table that gets out of the way.
 | `--timeout <DURATION>` | How long to wait for any one request to the cluster. Default `30s`; `0` waits for as long as it takes |
 | `--refresh <DURATION>` | How often the dashboard refreshes its panes in the background. Default `15s`; `0` turns automatic refresh off (`r` still refreshes on demand) |
 | `--color <WHEN>` | `auto` (default), `always`, or `never`. Spelled `--colour` too |
+| `--login <WHEN>` | Whether to log in to AWS IAM Identity Center for you when the session has run out. `auto` (default) offers, `always` does it without asking, `never` just tells you what to run |
 | `-v, --verbose` | Increase log verbosity (repeatable) |
 
 `KUBECONFIG` is honoured, including multi-path values, with the same precedence
@@ -448,9 +494,11 @@ A private EKS endpoint only answers from inside its VPC or over a VPN. If the cl
 
 That is the failure the flag exists for: a private endpoint reached from outside
 its VPC does not refuse the connection, it simply never answers. `--timeout 0`
-restores the old behaviour of waiting indefinitely. It covers requests, not the
-kubeconfig's credential helper — `aws eks get-token` runs before the first
-request and outside anything this flag can interrupt.
+restores the old behaviour of waiting indefinitely. It covers the kubeconfig's
+credential helper as well as the requests after it, spent per step rather than
+per command. What it deliberately does *not* cover is `aws sso login`: that one
+is waiting for a human at a browser, and cutting it off after thirty seconds
+would be cutting off the thing you asked for.
 
 ### Keys
 
@@ -463,6 +511,7 @@ request and outside anything this flag can interrupt.
 | `Enter` | Drill in — a node's pods, a pod's containers, a container's log |
 | `Esc` | Back out one level; quits once there is nowhere left to back out to |
 | `r` | Refresh the node pane now |
+| `L` | Log in to AWS again — only offered when the pane is showing a credential failure |
 | `f` | Toggle following a container's log |
 | `w` | Toggle line wrap in a container's log |
 | `p` | Switch a container's log between its current instance and its previous one |

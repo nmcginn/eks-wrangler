@@ -6,8 +6,9 @@ use std::sync::mpsc;
 use anyhow::{Result, anyhow};
 use k8s_openapi::jiff::Timestamp;
 
+use crate::aws::LoginMode;
 use crate::cluster::ClusterView;
-use crate::commands::{self, contexts};
+use crate::commands::{self, contexts, credentials};
 use crate::format::Width;
 use crate::k8s::metrics::{self as k8s_metrics};
 use crate::k8s::order::Direction;
@@ -42,6 +43,11 @@ pub struct Request {
     /// all of them is the credential helper, which `k8s::connect` runs on a
     /// blocking task so that this can bound it.
     pub budget: page::Budget,
+    /// `--login`: whether a stale IAM Identity Center session may be refreshed
+    /// for the user before the credential helper is run. Carried beside the
+    /// budget because it belongs to the same step — the one before the first
+    /// request.
+    pub login: LoginMode,
 }
 
 /// What one fetch found, before either renderer decides what to do with it.
@@ -73,11 +79,12 @@ async fn gather(
     paths: &[PathBuf],
     selector: Option<&str>,
     budget: page::Budget,
+    login: LoginMode,
 ) -> Result<Gathered> {
     let target = target_cluster(config, selector)?;
     let label = target.label();
 
-    let client = k8s::connect(paths, &target, budget).await?;
+    let client = credentials::connect(paths, &target, budget, login).await?;
 
     // Concurrently, not in sequence: the three requests are independent, and the
     // command should cost one round trip's worth of waiting rather than three.
@@ -91,7 +98,10 @@ async fn gather(
         // The raw error is worth having when debugging, but it is not what the
         // user needs to read; `-vv` brings it back.
         tracing::debug!(%error, "listing nodes failed");
-        anyhow!(k8s::explain(&error, &label))
+        // `Error::explained` rather than a bare sentence: the classification
+        // behind the wording is what lets the dashboard offer `L` for a
+        // listing the cluster refused, and not for one it could not reach.
+        k8s::client::Error::explained(&error, &label)
     })?;
 
     // Only the node listing is fatal. The other two each cost the user some
@@ -195,6 +205,7 @@ pub async fn list(
         width,
         palette,
         budget,
+        login,
     } = request;
 
     let Gathered {
@@ -204,7 +215,7 @@ pub async fn list(
         usage,
         samples,
         now,
-    } = gather(config, paths, selector, budget).await?;
+    } = gather(config, paths, selector, budget, login).await?;
 
     // Ordering lives in `k8s::nodes::order` rather than here, so the default and
     // the one `--sort` asks for are decided in the same place and by the same
@@ -305,24 +316,35 @@ pub fn spawn_gather(
     paths: Vec<PathBuf>,
     selector: Option<String>,
     budget: page::Budget,
-) -> mpsc::Receiver<Result<NodesFetch, String>> {
+) -> mpsc::Receiver<Result<NodesFetch, commands::FetchError>> {
     commands::spawn(async move {
-        gather(&config, &paths, selector.as_deref(), budget)
-            .await
-            .map(|gathered| {
-                let usage_note = k8s_nodes::usage_note(
-                    &gathered.rows,
-                    &gathered.usage,
-                    &gathered.samples,
-                    gathered.now,
-                    &gathered.label,
-                );
-                NodesFetch {
-                    rows: gathered.rows,
-                    usage_note,
-                }
-            })
-            .map_err(|error| format!("{error:#}"))
+        // `Never`, always. This runs on a background thread that does not own
+        // the terminal, so it must never stop to ask a question or hand a
+        // browser prompt to a screen the dashboard is drawing on. The
+        // dashboard's own login paths are `credentials::preflight` before the
+        // terminal opens, and the `L` key once it has.
+        gather(
+            &config,
+            &paths,
+            selector.as_deref(),
+            budget,
+            LoginMode::Never,
+        )
+        .await
+        .map(|gathered| {
+            let usage_note = k8s_nodes::usage_note(
+                &gathered.rows,
+                &gathered.usage,
+                &gathered.samples,
+                gathered.now,
+                &gathered.label,
+            );
+            NodesFetch {
+                rows: gathered.rows,
+                usage_note,
+            }
+        })
+        .map_err(|error| commands::FetchError::of(&error))
     })
 }
 

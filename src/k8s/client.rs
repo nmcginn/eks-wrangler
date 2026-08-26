@@ -64,8 +64,14 @@ pub enum Error {
 
     /// A failure that already carries a user-facing explanation, from
     /// [`explain`].
-    #[error("{0}")]
-    Cluster(String),
+    ///
+    /// `failure` is the classification that produced that sentence, kept beside
+    /// it rather than thrown away: [`crate::commands::credentials`] has to ask
+    /// whether a build failed for want of credentials — the one kind of failure
+    /// logging in again could fix — and reading the answer back out of English
+    /// prose would be a second, worse copy of [`Failure::of`].
+    #[error("{message}")]
+    Cluster { message: String, failure: Failure },
 
     /// The context's credential helper was still running when the budget ran
     /// out. Carries its explanation from [`stalled_helper`], which is a
@@ -83,6 +89,25 @@ pub enum Error {
          please report it with the output of `eks -vv`."
     )]
     Interrupted { cluster: String, message: String },
+}
+
+impl Error {
+    /// An explained failure from a request, keeping the classification beside
+    /// the sentence.
+    ///
+    /// The same pairing [`build`] produces, for the listings that run *after*
+    /// a client exists. Those failures are explained through [`explain`] too,
+    /// and a caller asking "could a fresh login fix this?" has to be able to
+    /// ask it of them as well — an expired token is refused by the API server
+    /// just as readily as by the credential helper, and which of the two
+    /// noticed is not something the user should have to care about.
+    #[must_use]
+    pub fn explained(error: &page::Error, cluster: &str) -> Self {
+        Self::Cluster {
+            failure: Failure::of(error),
+            message: explain(error, cluster),
+        }
+    }
 }
 
 fn format_paths(paths: &[PathBuf]) -> String {
@@ -116,6 +141,23 @@ pub async fn connect(
     cluster: &ClusterView,
     budget: Budget,
 ) -> Result<Client, Error> {
+    let config = resolve(paths, cluster).await?;
+    build(config, &cluster.label(), budget).await
+}
+
+/// Read the kubeconfig and settle which cluster, user, and auth a context
+/// names — without running anything.
+///
+/// The half of [`connect`] that is genuinely free. Nothing here starts a
+/// process or opens a socket, so the resulting [`Config`] can be inspected
+/// before the decision to run its credential helper is taken: it carries the
+/// `exec` block, which is where [`crate::aws::profile::profile_for`] finds the
+/// AWS profile whose Identity Center session might be the reason the helper is
+/// about to fail.
+///
+/// Split out for that caller, and kept public so the inspection does not have
+/// to re-read and re-merge the same files a second time.
+pub async fn resolve(paths: &[PathBuf], cluster: &ClusterView) -> Result<Config, Error> {
     let kubeconfig = read_merged(paths)?;
 
     let options = KubeConfigOptions {
@@ -124,14 +166,23 @@ pub async fn connect(
         user: None,
     };
 
-    let config = Config::from_custom_kubeconfig(kubeconfig, &options)
+    Config::from_custom_kubeconfig(kubeconfig, &options)
         .await
         .map_err(|source| Error::Context {
             context: cluster.context_name.clone(),
             message: source.to_string(),
-        })?;
+        })
+}
 
-    let label = cluster.label();
+/// Turn a resolved [`Config`] into a client, running the context's credential
+/// helper and giving up on it after `budget`.
+///
+/// The half of [`connect`] with the side effect in it. Separate so a caller
+/// that has already looked at the `Config` — and possibly logged the user in
+/// since — can try it twice without resolving twice; `label` is the human name
+/// for the cluster, the same one [`ClusterView::label`] gives.
+pub async fn build(config: Config, label: &str, budget: Budget) -> Result<Client, Error> {
+    let label = label.to_owned();
     // Read before `config` moves onto the blocking task, because the message
     // for a helper that never answers has to name the command to run by hand.
     let helper = helper_command(&config.auth_info);
@@ -168,7 +219,11 @@ pub async fn connect(
         })?
         .map_err(|source| {
             tracing::debug!(%source, "building a client failed");
-            Error::Cluster(explain(&source.into(), &label))
+            let error = source.into();
+            Error::Cluster {
+                failure: Failure::of(&error),
+                message: explain(&error, &label),
+            }
         })
 }
 
@@ -194,18 +249,14 @@ pub fn helper_command(auth: &AuthInfo) -> Option<String> {
 
     let mut line = String::new();
 
-    // The same two keys `kube` reads, and the same silence about an entry
-    // carrying anything else: a variable it will not pass is not one to print.
-    for variable in exec.env.iter().flatten() {
-        if let (Some(name), Some(value)) = (variable.get("name"), variable.get("value")) {
-            // The name is written bare. A shell will not accept a quoted one on
-            // the left of `=`, and a name that would need quoting is not a
-            // variable name.
-            line.push_str(name);
-            line.push('=');
-            line.push_str(&shell_word(value));
-            line.push(' ');
-        }
+    for (name, value) in exec_env(auth) {
+        // The name is written bare. A shell will not accept a quoted one on
+        // the left of `=`, and a name that would need quoting is not a
+        // variable name.
+        line.push_str(name);
+        line.push('=');
+        line.push_str(&shell_word(value));
+        line.push(' ');
     }
 
     line.push_str(&shell_word(command));
@@ -214,6 +265,32 @@ pub fn helper_command(auth: &AuthInfo) -> Option<String> {
         line.push_str(&shell_word(argument));
     }
     Some(line)
+}
+
+/// The environment variables a context's `exec` block sets, as name/value
+/// pairs.
+///
+/// The same two keys `kube` reads, and the same silence about an entry carrying
+/// anything else: a variable it will not pass to the helper is not one anybody
+/// here should act on either.
+///
+/// Shared rather than walked twice, because two callers ask this question for
+/// two purposes that must agree. [`helper_command`] prints the assignments in
+/// front of the command line it tells the user to run; [`crate::aws::profile`]
+/// reads `AWS_PROFILE` out of them to decide which profile to log in. A tool
+/// that logged in to one profile and then printed a command naming another
+/// would be worse than one that did neither.
+pub fn exec_env(auth: &AuthInfo) -> impl Iterator<Item = (&str, &str)> {
+    auth.exec
+        .as_ref()
+        .into_iter()
+        .flat_map(|exec| exec.env.iter().flatten())
+        .filter_map(|variable| {
+            Some((
+                variable.get("name")?.as_str(),
+                variable.get("value")?.as_str(),
+            ))
+        })
 }
 
 /// One word of a command line, quoted if a shell would need it quoted.

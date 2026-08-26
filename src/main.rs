@@ -12,8 +12,9 @@ use clap::Parser;
 use ratatui::crossterm::terminal;
 use tracing_subscriber::EnvFilter;
 
+use eks::aws::LoginMode;
 use eks::cli::{Cli, Command, GlobalArgs};
-use eks::commands::{self, contexts, nodes, pods};
+use eks::commands::{self, contexts, credentials, nodes, pods};
 use eks::format::Width;
 use eks::k8s::order::Direction;
 use eks::k8s::page::Budget;
@@ -58,6 +59,7 @@ fn run(cli: Cli) -> Result<()> {
                 cli.global.timeout,
                 cli.global.refresh,
                 &selectors,
+                cli.global.login,
             )
         }
         Command::Contexts { quiet } => {
@@ -81,6 +83,7 @@ fn run(cli: Cli) -> Result<()> {
                     width: Width::for_terminal(wide, stdout_terminal_cols()),
                     palette: stdout_palette(cli.global.color),
                     budget: cli.global.timeout,
+                    login: cli.global.login,
                 },
             ))?;
             print_line(&output);
@@ -106,6 +109,7 @@ fn run(cli: Cli) -> Result<()> {
                     width: Width::for_terminal(wide, stdout_terminal_cols()),
                     palette: stdout_palette(cli.global.color),
                     budget: cli.global.timeout,
+                    login: cli.global.login,
                 },
             ))?;
             print_line(&output);
@@ -129,6 +133,7 @@ fn dashboard(
     budget: Budget,
     refresh: RefreshInterval,
     selectors: &Selectors,
+    login: LoginMode,
 ) -> Result<()> {
     let views = contexts::views(config);
     let mut app = App::new(views);
@@ -141,6 +146,20 @@ fn dashboard(
         if !app.select_context(&context_name) {
             bail!("context {name:?} disappeared while starting up");
         }
+    }
+
+    // The dashboard's one chance to ask a question with an ordinary terminal in
+    // front of it. Every fetch after this point runs on a background thread and
+    // draws onto an alternate screen, so a login offered from there would be
+    // shouting over the pane it was trying to fill; `L` on the failure banner is
+    // how a session that dies later gets refreshed instead.
+    //
+    // Skipped outright under `--login never`, so that flag costs nothing at all
+    // — not even the runtime this would otherwise build before first paint.
+    if !matches!(login, LoginMode::Never)
+        && let Some(cluster) = app.selected_cluster().cloned()
+    {
+        commands::block_on(credentials::preflight(paths, &cluster, login))?;
     }
 
     // Every fetch after this one — `r`, the refresh interval, a different
@@ -240,7 +259,27 @@ fn dashboard(
         spawn_logs: &spawn_logs,
     };
 
-    ui::run(app, nodes_rx, &spawn_nodes, &drill, refresh)
+    // What `L` runs. Unlike the four fetchers above it does not spawn a thread:
+    // it blocks, because it owns the terminal `ui::run` hands back to it, and a
+    // browser login is a thing to wait for rather than to poll.
+    //
+    // `Always`, not the flag the user passed: pressing `L` *is* the yes, and
+    // asking a second question over a dashboard that has just given the screen
+    // back would be asking it twice. The key only appears at all when the pane
+    // is showing a credential failure, so there is nothing here to decide.
+    let login: ui::LoginRunner = {
+        let config = config.clone();
+        let paths = paths.to_vec();
+        Box::new(move |context: &str| {
+            let views = contexts::views(&config);
+            let cluster = contexts::resolve_selector(&views, context)
+                .map_err(|error| format!("{error:#}"))?;
+            commands::block_on(credentials::preflight(&paths, cluster, LoginMode::Always))
+                .map_err(|error| format!("{error:#}"))
+        })
+    };
+
+    ui::run(app, nodes_rx, &spawn_nodes, &drill, refresh, &login)
 }
 
 /// Print a command's output, skipping the newline for empty results so

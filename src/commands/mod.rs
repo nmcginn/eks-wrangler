@@ -10,8 +10,48 @@ use std::sync::mpsc;
 use anyhow::{Context as _, Result};
 
 pub mod contexts;
+pub mod credentials;
 pub mod nodes;
 pub mod pods;
+
+/// A failed background fetch, as the dashboard receives it.
+///
+/// The panes render `message` and nothing else — it is already a full sentence
+/// from `k8s::client::explain`. `credentials` is the one fact about it they
+/// cannot recover from the text: whether this is the failure a fresh AWS login
+/// would fix, which is what decides whether `L` does anything.
+///
+/// It exists because the classification is lost at the thread boundary.
+/// [`spawn`] hands back whatever the future produced, and by then a typed
+/// `k8s::client::Error` has been flattened into an `anyhow::Error` inside a
+/// `Result` the receiving end only knows how to print. Asking the question
+/// while the typed error is still in hand — in [`Self::of`] — and carrying the
+/// answer across is what stops the dashboard from re-deriving it by matching on
+/// English prose.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FetchError {
+    pub message: String,
+    pub credentials: bool,
+}
+
+impl FetchError {
+    /// Classify and flatten a failed fetch on its way back to the dashboard.
+    #[must_use]
+    pub fn of(error: &anyhow::Error) -> Self {
+        Self {
+            // `{:#}` prints the whole context chain on one line, which is what
+            // a pane has room for.
+            message: format!("{error:#}"),
+            credentials: credentials::refused_credentials(error),
+        }
+    }
+}
+
+impl std::fmt::Display for FetchError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
 
 /// Run one async command to completion.
 ///

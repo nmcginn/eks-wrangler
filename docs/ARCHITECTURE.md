@@ -12,6 +12,9 @@ src/
   format.rs            Ages and aligned tables — pure string formatting.
   theme.rs             The entire colour palette, the severity thresholds, and
                        the CLI's colour palette and escape sequences.
+  aws/                 Which AWS profile a context uses, whether its IAM
+                       Identity Center session is still alive, and running
+                       `aws sso login` when it is not.
   k8s/                 The Kubernetes client, paging and request budgets,
                        quantities, selectors, nodes, pods, and metrics.
   commands/            One module per user-facing command.
@@ -74,6 +77,35 @@ install for you, so on a fresh cluster there is simply nothing to show.
 The metrics request has a third outcome that is neither of those: it succeeds and
 carries nothing. That costs the same two columns a failure does, so it earns a
 footnote of its own rather than the silence a successful request used to buy.
+
+Before any of that runs, there is a step that costs nothing and saves the whole
+pipeline: `commands::credentials::connect` asks whether the credentials are
+going to work at all. `aws::profile::profile_for` reads the AWS profile out of
+the context's own `exec` block, `aws::config` finds the Identity Center session
+that profile authenticates through in `~/.aws/config`, and `aws::sso::classify`
+reads the AWS CLI's token cache to see when it expires. Three file reads and two
+pure functions — no network, no subprocess — which is the only reason the check
+can happen *before* connecting rather than in reaction to a `401` the user has
+already waited for.
+
+`aws::decide` is the whole policy, as one pure function over the session, the
+`--login` flag, and whether there is a human at the terminal to answer. It is a
+pure function precisely so that "never open a browser at somebody who is piping
+this into a file" is a test rather than a hope. Nothing in `aws/` holds a
+credential: the token cache is read for its `expiresAt` and its `startUrl`, and
+`aws::login` shells out to the AWS CLI — already a hard requirement of every EKS
+context — rather than implementing the OIDC device flow and a cache format that
+is `botocore`'s to change.
+
+The dashboard cannot do this the way a one-shot command does, because its
+fetches run on background threads that do not own the terminal. So it splits:
+`credentials::preflight` puts the question once in `main::dashboard`, before
+`ui::run` opens the alternate screen, and every fetcher after it is built with
+`LoginMode::Never`. A session that dies mid-session becomes `Flow::Login` from
+`App::on_key`, and `ui::run` — the one function that knows a real terminal is
+involved — hands it back, runs the login, and takes it again. `event_loop` stays
+generic over the backend, taking the suspend as a closure, so every keypress
+test still runs against `TestBackend` with no terminal anywhere near it.
 
 `NodeRow::from_node` takes an explicit `now`, so ages are computed rather than
 observed and every row in a listing shares one instant.
