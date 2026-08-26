@@ -249,7 +249,7 @@ cluster.
   GATES` as a third pod column, because the default table cannot explain a pod
   whose `READY` reads `1/1` while the cluster calls it unready.
 
-- [ ] **Decide what `--wide` means in a dashboard pane.**
+- [x] **Decide what `--wide` means in a dashboard pane.**
   `format::Width` and the two `columns` functions are ready for a third caller,
   and the pod and node panes will meet the same question the CLI tables did.
   Separate because the answer may not be a wide mode at all: a pane is narrower
@@ -261,6 +261,32 @@ cluster.
   `k8s::pods::row::columns` and `k8s::nodes::columns` rather than a second list;
   a pane that shows the extra fields at all shows them under the same headings
   the CLI uses.
+  Landed as "no wide mode": the pod-containers pane now shows `IP`,
+  `NOMINATED NODE`, and `READINESS GATES` as plain lines above the container
+  list, unconditionally, rather than behind a mode switch — the pane already
+  commits to one pod, so there is nothing left to widen away from. The values
+  come from `k8s::pods::row::pod_ip`/`nominated_node`/`readiness_gates`, now
+  `pub(crate)` and shared with `PodRow::from_pod` rather than read twice. The
+  node half is a new entry below: the reasoning here depends on a detail view
+  existing to hold the facts, and the node pane has none — `Enter` drills into
+  a node's pods, not the node itself. See decision 72.
+
+- [ ] **A node's own detail view, and its `--wide` facts in it.**
+  The pod half of "Decide what `--wide` means in a dashboard pane" landed the
+  facts as plain lines in the pod-containers pane, because that pane already
+  commits to one pod and had somewhere to put them. Nothing plays that role
+  for a node: `Enter` on a highlighted node drills into its pods, and there is
+  no view of the node itself to hold `INTERNAL-IP`, `EXTERNAL-IP`, `OS-IMAGE`,
+  `KERNEL-VERSION`, or `CONTAINER-RUNTIME` — `eks nodes --wide`'s five columns
+  — even if the same "no wide mode, just say it" answer applies once a view
+  exists. Separate because it is a real new surface, not a rendering choice
+  inside one: "A node's full condition list, not just its derived status",
+  above, wants the same view for a different set of facts, and whether the
+  two ship together or the second earns its own key is the same kind of
+  question the pod side already had to answer as it built its detail view.
+  *Acceptance:* whichever shape the view takes, its wide facts come from
+  `k8s::nodes::columns`' existing `Column` variants rather than a second
+  reading of `Node`; a node pane that never opens the view is unchanged.
 
 ### Follow-ups from the usage columns
 
@@ -1055,6 +1081,30 @@ cluster.
 ---
 
 ## Done
+
+- **Decide what `--wide` means in a dashboard pane** (2026-08-26) — the
+  pod-containers pane now shows `IP:`, `Nominated node:`, and
+  `Readiness gates:` above its container list — the three facts
+  `eks pods --wide` reserves a column for — printed outright rather than
+  behind a mode switch. The task's own wording had left the shape open: a
+  pane is narrower than a terminal, not wider, so widening it was never
+  obviously the right answer, and the pane already commits to one pod, with
+  nothing else competing with these facts for space. `IP` always prints,
+  `-` included, since a pod with no address yet is itself the answer to "why
+  can't anything reach this pod"; `NOMINATED NODE` and `READINESS GATES`
+  follow the CLI columns' own judgement of when they earn print space, so
+  the ordinary pod with neither gains nothing extra. `k8s::pods::row::pod_ip`
+  and `::readiness_gates` moved from private to `pub(crate)`, and the
+  nominated-node lookup — inlined in `PodRow::from_pod` before tonight — is
+  now its own function beside them, so the pane's fetch and the CLI's row
+  builder read the same three functions rather than one of them keeping a
+  second copy. `commands::pods::gather_containers` already had the full
+  `Pod` these need for its `ContainerRow` list; `ContainersFetch` and
+  `ContainersState::Loaded` just carry three more fields of what was already
+  fetched, so nothing new goes over the wire. The node table's five `--wide`
+  columns are not part of this: the pod side's answer depends on a detail
+  view to hold the facts, and the node pane has none — see the new entry
+  below. See decision 72.
 
 - **Say when the ordering a user actually typed ranked everything and changed
   nothing** (2026-08-26) — `--sort status` on a cluster where every node is

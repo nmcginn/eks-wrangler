@@ -42,7 +42,7 @@ use crate::k8s::quantity::{self, Quantity};
 use crate::theme::{Palette, Severity};
 
 /// Shown wherever the API server left a field empty, as elsewhere in the tool.
-const UNKNOWN: &str = "-";
+pub(crate) const UNKNOWN: &str = "-";
 
 /// The reason a pod carries when the node running it stopped answering. Its
 /// pods are not really terminating — nobody can confirm anything about them.
@@ -195,12 +195,7 @@ impl PodRow {
                 .filter(|name| !name.is_empty())
                 .map_or_else(|| UNKNOWN.to_owned(), str::to_owned),
             ip: pod_ip(pod),
-            nominated_node: pod
-                .status
-                .as_ref()
-                .and_then(|status| status.nominated_node_name.as_deref())
-                .filter(|name| !name.is_empty())
-                .map_or_else(|| UNKNOWN.to_owned(), str::to_owned),
+            nominated_node: nominated_node(pod),
             readiness_gates: readiness_gates(pod),
         }
     }
@@ -212,7 +207,11 @@ impl PodRow {
 /// fills both, but only the list can hold the IPv6 address of a dual-stack pod,
 /// and its first entry is the one matching the pod's primary IP family. Falling
 /// back to `podIP` covers the pod whose kubelet is older than the list field.
-fn pod_ip(pod: &Pod) -> String {
+///
+/// `pub(crate)` so the pod-containers pane can read the same fact directly off
+/// the one `Pod` it fetches, rather than a second reading of the status —
+/// see [`crate::ui::containers`].
+pub(crate) fn pod_ip(pod: &Pod) -> String {
     let status = pod.status.as_ref();
     let from_list = status
         .and_then(|status| status.pod_ips.as_ref())
@@ -226,6 +225,18 @@ fn pod_ip(pod: &Pod) -> String {
         .map_or_else(|| UNKNOWN.to_owned(), str::to_owned)
 }
 
+/// The node the scheduler has earmarked for this pod while it evicts
+/// something to make room, or `-` — which is nearly every pod.
+///
+/// `pub(crate)` for the same reason [`pod_ip`] is.
+pub(crate) fn nominated_node(pod: &Pod) -> String {
+    pod.status
+        .as_ref()
+        .and_then(|status| status.nominated_node_name.as_deref())
+        .filter(|name| !name.is_empty())
+        .map_or_else(|| UNKNOWN.to_owned(), str::to_owned)
+}
+
 /// How many of the pod's readiness gates its conditions satisfy, as `1/2`.
 ///
 /// `None` when the pod declares no gates, which reads as `-`: `0/0` would
@@ -233,7 +244,9 @@ fn pod_ip(pod: &Pod) -> String {
 /// is nothing to satisfy. A gate whose condition the API server has not
 /// recorded at all counts as unsatisfied, which is what the pod's own readiness
 /// does with it.
-fn readiness_gates(pod: &Pod) -> Option<String> {
+///
+/// `pub(crate)` for the same reason [`pod_ip`] is.
+pub(crate) fn readiness_gates(pod: &Pod) -> Option<String> {
     let gates = pod.spec.as_ref()?.readiness_gates.as_deref()?;
     if gates.is_empty() {
         return None;
