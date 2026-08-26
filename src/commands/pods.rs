@@ -311,9 +311,18 @@ fn scoped_to_node(node: &str, selectors: &Selectors) -> Selectors {
 }
 
 /// What the pod-containers pane's background fetch delivers.
+///
+/// `ip`, `nominated_node`, and `readiness_gates` are the pod-level facts
+/// `eks pods --wide` reserves a column for — see decision 72. A pane already
+/// committed to one pod has room to say them outright, so they ride along
+/// beside its containers rather than waiting on a wide mode this pane will
+/// never grow.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ContainersFetch {
     pub rows: Vec<ContainerRow>,
+    pub ip: String,
+    pub nominated_node: String,
+    pub readiness_gates: Option<String>,
 }
 
 /// Fetch one pod's containers, on a background thread.
@@ -373,6 +382,9 @@ async fn gather_containers(
 
     Ok(ContainersFetch {
         rows: ContainerRow::from_pod(&fetched),
+        ip: k8s::pods::pod_ip(&fetched),
+        nominated_node: k8s::pods::nominated_node(&fetched),
+        readiness_gates: k8s::pods::readiness_gates(&fetched),
     })
 }
 

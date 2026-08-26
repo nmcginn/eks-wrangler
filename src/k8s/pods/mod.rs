@@ -42,6 +42,7 @@ pub use containers::ContainerRow;
 pub use logs::LogEvent;
 pub use order::{Missing, Order, cause, distinguishes, ranks_any, sort};
 pub use row::{PodRow, render, selector_note, shows_usage, usage_unavailable, usage_unsampled};
+pub(crate) use row::{nominated_node, pod_ip, readiness_gates};
 
 /// Pods that have finished linger in the API server until something collects
 /// them, and they hold nothing on the node. Excluding them server-side keeps a

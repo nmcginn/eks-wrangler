@@ -2237,3 +2237,57 @@ to keep testing what it was written to test — the same shape of fix decision
 against the single-row case to cover what actually changed. Sorting one row
 was always a no-op, so the new line is the honest one, and it is now said in
 the one place `--sort` speaks rather than left to the reader to notice.
+
+### 72. A dashboard pane's `--wide` facts move to the detail view they are
+about, rather than growing a wide mode
+
+The roadmap left "Decide what `--wide` means in a dashboard pane" open on
+purpose: `format::Width::Wide` reserves five columns on `eks nodes` and three
+on `eks pods` for facts most listings never need, and whether a pane meets
+the same flag with the same mechanism — a wider table — or with something
+else was called out as a question a pane's own shape should answer, not one
+the CLI's answer could be guessed forward from.
+
+It answers "something else", and only for pods tonight. A CLI table earns a
+wide mode because every row is a line the reader either reads or skips, and
+five more columns are five more things to skip past on a hundred rows that
+did not need them. A dashboard pane showing one pod's containers has already
+committed to that one row — the breadcrumb names it, `Enter` chose it — so
+its extra facts are not competing with anything else on screen for space.
+There is nothing left to widen *away from*.
+
+So `IP`, `NOMINATED NODE`, and `READINESS GATES` — `k8s::pods::row::Column`'s
+three `--wide`-only pod columns — now appear as plain lines above the
+container list in the pod-containers pane (`ui::containers::identity_lines`),
+unconditionally, with no `--wide` equivalent key to press. `IP` always shows,
+`-` included, because a pod with no address yet is itself the answer to "why
+can't anything reach this pod". `NOMINATED NODE` and `READINESS GATES` follow
+the CLI columns' own judgement of when they are worth print space — neither
+line appears for the ordinary pod that has neither — which is the one thing
+this change keeps rather than reopens: nearly every pod would print nothing
+new, and the pane should not either.
+
+The values themselves come from the same three functions the CLI's `Column`
+already called, not a second reading of `pod.status`: `k8s::pods::row::pod_ip`
+and `::readiness_gates` were private free functions and are now `pub(crate)`,
+and the nominated-node lookup — inlined before tonight, directly in
+`PodRow::from_pod` — is now its own function, `nominated_node`, beside them,
+so `PodRow::from_pod` and the pane's fetch call the identical three functions
+rather than one of them keeping a second copy of the field it reads.
+`commands::pods::gather_containers` already fetches the one full `Pod` these
+need; it was building a `ContainerRow` list from it and discarding the rest,
+so nothing new is fetched — `ContainersFetch` just keeps three more fields of
+what it already has, and `ContainersState::Loaded` carries them to the pane
+the same way.
+
+What this does not settle: the node table's five `--wide` columns
+(`INTERNAL-IP`, `EXTERNAL-IP`, `OS-IMAGE`, `KERNEL-VERSION`,
+`CONTAINER-RUNTIME`) have nowhere to land by the same reasoning, because the
+node pane has no equivalent of the pod-containers pane — `Enter` on a node
+drills into its pods, not into a detail view of the node itself. The
+"detail view already exists" argument above depends on that view existing,
+and for nodes it does not; a new roadmap entry below builds that surface
+before this question can be answered for it, rather than this change
+guessing at a view's shape to hang five facts on. The pod half above is the
+complete answer to its half of the question, not a partial answer to the
+whole of it.
