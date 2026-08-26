@@ -2118,3 +2118,67 @@ open, whether opening a previous log should force `follow: false`: yes,
 unconditionally, because a terminated container's log has already stopped
 growing and a `follow`ed read of one would sit open waiting for a line that
 is never coming. The current log's own `follow: true` is untouched.
+
+### 70. `--sort` advice is filtered by `distinguishes`, a second and stricter
+predicate than `ranks_any`
+
+`k8s::order::unranked_note`'s "sort by X instead" line used to suggest any
+ordering `ranks_any` said yes to — has at least one row it can rank. `--sort
+status` on a cluster where every node is `Ready` exposed the gap: every node
+has a status, so `ranks_any` is trivially true for it, and offering it as the
+fix for a failed ordering sends the reader to a table that looks exactly like
+the one that just told them nothing worked. The roadmap entry behind this
+posed two questions and left both to whoever picked the task up.
+
+The first: whether "the rows differ under this ordering" is the right bar for
+a *suggestion*, given "one row ranked" is deliberately the bar everywhere
+else `k8s::order` asks it — whether the flag itself is honoured, whether the
+diagnosis fires, which tail tier an unranked row lands in. It is, and only
+there: `unranked_note` now takes a second closure, `distinguishes`, asked
+only inside `alternatives`, and ANDed with the existing `ranks` rather than
+replacing it — an ordering has to both have something to rank a row by *and*
+actually put two rows in a different arrangement before it earns a place in
+the advice. Every other use of `ranks_any` — deciding whether the user's own
+chosen ordering counts as unranked, deciding a row's tail tier, deciding
+`cause` — is untouched. The advice line is the one place in the tool that
+promises the reader something will look different if they type this, so it
+is the one place held to a promise the rest of `--sort` does not make.
+
+The second: whether an ordering that puts every row in one group is really
+saying nothing, given "everything here is `Ready`" is an answer of a kind.
+It is not treated as one here. The advice list exists to name a flag worth
+typing next, and an ordering that provably rearranges nothing is not that,
+whatever true thing it could be read as saying about the cluster instead. A
+note that answered "is everything healthy" would be a different, useful
+feature — closer to a summary line than to sort advice — and it is not this
+one; building it would have been guessing at a feature the task never asked
+for under the cover of answering the one it did.
+
+`distinguishes(rows, order)` is implemented once per listing, beside its
+`ranks_any`, by comparing every row's `rank` against the first row's rather
+than comparing every pair: `rank` is already a total order (it is what `sort`
+itself uses before the alphabetical tie-break), so if every row compares
+equal to the first they compare equal to each other, and one pass is enough.
+`ranks_any` and `distinguishes` genuinely diverge, not only on the uniform-
+status case the roadmap entry named: two nodes tied at the same share of
+allocatable both rank under `cpu` and distinguish nothing between them,
+proven directly in `k8s::nodes::order`'s tests.
+
+The consequence worth flagging rather than discovering later: a listing of
+exactly one row can never be distinguished by anything, so a single-node or
+single-pod cluster now gets the bare diagnosis with no "sort by X instead" at
+all, where before it got whichever alternatives `ranks_any` allowed regardless
+of how many rows were on screen. Sorting one row was always a no-op, so the
+new note is arguably the honest one — but it is a real behaviour change
+beyond the literal example the roadmap entry gave, and several existing tests
+in `k8s::nodes` that used single-row fixtures needed a second, contrasting row
+added to keep testing what they were written to test rather than quietly
+starting to test the single-row case instead.
+
+Left open, and its own roadmap entry: `unranked_note`'s gate on the user's
+*own* chosen ordering is still `ranks_any` alone, so `--sort status` typed
+directly against a uniform cluster still prints `Sorted by status.` with
+nothing said about the fact that it changed nothing. That is a different
+question — whether a working-but-vacuous ordering deserves a note at all,
+given the line is not lying — and answering it was not this decision's to
+make.

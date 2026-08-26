@@ -17,7 +17,7 @@ use kube::api::{Api, ListParams};
 
 pub mod order;
 
-pub use order::{Missing, Order, cause, ranks_any, sort};
+pub use order::{Missing, Order, cause, distinguishes, ranks_any, sort};
 
 use crate::format;
 use crate::k8s::metrics::{self, Sample, Usage};
@@ -1344,6 +1344,23 @@ mod tests {
         }
     }
 
+    /// A second node, differing from [`healthy_node`] in every field an
+    /// ordering here could rank by: status and creation time. The
+    /// "unranked note" tests below pair the two so their advice proves
+    /// something stronger than "this ordering ranked a row" — that it would
+    /// actually put two rows in a different arrangement, which is what
+    /// [`crate::k8s::nodes::distinguishes`] asks and a single-row listing
+    /// can never answer yes to.
+    fn contrasting_node() -> Node {
+        let mut other = healthy_node();
+        other.metadata.name = Some("ip-10-0-2-7.ec2.internal".to_owned());
+        other.metadata.creation_timestamp = Some(ago(2));
+        if let Some(status) = other.status.as_mut() {
+            status.conditions = Some(vec![condition("Ready", "False")]);
+        }
+        other
+    }
+
     fn quantities(pairs: &[(&str, &str)]) -> BTreeMap<String, ApiQuantity> {
         pairs
             .iter()
@@ -2233,12 +2250,18 @@ mod tests {
         // usage footnote explains the missing columns; without the second note
         // nothing explains what became of the flag the user actually typed —
         // and the third line is the flag that would have worked on this table.
-        let rows = [NodeRow::from_node(
-            &healthy_node(),
-            Some(&idle()),
-            None,
-            now(),
-        )];
+        // Two nodes, contrasting in status, requests, and age, so the advice
+        // proves it named orderings that would have rearranged this listing
+        // rather than merely ranked it.
+        let rows = [
+            NodeRow::from_node(&healthy_node(), Some(&idle()), None, now()),
+            NodeRow::from_node(
+                &contrasting_node(),
+                Some(&booked("500m", "1Gi")),
+                None,
+                now(),
+            ),
+        ];
         let notes = sort_notes(&rows, Order::Cpu, no_usage());
 
         let output = render(
@@ -2263,8 +2286,13 @@ mod tests {
         // `eks nodes --sort pods` where the role grants nodes but not pods.
         // Every count is unknown, so the ordering ranked nothing — and the
         // request footnote above already says why, so the note points at it
-        // rather than explaining the same failure twice.
-        let rows = [NodeRow::from_node(&healthy_node(), None, None, now())];
+        // rather than explaining the same failure twice. Two contrasting
+        // nodes, so the suggested orderings are ones that would actually
+        // reorder this listing rather than a single row with nowhere to go.
+        let rows = [
+            NodeRow::from_node(&healthy_node(), None, None, now()),
+            NodeRow::from_node(&contrasting_node(), None, None, now()),
+        ];
         let missing = Missing {
             requests: true,
             usage: true,
@@ -2295,12 +2323,19 @@ mod tests {
         if let Some(status) = sampled_but_undescribed.status.as_mut() {
             status.allocatable = None;
         }
-        let rows = [NodeRow::from_node(
-            &sampled_but_undescribed,
-            Some(&idle()),
-            Some(used("392m", "1552515Ki")),
-            now(),
-        )];
+        let mut other = contrasting_node();
+        if let Some(status) = other.status.as_mut() {
+            status.allocatable = None;
+        }
+        let rows = [
+            NodeRow::from_node(
+                &sampled_but_undescribed,
+                Some(&idle()),
+                Some(used("392m", "1552515Ki")),
+                now(),
+            ),
+            NodeRow::from_node(&other, Some(&idle()), Some(used("100m", "256Mi")), now()),
+        ];
 
         assert!(shows_usage(&rows), "the columns should be in the table");
 
@@ -2308,7 +2343,8 @@ mod tests {
 
         // The booked orderings rank by share too, so removing the denominator
         // takes them with it — which is exactly why the advice is computed from
-        // the rows rather than listed out by hand.
+        // the rows rather than listed out by hand. The second node contrasts in
+        // status and age only, so those are the two orderings left standing.
         assert_eq!(
             notes[1],
             "Nothing here has cpu to sort by.\nSort by status or age instead."
@@ -2320,13 +2356,18 @@ mod tests {
         // The other half of the pair above, and what changed: metrics-server
         // answered with nothing, the columns are gone, and there is now a
         // footnote saying so — so the note points at it rather than restating
-        // the advice a paragraph later.
-        let rows = [NodeRow::from_node(
-            &healthy_node(),
-            Some(&idle()),
-            None,
-            now(),
-        )];
+        // the advice a paragraph later. Two contrasting nodes again, for the
+        // same reason as the test above: the advice has to name orderings
+        // that would rearrange this listing, not merely rank a lone row.
+        let rows = [
+            NodeRow::from_node(&healthy_node(), Some(&idle()), None, now()),
+            NodeRow::from_node(
+                &contrasting_node(),
+                Some(&booked("500m", "1Gi")),
+                None,
+                now(),
+            ),
+        ];
 
         assert!(
             !shows_usage(&rows),
@@ -2349,7 +2390,19 @@ mod tests {
         // neither of them is about `age`, so pointing at them would send the
         // user to read a paragraph that does not mention the column.
         // `Node::default()`: no creation timestamp, no allocatable, no status.
-        let rows = [NodeRow::from_node(&Node::default(), None, None, now())];
+        // A second, equally bare node but with a real status condition, so
+        // `status` has something to distinguish even though `age` never will.
+        let reporting = Node {
+            status: Some(NodeStatus {
+                conditions: Some(vec![condition("Ready", "True")]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let rows = [
+            NodeRow::from_node(&Node::default(), None, None, now()),
+            NodeRow::from_node(&reporting, None, None, now()),
+        ];
         let missing = Missing {
             requests: true,
             usage: true,
@@ -2411,6 +2464,7 @@ mod tests {
             order,
             crate::k8s::nodes::cause(order, missing),
             |candidate| crate::k8s::nodes::ranks_any(rows, candidate),
+            |candidate| crate::k8s::nodes::distinguishes(rows, candidate),
         ));
         notes
     }

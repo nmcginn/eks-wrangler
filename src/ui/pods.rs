@@ -10,7 +10,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Wrap};
 
 use crate::k8s::order::{self, Direction};
-use crate::k8s::pods::{Missing, Order, PodRow, cause, ranks_any};
+use crate::k8s::pods::{Missing, Order, PodRow, cause, distinguishes, ranks_any};
 use crate::theme::{Severity, Theme};
 
 /// What the pod-drilldown pane is showing, independent of how it is drawn.
@@ -101,11 +101,12 @@ pub(super) fn draw(
             // false` — is always the honest reading: nothing above these
             // rows explains why `cpu`/`memory` ranked nothing, because
             // nothing is printed about metrics here at all.
-            if let Some(note) =
-                order::unranked_note(order, cause(order, Missing::default()), |candidate| {
-                    ranks_any(rows, candidate)
-                })
-            {
+            if let Some(note) = order::unranked_note(
+                order,
+                cause(order, Missing::default()),
+                |candidate| ranks_any(rows, candidate),
+                |candidate| distinguishes(rows, candidate),
+            ) {
                 lines.extend(
                     note.lines()
                         .map(|line| Line::styled(line.to_owned(), theme.dim())),

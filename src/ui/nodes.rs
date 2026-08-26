@@ -10,7 +10,8 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Wrap};
 
 use crate::k8s::nodes::{
-    Capacity, Missing, NodeRow, Order, Share, cause, ranks_any, usage_missing_explained,
+    Capacity, Missing, NodeRow, Order, Share, cause, distinguishes, ranks_any,
+    usage_missing_explained,
 };
 use crate::k8s::order::{self, Direction};
 use crate::k8s::quantity::{self, Quantity};
@@ -132,9 +133,12 @@ pub(super) fn draw(
                 requests: false,
                 usage: usage_missing_explained(rows, usage_note.as_deref()),
             };
-            if let Some(note) = order::unranked_note(order, cause(order, missing), |candidate| {
-                ranks_any(rows, candidate)
-            }) {
+            if let Some(note) = order::unranked_note(
+                order,
+                cause(order, missing),
+                |candidate| ranks_any(rows, candidate),
+                |candidate| distinguishes(rows, candidate),
+            ) {
                 lines.extend(
                     note.lines()
                         .map(|line| Line::styled(line.to_owned(), theme.dim())),

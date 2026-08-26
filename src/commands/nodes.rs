@@ -272,6 +272,7 @@ pub async fn list(
         order,
         k8s_nodes::cause(order, missing),
         |candidate| k8s_nodes::ranks_any(&rows, candidate),
+        |candidate| k8s_nodes::distinguishes(&rows, candidate),
     ));
 
     Ok(k8s_nodes::render(&rows, &label, &footnotes, width, palette))

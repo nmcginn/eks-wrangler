@@ -187,6 +187,7 @@ pub async fn list(
         request.order,
         k8s_pods::cause(request.order, missing),
         |candidate| k8s_pods::ranks_any(&rows, candidate),
+        |candidate| k8s_pods::distinguishes(&rows, candidate),
     ));
 
     Ok(k8s_pods::render(

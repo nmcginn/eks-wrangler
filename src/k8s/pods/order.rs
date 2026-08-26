@@ -83,6 +83,29 @@ pub fn ranks_any(rows: &[PodRow], order: Order) -> bool {
     rows.iter().any(|row| ranked(row, order))
 }
 
+/// Whether this ordering would put two of these rows in a different
+/// arrangement than they are already in.
+///
+/// The question behind the *advice* half of the note under the table, and a
+/// stricter one than [`ranks_any`]. See [`crate::k8s::nodes::distinguishes`],
+/// the same function over a node listing, for the case this exists to catch:
+/// no pod ordering here has a `status`-shaped column that is always present
+/// and often uniform, so this is mostly the safety net for a namespace where
+/// every sampled pod happens to be using the exact same amount of CPU.
+///
+/// Compared against the first row rather than every pair, which is enough
+/// because `rank` is a total order: if every row compares equal to the
+/// first, they compare equal to each other, and sorting leaves the listing
+/// exactly as it was.
+#[must_use]
+pub fn distinguishes(rows: &[PodRow], order: Order) -> bool {
+    let mut rows = rows.iter();
+    let Some(first) = rows.next() else {
+        return false;
+    };
+    rows.any(|row| rank(first, row, order, Direction::Natural) != Ordering::Equal)
+}
+
 /// Whether one row carries what an ordering sorts on.
 ///
 /// A second exhaustive match over `Order` beside [`rank`], on purpose: adding an
@@ -355,6 +378,49 @@ mod tests {
     #[test]
     fn every_pod_ranks_by_name() {
         assert!(ranks_any(&[row("api", 0, None)], Order::Name));
+    }
+
+    #[test]
+    fn a_single_row_listing_distinguishes_nothing_under_any_ordering() {
+        // Sorting one row is a no-op whatever the key, so nothing here can ever
+        // put it anywhere it was not already — unlike `ranks_any`, which only
+        // asks whether the row has a key at all.
+        let rows = [row("only", 3, Some(5))];
+
+        for order in ORDERS {
+            assert!(!distinguishes(&rows, order), "{order:?}");
+        }
+    }
+
+    #[test]
+    fn an_empty_listing_distinguishes_nothing_under_any_ordering() {
+        for order in ORDERS {
+            assert!(!distinguishes(&[], order), "{order:?}");
+        }
+    }
+
+    #[test]
+    fn rows_tied_on_a_figure_distinguish_nothing_even_though_both_ranked() {
+        // Two pods using the exact same amount of CPU: `ranks_any` says yes for
+        // both, and sorting between them changes nothing either way.
+        let rows = [
+            using("api", Some("250m"), None),
+            using("worker", Some("250m"), None),
+        ];
+
+        assert!(ranks_any(&rows, Order::Cpu));
+        assert!(!distinguishes(&rows, Order::Cpu));
+    }
+
+    #[test]
+    fn pods_at_the_same_recency_but_different_counts_still_distinguish() {
+        // A tie on the dated part of `restarts` falls through to the count,
+        // which `rank` — and so `distinguishes` — already treats as the
+        // tie-break; two pods that crashed at the same instant a different
+        // number of times are still worth separating.
+        let rows = [row("quiet", 1, Some(5)), row("noisy", 40, Some(5))];
+
+        assert!(distinguishes(&rows, Order::Restarts));
     }
 
     #[test]
