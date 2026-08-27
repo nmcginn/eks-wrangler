@@ -20,9 +20,14 @@ pub fn views(config: &KubeConfig) -> Vec<ClusterView> {
 /// Render `eks contexts` output.
 ///
 /// `quiet` prints bare context names for piping into other tools; the default
-/// is an aligned table with the active cluster marked.
+/// is an aligned table with the active cluster marked. `palette` is threaded
+/// through to [`format::table`] like every other listing's is, even though
+/// nothing in this one carries a [`Severity`](crate::theme::Severity) to
+/// paint — see `render_table`'s own doc comment for why a table with nothing
+/// to grade still takes the palette it was given rather than a hardcoded
+/// one.
 #[must_use]
-pub fn list(config: &KubeConfig, quiet: bool) -> String {
+pub fn list(config: &KubeConfig, quiet: bool, palette: Palette) -> String {
     let views = views(config);
 
     if quiet {
@@ -33,7 +38,7 @@ pub fn list(config: &KubeConfig, quiet: bool) -> String {
             .join("\n");
     }
 
-    render_table(&views)
+    render_table(&views, palette)
 }
 
 /// Render `eks current`.
@@ -138,7 +143,23 @@ pub fn resolve_selector<'a>(views: &'a [ClusterView], selector: &str) -> Result<
 /// make the rows read `*  prod`, since every column carries a two-space
 /// separator after it — and it belongs to this listing alone: no other table
 /// has a row that is more "current" than its neighbours.
-fn render_table(views: &[ClusterView]) -> String {
+///
+/// `palette` is now the one the caller was given, not a hardcoded
+/// [`Palette::Plain`] — `--color` was already a global flag with nothing to
+/// do here, which was the bug: a table that ignores the flag it was handed
+/// looks the same as one honouring it only by accident. It changes nothing
+/// visible yet, on purpose. Every cell below is [`format::Cell::plain`],
+/// because none of `NAME`, `REGION`, or `NAMESPACE` is a reading off a
+/// cluster's health — a context is not healthy or unhealthy, and a plain
+/// cell prints identically under any palette. The one mark that does single
+/// a row out, the `*` gutter, is not a cell `format::table` ever sees, and
+/// deliberately stays outside this decision: colouring it is not "does this
+/// table honour `--color`", it is "is the active row, distinct from any
+/// health signal, colour's business at all" — the same question the
+/// Milestone 3 light-theme task inherits, and a call better made once, with
+/// a WCAG contrast budget in front of it, than guessed at here for one
+/// gutter.
+fn render_table(views: &[ClusterView], palette: Palette) -> String {
     const CURRENT: &str = "* ";
     const OTHER: &str = "  ";
 
@@ -167,14 +188,7 @@ fn render_table(views: &[ClusterView]) -> String {
             .map(|v| if v.is_current { CURRENT } else { OTHER }),
     );
 
-    // `Palette::Plain`, and not because colour is unwanted here: nothing in
-    // this table carries a severity. A context is not healthy or unhealthy —
-    // it is a name, a region, and a namespace read out of a file — so every
-    // cell above is plain, and a palette would have nothing to paint. The one
-    // mark that does single a row out, the `*` gutter, is not a severity
-    // either; whether it should be coloured is the same question `eks
-    // contexts` would ask of any highlight, and it is not this one.
-    format::table(&["NAME", "REGION", "NAMESPACE"], &rows, Palette::Plain)
+    format::table(&["NAME", "REGION", "NAMESPACE"], &rows, palette)
         .lines()
         .zip(gutters)
         .map(|(line, gutter)| format!("{gutter}{line}"))
@@ -221,9 +235,18 @@ contexts:
         }
     }
 
+    /// The palette a CLI listing gets when `--color=always` was typed, without
+    /// asking a terminal anything — the same helper `format`'s and `theme`'s
+    /// own tests use, so `eks contexts` is exercised against a real
+    /// [`Palette::Colour`], not only the [`Palette::Plain`] every other test
+    /// here passes.
+    fn colour() -> Palette {
+        Palette::choose(crate::theme::ColourChoice::Always, false, None, None)
+    }
+
     #[test]
     fn table_marks_the_current_cluster_and_hides_arns() {
-        let output = list(&config(), false);
+        let output = list(&config(), false, Palette::Plain);
 
         assert!(output.contains("* prod"), "output was:\n{output}");
         assert!(output.contains("staging"));
@@ -241,13 +264,29 @@ contexts:
         // output changes — including the two spaces between every column and the
         // two-character gutter that is not one.
         assert_eq!(
-            list(&config(), false),
+            list(&config(), false, Palette::Plain),
             [
                 "  NAME     REGION     NAMESPACE",
                 "* prod     us-east-1  default",
                 "  staging  us-west-2  payments",
             ]
             .join("\n")
+        );
+    }
+
+    #[test]
+    fn a_colour_palette_changes_nothing_because_nothing_here_is_graded() {
+        // The point of this task: `eks contexts` now goes through the palette
+        // it is given rather than a hardcoded `Palette::Plain`, and the reason
+        // that is safe is that none of `NAME`, `REGION`, or `NAMESPACE` is a
+        // reading off a cluster's health. A table with nothing graded prints
+        // identically under `Palette::Colour` and `Palette::Plain` — see
+        // `format::table`'s own
+        // `a_table_of_plain_cells_is_the_same_bytes_under_any_palette` for the
+        // general property this relies on.
+        assert_eq!(
+            list(&config(), false, colour()),
+            list(&config(), false, Palette::Plain)
         );
     }
 
@@ -265,7 +304,7 @@ contexts:
         ];
 
         assert_eq!(
-            render_table(&views),
+            render_table(&views, Palette::Plain),
             [
                 "  NAME                      REGION     NAMESPACE",
                 "* a-very-long-cluster-name  us-east-1  default",
@@ -277,7 +316,7 @@ contexts:
 
     #[test]
     fn table_columns_line_up() {
-        let output = list(&config(), false);
+        let output = list(&config(), false, Palette::Plain);
         let starts: Vec<_> = output
             .lines()
             .map(|line| line.find("us-").unwrap_or_default())
@@ -292,14 +331,14 @@ contexts:
 
     #[test]
     fn table_rows_have_no_trailing_whitespace() {
-        for line in list(&config(), false).lines() {
+        for line in list(&config(), false, Palette::Plain).lines() {
             assert_eq!(line, line.trim_end(), "trailing whitespace in {line:?}");
         }
     }
 
     #[test]
     fn quiet_mode_prints_context_names_for_scripting() {
-        let output = list(&config(), true);
+        let output = list(&config(), true, Palette::Plain);
 
         assert_eq!(
             output.lines().collect::<Vec<_>>(),
@@ -308,8 +347,18 @@ contexts:
     }
 
     #[test]
+    fn quiet_mode_ignores_the_palette_too() {
+        // Bare names for piping never go through `format::table` at all, so a
+        // palette passed alongside `quiet` has nothing to reach.
+        assert_eq!(
+            list(&config(), true, colour()),
+            list(&config(), true, Palette::Plain)
+        );
+    }
+
+    #[test]
     fn empty_kubeconfig_explains_what_to_do_next() {
-        let output = list(&KubeConfig::default(), false);
+        let output = list(&KubeConfig::default(), false, Palette::Plain);
         assert!(output.contains("update-kubeconfig"), "{output}");
     }
 

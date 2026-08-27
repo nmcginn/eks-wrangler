@@ -601,21 +601,6 @@ cluster.
   site, and `Column::severity` in `k8s::pods::row` reads it; the node columns are
   unchanged.
 
-- [ ] **Whether anything in a table with no severities deserves colour.**
-  `--color` is global, and on `eks contexts` it has nothing to do: none of that
-  table's cells is a reading off a cluster. The one mark that does single a row
-  out is the `*` gutter, which the dashboard already draws in
-  `Severity::Ok` green — so the tool is inconsistent about the same marker across
-  two surfaces. Discovered while threading the palette through the third caller
-  of `format::table`. Separate because the answer is a design question this
-  change had no business guessing: a selection marker is not a severity, and
-  deciding it should be green pulls in the wider question of whether headings,
-  the active row, or a cluster's name are colour's business at all — which is the
-  light-theme task's territory as much as this one's.
-  *Acceptance:* whatever it turns into, `eks contexts` goes through the palette
-  it is given rather than a hardcoded `Palette::Plain`; a listing under
-  `--color never` is unchanged to the byte.
-
 ### Follow-ups from the client bootstrap
 
 - [x] **Paginate node listings.**
@@ -1081,6 +1066,23 @@ cluster.
 ---
 
 ## Done
+
+- **Whether anything in a table with no severities deserves colour**
+  (2026-08-27) — `eks contexts` now renders through the `Palette` it is
+  given, `stdout_palette(cli.global.color)` exactly as `eks nodes` and `eks
+  pods` already receive it, rather than a hardcoded `Palette::Plain`. The
+  visible output is unchanged under every `--color` value, including
+  `always`: none of `NAME`/`REGION`/`NAMESPACE` is a reading off a cluster's
+  health, so every cell stays `format::Cell::plain` and a palette has
+  nothing to paint — a new test asserts the colour and plain renders are
+  identical, so that stays a tested property rather than an accident of
+  today's columns. The `*` gutter, the one mark that does single a row out,
+  stays uncoloured: it sits outside `format::table` entirely, and whether an
+  identity marker rather than a health reading is colour's business at all
+  is left to the Milestone 3 light-theme task, which already owns headings,
+  a selection highlight, and a WCAG contrast budget — deciding the gutter
+  alone tonight would be one more guess in the direction that task exists to
+  settle deliberately. See decision 73.
 
 - **Decide what `--wide` means in a dashboard pane** (2026-08-26) — the
   pod-containers pane now shows `IP:`, `Nominated node:`, and
