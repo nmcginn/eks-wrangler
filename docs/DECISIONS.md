@@ -2291,3 +2291,35 @@ before this question can be answered for it, rather than this change
 guessing at a view's shape to hang five facts on. The pod half above is the
 complete answer to its half of the question, not a partial answer to the
 whole of it.
+
+### 73. `eks contexts` honours `--color`, and the `*` gutter still does not
+
+`commands::contexts::render_table` hardcoded `Palette::Plain` even though
+`--color` has been a global flag since the CLI colour task landed — `eks
+contexts --color always` and `eks contexts --color never` printed the same
+bytes, silently ignoring what the user typed. That was always going to be
+invisible rather than wrong, because nothing in `NAME`/`REGION`/`NAMESPACE`
+is a reading off a cluster's health: a context is a name, a region, and a
+namespace read out of a file, so every cell is `format::Cell::plain` and a
+palette has nothing to paint. But "invisible" and "correct" are different
+claims, and a table that only happens to look right under `--color` because
+it never looks at the flag would stop looking right the day a graded column
+is added here. `list` and `render_table` now take the `Palette` the caller
+was given, `main::run` passes `stdout_palette(cli.global.color)` exactly as
+`nodes::list` and `pods::list` already do, and a new test asserts the two
+palettes render identically — the property this relies on, not an
+accident of today's columns.
+
+The `*` gutter is the one mark in this table that does single a row out,
+and it is not a `format::Cell` — it is written outside `format::table`
+entirely, the same way the dashboard's sidebar draws its own current-cluster
+marker in `Severity::Ok` green. The roadmap task this closes noticed that
+inconsistency and asked whether the gutter should match. It stays
+uncoloured. Colouring it is not "does this table honour the palette it is
+given" — that question is now answered, plainly, by the fix above — it is
+"is an identity marker, as opposed to a health reading, colour's business at
+all", and that question already has a claimant: the Milestone 3 light-theme
+task, which is where headings, a selection highlight, and a cluster's own
+name would all get decided together against a WCAG contrast budget this
+task was never given. Deciding the gutter alone, tonight, would be one more
+guess in the direction that task exists to settle deliberately.
