@@ -2477,3 +2477,50 @@ listing nothing can refill anyway. And `NodesState::Error` is now drawn as one
 line per sentence: every message from `explain` diagnoses and then advises, and
 `ratatui` draws an embedded newline as one unbroken line, which had been putting
 the half that says what to do next off the right-hand edge of the pane.
+
+### 78. The node's `--wide` facts land on the pod-drilldown pane, not a new `View`
+
+Decision 72 answered the pod half of "what does `--wide` mean in a dashboard
+pane" and left the node half open: a pod-containers pane could hold its wide
+facts because it already committed to one pod, and nothing played that role
+for a node — `Enter` on one drills into its pods, not into a view of the node
+itself. The roadmap entry this closes framed the missing piece as "a node's
+own detail view", which reads like a new surface. It turned out not to need
+one.
+
+`View::NodePods { node }` already commits to exactly one node the same way
+`View::PodContainers` commits to exactly one pod — the breadcrumb names it,
+`Enter` chose it, and nothing else is competing for the pane's space. The
+only reason it did not already look like a detail view is that nothing had
+put node-level facts in it yet; once something does, it *is* the view decision
+72 was waiting on, not a stand-in for one. A fifth `View` variant naming a
+node whose pods `NodePods` already names would have been two views with one
+identity, and `App::retreat`/`back_out_one_level` would have gained a level
+that backs out to nowhere new.
+
+So `INTERNAL-IP`, `EXTERNAL-IP`, `OS-IMAGE`, `KERNEL-VERSION`, and
+`CONTAINER-RUNTIME` — `k8s::nodes::Column`'s five `--wide`-only columns —
+now draw as plain lines above the pod list in `ui::pods::draw`
+(`node_facts_lines`), the same shape decision 72 used for the pod side. They
+are unconditional, unlike that decision's `NOMINATED NODE`/`READINESS GATES`:
+the node table's `--wide` tail prints every column whatever is in the cell,
+never dropping one because a row has nothing to say, and the detail view
+inherits that rule along with the columns rather than the pod side's
+any-not-all one. `k8s::nodes::wide_facts` is the pure function that reads
+them off a `NodeRow` through the same `Column::header`/`Column::text` the
+table calls, so the two surfaces cannot describe a node's addresses or AMI
+differently — this is a second presentation of already-computed fields, not
+a second reading of `Node`.
+
+The facts need no second fetch. `View::NodePods` is reached only from a
+highlighted row in the node pane's own listing, which already holds a full
+`NodeRow` — including the five wide fields, always computed, never gated on
+`--wide` there either. `App::drilled_node` looks it up by name from
+`App::nodes()` rather than `View` carrying a copy, so a background refresh
+that changes the row is picked up for free and one that drops the node
+entirely — scaled down mid-session — reads as no facts rather than stale
+ones. Drawing them ahead of the pod fetch's own result, including while it is
+still `Loading`, was a deliberate choice rather than an oversight: they were
+known before that fetch even started, and making a reader wait for the pods
+to answer before showing facts about the node they are already looking at
+would cost first paint for no reason.

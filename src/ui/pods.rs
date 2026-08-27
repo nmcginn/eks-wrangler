@@ -9,6 +9,7 @@ use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Wrap};
 
+use crate::k8s::nodes::{self as k8s_nodes, NodeRow};
 use crate::k8s::order::{self, Direction};
 use crate::k8s::pods::{Missing, Order, PodRow, cause, distinguishes, ranks_any};
 use crate::theme::{Severity, Theme};
@@ -49,26 +50,34 @@ impl PodsState {
 
 /// Draw whatever the pod pane currently knows.
 ///
-/// `selected` highlights a row — `None` when the pane does not currently
-/// hold keyboard focus, so the highlight disappears the moment `Tab` moves
-/// it back to the sidebar. `order` and `direction` are the pane's own
-/// ordering, changed by `s`/`S` in [`super::App`] rather than by a request —
-/// see [`super::nodes::draw`], whose node-pane counterpart this mirrors.
-/// `filter` is the `/` query, empty when no filter is active — see that same
-/// doc comment for why every footnote above still reads off the full `rows`
-/// and only the drawn rows themselves narrow.
+/// `node` is the [`NodeRow`] behind the node drilled into, from the node
+/// pane's own listing — `None` when it has since left that listing (a node
+/// that scaled down while its pods were open) or, in a test, was never given
+/// one. Its `--wide` facts are drawn above the pod list regardless of whether
+/// the pod fetch itself has finished: they were already known before this
+/// pane's own fetch started, and there is no reason to make them wait on a
+/// second request. `selected` highlights a row — `None` when the pane does
+/// not currently hold keyboard focus, so the highlight disappears the moment
+/// `Tab` moves it back to the sidebar. `order` and `direction` are the pane's
+/// own ordering, changed by `s`/`S` in [`super::App`] rather than by a
+/// request — see [`super::nodes::draw`], whose node-pane counterpart this
+/// mirrors. `filter` is the `/` query, empty when no filter is active — see
+/// that same doc comment for why every footnote above still reads off the
+/// full `rows` and only the drawn rows themselves narrow.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn draw(
     frame: &mut Frame,
     area: Rect,
     state: &PodsState,
+    node: Option<&NodeRow>,
     selected: Option<usize>,
     order: Order,
     direction: Direction,
     filter: &str,
     theme: Theme,
 ) {
-    let lines: Vec<Line> = match state {
+    let mut lines: Vec<Line> = node_facts_lines(node, theme);
+    lines.extend(match state {
         PodsState::Loading => vec![Line::styled("Loading pods…", theme.dim())],
         PodsState::Error(message) => vec![Line::styled(
             message.clone(),
@@ -128,9 +137,26 @@ pub(super) fn draw(
             }
             lines
         }
-    };
+    });
 
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), area);
+}
+
+/// The node's `--wide` facts above the pod list — empty when `node` is
+/// `None`, so a pane that never had one to draw is unchanged.
+///
+/// Unconditional once a `NodeRow` is in hand, the way [`k8s_nodes::wide_facts`]
+/// itself is: every one of the five lines is drawn whatever is in it, `-`
+/// included, rather than the `any`-not-`all` rule the pod-level facts beside
+/// [`super::containers::draw`] follow for the two that are usually absent.
+fn node_facts_lines(node: Option<&NodeRow>, theme: Theme) -> Vec<Line<'static>> {
+    let Some(node) = node else {
+        return Vec::new();
+    };
+    k8s_nodes::wide_facts(node)
+        .into_iter()
+        .map(|(label, value)| Line::styled(format!("{label}: {value}"), theme.dim()))
+        .collect()
 }
 
 fn pod_line(row: &PodRow, selected: bool, theme: Theme) -> Line<'static> {
@@ -193,6 +219,34 @@ mod tests {
         }
     }
 
+    /// A `NodeRow` with every `--wide` fact filled in, for the tests below
+    /// that draw the pane's own node facts.
+    fn node_row(name: &str) -> NodeRow {
+        NodeRow {
+            name: name.to_owned(),
+            status: "Ready".to_owned(),
+            severity: Severity::Ok,
+            version: "v1.31".to_owned(),
+            cpu: crate::k8s::nodes::Capacity::default(),
+            memory: crate::k8s::nodes::Capacity::default(),
+            cpu_requested: crate::k8s::nodes::Share::default(),
+            memory_requested: crate::k8s::nodes::Share::default(),
+            cpu_used: crate::k8s::nodes::Share::default(),
+            memory_used: crate::k8s::nodes::Share::default(),
+            pods: crate::k8s::nodes::Share::default(),
+            age: "3d".to_owned(),
+            created_at: None,
+            internal_ip: "10.0.1.9".to_owned(),
+            external_ip: "-".to_owned(),
+            os_image: "Amazon Linux 2023".to_owned(),
+            kernel_version: "6.1.148".to_owned(),
+            container_runtime: "containerd://1.7.28".to_owned(),
+            devices: std::collections::BTreeMap::new(),
+            ephemeral_storage: crate::k8s::nodes::Capacity::default(),
+            hugepages: std::collections::BTreeMap::new(),
+        }
+    }
+
     fn render(state: &PodsState, selected: Option<usize>) -> String {
         render_ordered(state, selected, Order::default(), Direction::default())
     }
@@ -213,6 +267,29 @@ mod tests {
         direction: Direction,
         filter: &str,
     ) -> String {
+        render_full(state, None, selected, order, direction, filter)
+    }
+
+    fn render_with_node(state: &PodsState, node: Option<&NodeRow>) -> String {
+        render_full(
+            state,
+            node,
+            None,
+            Order::default(),
+            Direction::default(),
+            "",
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn render_full(
+        state: &PodsState,
+        node: Option<&NodeRow>,
+        selected: Option<usize>,
+        order: Order,
+        direction: Direction,
+        filter: &str,
+    ) -> String {
         let mut terminal = Terminal::new(TestBackend::new(90, 20)).unwrap();
         terminal
             .draw(|frame| {
@@ -221,6 +298,7 @@ mod tests {
                     frame,
                     area,
                     state,
+                    node,
                     selected,
                     order,
                     direction,
@@ -450,6 +528,7 @@ mod tests {
             rows: vec![pod("api-1")],
             selector_note: None,
         };
+        let node = node_row("worker-1");
         for (width, height) in [(1, 1), (8, 3), (20, 2), (200, 60)] {
             let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
             terminal
@@ -459,6 +538,7 @@ mod tests {
                         frame,
                         area,
                         &state,
+                        Some(&node),
                         Some(0),
                         Order::default(),
                         Direction::default(),
@@ -527,5 +607,63 @@ mod tests {
             "{rendered}"
         );
         assert!(!rendered.contains("label selector"), "{rendered}");
+    }
+
+    #[test]
+    fn the_drilled_into_nodes_wide_facts_are_drawn_above_the_pod_list() {
+        let state = PodsState::Loaded {
+            rows: vec![pod("api-1")],
+            selector_note: None,
+        };
+        let node = node_row("worker-1");
+
+        let rendered = render_with_node(&state, Some(&node));
+
+        assert!(rendered.contains("INTERNAL-IP: 10.0.1.9"), "{rendered}");
+        assert!(rendered.contains("EXTERNAL-IP: -"), "{rendered}");
+        assert!(
+            rendered.contains("OS-IMAGE: Amazon Linux 2023"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("KERNEL-VERSION: 6.1.148"), "{rendered}");
+        assert!(
+            rendered.contains("CONTAINER-RUNTIME: containerd://1.7.28"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("api-1"), "{rendered}");
+    }
+
+    #[test]
+    fn no_node_facts_are_drawn_when_the_node_has_left_the_node_panes_listing() {
+        let state = PodsState::Loaded {
+            rows: vec![pod("api-1")],
+            selector_note: None,
+        };
+
+        let rendered = render_with_node(&state, None);
+
+        assert!(!rendered.contains("INTERNAL-IP"), "{rendered}");
+        assert_eq!(rendered, render(&state, None));
+    }
+
+    #[test]
+    fn the_nodes_wide_facts_are_drawn_even_while_its_pods_are_still_loading() {
+        // Known before this pane's own fetch even started — see `draw`'s doc
+        // comment — so there is no reason to wait for the pod listing before
+        // showing them.
+        let node = node_row("worker-1");
+
+        let rendered = render_with_node(&PodsState::Loading, Some(&node));
+
+        assert!(rendered.contains("INTERNAL-IP: 10.0.1.9"), "{rendered}");
+        assert!(rendered.contains("Loading pods"), "{rendered}");
+    }
+
+    #[test]
+    fn a_pane_with_no_node_never_prints_a_blank_facts_line() {
+        // `node_facts_lines` returns nothing at all for `None`, rather than
+        // five dashes — there is a real difference between "this node has
+        // reported none of its wide facts" and "there is no node to ask".
+        assert!(node_facts_lines(None, Theme::dark()).is_empty());
     }
 }
