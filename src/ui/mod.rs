@@ -536,6 +536,20 @@ impl App {
     /// cluster's data rather than stale leftovers.
     pub fn start_loading_nodes(&mut self) {
         self.nodes = NodesState::Loading;
+        // The login offer belonged to the cluster whose rows just left the
+        // pane, and it does not transfer. This is the *only* thing that calls
+        // this method, so it is precisely the cluster-changed case and nothing
+        // else: `r` and the refresh interval refetch without coming through
+        // here, which is what keeps the offer alive while somebody retries the
+        // cluster that actually failed.
+        //
+        // Leaving it set would leave `L` armed over a pane that is loading
+        // rather than failing — and `L` does not ask, so it would open a
+        // browser for a different account's profile than the one the user was
+        // told about. That is the one property `aws::decide` exists to protect
+        // (decision 74), and a sidebar full of clusters in different accounts
+        // is exactly where it would have gone wrong.
+        self.credentials_lost = false;
     }
 
     /// Apply the outcome of a fetch for one node's pods.
@@ -2351,6 +2365,54 @@ mod tests {
                 refresh_error: Some("could not start `aws sso login`".to_owned()),
             }
         );
+    }
+
+    #[test]
+    fn switching_clusters_withdraws_a_login_offer_meant_for_the_previous_one() {
+        // A sidebar full of clusters in different AWS accounts is the case
+        // this protects: `L` does not ask before it runs, so an offer left
+        // over from the cluster that failed would open a browser for whatever
+        // account the *newly* selected one uses.
+        let mut app = app();
+        app.apply_nodes(Err(refused("prod rejected your credentials")));
+
+        app.start_loading_nodes();
+
+        assert!(!app.credentials_lost());
+        assert_eq!(app.login_hint(), None);
+        assert_eq!(app.on_key(press(KeyCode::Char('L'))), Flow::Continue);
+    }
+
+    #[test]
+    fn refreshing_the_same_cluster_keeps_the_offer() {
+        // The contrast case, and the reason the reset lives in
+        // `start_loading_nodes` rather than anywhere a refetch passes through:
+        // `r` is somebody retrying the cluster that failed, and the offer is
+        // still exactly what they need.
+        let mut app = app();
+        app.apply_nodes(Err(refused("prod rejected your credentials")));
+
+        assert!(is_refresh_key(press(KeyCode::Char('r'))));
+        app.on_key(press(KeyCode::Char('r')));
+
+        assert!(app.credentials_lost());
+        assert_eq!(app.on_key(press(KeyCode::Char('L'))), Flow::Login);
+    }
+
+    #[test]
+    fn the_footer_drops_the_login_hint_as_soon_as_the_pane_starts_loading_again() {
+        let mut terminal = Terminal::new(TestBackend::new(90, 20)).unwrap();
+        let mut app = app();
+        app.apply_nodes(Err(refused("prod rejected your credentials")));
+
+        app.start_loading_nodes();
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+
+        let rendered = terminal.backend().to_string();
+        assert!(!rendered.contains("log in"), "{rendered}");
+        // Back to the ordinary hint list rather than the credential one, which
+        // does not carry `s/S`.
+        assert!(rendered.contains("s/S"), "{rendered}");
     }
 
     #[test]
