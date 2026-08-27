@@ -7,6 +7,7 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
 
+use crate::aws::LoginMode;
 use crate::k8s::nodes::Order as NodeOrder;
 use crate::k8s::page::Budget;
 use crate::k8s::pods::Order as PodOrder;
@@ -74,6 +75,13 @@ pub struct GlobalArgs {
         default_value = "auto"
     )]
     pub color: ColourChoice,
+
+    /// When to log in to AWS IAM Identity Center for you: `auto` (offer, when
+    /// there is a terminal to ask at), `always` (log in without asking), or
+    /// `never` (be told what to run instead). Only ever offered for a context
+    /// whose AWS profile uses Identity Center and whose session has run out.
+    #[arg(long, global = true, value_name = "WHEN", default_value = "auto")]
+    pub login: LoginMode,
 
     /// How often the dashboard's panes refresh themselves in the background,
     /// on top of pressing `r` to refresh on demand. `0` turns automatic
@@ -484,6 +492,43 @@ mod tests {
         let (before, after) = both_ways(&["-vv"]);
         assert_eq!(before.global.verbose, after.global.verbose);
         assert_eq!(before.global.verbose, 2);
+
+        let (before, after) = both_ways(&["--login", "never"]);
+        assert_eq!(before.global.login, after.global.login);
+        assert_eq!(before.global.login, LoginMode::Never);
+    }
+
+    #[test]
+    fn login_offers_to_sign_you_in_unless_told_otherwise() {
+        // The default has to be `auto` rather than `always`: a browser opening
+        // without a yes is the one behaviour nobody asked for.
+        assert_eq!(parse(&["eks", "nodes"]).global.login, LoginMode::Auto);
+        assert_eq!(parse(&["eks"]).global.login, LoginMode::Auto);
+    }
+
+    #[test]
+    fn every_spelling_of_login_parses() {
+        for (flag, expected) in [
+            ("auto", LoginMode::Auto),
+            ("always", LoginMode::Always),
+            ("never", LoginMode::Never),
+        ] {
+            let cli = parse(&["eks", "nodes", "--login", flag]);
+            assert_eq!(cli.global.login, expected, "--login {flag}");
+        }
+    }
+
+    #[test]
+    fn a_login_value_that_is_not_one_of_the_three_is_rejected_with_the_three_listed() {
+        // The same bargain `--color`, `--sort`, and `--timeout` make: a bad
+        // value is a sentence naming the good ones, before anything connects.
+        let error = Cli::try_parse_from(["eks", "nodes", "--login", "maybe"])
+            .expect_err("`--login maybe` should be rejected")
+            .to_string();
+
+        assert!(error.contains("auto"), "{error}");
+        assert!(error.contains("always"), "{error}");
+        assert!(error.contains("never"), "{error}");
     }
 
     #[test]

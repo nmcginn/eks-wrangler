@@ -661,6 +661,46 @@ cluster.
   the message names `--timeout 0` as the way back to the old behaviour, which is
   the answer for a helper that is legitimately waiting on a human.
 
+- [x] **Log in to AWS when the selected cluster's session has expired.**
+  `k8s::client::explain` ends an expired-session failure by telling the user to
+  go and run `aws sso login` somewhere else. `eks` already knows the cluster, and
+  everything needed to work out *which* Identity Center session is stale is two
+  files on disk — so the sentence is the whole gap.
+  *Acceptance:* the expiry check is pure functions over `~/.aws/config` and the
+  AWS CLI's token cache, with fixtures rather than a real `~/.aws`, and costs no
+  network call; a browser never opens without a yes, and never at all when
+  nobody is at the terminal; `--login never` is the old behaviour down to the
+  error text; a piped listing is unchanged on stdout to the byte.
+  Landed as `src/aws/` — `profile_for` reads the AWS profile out of the
+  context's own `exec` block (sharing `client::exec_env` with
+  `helper_command`, so the profile logged in is the profile that message would
+  have named), `config` follows `sso_session`/`sso_start_url`/`source_profile`
+  to a start URL, and `sso::classify` reads the token cache's `expiresAt`.
+  `aws::decide` is the whole policy as one pure function; `aws::login` shells
+  out to `aws sso login --profile X` rather than adding an AWS SDK, for the
+  reasons in decision 74. `commands::credentials::connect` is the seam every
+  command connects through, offering once before the helper runs and once more
+  if the cluster refuses credentials the cache thought were live — but never
+  again after the user has said no. The dashboard splits the two halves by who
+  owns the screen: `preflight` before `ui::run` opens, `L` on the failure
+  banner after. See decisions 74–77.
+
+- [ ] **Refresh a token that expires partway through a paged listing.**
+  A listing is several requests now, and a token good at the first page can be
+  dead at the fourth — on a cluster large enough to need four pages, which is
+  exactly the cluster where waiting for the whole thing and starting again hurts
+  most. The pre-flight's sixty-second skew narrows the window rather than
+  closing it, and nothing between pages can widen it: `kube` holds one resolved
+  auth layer for the life of the client. Separate because closing it means
+  holding a *refreshable* credential rather than one token, which is the same
+  question the entry below turns on — whether `eks` owns credential resolution —
+  and decision 74 has just answered that "no" for the case it could afford to.
+  Reopening it is a night's work and a decision the reviewer should take
+  deliberately rather than as a consequence of this one.
+  *Acceptance:* a token that dies mid-listing costs the user the pages already
+  read rather than the command; whatever refreshes it words its failures
+  through `k8s::client::explain` rather than a second wording.
+
 - [ ] **Stop the credential helper, rather than only stopping waiting for it.**
   `--timeout` now ends the hang, and it ends it by abandonment: a blocking task
   cannot be cancelled, so `eks` prints its message and exits while the `aws eks
@@ -1066,6 +1106,33 @@ cluster.
 ---
 
 ## Done
+
+- **Log in to AWS when the selected cluster's session has expired**
+  (2026-08-27) — an expired IAM Identity Center session is now a question
+  rather than an errand: `prod (us-east-1) needs a fresh login: profile "corp"
+  signed out of IAM Identity Center 9h ago. Log in now with `aws sso login
+  --profile corp`? [Y/n]`. The check that produces it is three file reads and
+  two pure functions — the AWS profile out of the context's own `exec` block,
+  the Identity Center session behind it in `~/.aws/config`, and the `expiresAt`
+  in the AWS CLI's token cache — so it happens *before* connecting rather than
+  in reaction to a `401` the user already waited for, and measures under a
+  tenth of a millisecond against a 31-entry cache. No AWS SDK: `aws sso login`
+  is the AWS CLI's job, and the CLI is already a hard requirement of every EKS
+  context this tool opens (decision 74). Cache entries are matched on the
+  `startUrl` inside them rather than on the SHA-1 filename `botocore` happens
+  to use today (decision 75). `--login auto|always|never` decides, through one
+  pure `aws::decide` whose most important row is `auto` with no terminal: it
+  proceeds silently, because a listing being redirected into a file has nobody
+  to answer and a browser opening there is a thing people work around rather
+  than use (decision 76). Everything user-facing is on stderr, so a piped table
+  is unchanged to the byte, and `--login never` does not read `~/.aws` at all.
+  The dashboard splits the two halves by who owns the screen — the question
+  once before `ui::run` opens, and `L` on the failure banner after, never an
+  automatic suspend over somebody reading a log (decision 77). Two things fell
+  out of touching that pane: the credential state gets its own short footer,
+  because prepending one hint pushed `q quit` off an 80-column terminal, and a
+  failed node pane now draws one line per sentence instead of putting the half
+  that says what to do next off the right-hand edge.
 
 - **Whether anything in a table with no severities deserves colour**
   (2026-08-27) — `eks contexts` now renders through the `Palette` it is

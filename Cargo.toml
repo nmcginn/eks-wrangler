@@ -28,6 +28,11 @@ directories = "6.0.0"
 # code to the dependency tree, only the two traits `k8s::pods::logs` calls.
 futures-util = { version = "0.3.34", default-features = false, features = ["io", "std"] }
 k8s-openapi = { version = "0.28.0", features = ["latest"] }
+# The AWS CLI's IAM Identity Center token cache is JSON, and reading its expiry
+# is what lets `eks` tell a stale session from a live one without a network call
+# — see `aws::sso`. A hand-rolled reader for somebody else's format would be
+# worse than the dependency, which the tests already pulled in.
+serde_json = "1.0.145"
 kube = { version = "4.2.0", default-features = false, features = ["client", "config", "http-proxy", "ring", "rustls-tls"] }
 ratatui = "0.30.2"
 serde = { version = "1.0.229", features = ["derive"] }
@@ -42,9 +47,6 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 
 [dev-dependencies]
 insta = "1.44.2"
-# Only the tests need JSON: it is how a metrics-server response is pinned down
-# as a fixture, rather than by hand-building the structs it deserialises into.
-serde_json = "1.0.145"
 tempfile = "3.24.0"
 
 # Release builds optimise for a small, fast single binary. Startup time is a

@@ -4,6 +4,7 @@
 //! behaviour is reachable from unit tests. Anything that can be tested without
 //! a live cluster or a real terminal belongs here, not in `main.rs`.
 
+pub mod aws;
 pub mod cluster;
 pub mod commands;
 pub mod format;

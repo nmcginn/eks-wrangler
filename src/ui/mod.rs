@@ -11,15 +11,16 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use clap::ValueEnum;
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use ratatui::crossterm::{execute, terminal};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, List, ListItem, ListState, Paragraph, Wrap};
 use ratatui::{Frame, Terminal};
 
 use crate::cluster::ClusterView;
-use crate::commands::StreamHandle;
 use crate::commands::nodes::NodesFetch;
 use crate::commands::pods::{ContainersFetch, PodsFetch};
+use crate::commands::{FetchError, StreamHandle};
 use crate::k8s::nodes as k8s_nodes;
 use crate::k8s::order::Direction as SortDirection;
 use crate::k8s::page::{Budget, ParseError};
@@ -53,14 +54,31 @@ const QUIT_CONFIRM_WINDOW: Duration = Duration::from_millis(600);
 /// trigger (this change adds one, for pods) would otherwise grow a type
 /// parameter on both every time, for a distinction — which closure a
 /// function happens to be — nothing outside `main` cares about.
-pub type NodesFetcher = Box<dyn Fn(&str) -> mpsc::Receiver<Result<NodesFetch, String>>>;
+pub type NodesFetcher = Box<dyn Fn(&str) -> mpsc::Receiver<Result<NodesFetch, FetchError>>>;
+
+/// Log the selected cluster's AWS profile in, blocking until it is done.
+///
+/// Unlike every fetcher beside it this one runs on *this* thread, and that is
+/// the point: `aws sso login` prints a device code and waits for a browser, so
+/// it needs the terminal the dashboard is currently holding. [`run`] hands the
+/// terminal back before calling it and takes it again afterwards. The `&str` is
+/// the selected context's name; the `Err` is already a sentence.
+pub type LoginRunner = Box<dyn Fn(&str) -> Result<(), String>>;
+
+/// [`LoginRunner`] with the terminal handed back around it, as `event_loop`
+/// sees it.
+///
+/// Borrowed rather than boxed because it closes over [`run`]'s own borrow of
+/// the runner, and a `Box<dyn Fn>` would demand `'static` of it. A test builds
+/// one that does nothing.
+type Suspended<'a> = &'a dyn Fn(&str) -> Result<(), String>;
 
 /// Starts a fetch of the pods on one node of one cluster.
-pub type PodsFetcher = Box<dyn Fn(&str, &str) -> mpsc::Receiver<Result<PodsFetch, String>>>;
+pub type PodsFetcher = Box<dyn Fn(&str, &str) -> mpsc::Receiver<Result<PodsFetch, FetchError>>>;
 
 /// Starts a fetch of one pod's containers, given its namespace and name.
 pub type ContainersFetcher =
-    Box<dyn Fn(&str, &str, &str) -> mpsc::Receiver<Result<ContainersFetch, String>>>;
+    Box<dyn Fn(&str, &str, &str) -> mpsc::Receiver<Result<ContainersFetch, FetchError>>>;
 
 /// Starts streaming one container's log, given its pod's namespace and name,
 /// the container's own name, and whether to open its previous instance's log
@@ -130,6 +148,12 @@ impl std::fmt::Display for RefreshInterval {
 pub enum Flow {
     /// Stay in the loop.
     Continue,
+    /// Give the terminal back, log in to AWS, take it again, and refetch.
+    ///
+    /// Its own variant rather than something [`App`] could do itself, for the
+    /// reason [`Quit`](Self::Quit) is one: the state machine decides, and the
+    /// event loop — the only thing here that owns a terminal — acts.
+    Login,
     /// Tear down and exit.
     Quit,
 }
@@ -273,6 +297,16 @@ pub struct App {
     /// `None` when no quit is pending. A second press of either key within
     /// [`QUIT_CONFIRM_WINDOW`] confirms it; any other key clears it.
     quit_armed_at: Option<Instant>,
+    /// Whether the failure currently on screen is one a fresh AWS login could
+    /// fix, which is what `L` turns on.
+    ///
+    /// A flag rather than a fifth thing threaded through the pane states: the
+    /// question `L` asks is about the session, which belongs to the cluster
+    /// rather than to whichever pane happened to notice. Every `apply_*` sets
+    /// it from the [`FetchError`] it was handed, so a success anywhere clears
+    /// it and the key stops offering something there is no longer a reason to
+    /// do.
+    credentials_lost: bool,
 }
 
 impl App {
@@ -298,6 +332,7 @@ impl App {
             pod_order: k8s_pods::Order::default(),
             pod_direction: SortDirection::default(),
             quit_armed_at: None,
+            credentials_lost: false,
         }
     }
 
@@ -426,8 +461,9 @@ impl App {
     /// transient failure is no longer the *first* answer a pane can get, and
     /// the pane should not read as "the cluster lost every node" over one
     /// missed poll.
-    pub fn apply_nodes(&mut self, result: Result<NodesFetch, String>) {
+    pub fn apply_nodes(&mut self, result: Result<NodesFetch, FetchError>) {
         let (order, direction) = (self.node_order, self.node_direction);
+        self.credentials_lost = result.as_ref().is_err_and(|error| error.credentials);
         self.nodes = match (result, std::mem::take(&mut self.nodes)) {
             (Ok(fetch), _) => {
                 let mut rows = fetch.rows;
@@ -439,16 +475,55 @@ impl App {
                 }
             }
             (
-                Err(message),
+                Err(error),
                 NodesState::Loaded {
                     rows, usage_note, ..
                 },
             ) => NodesState::Loaded {
                 rows,
                 usage_note,
+                refresh_error: Some(error.message),
+            },
+            (Err(error), _) => NodesState::Error(error.message),
+        };
+    }
+
+    /// Whether the failure on screen is one a fresh AWS login could fix.
+    ///
+    /// What gates the `L` key and the hint that advertises it. Read by the
+    /// renderer rather than baked into the pane's message because
+    /// `k8s::client::explain` writes one wording for both surfaces: "run `aws
+    /// sso login`" is the right advice on the command line, and on a dashboard
+    /// that can do it for you it is not.
+    #[must_use]
+    pub fn credentials_lost(&self) -> bool {
+        self.credentials_lost
+    }
+
+    /// The line offering the login, or `None` when there is nothing to offer.
+    #[must_use]
+    pub fn login_hint(&self) -> Option<&'static str> {
+        self.credentials_lost
+            .then_some("Press L to log in to AWS and try again.")
+    }
+
+    /// Record that a login the user asked for did not happen.
+    ///
+    /// The message is already a sentence, from `aws::login::Error`. It lands
+    /// where a failed refresh lands, so it is read in the same place the
+    /// failure that prompted it was — and `credentials_lost` stays set, because
+    /// a login that did not run has not fixed anything and `L` is still the
+    /// thing to press.
+    pub fn apply_login_failure(&mut self, message: String) {
+        self.nodes = match std::mem::take(&mut self.nodes) {
+            NodesState::Loaded {
+                rows, usage_note, ..
+            } => NodesState::Loaded {
+                rows,
+                usage_note,
                 refresh_error: Some(message),
             },
-            (Err(message), _) => NodesState::Error(message),
+            _ => NodesState::Error(message),
         };
     }
 
@@ -461,6 +536,20 @@ impl App {
     /// cluster's data rather than stale leftovers.
     pub fn start_loading_nodes(&mut self) {
         self.nodes = NodesState::Loading;
+        // The login offer belonged to the cluster whose rows just left the
+        // pane, and it does not transfer. This is the *only* thing that calls
+        // this method, so it is precisely the cluster-changed case and nothing
+        // else: `r` and the refresh interval refetch without coming through
+        // here, which is what keeps the offer alive while somebody retries the
+        // cluster that actually failed.
+        //
+        // Leaving it set would leave `L` armed over a pane that is loading
+        // rather than failing — and `L` does not ask, so it would open a
+        // browser for a different account's profile than the one the user was
+        // told about. That is the one property `aws::decide` exists to protect
+        // (decision 76), and a sidebar full of clusters in different accounts
+        // is exactly where it would have gone wrong.
+        self.credentials_lost = false;
     }
 
     /// Apply the outcome of a fetch for one node's pods.
@@ -469,7 +558,8 @@ impl App {
     /// pod-drilldown pane fetches once per node it is asked to show rather
     /// than refreshing in the background, so there is no earlier good
     /// listing for this node worth keeping over a failed one.
-    pub fn apply_pods(&mut self, result: Result<PodsFetch, String>) {
+    pub fn apply_pods(&mut self, result: Result<PodsFetch, FetchError>) {
+        self.credentials_lost = result.as_ref().is_err_and(|error| error.credentials);
         self.pods = match result {
             Ok(fetch) => {
                 let mut rows = fetch.rows;
@@ -479,7 +569,7 @@ impl App {
                     selector_note: fetch.selector_note,
                 }
             }
-            Err(message) => PodsState::Error(message),
+            Err(error) => PodsState::Error(error.message),
         };
     }
 
@@ -489,7 +579,8 @@ impl App {
     /// fetches once per pod it is asked to show rather than refreshing in the
     /// background, so a failure always overwrites — there is no earlier good
     /// listing for *this* pod worth keeping over a failed one.
-    pub fn apply_containers(&mut self, result: Result<ContainersFetch, String>) {
+    pub fn apply_containers(&mut self, result: Result<ContainersFetch, FetchError>) {
+        self.credentials_lost = result.as_ref().is_err_and(|error| error.credentials);
         self.containers = match result {
             Ok(fetch) => ContainersState::Loaded {
                 rows: fetch.rows,
@@ -497,7 +588,7 @@ impl App {
                 nominated_node: fetch.nominated_node,
                 readiness_gates: fetch.readiness_gates,
             },
-            Err(message) => ContainersState::Error(message),
+            Err(error) => ContainersState::Error(error.message),
         };
     }
 
@@ -1062,6 +1153,10 @@ impl App {
             KeyCode::Enter => self.drill_in(),
             KeyCode::Char('s') => self.cycle_sort(),
             KeyCode::Char('S') => self.reverse_sort(),
+            // Only when there is something for it to fix. A key that silently
+            // does nothing is worse than one that is not offered, so the
+            // footer hint appears under exactly this condition too.
+            KeyCode::Char('L') if self.credentials_lost => return Flow::Login,
             // The container-logs pane has no rows to move a highlight
             // through — `j`/`k`/`Home`/`End`/`PageUp`/`PageDown` scroll its
             // text instead, the same keys a pager uses.
@@ -1165,15 +1260,62 @@ impl App {
 /// a keypress.
 pub fn run(
     app: App,
-    nodes_rx: Option<mpsc::Receiver<Result<NodesFetch, String>>>,
+    nodes_rx: Option<mpsc::Receiver<Result<NodesFetch, FetchError>>>,
     spawn_nodes: &NodesFetcher,
     drill: &DrillFetchers<'_>,
     refresh: RefreshInterval,
+    login: &LoginRunner,
 ) -> Result<()> {
     let mut terminal = ratatui::init();
-    let result = event_loop(&mut terminal, app, nodes_rx, spawn_nodes, drill, refresh);
+
+    // The suspend-and-resume that `L` needs, built here because this is the
+    // only function that knows a real terminal is involved. `event_loop` is
+    // generic over the backend so it can be driven by `TestBackend`, and a
+    // test's version of this does nothing at all.
+    let suspended = |context: &str| -> Result<(), String> {
+        // Give the shell its terminal back: `aws sso login` prints a device
+        // code and may prompt, and neither is readable through an alternate
+        // screen in raw mode.
+        let left = leave_terminal();
+        let outcome = login(context);
+        // Retaken whatever happened. Leaving the user in a half-restored
+        // terminal because a login failed would be worse than the failure, so
+        // a failure to re-enter is reported *after* the login's own.
+        let entered = enter_terminal();
+        outcome.and(left).and(entered)
+    };
+
+    let result = event_loop(
+        &mut terminal,
+        app,
+        nodes_rx,
+        spawn_nodes,
+        drill,
+        refresh,
+        &suspended,
+    );
     ratatui::restore();
     result
+}
+
+/// Hand the terminal back to the shell, keeping the `Terminal` handle valid.
+///
+/// Deliberately not `ratatui::restore()` followed by `ratatui::init()`: that
+/// pair hands back a *new* `Terminal`, and the one `event_loop` is holding —
+/// along with everything it has cached about the screen — would have to be
+/// replaced mid-loop. These are the two things `init` does that matter to a
+/// suspended session, undone and redone around the handle we already have.
+fn leave_terminal() -> Result<(), String> {
+    terminal::disable_raw_mode().map_err(|error| format!("could not leave raw mode: {error}"))?;
+    execute!(std::io::stdout(), terminal::LeaveAlternateScreen)
+        .map_err(|error| format!("could not leave the alternate screen: {error}"))
+}
+
+/// The other half of [`leave_terminal`].
+fn enter_terminal() -> Result<(), String> {
+    terminal::enable_raw_mode().map_err(|error| format!("could not re-enter raw mode: {error}"))?;
+    execute!(std::io::stdout(), terminal::EnterAlternateScreen)
+        .map_err(|error| format!("could not re-open the alternate screen: {error}"))
 }
 
 /// The fetchers for the detail pane's three drill-down levels, bundled into
@@ -1205,8 +1347,8 @@ impl std::fmt::Debug for DrillFetchers<'_> {
 /// [`crate::commands::spawn_stream`]).
 #[derive(Default)]
 struct Inflight {
-    pods: Option<mpsc::Receiver<Result<PodsFetch, String>>>,
-    containers: Option<mpsc::Receiver<Result<ContainersFetch, String>>>,
+    pods: Option<mpsc::Receiver<Result<PodsFetch, FetchError>>>,
+    containers: Option<mpsc::Receiver<Result<ContainersFetch, FetchError>>>,
     logs: Option<mpsc::Receiver<LogEvent>>,
     logs_handle: Option<StreamHandle>,
 }
@@ -1227,10 +1369,11 @@ impl Inflight {
 fn event_loop<B>(
     terminal: &mut Terminal<B>,
     mut app: App,
-    mut nodes_rx: Option<mpsc::Receiver<Result<NodesFetch, String>>>,
+    mut nodes_rx: Option<mpsc::Receiver<Result<NodesFetch, FetchError>>>,
     spawn_nodes: &NodesFetcher,
     drill: &DrillFetchers<'_>,
     refresh: RefreshInterval,
+    login: Suspended<'_>,
 ) -> Result<()>
 where
     B: ratatui::backend::Backend,
@@ -1292,8 +1435,26 @@ where
 
         let view_before = app.view().clone();
 
-        if app.on_key(key) == Flow::Quit {
-            return Ok(());
+        match app.on_key(key) {
+            Flow::Quit => return Ok(()),
+            Flow::Login => {
+                // The screen belonged to the AWS CLI for the duration, so
+                // whatever `ratatui` last drew is gone from the real terminal
+                // and its own idea of what is on screen is stale.
+                let outcome = login(selected_context.as_deref().unwrap_or_default());
+                terminal.clear()?;
+                match outcome {
+                    // A fresh token is worth nothing until something uses it:
+                    // refetching immediately is what turns the banner back
+                    // into rows without a second keystroke.
+                    Ok(()) => {
+                        refetch(spawn_nodes, &mut nodes_rx, selected_context.as_deref());
+                        next_refresh = schedule(refresh);
+                    }
+                    Err(message) => app.apply_login_failure(message),
+                }
+            }
+            Flow::Continue => {}
         }
 
         if is_refresh_key(key) {
@@ -1397,7 +1558,7 @@ fn start_drill_fetch(
 /// cluster to fetch.
 fn refetch(
     spawn_nodes: &NodesFetcher,
-    nodes_rx: &mut Option<mpsc::Receiver<Result<NodesFetch, String>>>,
+    nodes_rx: &mut Option<mpsc::Receiver<Result<NodesFetch, FetchError>>>,
     selected_context: Option<&str>,
 ) {
     if let Some(context) = selected_context {
@@ -1586,6 +1747,7 @@ fn draw_detail(frame: &mut Frame, area: Rect, app: &App) {
             app.node_order(),
             app.node_direction(),
             app.filter_query(),
+            app.login_hint(),
             theme,
         ),
         View::NodePods { .. } => pods::draw(
@@ -1641,6 +1803,21 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
         // `App::on_key` — so the hints say that instead of listing keys that
         // do not mean what they usually do right now.
         &[("type", "filter"), ("enter", "apply"), ("esc", "cancel")]
+    } else if app.credentials_lost() {
+        // Its own list rather than one more hint on the end of the others,
+        // for the reason the two branches around it are: this is a state that
+        // changes what the keys are worth. Until the session is back, `j/k`
+        // and `s/S` are moving around a listing nothing can refill, and the
+        // hints that survive are the ones that lead somewhere. Keeping the
+        // list short is also what keeps `q quit` on screen at eighty columns,
+        // which the default list below is deliberately ordered to protect.
+        &[
+            ("L", "log in"),
+            ("tab/→", "switch"),
+            ("←/esc", "back"),
+            ("r", "refresh"),
+            ("q", "quit"),
+        ]
     } else if matches!(app.view(), View::ContainerLogs { .. }) {
         // A log has nothing to `enter` further into and no ordering `s`/`S`
         // could apply to — `f`/`w`/`p` take their place, the three things
@@ -1695,6 +1872,24 @@ mod tests {
             account_id: Some("1234".to_owned()),
             namespace: "default".to_owned(),
             is_current,
+        }
+    }
+
+    /// A fetch that failed for a reason no login could fix — the ordinary
+    /// case. `refused` below is the other one.
+    fn failed(message: &str) -> FetchError {
+        FetchError {
+            message: message.to_owned(),
+            credentials: false,
+        }
+    }
+
+    /// A fetch the cluster refused for want of credentials, which is what
+    /// puts `L` on the footer.
+    fn refused(message: &str) -> FetchError {
+        FetchError {
+            message: message.to_owned(),
+            credentials: true,
         }
     }
 
@@ -2059,7 +2254,7 @@ mod tests {
     fn apply_nodes_moves_a_failure_into_the_error_state() {
         let mut app = app();
 
-        app.apply_nodes(Err("could not list nodes".to_owned()));
+        app.apply_nodes(Err(failed("could not list nodes")));
 
         assert_eq!(
             app.nodes(),
@@ -2075,7 +2270,7 @@ mod tests {
         let mut app = app();
         app.apply_nodes(Ok(NodesFetch::default()));
 
-        app.apply_nodes(Err("could not list nodes: nope".to_owned()));
+        app.apply_nodes(Err(failed("could not list nodes: nope")));
 
         assert_eq!(
             app.nodes(),
@@ -2088,10 +2283,162 @@ mod tests {
     }
 
     #[test]
+    fn l_offers_a_login_only_when_the_failure_on_screen_is_a_credential_one() {
+        let mut app = app();
+        app.apply_nodes(Err(refused("prod rejected your credentials")));
+
+        assert!(app.credentials_lost());
+        assert_eq!(app.on_key(press(KeyCode::Char('L'))), Flow::Login);
+    }
+
+    #[test]
+    fn l_does_nothing_when_the_failure_is_one_a_login_could_not_fix() {
+        // An unreachable private endpoint, a `403` from the cluster's own
+        // access entries: pressing `L` there would open a browser, log the
+        // user in perfectly, and change nothing at all.
+        let mut app = app();
+        app.apply_nodes(Err(failed("could not reach the API server for prod")));
+
+        assert!(!app.credentials_lost());
+        assert_eq!(app.on_key(press(KeyCode::Char('L'))), Flow::Continue);
+        assert_eq!(app.login_hint(), None);
+    }
+
+    #[test]
+    fn l_does_nothing_on_a_dashboard_that_is_working_fine() {
+        let mut app = app();
+        app.apply_nodes(Ok(NodesFetch::default()));
+
+        assert_eq!(app.on_key(press(KeyCode::Char('L'))), Flow::Continue);
+    }
+
+    #[test]
+    fn a_successful_fetch_withdraws_the_offer_of_a_login() {
+        // The banner and the key go together: rows on screen mean the
+        // credentials worked, and `L` has nothing left to put right.
+        let mut app = app();
+        app.apply_nodes(Err(refused("prod rejected your credentials")));
+
+        app.apply_nodes(Ok(NodesFetch::default()));
+
+        assert!(!app.credentials_lost());
+        assert_eq!(app.login_hint(), None);
+    }
+
+    #[test]
+    fn a_credential_refusal_from_any_pane_offers_the_login() {
+        // The session belongs to the cluster, not to whichever pane happened
+        // to be the one that asked.
+        let mut pods = app();
+        pods.apply_pods(Err(refused("prod rejected your credentials")));
+        assert!(pods.credentials_lost());
+
+        let mut containers = app();
+        containers.apply_containers(Err(refused("prod rejected your credentials")));
+        assert!(containers.credentials_lost());
+    }
+
+    #[test]
+    fn a_login_that_failed_is_reported_without_withdrawing_the_offer() {
+        // Nothing was fixed, so `L` is still the thing to press — and the
+        // reason it did not work has to be readable somewhere.
+        let mut app = app();
+        app.apply_nodes(Err(refused("prod rejected your credentials")));
+
+        app.apply_login_failure("could not start `aws sso login`".to_owned());
+
+        assert!(app.credentials_lost());
+        assert_eq!(
+            app.nodes(),
+            &NodesState::Error("could not start `aws sso login`".to_owned())
+        );
+    }
+
+    #[test]
+    fn a_login_that_failed_over_good_rows_keeps_them() {
+        // The same rule a failed refresh follows: one bad login does not blank
+        // a dashboard that is still showing a working listing.
+        let mut app = app();
+        app.apply_nodes(Ok(NodesFetch::default()));
+        app.apply_nodes(Err(refused("prod rejected your credentials")));
+
+        app.apply_login_failure("could not start `aws sso login`".to_owned());
+
+        assert_eq!(
+            app.nodes(),
+            &NodesState::Loaded {
+                rows: Vec::new(),
+                usage_note: None,
+                refresh_error: Some("could not start `aws sso login`".to_owned()),
+            }
+        );
+    }
+
+    #[test]
+    fn switching_clusters_withdraws_a_login_offer_meant_for_the_previous_one() {
+        // A sidebar full of clusters in different AWS accounts is the case
+        // this protects: `L` does not ask before it runs, so an offer left
+        // over from the cluster that failed would open a browser for whatever
+        // account the *newly* selected one uses.
+        let mut app = app();
+        app.apply_nodes(Err(refused("prod rejected your credentials")));
+
+        app.start_loading_nodes();
+
+        assert!(!app.credentials_lost());
+        assert_eq!(app.login_hint(), None);
+        assert_eq!(app.on_key(press(KeyCode::Char('L'))), Flow::Continue);
+    }
+
+    #[test]
+    fn refreshing_the_same_cluster_keeps_the_offer() {
+        // The contrast case, and the reason the reset lives in
+        // `start_loading_nodes` rather than anywhere a refetch passes through:
+        // `r` is somebody retrying the cluster that failed, and the offer is
+        // still exactly what they need.
+        let mut app = app();
+        app.apply_nodes(Err(refused("prod rejected your credentials")));
+
+        assert!(is_refresh_key(press(KeyCode::Char('r'))));
+        app.on_key(press(KeyCode::Char('r')));
+
+        assert!(app.credentials_lost());
+        assert_eq!(app.on_key(press(KeyCode::Char('L'))), Flow::Login);
+    }
+
+    #[test]
+    fn the_footer_drops_the_login_hint_as_soon_as_the_pane_starts_loading_again() {
+        let mut terminal = Terminal::new(TestBackend::new(90, 20)).unwrap();
+        let mut app = app();
+        app.apply_nodes(Err(refused("prod rejected your credentials")));
+
+        app.start_loading_nodes();
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+
+        let rendered = terminal.backend().to_string();
+        assert!(!rendered.contains("log in"), "{rendered}");
+        // Back to the ordinary hint list rather than the credential one, which
+        // does not carry `s/S`.
+        assert!(rendered.contains("s/S"), "{rendered}");
+    }
+
+    #[test]
+    fn l_is_filter_text_while_the_filter_is_capturing() {
+        // Every other key is, and a capital `L` in a node name is not a
+        // request to open a browser.
+        let mut app = app();
+        app.apply_nodes(Err(refused("prod rejected your credentials")));
+        app.on_key(press(KeyCode::Char('/')));
+
+        assert_eq!(app.on_key(press(KeyCode::Char('L'))), Flow::Continue);
+        assert_eq!(app.filter_query(), "L");
+    }
+
+    #[test]
     fn a_successful_refresh_clears_an_earlier_refresh_failure() {
         let mut app = app();
         app.apply_nodes(Ok(NodesFetch::default()));
-        app.apply_nodes(Err("could not list nodes: nope".to_owned()));
+        app.apply_nodes(Err(failed("could not list nodes: nope")));
 
         app.apply_nodes(Ok(NodesFetch::default()));
 
@@ -2126,6 +2473,32 @@ mod tests {
         assert!(rendered.contains("Clusters"), "{rendered}");
         assert!(rendered.contains("beta"), "{rendered}");
         assert!(rendered.contains("us-east-1"), "{rendered}");
+        assert!(rendered.contains("quit"), "{rendered}");
+    }
+
+    #[test]
+    fn the_footer_offers_l_only_while_a_login_would_help() {
+        let mut terminal = Terminal::new(TestBackend::new(90, 20)).unwrap();
+        let mut app = app();
+
+        app.apply_nodes(Err(failed("could not reach the API server")));
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+        assert!(
+            !terminal.backend().to_string().contains("log in"),
+            "an unreachable cluster is not a login problem"
+        );
+
+        app.apply_nodes(Err(refused("prod rejected your credentials")));
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+        let rendered = terminal.backend().to_string();
+        assert!(rendered.contains("log in"), "{rendered}");
+        // First on the line, because until it is done every other key here
+        // leads back to the same error — and `q quit` still fits beside it,
+        // which is the whole reason this footer is its own short list.
+        assert!(
+            rendered.find("log in") < rendered.find("quit"),
+            "{rendered}"
+        );
         assert!(rendered.contains("quit"), "{rendered}");
     }
 
@@ -2857,7 +3230,7 @@ mod tests {
         let mut app = app();
         app.apply_containers(Ok(ContainersFetch::default()));
 
-        app.apply_containers(Err("could not get pod".to_owned()));
+        app.apply_containers(Err(failed("could not get pod")));
 
         assert_eq!(
             app.containers(),
@@ -2936,7 +3309,7 @@ mod tests {
         let mut app = app();
         app.apply_pods(Ok(PodsFetch::default()));
 
-        app.apply_pods(Err("could not list pods".to_owned()));
+        app.apply_pods(Err(failed("could not list pods")));
 
         assert_eq!(
             app.pods(),

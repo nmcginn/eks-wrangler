@@ -2323,3 +2323,157 @@ task, which is where headings, a selection highlight, and a cluster's own
 name would all get decided together against a WCAG contrast budget this
 task was never given. Deciding the gutter alone, tonight, would be one more
 guess in the direction that task exists to settle deliberately.
+### 74. `eks` does not own credential resolution; it owns knowing when it will fail
+
+The open question in the roadmap's "Stop the credential helper" entry — whether
+`eks` wants to own credential resolution at all — is answered *no*, and this
+change is what makes the no affordable.
+
+Owning it would mean implementing the `client.authentication.k8s.io` exec
+protocol, or the IAM Identity Center OIDC device flow over `aws-sdk-ssooidc`,
+and handing `kube` a resolved `Config`. Both were weighed and both lost to the
+same two objections. The first is cost: `aws-config` and the smithy stack pull a
+second hyper/rustls tree into a binary whose startup time is priority one in
+`CLAUDE.md`, and the commands that touch nothing but the filesystem currently do
+not even build a runtime. The second is worse: a native device flow has to write
+the token cache in the format `aws eks get-token` reads back, and that format is
+`botocore`'s private contract. We would be pinning ourselves to an
+implementation detail of the tool we are trying to cooperate with, and a change
+to it would show up as "logging in silently does nothing".
+
+So `aws::login` shells out to `aws sso login --profile X`. The AWS CLI is
+already a hard requirement of every EKS context this tool opens — the `exec`
+block runs it — so this adds no dependency the user did not already have, and it
+inherits the browser handling, the device-code flow, and the cache format for
+free. Always the `--profile` spelling and never `--sso-session`: it works for
+both spellings of an Identity Center profile and on older CLI v2 builds, and one
+form is one thing to print in the message offering it.
+
+What `eks` does own is the *question*. That half needs no SDK at all, because
+the answer is on disk.
+
+### 75. The session check reads two files, and matches on `startUrl` rather than a hash
+
+`aws::config` reads `~/.aws/config` for four keys, and `aws::sso` reads the AWS
+CLI's token cache for two. Both are pure functions over file contents with an
+explicit `now`, which is what lets the check run *before* connecting instead of
+in reaction to a `401` the user has already waited for. Measured against a
+31-entry cache the whole pre-flight is under a tenth of a millisecond, so it
+sits before the dashboard's first paint without troubling the 50 ms budget.
+
+Two choices inside it are worth writing down.
+
+**The config reader is hand-written, not a dependency.** AWS's format looks like
+INI and is not: a value may be empty and continue as an indented block beneath
+it (`s3 =` followed by `addressing_style = path`), which a general-purpose
+reader either rejects or folds into the section as bare keys. We want four keys,
+none of which is ever written that way, so the parser skips indented lines
+rather than modelling sub-properties. Eighty lines, and it earns its place under
+`CLAUDE.md`'s dependency rule where a crate would not. `serde_json` was promoted
+from a dev-dependency for the cache, which is genuinely JSON and somebody
+else's; hand-rolling a reader for that would have been the worse trade.
+
+**Cache entries are matched on the `startUrl` inside them, not on the
+filename.** The AWS CLI names each file after the SHA-1 of the session name or
+start URL. That is a `botocore` implementation detail rather than a documented
+contract, and a tool that recomputed the hash would break silently the day it
+changed — while reading a hash of a value it is already holding. Matching the
+field costs a scan of a few small files, cannot drift, and skips the
+`botocore-client-id-*.json` registrations in the same directory for free, since
+they carry no `startUrl`. Every failure in that scan is a skip: a directory that
+does not exist means nobody has logged in yet, and a file we cannot parse
+belongs to a newer CLI than the one we were written against. The worst case of
+being wrong is offering a login that was not needed.
+
+A token with under sixty seconds left counts as expired. It would be refused
+partway through a paged listing otherwise, and a credential error about a
+session that was alive when the user pressed Enter is the worst of both answers.
+That folds two readings into one `Session::Expired`, so the wording function
+says "signs out in 40s" as readily as "signed out 9h ago".
+
+### 76. A browser never opens without a yes, and the policy is a pure function
+
+`--login` is `auto`, `always`, or `never`, spelled to match `--color`'s three
+rather than inventing a second vocabulary for the same shape of choice.
+
+`aws::decide` is the entire policy as one pure function over the session, the
+flag, and whether there is a human at the terminal — the last passed in rather
+than asked for, so the table is a test. The row that matters is `auto` with no
+terminal: it proceeds, and the user gets the message this tool has always
+printed. A listing being redirected into a file has nobody to answer a question,
+and a tool that opened a browser there — or worse, sat waiting on a keystroke
+nobody would type — is one people work around rather than use. "Interactive"
+means both stdin *and* stderr are terminals, since that is where the answer
+comes from and where the question goes.
+
+Everything user-facing goes to stderr, and when stdout is not a terminal the
+child's stdout is redirected there too: `eks nodes | column -t` prints the same
+bytes it printed before. `--login never` keeps that promise literally — it does
+not read `~/.aws` at all, and the dashboard does not even build the runtime the
+pre-flight would need.
+
+The offer is made at most once per command. The retry after a cluster refuses is
+real and worth having — a token revoked centrally still reads as live in the
+cache until something tries to use it — but it is gated on `Outcome::NothingToDo`
+rather than on "no login has run yet". Three outcomes rather than a `bool`,
+because a user who has just answered "no" and a pre-flight that found nothing to
+say mean opposite things to the retry. Asking the identical question twice in
+one command is how a tool teaches people to reach for `--login never`.
+
+`aws sso login` is deliberately outside `--timeout`. That budget is about a
+cluster that will not answer; this is a human at a browser, and bounding it
+would recreate the hang-versus-give-up problem decision 50 solved, on the one
+path where waiting is the correct behaviour.
+
+### 77. The dashboard asks before it opens, and offers `L` after
+
+A one-shot command can ask a question wherever it likes. The dashboard cannot:
+its fetches run on background threads that do not own the terminal, and a login
+offered from one would be shouting over the pane it was trying to fill. So the
+two halves are split by *who owns the screen*.
+
+Before `ui::run` opens the alternate screen, `credentials::preflight` puts the
+question with ordinary stdio. Every fetcher built after that point is pinned to
+`LoginMode::Never` — not the user's flag — so a worker thread can never reach
+the prompt at all. That is a construction-time guarantee rather than a rule
+somebody has to remember.
+
+A session that dies while the dashboard is open is `L`, and deliberately not an
+automatic suspend: seizing the terminal from under somebody who is reading a
+container's log, to open a browser they did not ask for, is worse than the
+failure. `App::on_key` returns a new `Flow::Login` — its own variant for the
+reason `Flow::Quit` is one, the state machine decides and the event loop acts —
+and only when the failure on screen is credential-shaped. `credentials_lost` is
+one flag on `App` rather than a field threaded through four pane states: the
+session belongs to the cluster, not to whichever pane happened to be the one
+that asked, so a refusal from any of them offers the key and a success anywhere
+withdraws it.
+
+Carrying that flag across the thread boundary is why `commands::FetchError`
+replaced the bare `String` the fetchers used to hand back. The classification
+exists while the typed `k8s::client::Error` is still in hand and is gone by the
+time the receiving end has a message to print, so it is asked once, at the
+boundary, rather than re-derived by matching on English prose later.
+`k8s::client::Error::Cluster` grew a `failure` field for the same reason, and
+`Error::explained` gives the listings that run *after* a client exists the same
+pairing — an expired token is refused by the API server as readily as by the
+credential helper, and which of the two noticed is not something the user should
+have to care about.
+
+`ui::run` owns the suspend, because it is the only function here that knows a
+real terminal is involved. It hands `event_loop` a closure; `event_loop` stays
+generic over the backend and a test passes one that does nothing, so every
+keypress test still runs against `TestBackend`. The closure leaves raw mode and
+the alternate screen and re-enters them around the login rather than calling
+`ratatui::restore()`/`init()`, which would hand back a *new* `Terminal` the loop
+would have to swap in mid-iteration.
+
+Two smaller things fell out of touching that pane. The credential footer is its
+own short hint list, beside the ones `/` and the log view already have, rather
+than one more hint appended to the default: prepending `L log in` pushed `q
+quit` off an 80-column terminal, which the default list is explicitly ordered to
+protect, and when the session is gone `j/k` and `s/S` are moving around a
+listing nothing can refill anyway. And `NodesState::Error` is now drawn as one
+line per sentence: every message from `explain` diagnoses and then advises, and
+`ratatui` draws an embedded newline as one unbroken line, which had been putting
+the half that says what to do next off the right-hand edge of the pane.

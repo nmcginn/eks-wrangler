@@ -10,8 +10,9 @@ use k8s_openapi::api::core::v1::Pod;
 use k8s_openapi::jiff::Timestamp;
 use kube::api::Api;
 
+use crate::aws::LoginMode;
 use crate::cluster::ClusterView;
-use crate::commands::{self, StreamHandle, nodes::target_cluster};
+use crate::commands::{self, StreamHandle, credentials, nodes::target_cluster};
 use crate::format::Width;
 use crate::k8s::metrics::{self as k8s_metrics};
 use crate::k8s::order::Direction;
@@ -57,6 +58,13 @@ pub struct Request<'a> {
     /// The first step is the credential helper, which `k8s::connect` runs on a
     /// blocking task so that this can bound it.
     pub budget: page::Budget,
+    /// `--login`, carried beside the budget for the reason `eks nodes` carries
+    /// it there: both describe the step before the first request. Only this
+    /// listing reads it — the dashboard's three pod fetches below run on
+    /// background threads that must never stop to ask a question, so they
+    /// connect through `k8s::connect` directly and the dashboard puts its own
+    /// question before the terminal opens (`credentials::preflight`).
+    pub login: LoginMode,
 }
 
 /// Fetch and render the pod table for the selected cluster and scope.
@@ -77,7 +85,7 @@ pub async fn list(
     let scope = scope_for(&target, request.namespace, request.all_namespaces)?;
     let selectors = selectors_for(request.label_selector, request.field_selector)?;
 
-    let client = k8s::connect(paths, &target, request.budget).await?;
+    let client = credentials::connect(paths, &target, request.budget, request.login).await?;
 
     // Concurrently, not in sequence: the two requests are independent, and the
     // command should cost one round trip's worth of waiting rather than two.
@@ -235,7 +243,7 @@ pub fn spawn_gather_for_node(
     node: String,
     selectors: Selectors,
     budget: page::Budget,
-) -> mpsc::Receiver<Result<PodsFetch, String>> {
+) -> mpsc::Receiver<Result<PodsFetch, commands::FetchError>> {
     commands::spawn(async move {
         gather_for_node(
             &config,
@@ -246,7 +254,7 @@ pub fn spawn_gather_for_node(
             budget,
         )
         .await
-        .map_err(|error| format!("{error:#}"))
+        .map_err(|error| commands::FetchError::of(&error))
     })
 }
 
@@ -267,7 +275,7 @@ async fn gather_for_node(
     let scoped = scoped_to_node(node, selectors);
     let pods = k8s_pods::fetch_scope(client, &Scope::All, &scoped, budget)
         .await
-        .map_err(|error| anyhow!(k8s::explain(&error, &label)))?;
+        .map_err(|error| k8s::client::Error::explained(&error, &label))?;
 
     let now = Timestamp::now();
     let rows = pods
@@ -343,7 +351,7 @@ pub fn spawn_gather_containers(
     namespace: String,
     pod: String,
     budget: page::Budget,
-) -> mpsc::Receiver<Result<ContainersFetch, String>> {
+) -> mpsc::Receiver<Result<ContainersFetch, commands::FetchError>> {
     commands::spawn(async move {
         gather_containers(
             &config,
@@ -354,7 +362,7 @@ pub fn spawn_gather_containers(
             budget,
         )
         .await
-        .map_err(|error| format!("{error:#}"))
+        .map_err(|error| commands::FetchError::of(&error))
     })
 }
 
@@ -378,7 +386,7 @@ async fn gather_containers(
     let fetched = budget
         .wrap(api.get(pod))
         .await
-        .map_err(|error| anyhow!(k8s::explain(&error, &label)))?;
+        .map_err(|error| k8s::client::Error::explained(&error, &label))?;
 
     Ok(ContainersFetch {
         rows: ContainerRow::from_pod(&fetched),

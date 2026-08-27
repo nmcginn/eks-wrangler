@@ -62,6 +62,19 @@ impl NodesState {
     }
 }
 
+/// The line offering `L`, when the failure on screen is one a login would fix.
+///
+/// Beside the message rather than inside it: `k8s::client::explain` writes one
+/// wording for both surfaces, and "press L" is true of the dashboard and
+/// nonsense on the command line. Returning lines rather than pushing them keeps
+/// the two places the hint can appear — a pane that never loaded and a refresh
+/// that failed over good rows — from wording it twice.
+fn hint_lines(hint: Option<&str>, theme: Theme) -> Vec<Line<'static>> {
+    hint.into_iter()
+        .map(|text| Line::styled(text.to_owned(), theme.severity(Severity::Warn)))
+        .collect()
+}
+
 /// Draw whatever the node pane currently knows.
 ///
 /// `selected` highlights a row — `None` when the pane does not currently
@@ -85,14 +98,24 @@ pub(super) fn draw(
     order: Order,
     direction: Direction,
     filter: &str,
+    login_hint: Option<&str>,
     theme: Theme,
 ) {
     let lines: Vec<Line> = match state {
         NodesState::Loading => vec![Line::styled("Loading nodes…", theme.dim())],
-        NodesState::Error(message) => vec![Line::styled(
-            message.clone(),
-            theme.severity(Severity::Critical),
-        )],
+        NodesState::Error(message) => {
+            // Split on newlines for the reason `usage_note` below is: every
+            // message from `k8s::client::explain` is a diagnosis and then a
+            // sentence of advice, and `ratatui` draws an embedded `\n` as one
+            // unbroken line — which put the half that says what to do next off
+            // the right-hand edge of the pane.
+            let mut lines: Vec<Line> = message
+                .lines()
+                .map(|line| Line::styled(line.to_owned(), theme.severity(Severity::Critical)))
+                .collect();
+            lines.extend(hint_lines(login_hint, theme));
+            lines
+        }
         NodesState::Loaded { rows, .. } if rows.is_empty() => {
             vec![Line::styled("This cluster has no nodes.", theme.dim())]
         }
@@ -103,10 +126,18 @@ pub(super) fn draw(
         } => {
             let mut lines = vec![Line::styled("NODES", theme.heading())];
             if let Some(error) = refresh_error {
-                lines.push(Line::styled(
-                    format!("Last refresh failed: {error}"),
-                    theme.severity(Severity::Warn),
-                ));
+                let mut wrapped = error.lines();
+                if let Some(first) = wrapped.next() {
+                    lines.push(Line::styled(
+                        format!("Last refresh failed: {first}"),
+                        theme.severity(Severity::Warn),
+                    ));
+                }
+                lines.extend(
+                    wrapped
+                        .map(|line| Line::styled(line.to_owned(), theme.severity(Severity::Warn))),
+                );
+                lines.extend(hint_lines(login_hint, theme));
             }
             if !filter.is_empty() {
                 lines.push(Line::styled(format!("Filter: \"{filter}\""), theme.dim()));
@@ -325,6 +356,18 @@ mod tests {
         direction: Direction,
         filter: &str,
     ) -> String {
+        render_with_hint(state, order, direction, filter, None)
+    }
+
+    /// The full-fat renderer the three above narrow: `login_hint` is what
+    /// `App::login_hint` would have handed in.
+    fn render_with_hint(
+        state: &NodesState,
+        order: Order,
+        direction: Direction,
+        filter: &str,
+        login_hint: Option<&str>,
+    ) -> String {
         let mut terminal = Terminal::new(TestBackend::new(90, 20)).unwrap();
         terminal
             .draw(|frame| {
@@ -337,6 +380,7 @@ mod tests {
                     order,
                     direction,
                     filter,
+                    login_hint,
                     Theme::dark(),
                 );
             })
@@ -414,6 +458,69 @@ mod tests {
     }
 
     #[test]
+    fn a_two_sentence_failure_is_drawn_as_two_lines() {
+        // Every message from `k8s::client::explain` diagnoses and then advises,
+        // and `ratatui` draws an embedded newline as one unbroken line — which
+        // pushed the advice off the right-hand edge of the pane.
+        let rendered = render(&NodesState::Error(
+            "prod rejected your credentials.\nRefresh them and try again.".to_owned(),
+        ));
+
+        assert!(
+            rendered.contains("prod rejected your credentials."),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("Refresh them and try again."),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn the_login_offer_is_drawn_under_a_failure_that_never_loaded() {
+        let rendered = render_with_hint(
+            &NodesState::Error("prod rejected your credentials.".to_owned()),
+            Order::default(),
+            Direction::default(),
+            "",
+            Some("Press L to log in to AWS and try again."),
+        );
+
+        assert!(rendered.contains("Press L to log in"), "{rendered}");
+    }
+
+    #[test]
+    fn the_login_offer_is_drawn_under_a_failed_refresh_over_good_rows() {
+        // The other place the pane can be showing a credential failure, and
+        // the more likely one: a session that died while the dashboard was
+        // open still has yesterday's rows on screen.
+        let state = NodesState::Loaded {
+            rows: vec![node("worker-1")],
+            usage_note: None,
+            refresh_error: Some("prod rejected your credentials.".to_owned()),
+        };
+
+        let rendered = render_with_hint(
+            &state,
+            Order::default(),
+            Direction::default(),
+            "",
+            Some("Press L to log in to AWS and try again."),
+        );
+
+        assert!(rendered.contains("Last refresh failed"), "{rendered}");
+        assert!(rendered.contains("Press L to log in"), "{rendered}");
+        assert!(rendered.contains("worker-1"), "{rendered}");
+    }
+
+    #[test]
+    fn no_login_offer_is_drawn_when_there_is_nothing_to_offer() {
+        let rendered = render(&NodesState::Error("could not reach prod.".to_owned()));
+
+        assert!(!rendered.contains("Press L"), "{rendered}");
+    }
+
+    #[test]
     fn rendering_the_node_pane_survives_a_tiny_terminal() {
         let state = loaded(vec![node("worker-1")]);
         for (width, height) in [(1, 1), (8, 3), (20, 2), (200, 60)] {
@@ -429,6 +536,7 @@ mod tests {
                         Order::default(),
                         Direction::default(),
                         "",
+                        None,
                         Theme::dark(),
                     );
                 })
@@ -481,6 +589,7 @@ mod tests {
                     Order::default(),
                     Direction::default(),
                     "",
+                    None,
                     Theme::dark(),
                 );
             })
@@ -717,6 +826,7 @@ mod tests {
                     Order::default(),
                     Direction::default(),
                     "",
+                    None,
                     Theme::dark(),
                 );
             })
