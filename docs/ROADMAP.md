@@ -271,7 +271,7 @@ cluster.
   existing to hold the facts, and the node pane has none — `Enter` drills into
   a node's pods, not the node itself. See decision 72.
 
-- [ ] **A node's own detail view, and its `--wide` facts in it.**
+- [x] **A node's own detail view, and its `--wide` facts in it.**
   The pod half of "Decide what `--wide` means in a dashboard pane" landed the
   facts as plain lines in the pod-containers pane, because that pane already
   commits to one pod and had somewhere to put them. Nothing plays that role
@@ -287,6 +287,25 @@ cluster.
   *Acceptance:* whichever shape the view takes, its wide facts come from
   `k8s::nodes::columns`' existing `Column` variants rather than a second
   reading of `Node`; a node pane that never opens the view is unchanged.
+  Landed on the pod-drilldown pane itself rather than a new `View`: like the
+  pod-containers pane, `View::NodePods` already commits to one node — it is
+  the view `Enter` on a highlighted node opens — so it plays exactly the role
+  the pod side's pane played, and a fifth `View` variant naming a node whose
+  pods the current one already names would have been two views for one
+  identity. `k8s::nodes::wide_facts` is the new pure function, built from the
+  same five `Column` variants `--wide` appends and in the same order, so the
+  two surfaces cannot describe a node differently; unconditional the way the
+  table's own wide columns are, so a node reporting none of them still gets
+  five lines of `-` rather than a shorter list. No second fetch: the facts
+  come from the `NodeRow` the node pane already fetched, found by name
+  through the new `App::drilled_node`, and drawn above the pod list — even
+  while that pane's own pod fetch is still loading, since the facts were
+  known before it started. A node that leaves the listing after being
+  drilled into (scaled down, mid-session) reads as no facts at all rather
+  than stale ones. "A node's full condition list", below, is left for its own
+  entry, unstarted: it wants the same pane for a different, wider set of
+  facts, and nothing about landing the `--wide` five decided whether the two
+  belong under one key or two.
 
 ### Follow-ups from the usage columns
 

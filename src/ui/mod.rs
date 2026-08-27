@@ -844,6 +844,23 @@ impl App {
         })
     }
 
+    /// The [`k8s_nodes::NodeRow`] behind the node currently drilled into, from
+    /// the node pane's own listing — not a second fetch of the node, since
+    /// [`View::NodePods`] already names it and [`Self::nodes`] already holds
+    /// it, fetched before the drill-down happened. `None` once a node has
+    /// left that listing after being drilled into (scaled down, for
+    /// instance), and outside [`View::NodePods`] entirely, where there is
+    /// nothing to look up. Read off the full, unfiltered rows rather than
+    /// [`Self::visible_nodes`]: a `/` query typed after drilling in narrows
+    /// the *pod* list this pane is now showing, not the node identity the
+    /// breadcrumb and this lookup are about.
+    fn drilled_node(&self) -> Option<&k8s_nodes::NodeRow> {
+        let View::NodePods { node } = &self.view else {
+            return None;
+        };
+        self.nodes.rows().iter().find(|row| row.name == *node)
+    }
+
     /// `Right`/`Tab`: move toward the detail pane and deeper into it —
     /// switch focus to [`Focus::Detail`] if the sidebar has it, or drill in
     /// if the detail pane already does.
@@ -1754,6 +1771,7 @@ fn draw_detail(frame: &mut Frame, area: Rect, app: &App) {
             frame,
             sections[1],
             app.pods(),
+            app.drilled_node(),
             highlighted,
             app.pod_order(),
             app.pod_direction(),
@@ -2539,6 +2557,69 @@ mod tests {
             let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
             terminal.draw(|frame| draw(frame, &app())).unwrap();
         }
+    }
+
+    #[test]
+    fn a_frame_drilled_into_a_nodes_pods_shows_its_wide_facts() {
+        let node = crate::k8s::nodes::NodeRow {
+            internal_ip: "10.0.1.9".to_owned(),
+            external_ip: "34.201.1.2".to_owned(),
+            os_image: "Amazon Linux 2023".to_owned(),
+            kernel_version: "6.1.148".to_owned(),
+            container_runtime: "containerd://1.7.28".to_owned(),
+            ..node_row("worker-1")
+        };
+        let mut app = app();
+        app.apply_nodes(Ok(NodesFetch {
+            rows: vec![node],
+            usage_note: None,
+        }));
+        app.toggle_focus();
+        app.on_key(press(KeyCode::Enter));
+        app.apply_pods(Ok(PodsFetch {
+            rows: vec![pod_row("api-1")],
+            selector_note: None,
+        }));
+
+        let mut terminal = Terminal::new(TestBackend::new(90, 20)).unwrap();
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+        let rendered = terminal.backend().to_string();
+
+        assert!(rendered.contains("INTERNAL-IP: 10.0.1.9"), "{rendered}");
+        assert!(rendered.contains("api-1"), "{rendered}");
+    }
+
+    #[test]
+    fn drilled_node_finds_the_row_behind_the_view() {
+        let mut app = app_with_node();
+        app.on_key(press(KeyCode::Enter));
+
+        assert_eq!(
+            app.drilled_node().map(|row| row.name.as_str()),
+            Some("worker-1")
+        );
+    }
+
+    #[test]
+    fn drilled_node_is_none_outside_the_node_pods_view() {
+        let app = app_with_node();
+
+        assert_eq!(app.drilled_node(), None);
+    }
+
+    #[test]
+    fn drilled_node_is_none_once_the_node_has_left_the_listing() {
+        // A background refresh that no longer reports this node — scaled
+        // down, or removed from the cluster, while its pods were open.
+        let mut app = app_with_node();
+        app.on_key(press(KeyCode::Enter));
+
+        app.apply_nodes(Ok(NodesFetch {
+            rows: vec![node_row("worker-2")],
+            usage_note: None,
+        }));
+
+        assert_eq!(app.drilled_node(), None);
     }
 
     #[test]

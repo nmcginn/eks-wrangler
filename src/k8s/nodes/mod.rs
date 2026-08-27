@@ -962,6 +962,30 @@ pub(crate) fn columns(rows: &[NodeRow], width: format::Width) -> Vec<Column<'_>>
     }
 }
 
+/// One node's `eks nodes --wide` facts, as label/value pairs — for a view that
+/// shows a single node's own detail rather than a row in a table.
+///
+/// Built from the same five `Column` variants `columns` appends under
+/// [`format::Width::Wide`], in the same order, so a node's detail view and its
+/// row in a wide listing can never describe it differently; this reads
+/// `NodeRow`'s existing wide fields rather than a second pass over `Node`.
+/// Unconditional, the way the table's own wide columns are: `--wide` prints
+/// every one of them whatever is in the cell, and a node that has not
+/// reported one reads `-`, not a missing line.
+#[must_use]
+pub fn wide_facts(row: &NodeRow) -> Vec<(String, String)> {
+    [
+        Column::InternalIp,
+        Column::ExternalIp,
+        Column::OsImage,
+        Column::KernelVersion,
+        Column::ContainerRuntime,
+    ]
+    .into_iter()
+    .map(|column| (column.header(), column.text(row)))
+    .collect()
+}
+
 /// The order columns get dropped in when [`Width::Narrow`] cannot fit them all.
 ///
 /// A list of predicates rather than a single ranking, because some columns want
@@ -2660,6 +2684,50 @@ mod tests {
             render(&rows, "prod (us-east-1)", &[], Width::Wide, Palette::Plain),
             "NAME                      STATUS  VERSION              CPU      CPU REQ  MEMORY         MEM REQ  PODS       AGE   INTERNAL-IP  EXTERNAL-IP  OS-IMAGE                      KERNEL-VERSION                   CONTAINER-RUNTIME\n\
              ip-10-0-1-9.ec2.internal  Ready   v1.33.1-eks-1a2b3c4  3920m/4  0 (0%)   14.8Gi/15.6Gi  0 (0%)   0/58 (0%)  2d2h  10.0.1.9     -            Amazon Linux 2023.9.20260714  6.1.148-172.265.amzn2023.x86_64  containerd://1.7.28"
+        );
+    }
+
+    #[test]
+    fn wide_facts_names_the_same_five_columns_wide_appends_in_the_same_order() {
+        let row = NodeRow::from_node(&wide_node(), Some(&idle()), None, now());
+
+        assert_eq!(
+            wide_facts(&row),
+            vec![
+                ("INTERNAL-IP".to_owned(), "10.0.1.9".to_owned()),
+                ("EXTERNAL-IP".to_owned(), "-".to_owned()),
+                (
+                    "OS-IMAGE".to_owned(),
+                    "Amazon Linux 2023.9.20260714".to_owned()
+                ),
+                (
+                    "KERNEL-VERSION".to_owned(),
+                    "6.1.148-172.265.amzn2023.x86_64".to_owned()
+                ),
+                (
+                    "CONTAINER-RUNTIME".to_owned(),
+                    "containerd://1.7.28".to_owned()
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn wide_facts_reads_a_node_with_none_of_them_as_dashes_not_a_shorter_list() {
+        // Unconditional, the way the table's own wide columns are: a node that
+        // has not reported these still gets all five lines, each `-`, rather
+        // than dropping the ones it has nothing to say.
+        let row = NodeRow::from_node(&healthy_node(), Some(&idle()), None, now());
+
+        assert_eq!(
+            wide_facts(&row),
+            vec![
+                ("INTERNAL-IP".to_owned(), "-".to_owned()),
+                ("EXTERNAL-IP".to_owned(), "-".to_owned()),
+                ("OS-IMAGE".to_owned(), "-".to_owned()),
+                ("KERNEL-VERSION".to_owned(), "-".to_owned()),
+                ("CONTAINER-RUNTIME".to_owned(), "-".to_owned()),
+            ]
         );
     }
 
