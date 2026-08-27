@@ -33,7 +33,7 @@
 use std::io::{BufRead, IsTerminal, Write};
 use std::path::PathBuf;
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 use k8s_openapi::jiff::Timestamp;
 use kube::{Client, Config};
 
@@ -134,11 +134,39 @@ pub async fn preflight(paths: &[PathBuf], cluster: &ClusterView, login: LoginMod
 /// the profile has an Identity Center session to refresh, because the
 /// refusal that put `L` on screen is already the evidence the cache's own
 /// answer was wrong.
-pub async fn retry_login(paths: &[PathBuf], cluster: &ClusterView, login: LoginMode) -> Result<()> {
+///
+/// Always [`LoginMode::Always`], not a flag the caller passes in: pressing
+/// `L` *is* the yes, and asking a second question over a dashboard that has
+/// just given the screen back would be asking it twice. Fixed here rather
+/// than left to `main.rs` to remember, so `Context::act` never has a question
+/// to ask and `Outcome::Declined` never happens.
+///
+/// `Outcome::NothingToDo` is turned into an error here rather than being
+/// swallowed the way [`preflight`] swallows it. A pre-flight finding nothing
+/// to do is the ordinary case — most sessions are fine — so proceeding
+/// quietly is correct there. `L` is different: it is only ever pressed
+/// because `is_credentials` already classified a real refusal, so
+/// `NothingToDo` here means the profile behind it has no Identity Center
+/// session for `aws sso login` to refresh at all — a static-key or
+/// instance-role profile whose credentials went bad some other way — and
+/// that is worth a sentence on screen instead of a silent flicker with
+/// nothing for the user to act on.
+pub async fn retry_login(paths: &[PathBuf], cluster: &ClusterView) -> Result<()> {
     let config = client::resolve(paths, cluster).await?;
-    let context = Context::of(&config, login);
-    context.act(&context.after_refusal(&cluster.label()))?;
-    Ok(())
+    let context = Context::of(&config, LoginMode::Always);
+    match context.act(&context.after_refusal(&cluster.label()))? {
+        Outcome::LoggedIn => Ok(()),
+        Outcome::NothingToDo => bail!(
+            "profile {:?} has no IAM Identity Center session to refresh; \
+             its credentials need fixing some other way.",
+            context.profile
+        ),
+        // `LoginMode::Always` never produces `Action::Ask`, so `Context::act`
+        // never has a question to decline. Worded rather than `unreachable!`,
+        // as everything in this crate is: a defensive branch should say what
+        // is wrong if it is ever proven wrong, not stop the terminal cold.
+        Outcome::Declined => bail!("logging in to AWS did not run"),
+    }
 }
 
 /// Whether a failed build is worth offering a login for a second time.
@@ -495,6 +523,29 @@ mod tests {
             context_with_a_still_valid_looking_cache().after_refusal("prod (us-east-1)"),
             Action::Run { .. }
         ));
+    }
+
+    #[test]
+    fn a_profile_with_no_identity_centre_session_leaves_after_refusal_nothing_to_do() {
+        // The state `retry_login` turns into an error rather than a silent
+        // `Ok`: a profile behind static keys or an instance role still gets
+        // classified `Failure::Credentials` when those credentials go bad,
+        // and there is no Identity Center session for `aws sso login` to
+        // refresh.
+        let context = Context {
+            mode: LoginMode::Always,
+            profile: "prod".to_owned(),
+            sso: None,
+            session: aws::sso::Session::NotSso,
+            env: Vec::new(),
+        };
+
+        assert_eq!(
+            context
+                .act(&context.after_refusal("prod (us-east-1)"))
+                .unwrap(),
+            Outcome::NothingToDo
+        );
     }
 
     #[test]

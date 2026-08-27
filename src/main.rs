@@ -267,13 +267,14 @@ fn dashboard(
     // it blocks, because it owns the terminal `ui::run` hands back to it, and a
     // browser login is a thing to wait for rather than to poll.
     //
-    // `Always`, not the flag the user passed: pressing `L` *is* the yes, and
-    // asking a second question over a dashboard that has just given the screen
-    // back would be asking it twice. `retry_login`, not `preflight`: the key
-    // only appears once a background fetch has already been refused, so the
-    // token cache `preflight` would re-read has already been proven stale —
-    // consulting it again would leave `L` doing nothing whenever the cache
-    // still called the dead session valid.
+    // `retry_login`, not `preflight`: the key only appears once a background
+    // fetch has already been refused, so the token cache `preflight` would
+    // re-read has already been proven stale — consulting it again would leave
+    // `L` doing nothing whenever the cache still called the dead session
+    // valid. `retry_login` always logs in without asking and reports plainly
+    // when there was nothing an Identity Center login could have fixed,
+    // rather than the two of those reading as the identical "flash and
+    // return" a bare `Ok(())` for both would give the event loop.
     let login: ui::LoginRunner = {
         let config = config.clone();
         let paths = paths.to_vec();
@@ -281,7 +282,7 @@ fn dashboard(
             let views = contexts::views(&config);
             let cluster = contexts::resolve_selector(&views, context)
                 .map_err(|error| format!("{error:#}"))?;
-            commands::block_on(credentials::retry_login(&paths, cluster, LoginMode::Always))
+            commands::block_on(credentials::retry_login(&paths, cluster))
                 .map_err(|error| format!("{error:#}"))
         })
     };
