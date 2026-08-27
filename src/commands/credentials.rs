@@ -22,7 +22,9 @@
 //! and the request, and a `~/.aws/config` this tool could not follow looks like
 //! "no Identity Center here" until the API server says otherwise. It is taken
 //! at most once, so a cluster that refuses a freshly minted token is an error
-//! rather than a loop.
+//! rather than a loop. [`connect`] takes it itself, right after `client::build`
+//! refuses; the dashboard's `L` key takes the same retry later, through
+//! [`retry_login`], once a background fetch has refused instead.
 //!
 //! The decisions are all next door in [`crate::aws::decide`] and
 //! [`crate::aws::after_refusal`], as pure functions. What lives here is the I/O
@@ -105,11 +107,37 @@ enum Outcome {
 /// terminal, so the question is put *here* — before `ui::run` opens the
 /// alternate screen, while stdin and stderr are still ordinary — and every
 /// fetcher after it is built with [`LoginMode::Never`]. A session that dies
-/// later is the `L` key's problem, not this function's.
+/// later is [`retry_login`]'s problem, not this function's: the cache this
+/// reads is exactly what a later refusal proves stale, so this is never the
+/// right check for `L` to repeat.
 pub async fn preflight(paths: &[PathBuf], cluster: &ClusterView, login: LoginMode) -> Result<()> {
     let config = client::resolve(paths, cluster).await?;
     let context = Context::of(&config, login);
     context.act(&context.before(&cluster.label()))?;
+    Ok(())
+}
+
+/// What the `L` key runs: the **retry**'s question, not the pre-flight's.
+///
+/// `L` only appears once a fetch has already been refused for a credentials
+/// reason (`App::credentials_lost`), so calling [`preflight`] here would ask
+/// the wrong question: its `before` reads the token cache and proceeds
+/// whenever the cache still calls the session valid — which is nearly always
+/// true right after a dashboard's own refusal, since a token revoked
+/// centrally still reads as live in the cache until something tries to use
+/// it, and something already did. Consulting the cache a second time would
+/// leave `L` doing nothing, silently, in exactly the case it exists for.
+///
+/// This runs `Context::after_refusal` instead — the same question
+/// [`connect`]'s own retry asks after a one-shot command's request is
+/// refused — which does not look at the cache at all: it logs in whenever
+/// the profile has an Identity Center session to refresh, because the
+/// refusal that put `L` on screen is already the evidence the cache's own
+/// answer was wrong.
+pub async fn retry_login(paths: &[PathBuf], cluster: &ClusterView, login: LoginMode) -> Result<()> {
+    let config = client::resolve(paths, cluster).await?;
+    let context = Context::of(&config, login);
+    context.act(&context.after_refusal(&cluster.label()))?;
     Ok(())
 }
 
@@ -426,6 +454,47 @@ mod tests {
                 "{before:?}"
             );
         }
+    }
+
+    /// A profile whose Identity Center session the cache still calls
+    /// valid — the exact shape of the state `L` is pressed into, since a
+    /// token revoked centrally still reads as live in the cache until
+    /// something tries to use it, and a real fetch already just did.
+    fn context_with_a_still_valid_looking_cache() -> Context {
+        Context {
+            mode: LoginMode::Always,
+            profile: "prod".to_owned(),
+            sso: Some(aws::config::Sso {
+                start_url: "https://acme.awsapps.com/start".to_owned(),
+                session: Some("corp".to_owned()),
+            }),
+            session: aws::sso::Session::Valid {
+                expires_at: "2099-01-01T00:00:00Z".parse().unwrap(),
+            },
+            env: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn the_pre_flight_question_would_leave_l_doing_nothing_over_a_stale_cache() {
+        // This is the bug `retry_login` exists to avoid: re-asking `before`
+        // (what `preflight` runs) after a live refusal reads the same cache
+        // that refusal just proved wrong, and finds nothing to do.
+        assert_eq!(
+            context_with_a_still_valid_looking_cache().before("prod (us-east-1)"),
+            Action::Proceed
+        );
+    }
+
+    #[test]
+    fn l_logs_in_even_though_the_cache_still_calls_the_session_valid() {
+        // `after_refusal` — what `retry_login` runs instead — does not
+        // consult `self.session` at all, so the same context that left
+        // `before` with nothing to do here runs the login unconditionally.
+        assert!(matches!(
+            context_with_a_still_valid_looking_cache().after_refusal("prod (us-east-1)"),
+            Action::Run { .. }
+        ));
     }
 
     #[test]

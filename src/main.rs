@@ -269,8 +269,11 @@ fn dashboard(
     //
     // `Always`, not the flag the user passed: pressing `L` *is* the yes, and
     // asking a second question over a dashboard that has just given the screen
-    // back would be asking it twice. The key only appears at all when the pane
-    // is showing a credential failure, so there is nothing here to decide.
+    // back would be asking it twice. `retry_login`, not `preflight`: the key
+    // only appears once a background fetch has already been refused, so the
+    // token cache `preflight` would re-read has already been proven stale —
+    // consulting it again would leave `L` doing nothing whenever the cache
+    // still called the dead session valid.
     let login: ui::LoginRunner = {
         let config = config.clone();
         let paths = paths.to_vec();
@@ -278,7 +281,7 @@ fn dashboard(
             let views = contexts::views(&config);
             let cluster = contexts::resolve_selector(&views, context)
                 .map_err(|error| format!("{error:#}"))?;
-            commands::block_on(credentials::preflight(&paths, cluster, LoginMode::Always))
+            commands::block_on(credentials::retry_login(&paths, cluster, LoginMode::Always))
                 .map_err(|error| format!("{error:#}"))
         })
     };
