@@ -63,7 +63,11 @@ fn run(cli: Cli) -> Result<()> {
             )
         }
         Command::Contexts { quiet } => {
-            print_line(&contexts::list(&config, quiet));
+            print_line(&contexts::list(
+                &config,
+                quiet,
+                stdout_palette(cli.global.color),
+            ));
             Ok(())
         }
         Command::Nodes {

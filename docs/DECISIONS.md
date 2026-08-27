@@ -2238,7 +2238,92 @@ against the single-row case to cover what actually changed. Sorting one row
 was always a no-op, so the new line is the honest one, and it is now said in
 the one place `--sort` speaks rather than left to the reader to notice.
 
-### 72. `eks` does not own credential resolution; it owns knowing when it will fail
+### 72. A dashboard pane's `--wide` facts move to the detail view they are
+about, rather than growing a wide mode
+
+The roadmap left "Decide what `--wide` means in a dashboard pane" open on
+purpose: `format::Width::Wide` reserves five columns on `eks nodes` and three
+on `eks pods` for facts most listings never need, and whether a pane meets
+the same flag with the same mechanism — a wider table — or with something
+else was called out as a question a pane's own shape should answer, not one
+the CLI's answer could be guessed forward from.
+
+It answers "something else", and only for pods tonight. A CLI table earns a
+wide mode because every row is a line the reader either reads or skips, and
+five more columns are five more things to skip past on a hundred rows that
+did not need them. A dashboard pane showing one pod's containers has already
+committed to that one row — the breadcrumb names it, `Enter` chose it — so
+its extra facts are not competing with anything else on screen for space.
+There is nothing left to widen *away from*.
+
+So `IP`, `NOMINATED NODE`, and `READINESS GATES` — `k8s::pods::row::Column`'s
+three `--wide`-only pod columns — now appear as plain lines above the
+container list in the pod-containers pane (`ui::containers::identity_lines`),
+unconditionally, with no `--wide` equivalent key to press. `IP` always shows,
+`-` included, because a pod with no address yet is itself the answer to "why
+can't anything reach this pod". `NOMINATED NODE` and `READINESS GATES` follow
+the CLI columns' own judgement of when they are worth print space — neither
+line appears for the ordinary pod that has neither — which is the one thing
+this change keeps rather than reopens: nearly every pod would print nothing
+new, and the pane should not either.
+
+The values themselves come from the same three functions the CLI's `Column`
+already called, not a second reading of `pod.status`: `k8s::pods::row::pod_ip`
+and `::readiness_gates` were private free functions and are now `pub(crate)`,
+and the nominated-node lookup — inlined before tonight, directly in
+`PodRow::from_pod` — is now its own function, `nominated_node`, beside them,
+so `PodRow::from_pod` and the pane's fetch call the identical three functions
+rather than one of them keeping a second copy of the field it reads.
+`commands::pods::gather_containers` already fetches the one full `Pod` these
+need; it was building a `ContainerRow` list from it and discarding the rest,
+so nothing new is fetched — `ContainersFetch` just keeps three more fields of
+what it already has, and `ContainersState::Loaded` carries them to the pane
+the same way.
+
+What this does not settle: the node table's five `--wide` columns
+(`INTERNAL-IP`, `EXTERNAL-IP`, `OS-IMAGE`, `KERNEL-VERSION`,
+`CONTAINER-RUNTIME`) have nowhere to land by the same reasoning, because the
+node pane has no equivalent of the pod-containers pane — `Enter` on a node
+drills into its pods, not into a detail view of the node itself. The
+"detail view already exists" argument above depends on that view existing,
+and for nodes it does not; a new roadmap entry below builds that surface
+before this question can be answered for it, rather than this change
+guessing at a view's shape to hang five facts on. The pod half above is the
+complete answer to its half of the question, not a partial answer to the
+whole of it.
+
+### 73. `eks contexts` honours `--color`, and the `*` gutter still does not
+
+`commands::contexts::render_table` hardcoded `Palette::Plain` even though
+`--color` has been a global flag since the CLI colour task landed — `eks
+contexts --color always` and `eks contexts --color never` printed the same
+bytes, silently ignoring what the user typed. That was always going to be
+invisible rather than wrong, because nothing in `NAME`/`REGION`/`NAMESPACE`
+is a reading off a cluster's health: a context is a name, a region, and a
+namespace read out of a file, so every cell is `format::Cell::plain` and a
+palette has nothing to paint. But "invisible" and "correct" are different
+claims, and a table that only happens to look right under `--color` because
+it never looks at the flag would stop looking right the day a graded column
+is added here. `list` and `render_table` now take the `Palette` the caller
+was given, `main::run` passes `stdout_palette(cli.global.color)` exactly as
+`nodes::list` and `pods::list` already do, and a new test asserts the two
+palettes render identically — the property this relies on, not an
+accident of today's columns.
+
+The `*` gutter is the one mark in this table that does single a row out,
+and it is not a `format::Cell` — it is written outside `format::table`
+entirely, the same way the dashboard's sidebar draws its own current-cluster
+marker in `Severity::Ok` green. The roadmap task this closes noticed that
+inconsistency and asked whether the gutter should match. It stays
+uncoloured. Colouring it is not "does this table honour the palette it is
+given" — that question is now answered, plainly, by the fix above — it is
+"is an identity marker, as opposed to a health reading, colour's business at
+all", and that question already has a claimant: the Milestone 3 light-theme
+task, which is where headings, a selection highlight, and a cluster's own
+name would all get decided together against a WCAG contrast budget this
+task was never given. Deciding the gutter alone, tonight, would be one more
+guess in the direction that task exists to settle deliberately.
+### 74. `eks` does not own credential resolution; it owns knowing when it will fail
 
 The open question in the roadmap's "Stop the credential helper" entry — whether
 `eks` wants to own credential resolution at all — is answered *no*, and this
@@ -2267,7 +2352,7 @@ form is one thing to print in the message offering it.
 What `eks` does own is the *question*. That half needs no SDK at all, because
 the answer is on disk.
 
-### 73. The session check reads two files, and matches on `startUrl` rather than a hash
+### 75. The session check reads two files, and matches on `startUrl` rather than a hash
 
 `aws::config` reads `~/.aws/config` for four keys, and `aws::sso` reads the AWS
 CLI's token cache for two. Both are pure functions over file contents with an
@@ -2306,7 +2391,7 @@ session that was alive when the user pressed Enter is the worst of both answers.
 That folds two readings into one `Session::Expired`, so the wording function
 says "signs out in 40s" as readily as "signed out 9h ago".
 
-### 74. A browser never opens without a yes, and the policy is a pure function
+### 76. A browser never opens without a yes, and the policy is a pure function
 
 `--login` is `auto`, `always`, or `never`, spelled to match `--color`'s three
 rather than inventing a second vocabulary for the same shape of choice.
@@ -2340,7 +2425,7 @@ cluster that will not answer; this is a human at a browser, and bounding it
 would recreate the hang-versus-give-up problem decision 50 solved, on the one
 path where waiting is the correct behaviour.
 
-### 75. The dashboard asks before it opens, and offers `L` after
+### 77. The dashboard asks before it opens, and offers `L` after
 
 A one-shot command can ask a question wherever it likes. The dashboard cannot:
 its fetches run on background threads that do not own the terminal, and a login

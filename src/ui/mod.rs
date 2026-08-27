@@ -547,7 +547,7 @@ impl App {
         // rather than failing — and `L` does not ask, so it would open a
         // browser for a different account's profile than the one the user was
         // told about. That is the one property `aws::decide` exists to protect
-        // (decision 74), and a sidebar full of clusters in different accounts
+        // (decision 76), and a sidebar full of clusters in different accounts
         // is exactly where it would have gone wrong.
         self.credentials_lost = false;
     }
@@ -582,7 +582,12 @@ impl App {
     pub fn apply_containers(&mut self, result: Result<ContainersFetch, FetchError>) {
         self.credentials_lost = result.as_ref().is_err_and(|error| error.credentials);
         self.containers = match result {
-            Ok(fetch) => ContainersState::Loaded { rows: fetch.rows },
+            Ok(fetch) => ContainersState::Loaded {
+                rows: fetch.rows,
+                ip: fetch.ip,
+                nominated_node: fetch.nominated_node,
+                readiness_gates: fetch.readiness_gates,
+            },
             Err(error) => ContainersState::Error(error.message),
         };
     }
@@ -2040,6 +2045,7 @@ mod tests {
         app.on_key(press(KeyCode::Enter));
         app.apply_containers(Ok(ContainersFetch {
             rows: vec![container_row("app")],
+            ..ContainersFetch::default()
         }));
         app
     }
@@ -2055,6 +2061,7 @@ mod tests {
                 restarts: 3,
                 ..container_row("app")
             }],
+            ..ContainersFetch::default()
         }));
         app
     }
@@ -2551,6 +2558,7 @@ mod tests {
                 cpu_limit: None,
                 memory_limit: None,
             }],
+            ..ContainersFetch::default()
         }));
 
         let mut terminal = Terminal::new(TestBackend::new(90, 20)).unwrap();
@@ -3204,7 +3212,12 @@ mod tests {
 
         assert_eq!(
             app.containers(),
-            &ContainersState::Loaded { rows: Vec::new() }
+            &ContainersState::Loaded {
+                rows: Vec::new(),
+                ip: String::new(),
+                nominated_node: String::new(),
+                readiness_gates: None,
+            }
         );
     }
 

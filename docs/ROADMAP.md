@@ -249,7 +249,7 @@ cluster.
   GATES` as a third pod column, because the default table cannot explain a pod
   whose `READY` reads `1/1` while the cluster calls it unready.
 
-- [ ] **Decide what `--wide` means in a dashboard pane.**
+- [x] **Decide what `--wide` means in a dashboard pane.**
   `format::Width` and the two `columns` functions are ready for a third caller,
   and the pod and node panes will meet the same question the CLI tables did.
   Separate because the answer may not be a wide mode at all: a pane is narrower
@@ -261,6 +261,32 @@ cluster.
   `k8s::pods::row::columns` and `k8s::nodes::columns` rather than a second list;
   a pane that shows the extra fields at all shows them under the same headings
   the CLI uses.
+  Landed as "no wide mode": the pod-containers pane now shows `IP`,
+  `NOMINATED NODE`, and `READINESS GATES` as plain lines above the container
+  list, unconditionally, rather than behind a mode switch — the pane already
+  commits to one pod, so there is nothing left to widen away from. The values
+  come from `k8s::pods::row::pod_ip`/`nominated_node`/`readiness_gates`, now
+  `pub(crate)` and shared with `PodRow::from_pod` rather than read twice. The
+  node half is a new entry below: the reasoning here depends on a detail view
+  existing to hold the facts, and the node pane has none — `Enter` drills into
+  a node's pods, not the node itself. See decision 72.
+
+- [ ] **A node's own detail view, and its `--wide` facts in it.**
+  The pod half of "Decide what `--wide` means in a dashboard pane" landed the
+  facts as plain lines in the pod-containers pane, because that pane already
+  commits to one pod and had somewhere to put them. Nothing plays that role
+  for a node: `Enter` on a highlighted node drills into its pods, and there is
+  no view of the node itself to hold `INTERNAL-IP`, `EXTERNAL-IP`, `OS-IMAGE`,
+  `KERNEL-VERSION`, or `CONTAINER-RUNTIME` — `eks nodes --wide`'s five columns
+  — even if the same "no wide mode, just say it" answer applies once a view
+  exists. Separate because it is a real new surface, not a rendering choice
+  inside one: "A node's full condition list, not just its derived status",
+  above, wants the same view for a different set of facts, and whether the
+  two ship together or the second earns its own key is the same kind of
+  question the pod side already had to answer as it built its detail view.
+  *Acceptance:* whichever shape the view takes, its wide facts come from
+  `k8s::nodes::columns`' existing `Column` variants rather than a second
+  reading of `Node`; a node pane that never opens the view is unchanged.
 
 ### Follow-ups from the usage columns
 
@@ -575,21 +601,6 @@ cluster.
   site, and `Column::severity` in `k8s::pods::row` reads it; the node columns are
   unchanged.
 
-- [ ] **Whether anything in a table with no severities deserves colour.**
-  `--color` is global, and on `eks contexts` it has nothing to do: none of that
-  table's cells is a reading off a cluster. The one mark that does single a row
-  out is the `*` gutter, which the dashboard already draws in
-  `Severity::Ok` green — so the tool is inconsistent about the same marker across
-  two surfaces. Discovered while threading the palette through the third caller
-  of `format::table`. Separate because the answer is a design question this
-  change had no business guessing: a selection marker is not a severity, and
-  deciding it should be green pulls in the wider question of whether headings,
-  the active row, or a cluster's name are colour's business at all — which is the
-  light-theme task's territory as much as this one's.
-  *Acceptance:* whatever it turns into, `eks contexts` goes through the palette
-  it is given rather than a hardcoded `Palette::Plain`; a listing under
-  `--color never` is unchanged to the byte.
-
 ### Follow-ups from the client bootstrap
 
 - [x] **Paginate node listings.**
@@ -667,12 +678,12 @@ cluster.
   to a start URL, and `sso::classify` reads the token cache's `expiresAt`.
   `aws::decide` is the whole policy as one pure function; `aws::login` shells
   out to `aws sso login --profile X` rather than adding an AWS SDK, for the
-  reasons in decision 72. `commands::credentials::connect` is the seam every
+  reasons in decision 74. `commands::credentials::connect` is the seam every
   command connects through, offering once before the helper runs and once more
   if the cluster refuses credentials the cache thought were live — but never
   again after the user has said no. The dashboard splits the two halves by who
   owns the screen: `preflight` before `ui::run` opens, `L` on the failure
-  banner after. See decisions 72–75.
+  banner after. See decisions 74–77.
 
 - [ ] **Refresh a token that expires partway through a paged listing.**
   A listing is several requests now, and a token good at the first page can be
@@ -683,7 +694,7 @@ cluster.
   auth layer for the life of the client. Separate because closing it means
   holding a *refreshable* credential rather than one token, which is the same
   question the entry below turns on — whether `eks` owns credential resolution —
-  and decision 72 has just answered that "no" for the case it could afford to.
+  and decision 74 has just answered that "no" for the case it could afford to.
   Reopening it is a night's work and a decision the reviewer should take
   deliberately rather than as a consequence of this one.
   *Acceptance:* a token that dies mid-listing costs the user the pages already
@@ -1096,6 +1107,74 @@ cluster.
 
 ## Done
 
+- **Log in to AWS when the selected cluster's session has expired**
+  (2026-08-27) — an expired IAM Identity Center session is now a question
+  rather than an errand: `prod (us-east-1) needs a fresh login: profile "corp"
+  signed out of IAM Identity Center 9h ago. Log in now with `aws sso login
+  --profile corp`? [Y/n]`. The check that produces it is three file reads and
+  two pure functions — the AWS profile out of the context's own `exec` block,
+  the Identity Center session behind it in `~/.aws/config`, and the `expiresAt`
+  in the AWS CLI's token cache — so it happens *before* connecting rather than
+  in reaction to a `401` the user already waited for, and measures under a
+  tenth of a millisecond against a 31-entry cache. No AWS SDK: `aws sso login`
+  is the AWS CLI's job, and the CLI is already a hard requirement of every EKS
+  context this tool opens (decision 74). Cache entries are matched on the
+  `startUrl` inside them rather than on the SHA-1 filename `botocore` happens
+  to use today (decision 75). `--login auto|always|never` decides, through one
+  pure `aws::decide` whose most important row is `auto` with no terminal: it
+  proceeds silently, because a listing being redirected into a file has nobody
+  to answer and a browser opening there is a thing people work around rather
+  than use (decision 76). Everything user-facing is on stderr, so a piped table
+  is unchanged to the byte, and `--login never` does not read `~/.aws` at all.
+  The dashboard splits the two halves by who owns the screen — the question
+  once before `ui::run` opens, and `L` on the failure banner after, never an
+  automatic suspend over somebody reading a log (decision 77). Two things fell
+  out of touching that pane: the credential state gets its own short footer,
+  because prepending one hint pushed `q quit` off an 80-column terminal, and a
+  failed node pane now draws one line per sentence instead of putting the half
+  that says what to do next off the right-hand edge.
+
+- **Whether anything in a table with no severities deserves colour**
+  (2026-08-27) — `eks contexts` now renders through the `Palette` it is
+  given, `stdout_palette(cli.global.color)` exactly as `eks nodes` and `eks
+  pods` already receive it, rather than a hardcoded `Palette::Plain`. The
+  visible output is unchanged under every `--color` value, including
+  `always`: none of `NAME`/`REGION`/`NAMESPACE` is a reading off a cluster's
+  health, so every cell stays `format::Cell::plain` and a palette has
+  nothing to paint — a new test asserts the colour and plain renders are
+  identical, so that stays a tested property rather than an accident of
+  today's columns. The `*` gutter, the one mark that does single a row out,
+  stays uncoloured: it sits outside `format::table` entirely, and whether an
+  identity marker rather than a health reading is colour's business at all
+  is left to the Milestone 3 light-theme task, which already owns headings,
+  a selection highlight, and a WCAG contrast budget — deciding the gutter
+  alone tonight would be one more guess in the direction that task exists to
+  settle deliberately. See decision 73.
+
+- **Decide what `--wide` means in a dashboard pane** (2026-08-26) — the
+  pod-containers pane now shows `IP:`, `Nominated node:`, and
+  `Readiness gates:` above its container list — the three facts
+  `eks pods --wide` reserves a column for — printed outright rather than
+  behind a mode switch. The task's own wording had left the shape open: a
+  pane is narrower than a terminal, not wider, so widening it was never
+  obviously the right answer, and the pane already commits to one pod, with
+  nothing else competing with these facts for space. `IP` always prints,
+  `-` included, since a pod with no address yet is itself the answer to "why
+  can't anything reach this pod"; `NOMINATED NODE` and `READINESS GATES`
+  follow the CLI columns' own judgement of when they earn print space, so
+  the ordinary pod with neither gains nothing extra. `k8s::pods::row::pod_ip`
+  and `::readiness_gates` moved from private to `pub(crate)`, and the
+  nominated-node lookup — inlined in `PodRow::from_pod` before tonight — is
+  now its own function beside them, so the pane's fetch and the CLI's row
+  builder read the same three functions rather than one of them keeping a
+  second copy. `commands::pods::gather_containers` already had the full
+  `Pod` these need for its `ContainerRow` list; `ContainersFetch` and
+  `ContainersState::Loaded` just carry three more fields of what was already
+  fetched, so nothing new goes over the wire. The node table's five `--wide`
+  columns are not part of this: the pod side's answer depends on a detail
+  view to hold the facts, and the node pane has none — see the new entry
+  below. See decision 72.
+
 - **Say when the ordering a user actually typed ranked everything and changed
   nothing** (2026-08-26) — `--sort status` on a cluster where every node is
   `Ready` used to print only `Sorted by status.`, true and silent about the
@@ -1337,33 +1416,6 @@ cluster.
   and round trip rather than growing a second duration parser, staying its
   own type because `0` means something different for the two flags. See
   decision 55.
-
-- **Log in to AWS when the selected cluster's session has expired**
-  (2026-08-26) — an expired IAM Identity Center session is now a question
-  rather than an errand: `prod (us-east-1) needs a fresh login: profile "corp"
-  signed out of IAM Identity Center 9h ago. Log in now with `aws sso login
-  --profile corp`? [Y/n]`. The check that produces it is three file reads and
-  two pure functions — the AWS profile out of the context's own `exec` block,
-  the Identity Center session behind it in `~/.aws/config`, and the `expiresAt`
-  in the AWS CLI's token cache — so it happens *before* connecting rather than
-  in reaction to a `401` the user already waited for, and measures under a
-  tenth of a millisecond against a 31-entry cache. No AWS SDK: `aws sso login`
-  is the AWS CLI's job, and the CLI is already a hard requirement of every EKS
-  context this tool opens (decision 72). Cache entries are matched on the
-  `startUrl` inside them rather than on the SHA-1 filename `botocore` happens
-  to use today (decision 73). `--login auto|always|never` decides, through one
-  pure `aws::decide` whose most important row is `auto` with no terminal: it
-  proceeds silently, because a listing being redirected into a file has nobody
-  to answer and a browser opening there is a thing people work around rather
-  than use (decision 74). Everything user-facing is on stderr, so a piped table
-  is unchanged to the byte, and `--login never` does not read `~/.aws` at all.
-  The dashboard splits the two halves by who owns the screen — the question
-  once before `ui::run` opens, and `L` on the failure banner after, never an
-  automatic suspend over somebody reading a log (decision 75). Two things fell
-  out of touching that pane: the credential state gets its own short footer,
-  because prepending one hint pushed `q quit` off an 80-column terminal, and a
-  failed node pane now draws one line per sentence instead of putting the half
-  that says what to do next off the right-hand edge.
 
 - **Carry the freshness and unsampled notes into the dashboard's panes**
   (2026-08-22) — the node pane now says how old its usage bars are, in a line
