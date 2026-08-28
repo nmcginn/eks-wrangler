@@ -186,11 +186,14 @@ is the one with two slots left, not the one running the most pods.
 Which columns a table has is the same shape of decision, one hop later, and it is
 settled the same way: `k8s::nodes::columns` and `k8s::pods::row::columns` are
 pure functions from a listing's conditions — the scope, whether any row carries
-live usage, whether any row shows that usage against a request, and
-`format::Width` — to a `Vec<Column>`, and each `Column` answers for both its
-heading and its cell. The pod table's usage columns carry that last condition as
-data, because it decides a heading rather than a column: `CPU/REQ` over a column
-of `262m/500m (52%)` pairs, plain `CPU` where no row has one. Two parallel lists of headers and cells is the
+live usage, whether any row carries a nonzero request, which extended resources
+some row asked for, and `format::Width` — to a `Vec<Column>`, and each `Column`
+answers for both its heading and its cell. The pod table's `CPU REQ`/`MEMORY REQ`
+and `CPU`/`MEMORY` are four columns rather than two pairs, on the node table's own
+shape: a request is a fact with no denominator of its own, so it gets a plain
+column, `262m`, and the usage cell beside it carries only the percentage of that
+figure, `262m (52%)`, rather than repeating the number the column to its left
+already shows. Two parallel lists of headers and cells is the
 alternative, and it has a failure that type-checks: a heading added under one
 condition and its cell under a subtly different one shifts every figure to the
 right of it under the wrong heading, and the table still renders. `format::Width`
@@ -296,7 +299,12 @@ exactly this reason: it is the one column whose identity is data.
 The same names reach the other end of the pipeline through `pods::Requests`,
 which keeps `cpu` and `memory` as fields and everything else in a map, so
 `effective_requests` charges a pod's GPU by the scheduler's rules rather than by
-a second sum written for devices.
+a second sum written for devices. `PodRow` carries that same map through to a
+`Column::Device` of its own, reusing `k8s::nodes::columns`' union-across-the-
+listing shape — but reading an absent entry as `0` rather than the node
+table's `-`: a node either has a device or does not, and a pod has no
+hardware to have or not have, so a resource it never named is a real zero
+the same way an unset CPU or memory request already is.
 
 Every one of those listings reaches the wire through one function. `k8s::page`
 asks for `page::SIZE` objects at a time and follows the `continue` token, so a

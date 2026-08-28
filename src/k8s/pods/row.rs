@@ -29,6 +29,8 @@
 //! each of those cases is a fixture and a test rather than a cluster someone
 //! has to break on purpose.
 
+use std::collections::{BTreeMap, BTreeSet};
+
 use k8s_openapi::api::core::v1::{
     Container, ContainerState, ContainerStateTerminated, ContainerStatus, Pod, PodCondition,
     PodStatus,
@@ -39,6 +41,7 @@ use crate::format;
 use crate::k8s::metrics::Usage;
 use crate::k8s::pods::is_sidecar;
 use crate::k8s::quantity::{self, Quantity};
+use crate::k8s::resource;
 use crate::theme::{Palette, Severity};
 
 /// Shown wherever the API server left a field empty, as elsewhere in the tool.
@@ -109,6 +112,13 @@ pub struct PodRow {
     pub cpu_requested: Quantity,
     /// Memory the pod asked for, on the same terms as [`Self::cpu_requested`].
     pub memory_requested: Quantity,
+    /// Extended resources the pod asked for — a GPU, a dongle, a licence count
+    /// — keyed by their fully-qualified name.
+    ///
+    /// [`crate::k8s::pods::effective_requests`]'s own map, on the same terms
+    /// as [`Self::cpu_requested`]: whatever this pod's containers did not ask
+    /// for is simply absent, which is a real zero rather than an unknown.
+    pub extended_requested: BTreeMap<String, Quantity>,
     /// The node the pod landed on, or `-` while it is still unscheduled.
     pub node: String,
     /// The address the pod answers on, or `-` before the CNI has assigned one.
@@ -188,6 +198,7 @@ impl PodRow {
             memory_used: used.and_then(|usage| usage.memory),
             cpu_requested: requested.cpu,
             memory_requested: requested.memory,
+            extended_requested: requested.extended,
             node: pod
                 .spec
                 .as_ref()
@@ -638,19 +649,35 @@ pub fn shows_usage(rows: &[PodRow]) -> bool {
         .any(|row| row.cpu_used.is_some() || row.memory_used.is_some())
 }
 
-/// Whether any row will show its usage against a request.
+/// Whether `CPU REQ` and `MEMORY REQ` are worth two columns.
 ///
-/// Asked of the rendered pair rather than of the request alone, so the heading
-/// and the cells under it cannot come apart: a pod that asked for 500m but has
-/// never been sampled shows `-`, and a `/REQ` heading over a table of those
-/// would name a denominator no row displays.
-///
-/// `pick` is the resource, as the pair the cell is built from.
-fn shows_request(rows: &[PodRow], pick: fn(&PodRow) -> (Option<Quantity>, Quantity)) -> bool {
+/// `any`, not `all` — the same rule [`shows_usage`] follows, so a namespace
+/// where nobody set a request does not grow two columns of `0`. Paired rather
+/// than asked per resource, for the reason the usage pair is: a request is one
+/// question — "what did this book?" — and a pod that set a memory request and
+/// left CPU unbounded still belongs beside a `CPU REQ` reading `0`, its own
+/// honest answer, rather than losing the column a neighbouring row earned.
+#[must_use]
+fn shows_requests(rows: &[PodRow]) -> bool {
     rows.iter().any(|row| {
-        let (used, requested) = pick(row);
-        used.is_some_and(|used| used.ratio_of(requested).is_some())
+        row.cpu_requested != Quantity::default() || row.memory_requested != Quantity::default()
     })
+}
+
+/// Every extended resource some pod in this listing asked for, in name order.
+///
+/// The pod table's twin of [`crate::k8s::nodes::device_names`], and the same
+/// `any`-not-`all` reasoning: one pod on a GPU node group must not cost every
+/// other pod's listing the column. Unlike a node, a pod has no hardware to
+/// report — every name here came from some container's own resource request —
+/// so there is no "does not have one" case for the cell to tell apart from a
+/// real zero the way [`crate::k8s::nodes::Device`]'s does; a pod that did not
+/// ask reads `0`, not `-`.
+#[must_use]
+fn device_names(rows: &[PodRow]) -> BTreeSet<&str> {
+    rows.iter()
+        .flat_map(|row| row.extended_requested.keys().map(String::as_str))
+        .collect()
 }
 
 /// The `RESTARTS` cell: the count, and when the newest restart happened.
@@ -666,38 +693,31 @@ fn restarts_cell(row: &PodRow) -> String {
     }
 }
 
-/// One usage cell: what the pod is burning, against what it asked for.
+/// One usage cell: what the pod is burning, and what share of its own request
+/// that is.
 ///
-/// `250m/500m (50%)`. A bare `250m` cannot be read: it is a fifth of a core,
+/// `262m (52%)`. A bare `262m` cannot be read: it is over a quarter of a core,
 /// and whether that is fine, throttled, or about to be OOM-killed depends
 /// entirely on the number the pod asked for. A pod has no allocatable of its
 /// own to be a share of — the node table's denominator — so its request is the
-/// one honest denominator there is, and it is the number a reader would go on
-/// to change.
+/// one honest denominator there is.
 ///
-/// The pair is one cell rather than a usage column and a request column, for
-/// the reason the node table puts `1200m (32%)` in one: the two halves are read
-/// together or not at all, and the pod table is already the wider of the two
-/// listings. `READY`'s `1/2` and the node table's `CPU` cell make `a/b` this
-/// tool's spelling for a part and its whole.
+/// The request itself has its own column, `CPU REQ`, so this cell shows only
+/// the percentage rather than repeating the number beside it — `262m/500m
+/// (52%)` would print `500m` a second time now that it is not the only place
+/// to find it.
 ///
-/// A pod that asked for nothing keeps the bare figure. It is the honest reading
-/// — such a pod really has no denominator — and `250m/0 (∞%)` is not a cell.
+/// A pod that asked for nothing, or has not been sampled, keeps the bare
+/// figure: `ratio_of` declines a zero denominator, which is exactly the pod
+/// that asked for nothing, so the two cases are one branch rather than a
+/// second check for zero that could come to disagree with it.
 fn usage_cell(used: Option<Quantity>, requested: Quantity, show: fn(Quantity) -> String) -> String {
     let Some(used) = used else {
         return UNKNOWN.to_owned();
     };
 
-    // `ratio_of` declines a zero denominator, which is exactly the pod that
-    // asked for nothing — so the two cases are one branch rather than a
-    // separate test for zero that could come to disagree with it.
     match used.ratio_of(requested) {
-        Some(ratio) => format!(
-            "{}/{} ({})",
-            show(used),
-            show(requested),
-            format::percentage(ratio)
-        ),
+        Some(ratio) => format!("{} ({})", show(used), format::percentage(ratio)),
         None => show(used),
     }
 }
@@ -710,25 +730,30 @@ fn usage_cell(used: Option<Quantity>, requested: Quantity, show: fn(Quantity) ->
 /// puts every figure to the right of it under the wrong heading, and the table
 /// still renders. With this, each column answers for both halves of itself.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Column {
+pub(crate) enum Column<'a> {
     Namespace,
     Name,
     Ready,
     Status,
     Restarts,
-    /// Live CPU usage. `against_request` is whether any row in this listing
-    /// shows it against a request, which is the difference between a column of
-    /// figures and a column of pairs — and so is the difference between two
-    /// headings.
-    Cpu {
-        against_request: bool,
-    },
-    /// Live memory usage, on the same terms as [`Self::Cpu`]. Asked
-    /// separately, because a deployment that sets a memory request and leaves
-    /// CPU unbounded is a common shape and only one of its columns is a pair.
-    Memory {
-        against_request: bool,
-    },
+    /// What the pod asked for — [`PodRow::cpu_requested`] — on its own,
+    /// regardless of whether anything has measured it yet.
+    CpuRequested,
+    /// Live CPU usage, against [`Self::CpuRequested`].
+    Cpu,
+    /// What the pod asked for in memory, on the same terms as
+    /// [`Self::CpuRequested`].
+    MemoryRequested,
+    /// Live memory usage, on the same terms as [`Self::Cpu`].
+    Memory,
+    /// One extended resource some pod in this listing asked for, by its
+    /// fully-qualified name.
+    ///
+    /// The only column whose identity is not known until the pods arrive, so
+    /// it borrows the name from the rows it was computed from rather than
+    /// owning a copy per column — the node table's own device column does the
+    /// same.
+    Device(&'a str),
     Age,
     Ip,
     Node,
@@ -736,40 +761,29 @@ pub(crate) enum Column {
     ReadinessGates,
 }
 
-impl Column {
+impl Column<'_> {
     /// The heading, spelled as `kubectl get pods` spells it.
-    fn header(self) -> &'static str {
+    ///
+    /// A `String` rather than a `&'static str`, for the reason the node
+    /// table's twin is: a device column is headed by a name the cluster
+    /// invented.
+    fn header(self) -> String {
         match self {
-            Self::Namespace => "NAMESPACE",
-            Self::Name => "NAME",
-            Self::Ready => "READY",
-            Self::Status => "STATUS",
-            Self::Restarts => "RESTARTS",
-            // `CPU/REQ` over a cell reading `250m/500m (50%)`: the heading is
-            // the shape of the cell under it, so what the percentage is a
-            // percentage *of* is answered in the table rather than in a manual.
-            // A listing where nothing shows a pair keeps the plain heading — a
-            // `/REQ` over a column of bare figures would promise a denominator
-            // that is not there.
-            Self::Cpu { against_request } => {
-                if against_request {
-                    "CPU/REQ"
-                } else {
-                    "CPU"
-                }
-            }
-            Self::Memory { against_request } => {
-                if against_request {
-                    "MEMORY/REQ"
-                } else {
-                    "MEMORY"
-                }
-            }
-            Self::Age => "AGE",
-            Self::Ip => "IP",
-            Self::Node => "NODE",
-            Self::NominatedNode => "NOMINATED NODE",
-            Self::ReadinessGates => "READINESS GATES",
+            Self::Namespace => "NAMESPACE".to_owned(),
+            Self::Name => "NAME".to_owned(),
+            Self::Ready => "READY".to_owned(),
+            Self::Status => "STATUS".to_owned(),
+            Self::Restarts => "RESTARTS".to_owned(),
+            Self::CpuRequested => "CPU REQ".to_owned(),
+            Self::Cpu => "CPU".to_owned(),
+            Self::MemoryRequested => "MEMORY REQ".to_owned(),
+            Self::Memory => "MEMORY".to_owned(),
+            Self::Device(name) => resource::heading(name),
+            Self::Age => "AGE".to_owned(),
+            Self::Ip => "IP".to_owned(),
+            Self::Node => "NODE".to_owned(),
+            Self::NominatedNode => "NOMINATED NODE".to_owned(),
+            Self::ReadinessGates => "READINESS GATES".to_owned(),
         }
     }
 
@@ -789,10 +803,20 @@ impl Column {
             Self::Ready => row.ready.clone(),
             Self::Status => row.status.clone(),
             Self::Restarts => restarts_cell(row),
-            Self::Cpu { .. } => usage_cell(row.cpu_used, row.cpu_requested, quantity::cpu),
-            Self::Memory { .. } => {
-                usage_cell(row.memory_used, row.memory_requested, quantity::memory)
-            }
+            Self::CpuRequested => quantity::cpu(row.cpu_requested),
+            Self::Cpu => usage_cell(row.cpu_used, row.cpu_requested, quantity::cpu),
+            Self::MemoryRequested => quantity::memory(row.memory_requested),
+            Self::Memory => usage_cell(row.memory_used, row.memory_requested, quantity::memory),
+            // A pod that never named this resource reads `0`, not `-`: unlike
+            // a node, which either has a device or does not, every pod could
+            // in principle have asked for any resource, and not asking is
+            // itself a real, honest zero.
+            Self::Device(name) => quantity::count(
+                row.extended_requested
+                    .get(name)
+                    .copied()
+                    .unwrap_or_default(),
+            ),
             Self::Age => row.age.clone(),
             Self::Ip => row.ip.clone(),
             Self::Node => row.node.clone(),
@@ -817,9 +841,9 @@ impl Column {
     /// [`severity`] — so colouring it too would paint one
     /// judgement across two columns and say nothing new in the second.
     ///
-    /// `CPU/REQ` and `MEMORY/REQ` are not graded either, and that is a gap
-    /// rather than a rule: those cells carry a percentage, and there is a
-    /// perfectly good [`Severity`] waiting to be applied to it — but not
+    /// `CPU` and `MEMORY` are not graded either, and that is a gap rather than
+    /// a rule: those cells carry a percentage, and there is a perfectly good
+    /// [`Severity`] waiting to be applied to it — but not
     /// [`Severity::from_utilisation`]'s. Its thresholds are about a *node's*
     /// allocatable, where 90% booked is nearly full; a pod at 90% of the CPU
     /// it asked for is a well-sized pod, and one at 400% of a 10m request is
@@ -827,7 +851,9 @@ impl Column {
     /// thresholds would tell the reader something untrue, in red, on most of
     /// their rows. What "hot" means for a pod against its own request is a
     /// decision, and it is the reviewer's to make before this column takes a
-    /// colour.
+    /// colour. `CPU REQ`, `MEMORY REQ`, and the device columns carry no
+    /// percentage at all — they are a plain fact about the pod, like `AGE` —
+    /// so there is nothing pending for them to grade.
     ///
     /// [`Severity::from_utilisation`]: crate::theme::Severity::from_utilisation
     fn severity(self, row: &PodRow) -> Option<Severity> {
@@ -837,8 +863,11 @@ impl Column {
             | Self::Name
             | Self::Ready
             | Self::Restarts
-            | Self::Cpu { .. }
-            | Self::Memory { .. }
+            | Self::CpuRequested
+            | Self::Cpu
+            | Self::MemoryRequested
+            | Self::Memory
+            | Self::Device(_)
             | Self::Age
             | Self::Ip
             | Self::Node
@@ -850,25 +879,29 @@ impl Column {
 
 /// Which columns this listing gets, in order.
 ///
-/// A pure function over the three things that decide it — the scope, whether
-/// any row has live usage, and `--wide` — so the whole layout is settled by a
-/// test rather than by reading a table in a terminal.
+/// A pure function over the things that decide it — the scope, whether any
+/// row has live usage, whether any row has a request worth two more columns,
+/// which extended resources some row asked for, and `--wide` — so the whole
+/// layout is settled by a test rather than by reading a table in a terminal.
 ///
-/// The two conditions are not the same kind of condition, which is why they
-/// read differently. Usage is `any`: the columns appear unasked for, so a
-/// cluster with no metrics-server must not gain two empty ones. `--wide` was
-/// asked for, so its columns appear whatever is in them — a table of `-` under
-/// `NOMINATED NODE` is the answer "nothing is being preempted", and dropping
-/// the column would leave the user unable to tell that from a flag that did
-/// nothing.
+/// Usage, requests, and devices are all `any`: the columns appear unasked for,
+/// so a cluster with no metrics-server, or a namespace where nobody set a
+/// request, must not gain empty ones. `--wide` was asked for, so its columns
+/// appear whatever is in them — a table of `-` under `NOMINATED NODE` is the
+/// answer "nothing is being preempted", and dropping the column would leave
+/// the user unable to tell that from a flag that did nothing.
 ///
 /// [`Width::Narrow`] then drops columns from that set until the row fits its
 /// target — see [`DROP_ORDER`]. `Wide` is never narrowed: the user typed
 /// `--wide` for the extra columns, not for a table that keeps away from them.
 ///
 /// [`Width::Narrow`]: format::Width::Narrow
-pub(crate) fn columns(scope: &super::Scope, rows: &[PodRow], width: format::Width) -> Vec<Column> {
-    let mut columns = Vec::with_capacity(12);
+pub(crate) fn columns<'a>(
+    scope: &super::Scope,
+    rows: &'a [PodRow],
+    width: format::Width,
+) -> Vec<Column<'a>> {
+    let mut columns = Vec::with_capacity(14);
     if scope.needs_namespace_column() {
         columns.push(Column::Namespace);
     }
@@ -878,19 +911,26 @@ pub(crate) fn columns(scope: &super::Scope, rows: &[PodRow], width: format::Widt
         Column::Status,
         Column::Restarts,
     ]);
-    // CPU and MEMORY sit with STATUS and RESTARTS, the other columns about how
-    // the pod is doing, rather than at the end: a pod that is unhappy and one
-    // that is burning a core are usually the same investigation.
-    if shows_usage(rows) {
-        columns.extend([
-            Column::Cpu {
-                against_request: shows_request(rows, |row| (row.cpu_used, row.cpu_requested)),
-            },
-            Column::Memory {
-                against_request: shows_request(rows, |row| (row.memory_used, row.memory_requested)),
-            },
-        ]);
+    // The request, usage, and device columns sit with STATUS and RESTARTS, the
+    // other columns about how the pod is doing, rather than at the end: a pod
+    // that is unhappy and one that is burning a core are usually the same
+    // investigation. CPU and its request sit together, then MEMORY and its
+    // request, so the comparison a reader wants — booked against burnt — is a
+    // glance rather than a scan across the row, the same grouping the node
+    // table uses.
+    if shows_requests(rows) {
+        columns.push(Column::CpuRequested);
     }
+    if shows_usage(rows) {
+        columns.push(Column::Cpu);
+    }
+    if shows_requests(rows) {
+        columns.push(Column::MemoryRequested);
+    }
+    if shows_usage(rows) {
+        columns.push(Column::Memory);
+    }
+    columns.extend(device_names(rows).into_iter().map(Column::Device));
     // AGE, IP, NODE, NOMINATED NODE, READINESS GATES is `kubectl -o wide`'s own
     // tail order, kept to the letter. NODE is in this table by default where
     // `kubectl` holds it back for wide, so `--wide` adds the three columns
@@ -912,9 +952,9 @@ pub(crate) fn columns(scope: &super::Scope, rows: &[PodRow], width: format::Widt
 /// The order columns get dropped in when [`Width::Narrow`] cannot fit them all.
 ///
 /// A list of predicates rather than a ranking, like the node table's, because
-/// the usage columns want to leave together: `CPU/REQ` beside `AGE` with no
-/// `MEMORY/REQ` between them is half an answer to "what is this burning", and
-/// the eye reading a row of pairs pairs the wrong ones.
+/// the request and usage columns want to leave in their own pairs: `CPU` beside
+/// `AGE` with no `MEMORY` between them is half an answer to "what is this
+/// burning", and the eye reading a row of pairs pairs the wrong ones.
 ///
 /// The steps, and why they are in this order:
 ///
@@ -927,14 +967,20 @@ pub(crate) fn columns(scope: &super::Scope, rows: &[PodRow], width: format::Widt
 ///    looking at, and every column that stays is there to find that pod.
 ///    Dropping it lands on `kubectl get pods`'s own column set, which is where
 ///    a reader's habits are.
-/// 3. `CPU/REQ` and `MEMORY/REQ`, together — the pair the tool exists for, so
-///    late, and the same "both or neither" rule the node table's pairs follow.
-/// 4. `RESTARTS` — the first of the three health columns to go, because it is
+/// 3. `CPU REQ` and `MEMORY REQ`, together — dropping the pair leaves usage
+///    on its own, which is the "what is this doing right now" question.
+/// 4. `CPU` and `MEMORY`, together — the pair the tool exists for, so late,
+///    and the same "both or neither" rule the node table's pairs follow.
+/// 5. Every device column, together, for the node table's reason: a listing
+///    on a GPU cluster wants them all or none, and the alphabet is a bad rule
+///    for "which resource is important". A no-op on the overwhelming majority
+///    of listings, which ask for no extended resource at all.
+/// 6. `RESTARTS` — the first of the three health columns to go, because it is
 ///    the widest of them and because a pod restarting is usually a pod
 ///    `STATUS` has something to say about.
-/// 5. `READY` — five characters, and the refinement of `STATUS` rather than a
+/// 7. `READY` — five characters, and the refinement of `STATUS` rather than a
 ///    fact of its own: `0/1` is the detail under `CrashLoopBackOff`.
-/// 6. `STATUS` — the last thing to go, as on the node table. A listing down to
+/// 8. `STATUS` — the last thing to go, as on the node table. A listing down to
 ///    a name and one word keeps the word that names a problem.
 ///
 /// `NAME` never drops, for the node table's reason: a row we cannot fit is
@@ -952,10 +998,12 @@ pub(crate) fn columns(scope: &super::Scope, rows: &[PodRow], width: format::Widt
 /// never fires.
 ///
 /// [`Width::Narrow`]: format::Width::Narrow
-const DROP_ORDER: &[fn(&Column) -> bool] = &[
+const DROP_ORDER: &[fn(&Column<'_>) -> bool] = &[
     |c| matches!(c, Column::Age),
     |c| matches!(c, Column::Node),
-    |c| matches!(c, Column::Cpu { .. } | Column::Memory { .. }),
+    |c| matches!(c, Column::CpuRequested | Column::MemoryRequested),
+    |c| matches!(c, Column::Cpu | Column::Memory),
+    |c| matches!(c, Column::Device(_)),
     |c| matches!(c, Column::Restarts),
     |c| matches!(c, Column::Ready),
     |c| matches!(c, Column::Status),
@@ -971,12 +1019,12 @@ const DROP_ORDER: &[fn(&Column) -> bool] = &[
 /// together — the last step leaves `NAME` (and `NAMESPACE` under `-A`) and the
 /// row prints wider than the target. That is the terminal's problem to wrap,
 /// rather than ours to solve by printing rows nobody can identify.
-fn narrow_to_fit(columns: &[Column], rows: &[PodRow], target: u16) -> Vec<Column> {
+fn narrow_to_fit<'a>(columns: &[Column<'a>], rows: &[PodRow], target: u16) -> Vec<Column<'a>> {
     // Measured once: a column is as wide as its own widest cell whatever its
     // neighbours do, so dropping one changes which widths are in the sum and
     // not what any of them are. Rendering every cell in the listing again at
     // each step would be the same answer for a listing's worth of work.
-    let mut measured: Vec<(Column, usize)> =
+    let mut measured: Vec<(Column<'a>, usize)> =
         columns.iter().copied().zip(widths(columns, rows)).collect();
 
     let target = usize::from(target);
@@ -996,8 +1044,9 @@ fn narrow_to_fit(columns: &[Column], rows: &[PodRow], target: u16) -> Vec<Column
 /// [`format::column_widths`], over the headers and cells [`render`] is about
 /// to hand [`format::table`]. Measuring any other way would let the drop rule
 /// stop at a width the renderer does not print at.
-fn widths(columns: &[Column], rows: &[PodRow]) -> Vec<usize> {
-    let headers: Vec<&str> = columns.iter().map(|column| column.header()).collect();
+fn widths(columns: &[Column<'_>], rows: &[PodRow]) -> Vec<usize> {
+    let headings: Vec<String> = columns.iter().map(|column| column.header()).collect();
+    let headers: Vec<&str> = headings.iter().map(String::as_str).collect();
     let cells: Vec<Vec<format::Cell>> = rows
         .iter()
         .map(|row| columns.iter().map(|column| column.cell(row)).collect())
@@ -1007,7 +1056,7 @@ fn widths(columns: &[Column], rows: &[PodRow]) -> Vec<usize> {
 }
 
 /// How wide the row of the columns still standing will be.
-fn row_width(measured: &[(Column, usize)]) -> usize {
+fn row_width(measured: &[(Column<'_>, usize)]) -> usize {
     let widths: Vec<usize> = measured.iter().map(|(_, width)| *width).collect();
     format::row_width(&widths)
 }
@@ -1045,7 +1094,8 @@ pub fn render(
     }
 
     let columns = columns(scope, rows, width);
-    let headers: Vec<&str> = columns.iter().map(|column| column.header()).collect();
+    let headings: Vec<String> = columns.iter().map(|column| column.header()).collect();
+    let headers: Vec<&str> = headings.iter().map(String::as_str).collect();
     let cells: Vec<Vec<format::Cell>> = rows
         .iter()
         .map(|row| columns.iter().map(|column| column.cell(row)).collect())
@@ -2470,7 +2520,9 @@ mod tests {
     #[test]
     fn usage_is_shown_against_what_the_pod_asked_for() {
         // 250m on its own is unreadable: a fifth of a core is fine, throttled,
-        // or a mistake depending entirely on the number beside it.
+        // or a mistake depending entirely on the number beside it. The request
+        // itself has its own column now, so the usage cell carries only the
+        // percentage rather than the request a second time.
         let rendered = render(
             &requesting_rows(),
             "prod (us-east-1)",
@@ -2483,17 +2535,18 @@ mod tests {
 
         assert_eq!(
             rendered,
-            "NAME           READY  STATUS   RESTARTS  CPU/REQ          MEMORY/REQ       AGE  NODE\n\
-             api-7c9f       1/1    Running  0         250m/500m (50%)  512Mi/1Gi (50%)  90m  ip-10-0-1-9.ec2.internal\n\
-             checkout-5d4b  1/1    Running  0         1200m/2 (60%)    3Gi/4Gi (75%)    3m   ip-10-0-1-9.ec2.internal"
+            "NAME           READY  STATUS   RESTARTS  CPU REQ  CPU          MEMORY REQ  MEMORY       AGE  NODE\n\
+             api-7c9f       1/1    Running  0         500m     250m (50%)   1Gi         512Mi (50%)  90m  ip-10-0-1-9.ec2.internal\n\
+             checkout-5d4b  1/1    Running  0         2        1200m (60%)  4Gi         3Gi (75%)    3m   ip-10-0-1-9.ec2.internal"
         );
     }
 
     #[test]
-    fn a_pod_that_asked_for_nothing_keeps_the_bare_usage_figure() {
-        // The honest reading: such a pod has no denominator, and `250m/0` is
-        // not a percentage of anything. The heading drops the `/REQ` with it,
-        // rather than promising a column of pairs that is a column of figures.
+    fn a_pod_that_asked_for_nothing_keeps_the_bare_usage_figure_and_earns_no_req_column() {
+        // The honest reading: such a pod has no denominator, and a percentage
+        // of zero is not a cell. `CPU REQ`/`MEMORY REQ` do not appear at all —
+        // nobody here asked for anything, so two columns of `0` would be noise
+        // rather than the fact this listing has to report.
         let rendered = render(
             &sampled_rows(),
             "prod (us-east-1)",
@@ -2522,20 +2575,11 @@ mod tests {
             now(),
         );
 
-        assert_eq!(
-            Column::Cpu {
-                against_request: true
-            }
-            .text(&row),
-            "450m/100m (450%)"
-        );
-        assert_eq!(
-            Column::Memory {
-                against_request: true
-            }
-            .text(&row),
-            "1Gi/256Mi (400%)"
-        );
+        assert_eq!(Column::Cpu.text(&row), "450m (450%)");
+        assert_eq!(Column::Memory.text(&row), "1Gi (400%)");
+        // The number the percentage is a share of lives in its own column now.
+        assert_eq!(Column::CpuRequested.text(&row), "100m");
+        assert_eq!(Column::MemoryRequested.text(&row), "256Mi");
     }
 
     #[test]
@@ -2549,46 +2593,38 @@ mod tests {
             now(),
         );
 
-        assert_eq!(
-            Column::Cpu {
-                against_request: true
-            }
-            .text(&row),
-            "0/500m (0%)"
-        );
+        assert_eq!(Column::Cpu.text(&row), "0 (0%)");
     }
 
     #[test]
-    fn an_unsampled_pod_reads_as_unknown_however_much_it_asked_for() {
-        // A request is not a measurement. Rendering `-/500m` would put a figure
-        // in a cell that has none, and `0/500m (0%)` would invent an idle pod.
+    fn a_request_is_known_even_when_nothing_has_measured_it() {
+        // A request is not a measurement, so it does not wait on one:
+        // `CPU REQ`/`MEMORY REQ` come straight from `effective_requests` and
+        // read the same whether or not metrics-server has ever sampled this
+        // pod. Rendering `-/500m` in the old paired cell would have put a
+        // figure in a place that has none, and `0/500m (0%)` would have
+        // invented an idle pod — this pod was never measured at all.
         let row = PodRow::from_pod(&asking(&[("cpu", "500m"), ("memory", "1Gi")]), None, now());
 
-        assert_eq!(
-            Column::Cpu {
-                against_request: true
-            }
-            .text(&row),
-            "-"
-        );
-        assert_eq!(
-            Column::Memory {
-                against_request: true
-            }
-            .text(&row),
-            "-"
-        );
+        assert_eq!(Column::Cpu.text(&row), "-");
+        assert_eq!(Column::Memory.text(&row), "-");
+        assert_eq!(Column::CpuRequested.text(&row), "500m");
+        assert_eq!(Column::MemoryRequested.text(&row), "1Gi");
     }
 
     #[test]
-    fn a_request_on_one_resource_pairs_that_column_alone() {
-        // Setting a memory request and leaving CPU unbounded is a common shape,
-        // and each heading answers for its own column.
-        let rows = vec![PodRow::from_pod(
+    fn a_request_on_one_resource_still_shows_both_req_columns_paired() {
+        // Setting a memory request and leaving CPU unbounded is a common
+        // shape. Unlike the usage pair, `CPU REQ`/`MEMORY REQ` are not asked
+        // per resource — a pod that requested memory and not CPU reads a
+        // real `0` under `CPU REQ` rather than losing the column, so the
+        // request question is answered by one pair rather than two rules.
+        let row = PodRow::from_pod(
             &asking(&[("memory", "1Gi")]),
             Some(used("250m", "512Mi")),
             now(),
-        )];
+        );
+        let rows = vec![row.clone()];
 
         assert_eq!(
             columns(
@@ -2601,23 +2637,28 @@ mod tests {
                 Column::Ready,
                 Column::Status,
                 Column::Restarts,
-                Column::Cpu {
-                    against_request: false
-                },
-                Column::Memory {
-                    against_request: true
-                },
+                Column::CpuRequested,
+                Column::Cpu,
+                Column::MemoryRequested,
+                Column::Memory,
                 Column::Age,
                 Column::Node,
             ]
         );
+        // CPU has no request of its own, so its usage cell falls back to the
+        // bare figure exactly as an entirely unrequested pod's would.
+        assert_eq!(Column::CpuRequested.text(&row), "0");
+        assert_eq!(Column::Cpu.text(&row), "250m");
+        assert_eq!(Column::MemoryRequested.text(&row), "1Gi");
+        assert_eq!(Column::Memory.text(&row), "512Mi (50%)");
     }
 
     #[test]
-    fn one_pod_with_a_request_earns_the_heading_for_the_column() {
+    fn one_pod_with_a_request_earns_the_column_for_every_row() {
         // `any`, like the usage columns themselves: one pod that asked for
-        // something is a pair somebody can read, and the rows around it that
-        // asked for nothing keep their bare figures under the same heading.
+        // something earns `CPU REQ`/`MEMORY REQ` for the whole listing, and
+        // the rows around it that asked for nothing read their own honest `0`
+        // under the same columns rather than losing them.
         let mut rows = requesting_rows();
         rows[1] = PodRow::from_pod(&healthy(), Some(used("1200m", "3Gi")), now());
 
@@ -2632,36 +2673,120 @@ mod tests {
         );
 
         assert!(
-            rendered.starts_with("NAME      READY  STATUS   RESTARTS  CPU/REQ"),
+            rendered.starts_with("NAME      READY  STATUS   RESTARTS  CPU REQ"),
             "{rendered}"
         );
-        assert!(rendered.contains("250m/500m (50%)"), "{rendered}");
-        assert!(rendered.contains("1200m            3Gi"), "{rendered}");
+        assert!(rendered.contains("500m     250m (50%)"), "{rendered}");
+        assert!(rendered.contains("0        1200m"), "{rendered}");
     }
 
     #[test]
-    fn a_listing_nobody_sampled_promises_no_denominator() {
-        // Every pod here asked for something and none was measured, so there is
-        // no pair to head — and with no usage at all the columns are absent
-        // anyway, which the footnote above the table explains.
+    fn a_request_shows_on_a_cluster_with_no_metrics_server() {
+        // The point of the feature: a pod's request reaches the table without
+        // ever needing metrics-server, so `eks pods` on the EKS default — no
+        // add-on installed — still says what was booked. `CPU`/`MEMORY`, the
+        // usage columns, stay absent, exactly as they do today with no
+        // metrics-server at all: nothing here was sampled.
         let rows = vec![PodRow::from_pod(
             &asking(&[("cpu", "500m"), ("memory", "1Gi")]),
             None,
             now(),
         )];
+        let scope = Scope::Namespace("payments".to_owned());
+
+        let cols = columns(&scope, &rows, Width::Default);
+        assert!(cols.contains(&Column::CpuRequested), "{cols:?}");
+        assert!(cols.contains(&Column::MemoryRequested), "{cols:?}");
+        assert!(!cols.contains(&Column::Cpu), "{cols:?}");
+        assert!(!cols.contains(&Column::Memory), "{cols:?}");
 
         let rendered = render(
             &rows,
             "prod (us-east-1)",
-            &Scope::Namespace("payments".to_owned()),
+            &scope,
             &unfiltered(),
             &[],
             Width::Default,
             Palette::Plain,
         );
+        assert!(rendered.contains("CPU REQ"), "{rendered}");
+        assert!(rendered.contains("MEMORY REQ"), "{rendered}");
+        assert!(rendered.contains("500m"), "{rendered}");
+        assert!(rendered.contains("1Gi"), "{rendered}");
+    }
 
-        assert!(!rendered.contains("CPU"), "{rendered}");
-        assert!(!rendered.contains("REQ"), "{rendered}");
+    /// The healthy pod, asking for one extended resource.
+    fn asking_device(name: &str, count: &str) -> Pod {
+        let mut pod = healthy();
+        if let Some(spec) = pod.spec.as_mut() {
+            for container in &mut spec.containers {
+                container.resources = Some(ResourceRequirements {
+                    requests: Some(
+                        [(name.to_owned(), ApiQuantity(count.to_owned()))]
+                            .into_iter()
+                            .collect(),
+                    ),
+                    ..Default::default()
+                });
+            }
+        }
+        pod
+    }
+
+    #[test]
+    fn a_device_request_earns_its_own_column() {
+        let rows = vec![PodRow::from_pod(
+            &asking_device("nvidia.com/gpu", "2"),
+            None,
+            now(),
+        )];
+        let scope = Scope::Namespace("payments".to_owned());
+
+        let cols = columns(&scope, &rows, Width::Default);
+        assert!(cols.contains(&Column::Device("nvidia.com/gpu")), "{cols:?}");
+
+        let rendered = render(
+            &rows,
+            "prod (us-east-1)",
+            &scope,
+            &unfiltered(),
+            &[],
+            Width::Default,
+            Palette::Plain,
+        );
+        assert!(rendered.contains("NVIDIA.COM/GPU"), "{rendered}");
+        assert!(
+            rendered.contains("api-7c9f  1/1    Running  0         2"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn a_pod_that_did_not_ask_for_a_device_reads_a_real_zero_not_unknown() {
+        // Unlike the node table, where `-` tells "no such hardware" apart from
+        // "none free": every pod could in principle ask for any resource, so
+        // not asking is itself a real zero rather than an absence.
+        let rows = [
+            PodRow::from_pod(&asking_device("nvidia.com/gpu", "2"), None, now()),
+            PodRow::from_pod(&healthy(), None, now()),
+        ];
+
+        assert_eq!(
+            Column::Device("nvidia.com/gpu").text(&rows[1]),
+            "0",
+            "a pod that never asked reads 0, not -"
+        );
+    }
+
+    #[test]
+    fn a_cluster_with_no_extended_requests_gains_no_device_column() {
+        let rows = requesting_rows();
+        let cols = columns(&one_namespace(), &rows, Width::Default);
+
+        assert!(
+            !cols.iter().any(|c| matches!(c, Column::Device(_))),
+            "{cols:?}"
+        );
     }
 
     #[test]
@@ -3026,7 +3151,7 @@ mod tests {
             now(),
         )];
 
-        let headers: Vec<&str> = columns(&Scope::All, &rows, Width::Wide)
+        let headers: Vec<String> = columns(&Scope::All, &rows, Width::Wide)
             .iter()
             .map(|column| column.header())
             .collect();
@@ -3242,7 +3367,7 @@ mod tests {
     // something and each sampled, which is the shape nearly every real
     // deployment has and the widest the default table gets without `--wide`.
 
-    fn headings_at(scope: &Scope, rows: &[PodRow], target: u16) -> Vec<&'static str> {
+    fn headings_at(scope: &Scope, rows: &[PodRow], target: u16) -> Vec<String> {
         columns(scope, rows, Width::Narrow(target))
             .iter()
             .map(|column| column.header())
@@ -3289,50 +3414,86 @@ mod tests {
     }
 
     #[test]
-    fn a_hundred_columns_drops_age_first() {
-        // The fixture's default row is 104 characters, and `AGE` is the
-        // cheapest thing on it: three characters of information the table
-        // already carries in `RESTARTS`'s `9 (5m ago)`.
+    fn a_row_that_barely_overflows_drops_age_first() {
+        // The fixture's default row is 118 characters now that the request
+        // pair has its own two columns — `NAME(13) READY(5) STATUS(7)
+        // RESTARTS(8) CPU REQ(7) CPU(12) MEMORY REQ(10) MEMORY(11) AGE(3)
+        // NODE(24)` with nine two-space separators — and dropping `AGE` alone
+        // gets it to 113: three characters of information the table already
+        // carries in `RESTARTS`'s `9 (5m ago)`.
         let rows = requesting_rows();
 
         assert_eq!(
-            headings_at(&one_namespace(), &rows, 100),
+            headings_at(&one_namespace(), &rows, 115),
             [
                 "NAME",
                 "READY",
                 "STATUS",
                 "RESTARTS",
-                "CPU/REQ",
-                "MEMORY/REQ",
+                "CPU REQ",
+                "CPU",
+                "MEMORY REQ",
+                "MEMORY",
                 "NODE"
             ],
         );
     }
 
     #[test]
-    fn eighty_columns_keep_the_usage_pair_and_let_the_node_go() {
-        // 80 cols is the width every laptop lid narrows to under a docked
-        // browser. `NODE` is the widest cell in the table — a node is a
-        // forty-character DNS name on EKS — and it answers the question you
-        // ask *after* you have found the pod, so it goes before the columns
-        // that find it.
+    fn ninety_columns_keep_both_pairs_and_let_the_node_go() {
+        // 90 cols is past `AGE` and `NODE` both — `NODE` is the widest cell in
+        // the table on EKS, a forty-character DNS name, and it answers the
+        // question you ask *after* you have found the pod, so it goes before
+        // the columns that find it — and short of where the request pair has
+        // to leave too.
         let rows = requesting_rows();
         let scope = one_namespace();
 
         assert_eq!(
-            headings_at(&scope, &rows, 80),
+            headings_at(&scope, &rows, 90),
             [
                 "NAME",
                 "READY",
                 "STATUS",
                 "RESTARTS",
-                "CPU/REQ",
-                "MEMORY/REQ"
+                "CPU REQ",
+                "CPU",
+                "MEMORY REQ",
+                "MEMORY",
             ],
         );
         // And the columns it reported really do fit: the assertion is over the
         // rendered table rather than over the arithmetic that chose it, so a
         // drop rule measuring rows the renderer disagreed with would fail here.
+        let table = render(
+            &rows,
+            "prod (us-east-1)",
+            &scope,
+            &unfiltered(),
+            &[],
+            Width::Narrow(90),
+            Palette::Plain,
+        );
+        for line in table.lines() {
+            assert!(line.chars().count() <= 90, "{line:?} is wider than 90");
+        }
+    }
+
+    #[test]
+    fn eighty_columns_let_the_request_pair_go_too() {
+        // 80 cols is the width every laptop lid narrows to under a docked
+        // browser, and it is past where `CPU REQ`/`MEMORY REQ` fit beside the
+        // usage pair: dropping the request leaves capacity to burn, which is
+        // the "what is this pod doing right now" question — the pair the
+        // tool exists for, so it is the last of the four resource columns to
+        // go.
+        let rows = requesting_rows();
+        let scope = one_namespace();
+
+        assert_eq!(
+            headings_at(&scope, &rows, 80),
+            ["NAME", "READY", "STATUS", "RESTARTS", "CPU", "MEMORY"],
+        );
         let table = render(
             &rows,
             "prod (us-east-1)",
@@ -3385,8 +3546,8 @@ mod tests {
         let long = [PodRow::from_pod(&healthy(), None, now())];
         let scope = one_namespace();
 
-        assert!(headings_at(&scope, &short, 45).contains(&"NODE"));
-        assert!(!headings_at(&scope, &long, 45).contains(&"NODE"));
+        assert!(headings_at(&scope, &short, 45).iter().any(|h| h == "NODE"));
+        assert!(!headings_at(&scope, &long, 45).iter().any(|h| h == "NODE"));
     }
 
     #[test]
@@ -3407,24 +3568,24 @@ mod tests {
     }
 
     #[test]
-    fn the_usage_columns_leave_together_rather_than_singly() {
-        // `CPU/REQ` beside `AGE` with no `MEMORY/REQ` between them is half an
+    fn the_request_and_usage_columns_each_leave_together_rather_than_singly() {
+        // `CPU REQ` beside `AGE` with no `MEMORY REQ` between them is half an
         // answer, and an eye reading a row of pairs pairs the wrong ones. The
-        // same rule the node table's REQ and USE pairs follow.
+        // same rule the node table's REQ and USE pairs follow — and the same
+        // rule for each of the two pairs here, which now leave at different
+        // widths from each other.
         let rows = requesting_rows();
         let scope = one_namespace();
 
-        // A width tight enough to lose one of them loses both, at every step
+        // A width tight enough to lose one of a pair loses both, at every step
         // small enough to force the question. A loop rather than one number,
         // because the invariant is the pairing and not the fixture's exact
         // cell widths.
-        for target in [1_u16, 20, 40, 60, 73] {
+        for target in [1_u16, 20, 40, 60, 73, 80, 85, 90, 100, 200] {
             let cols = headings_at(&scope, &rows, target);
-            assert_eq!(
-                cols.contains(&"CPU/REQ"),
-                cols.contains(&"MEMORY/REQ"),
-                "{target}: {cols:?}"
-            );
+            let has = |heading: &str| cols.iter().any(|h| h == heading);
+            assert_eq!(has("CPU REQ"), has("MEMORY REQ"), "{target}: {cols:?}");
+            assert_eq!(has("CPU"), has("MEMORY"), "{target}: {cols:?}");
         }
     }
 
@@ -3598,12 +3759,11 @@ mod tests {
             Column::Name,
             Column::Ready,
             Column::Restarts,
-            Column::Cpu {
-                against_request: true,
-            },
-            Column::Memory {
-                against_request: true,
-            },
+            Column::CpuRequested,
+            Column::Cpu,
+            Column::MemoryRequested,
+            Column::Memory,
+            Column::Device("nvidia.com/gpu"),
             Column::Age,
             Column::Ip,
             Column::Node,
@@ -3628,12 +3788,9 @@ mod tests {
         // for a request, colouring it would be telling the reader something
         // untrue in red on most of their rows.
         let row = PodRow::from_pod(&asking(&[("cpu", "500m")]), Some(used("450m", "0")), now());
-        let cpu = Column::Cpu {
-            against_request: true,
-        };
 
-        assert_eq!(cpu.text(&row), "450m/500m (90%)");
-        assert_eq!(cpu.severity(&row), None);
+        assert_eq!(Column::Cpu.text(&row), "450m (90%)");
+        assert_eq!(Column::Cpu.severity(&row), None);
     }
 
     #[test]

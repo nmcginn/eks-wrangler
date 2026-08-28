@@ -212,6 +212,7 @@ mod tests {
             memory_used: None,
             cpu_requested: Quantity::default(),
             memory_requested: Quantity::default(),
+            extended_requested: std::collections::BTreeMap::new(),
             node: "worker-1".to_owned(),
             ip: "-".to_owned(),
             nominated_node: "-".to_owned(),

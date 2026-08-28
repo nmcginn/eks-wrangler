@@ -2524,3 +2524,91 @@ still `Loading`, was a deliberate choice rather than an oversight: they were
 known before that fetch even started, and making a reader wait for the pods
 to answer before showing facts about the node they are already looking at
 would cost first paint for no reason.
+
+### 79. A pod's request gets its own columns; the usage pair loses its half
+
+The roadmap entry framed this as a choice between two designs: a `CPU REQ`
+column beside the existing `262m/500m (52%)` cell, which would print the
+request twice, or a column and a plainer usage cell — the node table's own
+shape, where `CPU REQ` and `CPU` sit side by side rather than one cell
+carrying both halves. The second was the only one that survives its own
+premise: the whole point of the task is that a request has to be visible
+*without* a sample behind it, and a number that lives only inside a usage
+cell cannot do that — a cluster with no metrics-server would still print
+nothing about what anything booked, the exact complaint the roadmap entry
+opened with.
+
+So `k8s::pods::row::Column` gained `CpuRequested` and `MemoryRequested`,
+carrying `PodRow::cpu_requested`/`memory_requested` — already there as the
+usage cell's denominator — through `quantity::cpu`/`quantity::memory`
+directly, with no percentage of their own: a request is not a share of
+anything, it is the number itself. `Column::Cpu`/`Column::Memory` (the usage
+cells) lost the `against_request: bool` field their heading used to switch
+on: `CPU/REQ` over `250m/500m (50%)` becomes plain `CPU` over `250m (50%)`,
+always — the heading no longer needs to promise a denominator it might not
+have, because the denominator has its own column now. `usage_cell` dropped
+the branch that printed `requested` a second time; `ratio_of`'s existing
+zero-denominator check still decides when there is no percentage to show at
+all, unchanged from before.
+
+The two new columns are gated together, on whether *any* row in the listing
+has a nonzero request in either resource — the same `any`-not-`all` shape
+`shows_usage` already used, so a namespace where nobody set a request does
+not grow two columns of `0`. They are gated as a pair rather than per
+resource: unlike the extended-resource columns below, which answer "did a
+pod ask for this specific thing", a request is one question — "what did this
+book?" — and a pod that set a memory request and left CPU unbounded still
+belongs beside a `CPU REQ` reading `0`, its own honest answer, rather than
+losing the column a neighbouring row earned. A pod's own `CPU`/`MEMORY`
+usage cell still falls back to its bare figure when *that pod's* request is
+zero, through the same `ratio_of` check as before — the pairing decides
+whether the column exists, not what any one row's cell says.
+
+The device half followed the node table's own device columns exactly:
+`PodRow` gained `extended_requested: BTreeMap<String, Quantity>`, the
+`Requests::extended` map `effective_requests` already computed and
+`cpu_requested`/`memory_requested` already draw from, just never carried
+through to the row before. `Column::Device(&str)` borrows the resource name
+from the rows the way `k8s::nodes::Column::Device` does, and the set of
+names worth a column is `device_names`'s union across every row's map — no
+nonzero filter, unlike `k8s::nodes::hugepage_names`: a pod's extended map
+only ever holds a resource some container's spec actually named, so there is
+no "every pod reports this at zero" noise to filter the way huge-page sizes
+have on every node. One genuine divergence from the node table: a pod that
+never asked for a device reads `0` in that column, not `-`. A node's `-`
+tells "no such hardware" apart from "hardware nobody is using" — two
+different facts about a machine. A pod has no hardware to have or not have;
+every pod could in principle request any resource, so not asking is itself
+a real, honest zero, the same reading `cpu_requested`/`memory_requested`
+already give a pod that set no request at all.
+
+`DROP_ORDER` needed two new steps rather than one, and they sit in the
+opposite order from how the columns are gated: `CpuRequested`/
+`MemoryRequested` drop *before* `Cpu`/`Memory`, leaving usage on its own —
+"what is this pod doing right now" is the question the tool exists to
+answer, so it is the resource pair that survives longest, exactly as the
+node table's own `CPU REQ`/`MEM REQ` step drops ahead of its `CPU USE`/`MEM
+USE` step. The device columns get their own step, all of them together, and
+it sits after the request and usage pairs but ahead of the health columns —
+a GPU cluster wants every device column or none, the same reasoning that
+keeps the node table's device columns as one step, and losing a pod's status
+to make room for its GPU count would be the wrong trade at any width.
+
+Nothing here touches the dashboard. `k8s::pods::row::Column` and its
+`columns`/`render` are `eks pods`-only — the pod-drilldown pane draws
+`PodRow` through its own hand-written lines in `ui::pods`, which never
+reads `cpu_requested`/`cpu_used` today (that pane does not sample usage at
+all yet; see the open "Wire `metrics.k8s.io` into the pod-drilldown pane"
+entry) — so this change is contained to the one table and its command-layer
+caller in `commands::pods::list`, neither of which needed to change beyond
+picking up the new columns.
+
+What "hot" means for a pod's own usage against its own request stays exactly
+where the roadmap already left it, deliberately unresolved: `CpuRequested`,
+`MemoryRequested`, and the device columns carry no percentage at all, so
+there is nothing pending for them to grade — they are plain facts, like
+`AGE`. Sorting a pod listing by a share of what it asked for, and sorting
+either table by an extended resource, are both still open for the same
+reason they were before: `Requests::extended`'s names are not known until
+the rows arrive, which is a `--sort` design question this change did not
+need to answer to give a request its own column.

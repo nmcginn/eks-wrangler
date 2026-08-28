@@ -267,6 +267,7 @@ mod tests {
             // nothing is a real pod; the orderings are over what is measured.
             cpu_requested: Quantity::default(),
             memory_requested: Quantity::default(),
+            extended_requested: std::collections::BTreeMap::new(),
             node: "ip-10-0-1-9.ec2.internal".to_owned(),
             ip: "10.0.1.42".to_owned(),
             nominated_node: "-".to_owned(),
