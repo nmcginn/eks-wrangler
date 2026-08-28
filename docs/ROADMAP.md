@@ -321,7 +321,7 @@ cluster.
   `CPU/REQ` over a column of pairs, plain `CPU` where no row in the listing has
   one, so the table says what the percentage is a share of.
 
-- [ ] **What a pod asked for, when nothing has measured it.**
+- [x] **What a pod asked for, when nothing has measured it.**
   A pod's request reaches the table only as the denominator of a usage figure, so
   on a cluster with no metrics-server — the EKS default — `eks pods` still says
   nothing about what anything booked. "What did this ask for?" is a different
@@ -345,6 +345,17 @@ cluster.
   already is; whichever shape it takes, no listing shows one pod's request twice;
   a device column on `eks pods` appears on the condition the node table's does —
   some row in this listing asked for one — rather than on a second rule.
+  Landed as the node table's shape: `CPU REQ` and `MEMORY REQ` are their own
+  columns now, holding the bare `effective_requests` figure regardless of
+  whether metrics-server has ever sampled the pod, and the usage cell dropped
+  its half of the pair — `262m (52%)` rather than `262m/500m (52%)` — since the
+  request it is a percentage of is no longer only visible beside it. Extended
+  resources followed the same shape: a `Column::Device` per fully-qualified
+  name some pod in the listing asked for, gated on the same "any row asked for
+  one" rule the node table's own device columns use, with the pod table's own
+  reading of what an absent entry means — `0`, not `-`, because unlike a node's
+  hardware every pod could in principle have asked for any resource, so not
+  asking is a real zero rather than an unknown. See decision 79.
 
 - [ ] **Sort a pod listing by its share of what it asked for.**
   `--sort cpu` ranks the figure, which is the right key for "what is eating this
@@ -1125,6 +1136,31 @@ cluster.
 ---
 
 ## Done
+
+- **What a pod asked for, when nothing has measured it** (2026-08-28) —
+  `eks pods` now shows what every pod booked whether or not metrics-server has
+  ever sampled it: `CPU REQ` and `MEMORY REQ` are their own columns, carrying
+  the bare `effective_requests` figure, shown whenever some row in the listing
+  asked for something — the same `any`-not-`all` rule the usage columns
+  follow, paired together rather than per resource so a pod that requested
+  memory and not CPU still reads an honest `0` under `CPU REQ` instead of
+  losing the column. The usage cell lost its half of the old pair — `262m
+  (52%)` rather than `262m/500m (52%)` — since the number it was a percentage
+  of is no longer only visible beside it; `usage_cell`'s zero-denominator
+  fallback to the bare figure is otherwise unchanged. Extended resources
+  followed the node table's own device columns: `PodRow` now carries
+  `extended_requested`, `effective_requests`'s map, and `Column::Device`
+  appears per fully-qualified name some pod in the listing asked for. A pod
+  that never asked reads `0`, not the node table's `-`: unlike a node, which
+  either has a device or does not, every pod could in principle request any
+  resource, so not asking is a real zero rather than an absence. `DROP_ORDER`
+  gained two new steps — the request pair leaves before the usage pair, since
+  "what is this doing right now" is the pair the tool exists for and survives
+  longest; every device column leaves together, after both resource pairs and
+  ahead of the health columns, the same place the node table's own device
+  step sits. Coloring the request/device figures and sorting by a share or an
+  extended resource are both still open, for the reasons already on the
+  roadmap. See decision 79.
 
 - **Log in to AWS when the selected cluster's session has expired**
   (2026-08-27) — an expired IAM Identity Center session is now a question
