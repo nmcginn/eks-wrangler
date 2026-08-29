@@ -12,6 +12,7 @@ use ratatui::widgets::{Paragraph, Wrap};
 
 use crate::k8s::pods::ContainerRow;
 use crate::k8s::pods::containers::resources_summary;
+use crate::k8s::pods::events::EventRow;
 use crate::k8s::pods::row;
 use crate::theme::{Severity, Theme};
 
@@ -29,11 +30,20 @@ pub enum ContainersState {
     /// per-container — the same three facts `eks pods --wide` holds back into
     /// its own columns, shown here instead of behind a wide mode this pane
     /// does not have. See decision 72.
+    ///
+    /// `events`, `events_error`, and `events_empty_note` are a second,
+    /// independent fetch that can fail on its own (an RBAC role granting
+    /// `pods/get` but not `events/list` is ordinary) without emptying the
+    /// container list beside it — see
+    /// [`crate::commands::pods::ContainersFetch`].
     Loaded {
         rows: Vec<ContainerRow>,
         ip: String,
         nominated_node: String,
         readiness_gates: Option<String>,
+        events: Vec<EventRow>,
+        events_error: Option<String>,
+        events_empty_note: String,
     },
     /// The fetch failed; the message is already a full sentence, via
     /// `k8s::explain`.
@@ -87,6 +97,9 @@ pub(super) fn draw(
             ip,
             nominated_node,
             readiness_gates,
+            events,
+            events_error,
+            events_empty_note,
         } => {
             let mut lines = identity_lines(ip, nominated_node, readiness_gates.as_deref(), theme);
             lines.push(Line::styled("CONTAINERS", theme.heading()));
@@ -106,6 +119,15 @@ pub(super) fn draw(
                     }),
                 );
             }
+
+            lines.push(Line::raw(""));
+            lines.push(Line::styled("EVENTS", theme.heading()));
+            lines.extend(events_lines(
+                events,
+                events_error.as_deref(),
+                events_empty_note,
+                theme,
+            ));
             lines
         }
     };
@@ -182,6 +204,64 @@ fn container_lines(row: &ContainerRow, selected: bool, theme: Theme) -> Vec<Line
     vec![identity, resources]
 }
 
+/// The `EVENTS` section under the container list: whatever
+/// [`ContainersState::Loaded`] learned about this pod's recent activity.
+///
+/// Three distinct outcomes, and they must not read alike: a failed events
+/// listing is worded as information rather than as [`Severity::Critical`],
+/// the same distinction [`super::logs::LogsState::Unavailable`] draws,
+/// because the pane's own fetch — the containers above it — succeeded, and a
+/// missing `events/list` permission is not the same class of problem as a pod
+/// this tool could not find at all. A genuinely empty listing gets
+/// `events_empty_note`'s answer to "did nothing happen, or did something
+/// happen and expire" rather than the same sentence a failure would print.
+fn events_lines(
+    events: &[EventRow],
+    events_error: Option<&str>,
+    events_empty_note: &str,
+    theme: Theme,
+) -> Vec<Line<'static>> {
+    if let Some(error) = events_error {
+        return vec![Line::styled(error.to_owned(), theme.dim())];
+    }
+    if events.is_empty() {
+        return vec![Line::styled(events_empty_note.to_owned(), theme.dim())];
+    }
+    events
+        .iter()
+        .flat_map(|event| event_lines(event, theme))
+        .collect()
+}
+
+/// The two lines one grouped event occupies, on the same shape
+/// [`container_lines`] uses: an identity-and-timing line, then the message
+/// underneath.
+fn event_lines(event: &EventRow, theme: Theme) -> Vec<Line<'static>> {
+    let reason_style = if event.warning {
+        theme.severity(Severity::Warn)
+    } else {
+        theme.body()
+    };
+    let age = event.last_seen_age.as_deref().map_or_else(
+        || "at an unknown time".to_owned(),
+        |age| format!("{age} ago"),
+    );
+    let count = if event.count > 1 {
+        format!(" (×{})", event.count)
+    } else {
+        String::new()
+    };
+
+    let identity = Line::from(vec![
+        Span::styled(event.reason.clone(), reason_style),
+        Span::raw("  "),
+        Span::styled(format!("{age}{count}"), theme.dim()),
+    ]);
+    let message = Line::styled(format!("  {}", event.message), theme.dim());
+
+    vec![identity, message]
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
@@ -233,6 +313,41 @@ mod tests {
             ip: ip.to_owned(),
             nominated_node: nominated_node.to_owned(),
             readiness_gates: readiness_gates.map(str::to_owned),
+            events: Vec::new(),
+            events_error: None,
+            events_empty_note: "No events yet.".to_owned(),
+        }
+    }
+
+    fn event(reason: &str, message: &str, warning: bool) -> EventRow {
+        EventRow {
+            reason: reason.to_owned(),
+            message: message.to_owned(),
+            warning,
+            count: 1,
+            last_seen_age: Some("5m".to_owned()),
+            last_seen: None,
+        }
+    }
+
+    /// [`loaded`] with the events section spelled out — a plain function
+    /// rather than `ContainersState::Loaded { .., ..loaded(rows) }` for the
+    /// same reason [`loaded_with`] is: functional record update only works
+    /// against a struct literal, not a call that happens to return one.
+    fn loaded_with_events(
+        rows: Vec<ContainerRow>,
+        events: Vec<EventRow>,
+        events_error: Option<&str>,
+        events_empty_note: &str,
+    ) -> ContainersState {
+        ContainersState::Loaded {
+            rows,
+            ip: row::UNKNOWN.to_owned(),
+            nominated_node: row::UNKNOWN.to_owned(),
+            readiness_gates: None,
+            events,
+            events_error: events_error.map(str::to_owned),
+            events_empty_note: events_empty_note.to_owned(),
         }
     }
 
@@ -479,5 +594,123 @@ mod tests {
         assert!(!rendered.contains("IP:"), "{rendered}");
         assert!(!rendered.contains("Nominated node"), "{rendered}");
         assert!(!rendered.contains("Readiness gates"), "{rendered}");
+        assert!(!rendered.contains("EVENTS"), "{rendered}");
+    }
+
+    #[test]
+    fn events_appear_under_their_own_heading_with_age_and_message() {
+        let state = loaded_with_events(
+            vec![container("app")],
+            vec![event(
+                "BackOff",
+                "Back-off restarting failed container",
+                true,
+            )],
+            None,
+            "",
+        );
+        let rendered = render(&state, None);
+
+        assert!(rendered.contains("EVENTS"), "{rendered}");
+        assert!(rendered.contains("BackOff"), "{rendered}");
+        assert!(rendered.contains("5m ago"), "{rendered}");
+        assert!(
+            rendered.contains("Back-off restarting failed container"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn a_repeated_events_count_is_shown_beside_its_age() {
+        let state = loaded_with_events(
+            vec![container("app")],
+            vec![EventRow {
+                count: 12,
+                ..event("BackOff", "restarting", true)
+            }],
+            None,
+            "",
+        );
+        let rendered = render(&state, None);
+        assert!(rendered.contains("5m ago (×12)"), "{rendered}");
+    }
+
+    #[test]
+    fn an_event_with_no_age_says_so_rather_than_printing_nothing() {
+        let state = loaded_with_events(
+            vec![container("app")],
+            vec![EventRow {
+                last_seen_age: None,
+                ..event("Pulled", "pulled image", false)
+            }],
+            None,
+            "",
+        );
+        let rendered = render(&state, None);
+        assert!(rendered.contains("at an unknown time"), "{rendered}");
+    }
+
+    #[test]
+    fn a_pod_with_no_events_shows_the_empty_note_rather_than_a_bare_heading() {
+        let state = loaded_with_events(
+            vec![container("app")],
+            Vec::new(),
+            None,
+            "No events yet — this pod is only 2m old.",
+        );
+        let rendered = render(&state, None);
+        assert!(rendered.contains("No events yet"), "{rendered}");
+    }
+
+    #[test]
+    fn a_failed_events_listing_reads_as_information_not_as_an_error() {
+        // The containers fetch succeeded — this pane is not `Error` — so a
+        // missing `events/list` permission must not read like the pod itself
+        // could not be found.
+        let state = loaded_with_events(
+            vec![container("app")],
+            Vec::new(),
+            Some("prod (us-east-1) will not let you list this resource."),
+            "",
+        );
+        let rendered = render(&state, None);
+        assert!(rendered.contains("will not let you list"), "{rendered}");
+    }
+
+    #[test]
+    fn a_warning_events_reason_is_coloured_and_a_normal_ones_is_not() {
+        // Both render the same plain text either way, so the distinction that
+        // matters is the style carried on the reason span, not anything a
+        // rendered string comparison could see.
+        let theme = Theme::dark();
+        let warning = event_lines(&event("BackOff", "restarting", true), theme);
+        let normal = event_lines(&event("Pulled", "pulled image", false), theme);
+
+        assert_eq!(warning[0].spans[0].style, theme.severity(Severity::Warn));
+        assert_eq!(normal[0].spans[0].style, theme.body());
+        assert_ne!(warning[0].spans[0].style, normal[0].spans[0].style);
+    }
+
+    #[test]
+    fn rendering_the_events_section_survives_a_tiny_terminal() {
+        let state = loaded_with_events(
+            vec![container("app")],
+            vec![event(
+                "BackOff",
+                "a very long message that will need to wrap across several lines of a narrow pane",
+                true,
+            )],
+            None,
+            "",
+        );
+        for (width, height) in [(1, 1), (8, 3), (20, 2), (200, 60)] {
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            terminal
+                .draw(|frame| {
+                    let area = frame.area();
+                    draw(frame, area, &state, None, "", Theme::dark());
+                })
+                .unwrap();
+        }
     }
 }

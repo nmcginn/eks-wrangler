@@ -17,6 +17,7 @@ use crate::format::Width;
 use crate::k8s::metrics::{self as k8s_metrics};
 use crate::k8s::order::Direction;
 use crate::k8s::page;
+use crate::k8s::pods::events::{self, EventRow};
 use crate::k8s::pods::logs::{self, LogEvent};
 use crate::k8s::pods::{ContainerRow, Order, PodRow, Scope, Selectors};
 use crate::k8s::{self, pods as k8s_pods, selector};
@@ -325,12 +326,25 @@ fn scoped_to_node(node: &str, selectors: &Selectors) -> Selectors {
 /// committed to one pod has room to say them outright, so they ride along
 /// beside its containers rather than waiting on a wide mode this pane will
 /// never grow.
+///
+/// `events`, `events_error`, and `events_empty_note` are a second, independent
+/// fetch riding along in the same struct: the events listing can fail — most
+/// commonly an RBAC role that grants `pods/get` but not `events/list` —
+/// without the pod's own containers being any less real, the same
+/// "independent fetches, partial degradation" rule `eks nodes` follows for
+/// its own node/pod/metrics trio. `events_empty_note` is computed regardless
+/// of whether the pane ends up needing it, so rendering never has to reach
+/// for a clock or the pod's creation timestamp of its own — see
+/// [`events::empty_note`].
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ContainersFetch {
     pub rows: Vec<ContainerRow>,
     pub ip: String,
     pub nominated_node: String,
     pub readiness_gates: Option<String>,
+    pub events: Vec<EventRow>,
+    pub events_error: Option<String>,
+    pub events_empty_note: String,
 }
 
 /// Fetch one pod's containers, on a background thread.
@@ -380,19 +394,42 @@ async fn gather_containers(
     let label = target.label();
     let client = k8s::connect(paths, &target, budget).await?;
 
-    let api: Api<Pod> = Api::namespaced(client, namespace);
-    // A single `get` rather than a paged listing — `budget.wrap` covers both,
-    // spending the same per-request timeout every other fetch does.
-    let fetched = budget
-        .wrap(api.get(pod))
-        .await
-        .map_err(|error| k8s::client::Error::explained(&error, &label))?;
+    let api: Api<Pod> = Api::namespaced(client.clone(), namespace);
+    // Concurrently, not in sequence: the pod and its events are independent
+    // questions, and only one of the two — the pod itself — is fatal to the
+    // pane. `budget.wrap` covers the single `get`; `events::fetch` covers its
+    // own paging the same way every other listing in this tool does.
+    let (fetched, events) = tokio::join!(
+        budget.wrap(api.get(pod)),
+        events::fetch(client, namespace, pod, budget),
+    );
+    let fetched = fetched.map_err(|error| k8s::client::Error::explained(&error, &label))?;
+
+    let now = Timestamp::now();
+    let created_at = fetched
+        .metadata
+        .creation_timestamp
+        .as_ref()
+        .map(|created| created.0);
+    let (events, events_error) = match events {
+        Ok(events) => (events::from_events(&events, now), None),
+        Err(error) => {
+            // Not fatal: the containers this pane exists to show are already
+            // in hand, and a role that grants `pods/get` but not
+            // `events/list` is an ordinary shape of RBAC to run into.
+            tracing::debug!(%error, "listing pod events failed");
+            (Vec::new(), Some(k8s::explain(&error, &label)))
+        }
+    };
 
     Ok(ContainersFetch {
         rows: ContainerRow::from_pod(&fetched),
         ip: k8s::pods::pod_ip(&fetched),
         nominated_node: k8s::pods::nominated_node(&fetched),
         readiness_gates: k8s::pods::readiness_gates(&fetched),
+        events,
+        events_error,
+        events_empty_note: events::empty_note(created_at, now),
     })
 }
 
