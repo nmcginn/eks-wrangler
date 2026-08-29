@@ -966,7 +966,7 @@ cluster.
 
 ### Follow-ups from the pod-detail view
 
-- [ ] **Recent events in the pod-detail view.**
+- [x] **Recent events in the pod-detail view.**
   `kubectl describe pod` ends with the events the API server recorded against
   it — `FailedScheduling`, `BackOff`, `Pulled` — and they are frequently the
   only account of *why* a pod is in the state the rest of the view already
@@ -986,6 +986,46 @@ cluster.
   server's retention window with no events says so rather than reading like
   a fetch that failed; the fetch goes through the same `Budget`/`k8s::explain`
   path every other one in this tool does.
+  Landed as a new `EVENTS` section under the container list, in the same
+  `ContainersState::Loaded` and the same fetch — `k8s::pods::events::fetch`
+  lists `core::v1::Event` (not `events.k8s.io`, to stay in the API generation
+  every other type in this tool already reads) with a field selector on
+  `involvedObject.name`/`.namespace`, run concurrently with the pod's own
+  `get` via `tokio::join!` so the pane costs one round trip either way.
+  `from_events` groups by `(reason, message)`, preferring a server-side
+  `EventSeries`'s own `count`/`last_observed_time` and falling back to the
+  legacy `count`/`last_timestamp`/`event_time`/`creationTimestamp` in
+  `kubectl`'s own precedence — one row reads `BackOff  5m ago (×12)` under its
+  message. The events listing fails independently of the containers beside
+  it, the same "partial degradation" rule `eks nodes` follows for its own
+  node/pod/metrics trio: a role granting `pods/get` but not `events/list` is
+  ordinary RBAC, not a reason to blank out containers this pane already has.
+  A failed events listing is worded through `k8s::explain` and coloured as
+  information (`theme.dim()`), not `Severity::Critical` — the pane itself did
+  not fail. `events::empty_note` is the "no events" wording, computed at
+  fetch time from the pod's own `creationTimestamp` against a documented
+  one-hour retention assumption: younger than that, an empty list confidently
+  means nothing has happened; older, it hedges, since something may have
+  happened and expired before anyone looked. See decision 80.
+
+### Follow-ups from the pod's events
+
+- [ ] **Filter the pod-detail view's events with `/`, alongside its
+  containers.**
+  The pod-containers pane's `/` already narrows the container list; the new
+  `EVENTS` section underneath it does not take part, so a pod with a long
+  event history has no way to narrow it to, say, `BackOff`. Separate because
+  it is a real design question rather than a rendering gap: `fuzzy::rank`
+  narrows a list of *rows a reader picks one of* — `App`'s highlight and
+  `Enter` both read its output — and an event is not selectable today, so
+  reusing the same query for both would be the first case of one `/` press
+  affecting a highlighted list and a plain block of text at once. Whether
+  that is the right model, or whether events want their own filter (or none,
+  since a pod rarely has more than a handful), is a call this change had no
+  reason to make on its way to landing the section at all.
+  *Acceptance:* whichever shape it takes, it reuses `crate::fuzzy::rank`
+  rather than a second matcher; a pod with no events, or with an unfiltered
+  event list, renders exactly as it does today.
 
 ### Follow-ups from the node pane
 
@@ -1136,6 +1176,24 @@ cluster.
 ---
 
 ## Done
+
+- **Recent events in the pod-detail view** (2026-08-29) — the pod-containers
+  pane now ends with an `EVENTS` section: one row per `(reason, message)`,
+  reading `BackOff  5m ago (×12)` over `Back-off restarting failed
+  container`, sourced from `core::v1::Event` filtered to the drilled-into pod
+  and fetched concurrently with its own `get` so the pane costs no extra
+  round trip. Repeats collapse through `k8s::pods::events::from_events`,
+  preferring a server-side `EventSeries`'s own count and timestamp over the
+  legacy per-object fields in `kubectl`'s own precedence order. The listing
+  fails independently of the containers beside it — a role granting
+  `pods/get` but not `events/list` empties only the new section, worded
+  through `k8s::explain` and coloured as information rather than as the
+  pane's own failure — and a genuinely empty listing gets `events::empty_note`'s
+  answer to "did nothing happen, or did something happen and expire before
+  anyone looked", read from the pod's age against a documented one-hour
+  retention assumption. Extending the pane's existing `/` filter to the new
+  section is left open, since an event is not a selectable row the way a
+  container is. See decision 80.
 
 - **What a pod asked for, when nothing has measured it** (2026-08-28) —
   `eks pods` now shows what every pod booked whether or not metrics-server has

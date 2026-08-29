@@ -2612,3 +2612,88 @@ either table by an extended resource, are both still open for the same
 reason they were before: `Requests::extended`'s names are not known until
 the rows arrive, which is a `--sort` design question this change did not
 need to answer to give a request its own column.
+
+### 80. Pod events land in the existing pod-containers pane, as a section that
+can fail on its own
+
+The roadmap task built the case for a genuinely new surface — nothing in this
+tool reads the `Event` API yet — but stopped short of saying where the
+result should live. Decision 72 already answered the closest version of this
+question for `--wide`'s pod facts: a dashboard pane that has committed to one
+pod, via a breadcrumb and an `Enter` press, has nowhere to widen *away from*,
+so new facts about that pod are plain lines rather than a second view behind
+a new key. Events are the same shape of fact — true of the one pod already on
+screen, not a reason to make the reader navigate anywhere — so they became a
+second heading in the same pane, `EVENTS` under `CONTAINERS`, rather than a
+fifth `View` variant. Unlike the `--wide` facts, though, an event is not a
+field already sitting in the `Pod` `gather_containers` fetches; it needs its
+own request, and that request can fail on its own terms.
+
+That independence is the decision with real teeth. `commands::pods::
+ContainersFetch` used to be one `Result`: the pod existed or it did not, and
+every field the pane showed came from that one object. Splitting the events
+listing out as its own `Result`, joined concurrently with `budget.wrap(api.
+get(pod))` via `tokio::join!`, means a pod whose containers this tool can read
+perfectly well can still show `events_error` where an RBAC role granted
+`pods/get` but not `events/list` — a boundary this tool already treats as
+ordinary everywhere else (a node listing that fails does not empty a working
+pod listing; metrics.k8s.io failing does not empty either). Coloured as
+information (`theme.dim()`) rather than `Severity::Critical`, matching
+`ui::logs::LogsState::Unavailable`'s own reasoning: the pane itself did not
+fail, so painting the message in the colour reserved for that would overstate
+what went wrong. The alternative — folding the events failure into the
+pane's existing top-level `ContainersState::Error` — was rejected outright:
+it would turn a partial, ordinary permission gap into the same "this pod
+could not be found" sentence a failed `get` produces, for two failures that
+call for different next steps.
+
+Grouping settled on `(reason, message)` as the collapsing key, over the
+simpler "read each `Event` object's own `count` field and print one row per
+object." `EventSeries` — the mechanism a modern control plane uses to batch
+repeated occurrences into one object's `count`/`lastObservedTime` rather than
+minting a new object each time — already does most of this collapsing
+server-side, but nothing guarantees every event source on every cluster this
+tool will meet uses it: an older or third-party controller can still emit the
+same `BackOff` as several distinct objects. Grouping client-side on the
+content rather than trusting one server mechanism is what makes "matching
+`kubectl`'s own collapsing" — the acceptance criterion's own phrase — true
+regardless of which one produced the events, at the cost of a `BTreeMap` walk
+`k8s::pods::by_node` already established as an ordinary shape for this
+codebase to reach for.
+
+The empty case needed its own answer rather than reusing `LogsState::
+Unavailable`'s wording verbatim, because "no events" is not one claim — it
+depends on the *pod's* age relative to the API server's retention, a fact
+external to the events listing itself. `events::empty_note` reads the pod's
+own `creationTimestamp`, already in hand from the same `get` that built the
+container rows, against a constant, documented assumption
+(`RETENTION_SECS`, an hour) rather than anything this tool can actually
+observe — `kube-controller-manager`'s `--event-ttl` is not exposed by any API
+this tool reads, so the constant is a best-effort default rather than a
+measured fact, and a cluster operator who changed it would see this tool's
+hedge fire at the wrong boundary. Accepted because the two wordings it
+produces are each honest about what they know: a pod younger than the
+assumed window gets the confident one, and everything else gets the
+hedge — never a false "nothing has happened" for a pod old enough that
+something could have happened and already expired.
+
+The field selector doubles up deliberately:
+`involvedObject.name={pod},involvedObject.namespace={namespace}` is sent to
+an `Api::namespaced(client, namespace)` that already scopes the request to
+that namespace. Belt and braces rather than an oversight — `involvedObject.
+namespace` is one of the handful of fields the events API actually indexes
+on, specifically so a query naming it does not have to fall back to scanning
+every event in the namespace for one whose `involvedObject.name` matches — so
+naming it costs nothing and guards against the one server implementation
+detail this tool has no way to verify from here. `core::v1::Event`, not
+`events.k8s.io/v1::Event`, is the type read: the roadmap task left both
+open, and the older type's field names (`reason`, `message`, `count`,
+`lastTimestamp`) are the ones `kubectl describe pod` itself prints, which
+keeps this tool's wording recognisable rather than translating between two
+API generations' vocabularies for no reader-facing benefit.
+
+What this does not settle: the pane's existing `/` filter does not reach the
+new section, because an event is not a row `App`'s highlight or `Enter` can
+land on the way a container is — extending `fuzzy::rank`'s "narrow a list of
+selectable rows" to a block of read-only text is a question of its own, left
+as a follow-up rather than guessed at here.

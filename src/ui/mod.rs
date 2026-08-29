@@ -587,6 +587,9 @@ impl App {
                 ip: fetch.ip,
                 nominated_node: fetch.nominated_node,
                 readiness_gates: fetch.readiness_gates,
+                events: fetch.events,
+                events_error: fetch.events_error,
+                events_empty_note: fetch.events_empty_note,
             },
             Err(error) => ContainersState::Error(error.message),
         };
@@ -3299,6 +3302,9 @@ mod tests {
                 ip: String::new(),
                 nominated_node: String::new(),
                 readiness_gates: None,
+                events: Vec::new(),
+                events_error: None,
+                events_empty_note: String::new(),
             }
         );
     }
