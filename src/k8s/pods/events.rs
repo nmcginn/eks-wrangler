@@ -125,7 +125,7 @@ pub fn from_events(events: &[Event], now: Timestamp) -> Vec<EventRow> {
     // recently", not the alphabet. An event with no timestamp at all sorts
     // last rather than first, the tail rule every other ordering in this
     // tool gives a row it cannot rank.
-    rows.sort_by(|a, b| b.last_seen.cmp(&a.last_seen));
+    rows.sort_by_key(|row| std::cmp::Reverse(row.last_seen));
     rows
 }
 
