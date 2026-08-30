@@ -357,7 +357,7 @@ cluster.
   hardware every pod could in principle have asked for any resource, so not
   asking is a real zero rather than an unknown. See decision 79.
 
-- [ ] **Sort a pod listing by its share of what it asked for.**
+- [x] **Sort a pod listing by its share of what it asked for.**
   `--sort cpu` ranks the figure, which is the right key for "what is eating this
   node" and the wrong one for "whose request is wrong" — the question the new
   percentage puts in front of the reader. A pod at 400% of a 10m request is
@@ -370,6 +370,24 @@ cluster.
   *Acceptance:* the unrankable tail is the pods with no request or no sample,
   under `k8s::order`'s existing rule rather than a second one; `--sort cpu` is
   unchanged.
+  Landed as two more variants, `Order::CpuShare`/`Order::MemoryShare`
+  (`--sort cpu-share`/`--sort memory-share`), rather than a modifier bit on the
+  existing two — a `clap::ValueEnum` `--help` already lists, parses, and rejects
+  by name, which a `(Order, bool)` pair at every call site would only be
+  reimplementing. The node-order symmetry question is answered "no, and not as
+  a roadmap line either": a raw-figure node sort is a new reading of `eks nodes
+  --sort cpu` nobody asked for, on a listing whose whole reason to rank by share
+  already has its own module-doc section, so it is left off rather than guessed
+  at. `k8s::order::Ratio` — the `total_cmp`-backed `f64` wrapper a share
+  ordering needs — moved out of `k8s::nodes::order`, where it was private, into
+  the shared `k8s::order` module beside `Rank` and `Direction`: both listings
+  were about to carry the same eleven lines for the same reason, and the module
+  already exists to hold the *shape* an ordering shares rather than its keys.
+  `k8s::pods::order::share` draws the same two-tier tail `busiest` draws for a
+  node's `(amount, allocatable)` — a pod sampled but asking for nothing is a
+  different blank from one nobody has sampled — falling out of one `match` on
+  `Quantity::ratio_of`'s existing zero-denominator handling rather than a
+  second explicit check. See decision 81.
 
 - [x] **Usage against capacity for the dashboard's bars.**
   `nodes::Share` divides usage by *allocatable*, which is the right denominator

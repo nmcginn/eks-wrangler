@@ -167,7 +167,7 @@ pub enum Command {
 
         /// Order the listing. Every order but `name` puts the most
         /// interesting row first: the newest restart, the youngest pod, the
-        /// largest usage figure.
+        /// largest usage figure, or the pod furthest over its own request.
         #[arg(long, value_name = "ORDER", default_value = "name")]
         sort: PodOrder,
 
@@ -352,6 +352,8 @@ mod tests {
             ("age", PodOrder::Age),
             ("cpu", PodOrder::Cpu),
             ("memory", PodOrder::Memory),
+            ("cpu-share", PodOrder::CpuShare),
+            ("memory-share", PodOrder::MemoryShare),
         ] {
             let Some(Command::Pods { sort, .. }) = parse(&["eks", "pods", "--sort", flag]).command
             else {

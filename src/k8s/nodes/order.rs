@@ -29,7 +29,7 @@ use std::cmp::{Ordering, Reverse};
 use k8s_openapi::jiff::Timestamp;
 
 use super::{NodeRow, Share};
-use crate::k8s::order::{Cause, Direction, Rank, compare};
+use crate::k8s::order::{Cause, Direction, Rank, Ratio, compare};
 use crate::theme::Severity;
 
 /// The order the rows of a node listing are printed in.
@@ -242,36 +242,6 @@ fn busiest(share: Share) -> Rank<Reverse<Ratio>> {
         (Some(ratio), _) => Rank::By(Reverse(Ratio(ratio))),
         (None, Some(_)) => Rank::Unranked(0),
         (None, None) => Rank::Unranked(1),
-    }
-}
-
-/// A utilisation share, ordered.
-///
-/// `Share::ratio` returns an `f64`, which is not `Ord`, and a sort key has to
-/// be. `total_cmp` gives a total order over every `f64` there is, including the
-/// ones arithmetic on a nonsensical reading could produce, so a strange figure
-/// from the API server sorts strangely rather than making the comparison
-/// inconsistent and the sort meaningless.
-#[derive(Debug, Clone, Copy)]
-struct Ratio(f64);
-
-impl PartialEq for Ratio {
-    fn eq(&self, other: &Self) -> bool {
-        self.cmp(other) == Ordering::Equal
-    }
-}
-
-impl Eq for Ratio {}
-
-impl PartialOrd for Ratio {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl Ord for Ratio {
-    fn cmp(&self, other: &Self) -> Ordering {
-        self.0.total_cmp(&other.0)
     }
 }
 

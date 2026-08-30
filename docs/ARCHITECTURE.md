@@ -173,14 +173,20 @@ decides two things: which orderings the advice can name, and — the newer of
 the two — whether the ordering the user actually typed gets a "this changed
 nothing" diagnosis of its own rather than only the honest but silent `Sorted
 by status.`. What is *not* shared is the keys: `k8s::nodes::order` ranks by the share of
-allocatable a node's figures represent, where `k8s::pods::order` ranks by the
-figure itself. That was once for want of a denominator; now that a pod's usage
-has one, it is a choice — a node's denominator is the machine, so 95% of a small
-one is comparable to 30% of a large one, while a pod's is whatever a manifest
-asked for, and 400% of a 10m request is 40m of anybody's cluster. `NodeRow`
-gained a `created_at` beside its rendered `age` for the same reason `PodRow` has
-one — two nodes can both read `3d` and be nearly a day apart. `--sort pods` is
-the newest of the node orders and ranks a share too: the node worth looking at
+allocatable a node's figures represent, where `k8s::pods::order`'s `cpu`/
+`memory` rank by the figure itself. That was once for want of a denominator;
+now that a pod's usage has one, it is a choice — a node's denominator is the
+machine, so 95% of a small one is comparable to 30% of a large one, while a
+pod's is whatever a manifest asked for, and 400% of a 10m request is 40m of
+anybody's cluster: `cpu`/`memory` answer "what is eating this node", and stay
+figure-ranked for it. `cpu-share`/`memory-share` are the other question, "whose
+request is wrong", and rank the same fraction a node's orders do — a
+[`k8s::order::Ratio`] over the pod's own request rather than the node's
+allocatable, sharing the total-`f64`-order wrapper rather than a second copy of
+it. `NodeRow` gained a `created_at` beside its rendered `age` for the same
+reason `PodRow` has one — two nodes can both read `3d` and be nearly a day
+apart. `--sort pods` is the newest of the node orders and ranks a share too:
+the node worth looking at
 is the one with two slots left, not the one running the most pods.
 
 Which columns a table has is the same shape of decision, one hop later, and it is

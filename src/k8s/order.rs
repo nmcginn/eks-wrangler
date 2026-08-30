@@ -10,8 +10,12 @@
 //! What is shared is the *shape* of an ordering: which way round it runs, and
 //! what happens to a row it cannot rank. What is not shared is the keys — a
 //! node has no restart count and a pod has no kubelet version — so each listing
-//! keeps its own `Order` enum and its own `sort`, and borrows [`Direction`] and
-//! the crate-private `Rank` from here.
+//! keeps its own `Order` enum and its own `sort`, and borrows [`Direction`],
+//! the crate-private `Rank`, and the crate-private `Ratio` from here. `Ratio`
+//! is the one piece of a key both listings happen to need in the same shape:
+//! a node's own orders rank a share of its allocatable, and a pod's `--sort
+//! cpu-share`/`--sort memory-share` rank a share of its own request — two
+//! different denominators over the same total order on `f64`.
 //!
 //! # Which way is "first"
 //!
@@ -143,6 +147,38 @@ impl<T> Rank<T> {
     /// not order.
     pub(crate) fn is_ranked(&self) -> bool {
         matches!(self, Self::By(_))
+    }
+}
+
+/// A ratio, ordered.
+///
+/// Both listings rank a share of something by dividing one [`crate::k8s::
+/// quantity::Quantity`] by another — a node's usage over its allocatable, a
+/// pod's usage over its own request — and both land on an `f64`, which is not
+/// `Ord`, and a sort key has to be. `total_cmp` gives a total order over every
+/// `f64` there is, including the ones arithmetic on a nonsensical reading
+/// could produce, so a strange figure from the API server sorts strangely
+/// rather than making the comparison inconsistent and the sort meaningless.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Ratio(pub(crate) f64);
+
+impl PartialEq for Ratio {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == Ordering::Equal
+    }
+}
+
+impl Eq for Ratio {}
+
+impl PartialOrd for Ratio {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for Ratio {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.0.total_cmp(&other.0)
     }
 }
 

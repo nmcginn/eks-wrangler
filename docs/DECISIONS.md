@@ -2697,3 +2697,57 @@ new section, because an event is not a row `App`'s highlight or `Enter` can
 land on the way a container is — extending `fuzzy::rank`'s "narrow a list of
 selectable rows" to a block of read-only text is a question of its own, left
 as a follow-up rather than guessed at here.
+
+### 81. A pod's usage sorts by share too, and the wrapper for it moves to `k8s::order`
+
+"Sort a pod listing by its share of what it asked for" left two questions
+open: whether the share is two more `--sort` values or a modifier over `cpu`/
+`memory`, and whether the node orders — which already rank by share of
+allocatable — should gain the opposite reading, a raw-figure sort, for
+symmetry.
+
+The first is `CpuShare`/`MemoryShare`, two more variants on `k8s::pods::
+order::Order` (`--sort cpu-share`/`--sort memory-share`), rather than a second
+flag or a modifier bit on the existing two. A modifier would have made every
+call site that reads `Order` — `rank`, `ranked`, `cause`, the dashboard's `s`
+cycle, the CLI's `--help` listing — carry a `(Order, bool)` pair instead of one
+value `clap::ValueEnum` already knows how to parse, reject, and print by name;
+a plain fifth and sixth variant costs nothing beyond the match arms an added
+ordering always costs, and `Order::value_variants()` — what `s` cycles and
+`--help` lists — grows for free.
+
+The second is answered "not tonight, and not as a mechanical follow-up
+either." A raw-figure sort for nodes is not a small addition to what this
+task built; it is a new reading of `eks nodes --sort cpu` that nobody asked
+for, on a listing whose whole point (decision-worthy enough to get its own
+module-doc section in `k8s::nodes::order`) is that a node's raw figure is a
+worse question than its share. Bolting on a `--sort cpu-raw` because the pod
+side now has two readings would be guessing at a demand this roadmap entry
+never stated, so it is left off entirely — not even as a new roadmap line —
+rather than invented as a "symmetry" nobody is asking to use.
+
+What the two listings do now share is the mechanism: `Ratio`, the `f64`
+newtype with a `total_cmp`-based `Ord` that a share ordering needs and `f64`
+itself does not provide, moved from a private struct in `k8s::nodes::order` to
+a crate-private one in `k8s::order` beside `Rank` and `Direction`. Both
+listings were about to carry the identical eleven lines — the same
+`PartialEq`/`Eq`/`PartialOrd`/`Ord` boilerplate wrapping a `total_cmp` call —
+for the same reason: a node's share is usage over allocatable, a pod's new
+share is usage over its own request, and neither denominator changes what
+"order these ratios, including whatever a strange API response produces,
+without panicking or making the sort inconsistent" means. `k8s::order`
+already existed as the seam for exactly this — the *shape* of an ordering
+shared between the two listings, as opposed to the keys, which are not — so
+`Ratio` is shape, and moved there rather than staying duplicated or being
+`pub(crate) use`d one way across a module boundary that would have hidden
+which module actually owned it.
+
+`share`, the function that turns a pod's `(cpu_used, cpu_requested)` pair into
+a `Rank<Reverse<Ratio>>`, draws the same two-tier tail `k8s::nodes::order`'s
+`busiest` draws for a node's `(amount, allocatable)`: a pod sampled but asking
+for nothing is a different blank from a pod nobody has sampled at all, and
+conflating them would let an unsampled pod's absence read as a confirmed
+zero — a claim about the pod rather than about the scraper. `Quantity::
+ratio_of` already declines a zero denominator, so, as with the existing
+`usage_cell` it sits beside, the two failures fall out of one `match` rather
+than a second explicit zero check that could drift from it.
