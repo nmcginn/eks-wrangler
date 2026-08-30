@@ -15,13 +15,28 @@
 //! Which way round an ordering runs, and what happens to the rows it cannot
 //! rank, are [`crate::k8s::order`]'s rules rather than this module's — `eks
 //! nodes` follows the same ones. What lives here is the keys.
+//!
+//! # Ranking a pod's own share, alongside its figure
+//!
+//! `--sort cpu` ranks [`PodRow::cpu_used`] on its own, which is the right
+//! question for "what is eating this node" and the wrong one for "whose
+//! request is wrong": a pod at 400% of a 10m request is burning 40m and is
+//! nobody's problem, and the ordering that finds the pod burning a core is not
+//! the ordering that finds the one about to be OOM-killed or throttled.
+//! `--sort cpu-share`/`--sort memory-share` ask that second question, ranking
+//! usage as a fraction of [`PodRow::cpu_requested`]/[`PodRow::
+//! memory_requested`] instead — the same crate-private `Ratio`
+//! [`crate::k8s::nodes::order`] ranks a node's figures by, over a pod's own
+//! denominator rather than a node's allocatable. A pod nobody has sampled, or
+//! one that asked for nothing, has no fraction to rank it by and falls to the
+//! tail exactly as it does under the plain `cpu`/`memory` orders.
 
 use std::cmp::{Ordering, Reverse};
 
 use k8s_openapi::jiff::Timestamp;
 
 use super::PodRow;
-use crate::k8s::order::{Cause, Direction, Rank, compare};
+use crate::k8s::order::{Cause, Direction, Rank, Ratio, compare};
 use crate::k8s::quantity::Quantity;
 
 /// The order the rows of a pod listing are printed in.
@@ -42,6 +57,12 @@ pub enum Order {
     Cpu,
     /// Most memory first; pods with no sample last.
     Memory,
+    /// Furthest over its own CPU request first, as a share rather than a
+    /// figure; pods with no sample or no request last.
+    CpuShare,
+    /// Furthest over its own memory request first, as a share rather than a
+    /// figure; pods with no sample or no request last.
+    MemoryShare,
 }
 
 /// Sort a listing in place.
@@ -66,6 +87,16 @@ fn rank(a: &PodRow, b: &PodRow, order: Order, direction: Direction) -> Ordering 
         Order::Age => compare(&youngest(a), &youngest(b), direction),
         Order::Cpu => compare(&largest(a.cpu_used), &largest(b.cpu_used), direction),
         Order::Memory => compare(&largest(a.memory_used), &largest(b.memory_used), direction),
+        Order::CpuShare => compare(
+            &share(a.cpu_used, a.cpu_requested),
+            &share(b.cpu_used, b.cpu_requested),
+            direction,
+        ),
+        Order::MemoryShare => compare(
+            &share(a.memory_used, a.memory_requested),
+            &share(b.memory_used, b.memory_requested),
+            direction,
+        ),
     }
 }
 
@@ -124,6 +155,8 @@ fn ranked(row: &PodRow, order: Order) -> bool {
         Order::Age => youngest(row).is_ranked(),
         Order::Cpu => largest(row.cpu_used).is_ranked(),
         Order::Memory => largest(row.memory_used).is_ranked(),
+        Order::CpuShare => share(row.cpu_used, row.cpu_requested).is_ranked(),
+        Order::MemoryShare => share(row.memory_used, row.memory_requested).is_ranked(),
     }
 }
 
@@ -159,7 +192,7 @@ pub struct Missing {
 #[must_use]
 pub fn cause(order: Order, missing: Missing) -> Cause {
     Cause::explained(match order {
-        Order::Cpu | Order::Memory => missing.usage,
+        Order::Cpu | Order::Memory | Order::CpuShare | Order::MemoryShare => missing.usage,
         Order::Name | Order::Restarts | Order::Age => false,
     })
 }
@@ -213,6 +246,25 @@ fn largest(used: Option<Quantity>) -> Rank<Reverse<Quantity>> {
     }
 }
 
+/// Where a row sits in usage-share order: furthest over its own request
+/// first, then a sampled pod with no request to be a share of, then a pod
+/// nobody has sampled at all.
+///
+/// The two tail tiers are different failures and neither is a zero, the same
+/// distinction [`crate::k8s::nodes::order`]'s `busiest` draws for a node's
+/// allocatable: a pod that asked for nothing really did ask for nothing, which
+/// is a fact about the pod, while a pod nobody has sampled is a fact about the
+/// scraper. `Quantity::ratio_of` already declines a zero denominator, so the
+/// two cases fall out of one match rather than a second check for zero that
+/// could come to disagree with it.
+fn share(used: Option<Quantity>, requested: Quantity) -> Rank<Reverse<Ratio>> {
+    match used.and_then(|used| used.ratio_of(requested)) {
+        Some(ratio) => Rank::By(Reverse(Ratio(ratio))),
+        None if used.is_some() => Rank::Unranked(0),
+        None => Rank::Unranked(1),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
@@ -223,12 +275,14 @@ mod tests {
     use crate::theme::Severity;
 
     /// Every ordering, for the tests that must hold of all of them.
-    const ORDERS: [Order; 5] = [
+    const ORDERS: [Order; 7] = [
         Order::Name,
         Order::Restarts,
         Order::Age,
         Order::Cpu,
         Order::Memory,
+        Order::CpuShare,
+        Order::MemoryShare,
     ];
 
     const DIRECTIONS: [Direction; 2] = [Direction::Natural, Direction::Reversed];
@@ -296,6 +350,17 @@ mod tests {
         PodRow {
             cpu_used: cpu.map(|text| Quantity::parse(text).unwrap()),
             memory_used: memory.map(|text| Quantity::parse(text).unwrap()),
+            ..row(name, 0, None)
+        }
+    }
+
+    /// A row with a CPU request and, maybe, a sample against it — what the
+    /// share orderings need that `using` cannot give them, since `using`'s
+    /// rows all inherit `row`'s zero request.
+    fn against(name: &str, cpu_used: Option<&str>, cpu_requested: &str) -> PodRow {
+        PodRow {
+            cpu_used: cpu_used.map(|text| Quantity::parse(text).unwrap()),
+            cpu_requested: Quantity::parse(cpu_requested).unwrap(),
             ..row(name, 0, None)
         }
     }
@@ -431,8 +496,14 @@ mod tests {
         // instead of writing the same paragraph again a line later.
         let missing = Missing { usage: true };
 
-        assert_eq!(cause(Order::Cpu, missing), Cause::Explained);
-        assert_eq!(cause(Order::Memory, missing), Cause::Explained);
+        for order in [
+            Order::Cpu,
+            Order::Memory,
+            Order::CpuShare,
+            Order::MemoryShare,
+        ] {
+            assert_eq!(cause(order, missing), Cause::Explained, "{order:?}");
+        }
     }
 
     #[test]
@@ -747,6 +818,109 @@ mod tests {
         assert_eq!(names(&rows), ["measured", "unsampled"]);
     }
 
+    // --- cpu share and memory share ---
+
+    #[test]
+    fn share_order_ranks_the_fraction_of_the_request_not_the_raw_figure() {
+        // The reason this ordering exists: `big` is burning ten times what
+        // `small` is, and `--sort cpu` would put it first. `small` is the one
+        // at 400% of its own request — the pod actually in trouble.
+        let rows = vec![
+            against("big", Some("600m"), "1"),
+            against("small", Some("40m"), "10m"),
+        ];
+
+        assert_eq!(
+            sorted(&rows, Order::CpuShare, Direction::Natural),
+            ["small", "big"]
+        );
+    }
+
+    #[test]
+    fn memory_share_order_reads_the_memory_pair() {
+        let rows = vec![
+            PodRow {
+                memory_used: Some(Quantity::parse("900Mi").unwrap()),
+                memory_requested: Quantity::parse("1Gi").unwrap(),
+                ..row("tight", 0, None)
+            },
+            PodRow {
+                memory_used: Some(Quantity::parse("1Gi").unwrap()),
+                memory_requested: Quantity::parse("16Gi").unwrap(),
+                ..row("roomy", 0, None)
+            },
+        ];
+
+        assert_eq!(
+            sorted(&rows, Order::MemoryShare, Direction::Natural),
+            ["tight", "roomy"]
+        );
+    }
+
+    #[test]
+    fn a_sampled_pod_with_no_request_sorts_ahead_of_an_unsampled_one() {
+        // Two different failures, and the one where there is at least a
+        // figure is the one worth seeing first — the same distinction a
+        // node's own share orderings draw between a measurement with no
+        // allocatable and no measurement at all.
+        let rows = vec![
+            against("no-request", Some("500m"), "0"),
+            against("no-sample", None, "1"),
+        ];
+
+        for direction in DIRECTIONS {
+            assert_eq!(
+                sorted(&rows, Order::CpuShare, direction),
+                ["no-request", "no-sample"],
+                "{direction:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unsampled_listing_ranks_nothing_under_the_share_orderings() {
+        let rows = [using("api", None, None), using("worker", None, None)];
+
+        assert!(!ranks_any(&rows, Order::CpuShare));
+        assert!(!ranks_any(&rows, Order::MemoryShare));
+    }
+
+    #[test]
+    fn a_listing_where_nothing_asked_for_anything_ranks_nothing_under_cpu_share() {
+        // Sampled, but every request is a genuine zero — a fact about the
+        // pods, not about the scraper — and there is still nothing to divide
+        // a figure by.
+        let rows = [
+            against("api", Some("10m"), "0"),
+            against("worker", Some("5m"), "0"),
+        ];
+
+        assert!(!ranks_any(&rows, Order::CpuShare));
+    }
+
+    #[test]
+    fn one_pod_over_its_request_is_enough_for_cpu_share_to_have_ranked() {
+        let rows = [
+            against("api", Some("400m"), "100m"),
+            using("worker", None, None),
+        ];
+
+        assert!(ranks_any(&rows, Order::CpuShare));
+    }
+
+    #[test]
+    fn reversing_cpu_share_asks_which_pod_is_least_over_its_request() {
+        let rows = vec![
+            against("over", Some("400m"), "100m"),
+            against("under", Some("10m"), "100m"),
+        ];
+
+        assert_eq!(
+            sorted(&rows, Order::CpuShare, Direction::Reversed),
+            ["under", "over"]
+        );
+    }
+
     // --- reversal ---
 
     #[test]
@@ -847,6 +1021,14 @@ mod tests {
             Order::Age => row.created_at.is_none(),
             Order::Cpu => row.cpu_used.is_none(),
             Order::Memory => row.memory_used.is_none(),
+            Order::CpuShare => row
+                .cpu_used
+                .and_then(|used| used.ratio_of(row.cpu_requested))
+                .is_none(),
+            Order::MemoryShare => row
+                .memory_used
+                .and_then(|used| used.ratio_of(row.memory_requested))
+                .is_none(),
         };
 
         for order in ORDERS {
@@ -938,7 +1120,12 @@ mod tests {
         ];
 
         for direction in DIRECTIONS {
-            for order in [Order::Cpu, Order::Memory] {
+            for order in [
+                Order::Cpu,
+                Order::Memory,
+                Order::CpuShare,
+                Order::MemoryShare,
+            ] {
                 assert_eq!(
                     sorted(&rows, order, direction),
                     ["aardvark", "mongoose", "zebra"],
@@ -1037,6 +1224,21 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn a_multi_word_ordering_is_named_the_way_the_flag_spells_it() {
+        // `cpu-share`, not `CpuShare` — the note has to echo a value `--sort`
+        // would actually accept, as the node table's own `cpu-requested`
+        // already has to.
+        assert_eq!(
+            crate::k8s::order::note(Order::CpuShare, Direction::Natural).as_deref(),
+            Some("Sorted by cpu-share.")
+        );
+        assert_eq!(
+            crate::k8s::order::note(Order::MemoryShare, Direction::Natural).as_deref(),
+            Some("Sorted by memory-share.")
+        );
     }
 
     #[test]

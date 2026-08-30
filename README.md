@@ -258,18 +258,26 @@ here yet, rather than the one telling you to install it.
 for reading a namespace and the wrong one during an incident — the pod that
 restarted eight seconds ago, or the one burning a core, sits wherever its name
 puts it among ninety-nine healthy ones. The orders are `name` (the default,
-unchanged), `restarts`, `age`, `cpu`, and `memory`, and every one but `name` puts
-the row you went looking for first: the newest restart, the youngest pod, the
-largest figure.
+unchanged), `restarts`, `age`, `cpu`, `memory`, `cpu-share`, and
+`memory-share`, and every one but `name` puts the row you went looking for
+first: the newest restart, the youngest pod, the largest figure, or the pod
+furthest over its own request.
 
 `cpu` and `memory` rank what a pod is *using*, not its share of what it asked
 for. A pod at 400% of a 10m request is burning 40m and is nobody's problem; one
 at 60% of four cores is eating the node. The percentage in the cell is about that
 pod's own sizing; the figure beside it is what the listing is usually opened for.
 
+`cpu-share` and `memory-share` rank that percentage instead — the pod furthest
+over its own request first, whatever the raw figure is. That is the ordering
+that finds the pod at 400% of a 10m request; `cpu` finds the one eating the
+node. Pods with no request, and pods nobody has sampled, stay at the tail of
+either.
+
 ```sh
 eks pods -A --sort restarts     # what is crashing right now, across the cluster
 eks pods --sort memory          # what is closest to being OOM-killed
+eks pods --sort cpu-share       # what is furthest over what it asked for
 eks pods -A --sort age          # what has just rolled out
 ```
 
@@ -428,7 +436,7 @@ more columns, not for a table that gets out of the way.
 | `-A, --all-namespaces` | List pods across every namespace (`eks pods`) |
 | `-l, --selector <SEL>` | Filter pods by label selector (`eks pods`, and the dashboard's pod-drilldown pane) |
 | `--field-selector <SEL>` | Filter pods by field selector (`eks pods`, and the dashboard's pod-drilldown pane) |
-| `--sort <ORDER>` | Order the listing. Pods: `name` (default), `restarts`, `age`, `cpu`, `memory`. Nodes: `name` (default), `status`, `cpu`, `memory`, `cpu-requested`, `memory-requested`, `pods`, `age` |
+| `--sort <ORDER>` | Order the listing. Pods: `name` (default), `restarts`, `age`, `cpu`, `memory`, `cpu-share`, `memory-share`. Nodes: `name` (default), `status`, `cpu`, `memory`, `cpu-requested`, `memory-requested`, `pods`, `age` |
 | `--sort-reverse` | Reverse `--sort`; unrankable rows stay at the end. Either flag adds a line under the table naming the order |
 | `--wide` | Add the extra columns `kubectl -o wide` shows. Pods: `IP`, `NOMINATED NODE`, `READINESS GATES`. Nodes: `INTERNAL-IP`, `EXTERNAL-IP`, `OS-IMAGE`, `KERNEL-VERSION`, `CONTAINER-RUNTIME` |
 | `--kubeconfig <PATH>` | Override the kubeconfig search path |
