@@ -320,6 +320,7 @@ mod tests {
             memory_requested: Share::default(),
             cpu_used: share("1500m", "4"),
             memory_used: share("2Gi", "8Gi"),
+            usage_stale: false,
             pods: share("12", "58"),
             age: "3d".to_owned(),
             created_at: None,

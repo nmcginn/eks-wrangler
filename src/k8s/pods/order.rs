@@ -317,6 +317,7 @@ mod tests {
             created_at: Some(minutes_ago(180)),
             cpu_used: None,
             memory_used: None,
+            usage_stale: false,
             // Nothing here sorts on the request, and a pod that asked for
             // nothing is a real pod; the orderings are over what is measured.
             cpu_requested: Quantity::default(),

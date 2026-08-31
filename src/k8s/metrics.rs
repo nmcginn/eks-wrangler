@@ -162,6 +162,19 @@ impl Sample {
             window: window.and_then(parse_duration),
         }
     }
+
+    /// Whether this one reading, on its own, is old enough to call stale.
+    ///
+    /// [`freshness_note`] asks this of the whole listing's *oldest* sample, which
+    /// is a guarantee about every row and therefore only as good as the worst
+    /// one — a single node whose kubelet stopped reporting drags the note down
+    /// without saying which row is the reason. This asks
+    /// [`Freshness::is_stale`] the same question of one sample, so a row can
+    /// say the same thing about itself.
+    #[must_use]
+    pub fn is_stale(&self, now: Timestamp) -> bool {
+        freshness(std::iter::once(self), now).is_some_and(Freshness::is_stale)
+    }
 }
 
 /// Go's duration units, in nanoseconds, longest spelling first.
@@ -363,6 +376,27 @@ pub fn freshness_note(freshness: Freshness) -> String {
         )
     } else {
         format!("Usage is up to {age} old, averaged over {window}.")
+    }
+}
+
+/// Mark one row's own usage cell as older than the rest of the table.
+///
+/// [`freshness_note`] dates the whole listing from its oldest sample, so a
+/// table where one row's sample is stale and the rest are fresh reads as
+/// uniformly current everywhere but that line. This is the per-row half:
+/// [`Sample::is_stale`] on the one sample behind `cell`, not a second
+/// staleness rule. A no-op when `stale` is `false`, so a listing where every
+/// sample is current renders unchanged to the byte — and a caller that has
+/// not sampled this row at all passes `false` for the same reason, rather
+/// than a marker meaning two different things.
+///
+/// One wording for both listings, the same reason [`freshness_note`] is.
+#[must_use]
+pub fn mark_stale(cell: String, stale: bool) -> String {
+    if stale {
+        format!("{cell} (stale)")
+    } else {
+        cell
     }
 }
 

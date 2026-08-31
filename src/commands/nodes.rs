@@ -172,7 +172,7 @@ async fn gather(
                     .and_then(|name| totals.get(name))
                     .unwrap_or(&nothing)
             });
-            k8s_nodes::NodeRow::from_node(node, placed, sample.map(|s| s.usage), now)
+            k8s_nodes::NodeRow::from_node(node, placed, *sample, now)
         })
         .collect();
 

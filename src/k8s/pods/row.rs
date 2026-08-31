@@ -38,7 +38,7 @@ use k8s_openapi::api::core::v1::{
 use k8s_openapi::jiff::Timestamp;
 
 use crate::format;
-use crate::k8s::metrics::Usage;
+use crate::k8s::metrics::{self, Sample};
 use crate::k8s::pods::is_sidecar;
 use crate::k8s::quantity::{self, Quantity};
 use crate::k8s::resource;
@@ -99,6 +99,12 @@ pub struct PodRow {
     pub cpu_used: Option<Quantity>,
     /// Memory the pod is actually holding, from metrics-server.
     pub memory_used: Option<Quantity>,
+    /// Whether the sample behind [`Self::cpu_used`]/[`Self::memory_used`] is,
+    /// on its own, old enough to call stale — [`Sample::is_stale`], not a
+    /// second reading of "a couple of windows". `false` when there is no
+    /// sample at all: an absent figure already reads `-`, and marking it
+    /// stale too would say the same thing twice in two different words.
+    pub usage_stale: bool,
     /// Cores the pod asked for — the denominator `cpu_used` is shown against.
     ///
     /// [`crate::k8s::pods::effective_requests`]'s figure, which is the same one
@@ -151,12 +157,13 @@ impl PodRow {
     /// `now` is a parameter rather than a call to the clock so the age column
     /// is testable and so every row in one listing shares a single instant.
     ///
-    /// `used` is what metrics-server last sampled for this pod, already summed
-    /// across its containers. `None` covers every reason there is no figure —
-    /// no metrics-server, or a pod it has not reached — and all of them render
+    /// `sample` is what metrics-server last reported for this pod: the usage
+    /// already summed across its containers, and the two stamps that say how
+    /// old it is. `None` covers every reason there is no figure — no
+    /// metrics-server, or a pod it has not reached — and all of them render
     /// the same way, because to a reader they mean the same thing.
     #[must_use]
-    pub fn from_pod(pod: &Pod, used: Option<Usage>, now: Timestamp) -> Self {
+    pub fn from_pod(pod: &Pod, sample: Option<Sample>, now: Timestamp) -> Self {
         let derived = derive(pod);
         // The scheduler's own arithmetic, not a fresh sum over the containers:
         // `eks nodes` totals exactly this number per node, and the two commands
@@ -194,8 +201,9 @@ impl PodRow {
                 |created| format::human_duration(now.duration_since(created)),
             ),
             created_at,
-            cpu_used: used.and_then(|usage| usage.cpu),
-            memory_used: used.and_then(|usage| usage.memory),
+            cpu_used: sample.and_then(|sample| sample.usage.cpu),
+            memory_used: sample.and_then(|sample| sample.usage.memory),
+            usage_stale: sample.is_some_and(|sample| sample.is_stale(now)),
             cpu_requested: requested.cpu,
             memory_requested: requested.memory,
             extended_requested: requested.extended,
@@ -804,9 +812,15 @@ impl Column<'_> {
             Self::Status => row.status.clone(),
             Self::Restarts => restarts_cell(row),
             Self::CpuRequested => quantity::cpu(row.cpu_requested),
-            Self::Cpu => usage_cell(row.cpu_used, row.cpu_requested, quantity::cpu),
+            Self::Cpu => metrics::mark_stale(
+                usage_cell(row.cpu_used, row.cpu_requested, quantity::cpu),
+                row.usage_stale,
+            ),
             Self::MemoryRequested => quantity::memory(row.memory_requested),
-            Self::Memory => usage_cell(row.memory_used, row.memory_requested, quantity::memory),
+            Self::Memory => metrics::mark_stale(
+                usage_cell(row.memory_used, row.memory_requested, quantity::memory),
+                row.usage_stale,
+            ),
             // A pod that never named this resource reads `0`, not `-`: unlike
             // a node, which either has a device or does not, every pod could
             // in principle have asked for any resource, and not asking is
@@ -1197,6 +1211,7 @@ mod tests {
 
     use super::super::{Scope, Selectors};
     use super::*;
+    use crate::k8s::metrics::Usage;
 
     /// Most rendering tests are not about selectors; this is the "no filter"
     /// case they pass so the signature reads at the call site.
@@ -2231,11 +2246,32 @@ mod tests {
         );
     }
 
-    /// A `Usage` as metrics-server would have summed it for one pod.
-    fn used(cpu: &str, memory: &str) -> Usage {
-        Usage {
-            cpu: Quantity::parse(cpu).ok(),
-            memory: Quantity::parse(memory).ok(),
+    /// A `Sample` as metrics-server would have summed it for one pod, with no
+    /// timestamp or window — the ordinary case for these tests, which are not
+    /// about staleness. See `stale_sample` below for the one that is.
+    fn used(cpu: &str, memory: &str) -> Sample {
+        Sample {
+            usage: Usage {
+                cpu: Quantity::parse(cpu).ok(),
+                memory: Quantity::parse(memory).ok(),
+            },
+            taken_at: None,
+            window: None,
+        }
+    }
+
+    /// A sample old enough that [`Sample::is_stale`] calls it stale: two
+    /// sampling windows behind `now()`, with a one-second margin so the
+    /// comparison is not exactly on the boundary.
+    fn stale_sample(cpu: &str, memory: &str, now: Timestamp) -> Sample {
+        let window = SignedDuration::from_secs(20);
+        Sample {
+            usage: Usage {
+                cpu: Quantity::parse(cpu).ok(),
+                memory: Quantity::parse(memory).ok(),
+            },
+            taken_at: Some(now - window.checked_mul(2).unwrap() - SignedDuration::from_secs(1)),
+            window: Some(window),
         }
     }
 
@@ -2258,6 +2294,47 @@ mod tests {
 
         assert_eq!(row.cpu_used, Some(Quantity::parse("250m").unwrap()));
         assert_eq!(row.memory_used, Some(Quantity::parse("512Mi").unwrap()));
+    }
+
+    #[test]
+    fn a_fresh_sample_is_not_stale() {
+        let row = PodRow::from_pod(&healthy(), Some(used("250m", "512Mi")), now());
+
+        assert!(!row.usage_stale);
+    }
+
+    #[test]
+    fn a_sample_two_windows_old_is_stale() {
+        let now = now();
+        let row = PodRow::from_pod(&healthy(), Some(stale_sample("250m", "512Mi", now)), now);
+
+        assert!(row.usage_stale);
+    }
+
+    #[test]
+    fn a_pod_with_no_sample_is_not_marked_stale() {
+        // No sample is a different fact from a stale one, and reads as `-`
+        // rather than as a figure carrying a warning nobody measured.
+        let row = PodRow::from_pod(&healthy(), None, now());
+
+        assert!(!row.usage_stale);
+    }
+
+    #[test]
+    fn a_stale_sample_marks_the_cpu_and_memory_cells() {
+        let now = now();
+        let row = PodRow::from_pod(&healthy(), Some(stale_sample("250m", "512Mi", now)), now);
+
+        assert_eq!(Column::Cpu.text(&row), "250m (stale)");
+        assert_eq!(Column::Memory.text(&row), "512Mi (stale)");
+    }
+
+    #[test]
+    fn a_fresh_sample_leaves_the_usage_cells_unmarked() {
+        let row = PodRow::from_pod(&healthy(), Some(used("250m", "512Mi")), now());
+
+        assert_eq!(Column::Cpu.text(&row), "250m");
+        assert_eq!(Column::Memory.text(&row), "512Mi");
     }
 
     #[test]
@@ -2296,9 +2373,13 @@ mod tests {
         // Half a sample is the same story for the half that is missing.
         let half = PodRow::from_pod(
             &healthy(),
-            Some(Usage {
-                cpu: Quantity::parse("250m").ok(),
-                memory: None,
+            Some(Sample {
+                usage: Usage {
+                    cpu: Quantity::parse("250m").ok(),
+                    memory: None,
+                },
+                taken_at: None,
+                window: None,
             }),
             now(),
         );
@@ -3144,10 +3225,7 @@ mod tests {
         // disturb neither of the other two.
         let rows = [PodRow::from_pod(
             &wide_pod(),
-            Some(Usage {
-                cpu: Quantity::parse("250m").ok(),
-                memory: Quantity::parse("512Mi").ok(),
-            }),
+            Some(used("250m", "512Mi")),
             now(),
         )];
 

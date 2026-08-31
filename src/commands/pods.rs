@@ -152,7 +152,7 @@ pub async fn list(
     let mut rows: Vec<PodRow> = pods
         .iter()
         .zip(&samples)
-        .map(|(pod, sample)| PodRow::from_pod(pod, sample.map(|s| s.usage), now))
+        .map(|(pod, sample)| PodRow::from_pod(pod, *sample, now))
         .collect();
     // Ordering lives in `k8s::pods::order` rather than here, so the default and
     // the one `--sort` asks for are decided in the same place and by the same

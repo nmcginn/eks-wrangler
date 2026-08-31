@@ -2751,3 +2751,48 @@ zero — a claim about the pod rather than about the scraper. `Quantity::
 ratio_of` already declines a zero denominator, so, as with the existing
 `usage_cell` it sits beside, the two failures fall out of one `match` rather
 than a second explicit zero check that could drift from it.
+
+### 82. A stale sample gets a text marker on its own cell, not a column or a colour
+
+"A row whose sample is old, rather than a listing that is" left the shape open
+on purpose: an age column, or a marker on the row, and the marker option was
+explicitly blocked on `Severity` colour existing to make it legible. Colour now
+exists, which looked at first like the marker's design was already settled —
+paint the stale cell the way a hot one already is. It is not, for a reason the
+original wording did not anticipate: both tables already spend `Severity` on
+these exact cells, or are deliberately saving it for a decision not yet made.
+
+`eks nodes`' `CPU USE`/`MEM USE` are graded by `Share::severity`, one of
+`Severity::from_utilisation`'s thresholds — a node at 95% of allocatable reads
+as `Critical` today, on purpose. Staleness is an orthogonal fact about the
+*reading*, not a rival judgement about the *node*, and `format::Cell` carries
+exactly one `Severity` per cell. Making a stale-but-idle node's usage cell
+red would tell the reader the node is busy, which the sample cannot actually
+support — it might be busy, or idle, or anything else, because the only
+honest thing metrics-server's silence says is "ask again later." Overwriting
+the utilisation colour with a "stale" one the other way loses the reading the
+column exists to show. Blending the two into a third colour is a fabricated
+severity level with no threshold behind it, invented for one column.
+
+`eks pods`' `CPU`/`MEMORY` cells carry no `Severity` at all yet — "What 'hot'
+means for a pod against its own request", a few tasks below this one on the
+roadmap, is the open question of whether a pod's share of its own request
+should be graded, and on what thresholds. Answering "is a stale figure
+alarming" for that column first, as a side effect of this task, would have
+pre-empted a decision this change has no basis to make; the honest answer
+today is that pod usage carries no judgement of any kind, staleness included.
+
+Text sidesteps both problems: `k8s::metrics::mark_stale` appends `" (stale)"`
+to the cell `usage_cell`/`Share::cell` already built, which is legible under
+`Palette::Plain` as well as `Palette::Colour`, and it says nothing about
+whether the figure it decorates is otherwise good or bad. It is also `String`
+in, `String` out — a function beside `freshness_note`, not a new field on
+`format::Cell` or a second severity channel threaded through the render path.
+
+The follow-on cost is real and is written down rather than absorbed: the node
+pane's utilisation bars read `Share` directly, not through this cell text, so
+they carry no marker today. A bar's colour is even more fully spent than a
+CLI cell's — it is the *only* way a bar says anything — so the same "two
+judgements, one signal" problem applies there with no text fallback to reach
+for. That is its own roadmap entry rather than a guess at whether a stale bar
+wants a label, a hatch pattern, or a border mark.
