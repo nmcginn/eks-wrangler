@@ -20,7 +20,7 @@ pub mod order;
 pub use order::{Missing, Order, cause, distinguishes, ranks_any, sort};
 
 use crate::format;
-use crate::k8s::metrics::{self, Sample, Usage};
+use crate::k8s::metrics::{self, Sample};
 use crate::k8s::page;
 use crate::k8s::pods::{Placed, Requests};
 use crate::k8s::quantity::{self, Quantity};
@@ -61,6 +61,12 @@ pub struct NodeRow {
     pub cpu_used: Share,
     /// Memory the node is actually holding, from metrics-server.
     pub memory_used: Share,
+    /// Whether the sample behind [`Self::cpu_used`]/[`Self::memory_used`] is,
+    /// on its own, old enough to call stale — [`Sample::is_stale`], not a
+    /// second reading of "a couple of windows". `false` when there is no
+    /// sample at all: an absent figure already reads `-`, and marking it
+    /// stale too would say the same thing twice in two different words.
+    pub usage_stale: bool,
     /// How many pods are on the node, against how many it will accept.
     ///
     /// The third reason a pod will not schedule, and the one no amount of
@@ -365,15 +371,15 @@ impl NodeRow {
     /// node running nothing, and `None` only when the pods could not be listed
     /// at all.
     ///
-    /// `used` is what metrics-server last sampled for this node. `None` covers
-    /// both "there is no metrics-server" and "there is one and it has not
-    /// reached this node yet", which read the same in a table and lead to the
-    /// same footnote.
+    /// `sample` is what metrics-server last reported for this node: the usage,
+    /// and the two stamps that say how old it is. `None` covers both "there is
+    /// no metrics-server" and "there is one and it has not reached this node
+    /// yet", which read the same in a table and lead to the same footnote.
     #[must_use]
     pub fn from_node(
         node: &Node,
         placed: Option<&Placed>,
-        used: Option<Usage>,
+        sample: Option<Sample>,
         now: Timestamp,
     ) -> Self {
         let name = node
@@ -410,13 +416,14 @@ impl NodeRow {
                 allocatable: memory.allocatable,
             },
             cpu_used: Share {
-                amount: used.and_then(|usage| usage.cpu),
+                amount: sample.and_then(|sample| sample.usage.cpu),
                 allocatable: cpu.allocatable,
             },
             memory_used: Share {
-                amount: used.and_then(|usage| usage.memory),
+                amount: sample.and_then(|sample| sample.usage.memory),
                 allocatable: memory.allocatable,
             },
+            usage_stale: sample.is_some_and(|sample| sample.is_stale(now)),
             pods: Share {
                 // Counted from the pod listing rather than read from the node's
                 // own status, which reports no such figure — and unknown, not
@@ -762,10 +769,12 @@ impl Column<'_> {
             Self::Version => row.version.clone(),
             Self::Cpu => row.cpu.cell(quantity::cpu),
             Self::CpuRequested => row.cpu_requested.cell(quantity::cpu),
-            Self::CpuUsed => row.cpu_used.cell(quantity::cpu),
+            Self::CpuUsed => metrics::mark_stale(row.cpu_used.cell(quantity::cpu), row.usage_stale),
             Self::Memory => row.memory.cell(quantity::memory),
             Self::MemoryRequested => row.memory_requested.cell(quantity::memory),
-            Self::MemoryUsed => row.memory_used.cell(quantity::memory),
+            Self::MemoryUsed => {
+                metrics::mark_stale(row.memory_used.cell(quantity::memory), row.usage_stale)
+            }
             // The limit is spelled out rather than left to the percentage,
             // because it varies by instance type and by CNI configuration:
             // `21%` means something quite different on a node that takes 17
@@ -1292,6 +1301,7 @@ mod tests {
     use k8s_openapi::jiff::SignedDuration;
 
     use super::*;
+    use crate::k8s::metrics::Usage;
 
     /// Most tests care about a node's own fields, not its pods; this is the
     /// "we listed the pods and found none" case, which is a real zero in both
@@ -1320,10 +1330,32 @@ mod tests {
         }
     }
 
-    fn used(cpu: &str, memory: &str) -> Usage {
-        Usage {
-            cpu: Quantity::parse(cpu).ok(),
-            memory: Quantity::parse(memory).ok(),
+    /// A `Sample` as metrics-server would have reported it for one node, with
+    /// no timestamp or window — the ordinary case for these tests, which are
+    /// not about staleness. See `stale_used` below for the one that is.
+    fn used(cpu: &str, memory: &str) -> Sample {
+        Sample {
+            usage: Usage {
+                cpu: Quantity::parse(cpu).ok(),
+                memory: Quantity::parse(memory).ok(),
+            },
+            taken_at: None,
+            window: None,
+        }
+    }
+
+    /// A sample old enough that [`Sample::is_stale`] calls it stale: two
+    /// sampling windows behind `now()`, with a one-second margin so the
+    /// comparison is not exactly on the boundary.
+    fn stale_used(cpu: &str, memory: &str, now: Timestamp) -> Sample {
+        let window = SignedDuration::from_secs(20);
+        Sample {
+            usage: Usage {
+                cpu: Quantity::parse(cpu).ok(),
+                memory: Quantity::parse(memory).ok(),
+            },
+            taken_at: Some(now - window.checked_mul(2).unwrap() - SignedDuration::from_secs(1)),
+            window: Some(window),
         }
     }
 
@@ -1855,6 +1887,70 @@ mod tests {
     }
 
     #[test]
+    fn a_fresh_sample_is_not_stale() {
+        let row = NodeRow::from_node(
+            &healthy_node(),
+            Some(&booked("1960m", "7762576Ki")),
+            Some(used("392m", "1552515Ki")),
+            now(),
+        );
+
+        assert!(!row.usage_stale);
+    }
+
+    #[test]
+    fn a_sample_two_windows_old_is_stale() {
+        let row = NodeRow::from_node(
+            &healthy_node(),
+            Some(&booked("1960m", "7762576Ki")),
+            Some(stale_used("392m", "1552515Ki", now())),
+            now(),
+        );
+
+        assert!(row.usage_stale);
+    }
+
+    #[test]
+    fn a_node_with_no_sample_is_not_marked_stale() {
+        // No sample is a different fact from a stale one, and reads as `-`
+        // rather than as a figure carrying a warning nobody measured.
+        let row = NodeRow::from_node(
+            &healthy_node(),
+            Some(&booked("1960m", "7762576Ki")),
+            None,
+            now(),
+        );
+
+        assert!(!row.usage_stale);
+    }
+
+    #[test]
+    fn a_stale_sample_marks_the_cpu_and_mem_use_cells() {
+        let row = NodeRow::from_node(
+            &healthy_node(),
+            Some(&booked("1960m", "7762576Ki")),
+            Some(stale_used("392m", "1552515Ki", now())),
+            now(),
+        );
+
+        assert_eq!(Column::CpuUsed.text(&row), "392m (10%) (stale)");
+        assert_eq!(Column::MemoryUsed.text(&row), "1.5Gi (10%) (stale)");
+    }
+
+    #[test]
+    fn a_fresh_sample_leaves_the_use_cells_unmarked() {
+        let row = NodeRow::from_node(
+            &healthy_node(),
+            Some(&booked("1960m", "7762576Ki")),
+            Some(used("392m", "1552515Ki")),
+            now(),
+        );
+
+        assert_eq!(Column::CpuUsed.text(&row), "392m (10%)");
+        assert_eq!(Column::MemoryUsed.text(&row), "1.5Gi (10%)");
+    }
+
+    #[test]
     fn a_node_running_hot_is_coloured_by_the_same_thresholds_as_its_requests() {
         // 3528m is exactly 90% of a 3920m allocatable.
         let row = NodeRow::from_node(
@@ -1918,7 +2014,7 @@ mod tests {
 
     fn sampled(cpu: &str, memory: &str, seconds_ago: i64) -> Sample {
         Sample {
-            usage: used(cpu, memory),
+            usage: used(cpu, memory).usage,
             taken_at: Some(now() - SignedDuration::from_secs(seconds_ago)),
             window: Some(SignedDuration::from_secs(20)),
         }
@@ -2154,7 +2250,7 @@ mod tests {
             now(),
         )];
         let sample = crate::k8s::metrics::Sample {
-            usage: used("392m", "1552515Ki"),
+            usage: used("392m", "1552515Ki").usage,
             taken_at: Some(now() - SignedDuration::from_secs(12)),
             window: Some(SignedDuration::from_secs(20)),
         };

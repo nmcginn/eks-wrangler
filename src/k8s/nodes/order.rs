@@ -298,6 +298,7 @@ mod tests {
             memory_requested: Share::default(),
             cpu_used: Share::default(),
             memory_used: Share::default(),
+            usage_stale: false,
             pods: Share::default(),
             age: "3h".to_owned(),
             created_at: Some(minutes_ago(180)),

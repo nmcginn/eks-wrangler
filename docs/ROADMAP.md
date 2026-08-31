@@ -421,7 +421,7 @@ cluster.
   rather than the ones the endpoint returned; `metrics::Outcome` makes "answered
   with nothing" the third case it always was.
 
-- [ ] **A row whose sample is old, rather than a listing that is.**
+- [x] **A row whose sample is old, rather than a listing that is.**
   The freshness note is one line about the whole table, and it takes its age from
   the oldest sample in it — so a single node whose kubelet stopped reporting
   makes a listing of otherwise-current figures read as stale, and the reader has
@@ -437,6 +437,49 @@ cluster.
   *Acceptance:* whichever shape it takes, the staleness rule stays
   `Freshness::is_stale`'s rather than a second reading of "a couple of windows";
   a listing where every sample is current gains nothing.
+  Landed as the marker, not the column: `262m (52%) (stale)` on `eks pods` and
+  `392m (10%) (stale)` on `eks nodes`, appended to exactly the cell the stale
+  sample is behind rather than to the whole row, since a node's `CPU USE` and
+  `MEM USE` come from one sample and can go stale together but the marker still
+  names the figure, not the row. Colour was the other way `Severity` could have
+  said this, and it was rejected rather than merely deferred: the node table's
+  `CPU USE`/`MEM USE` cells are already coloured by
+  `Severity::from_utilisation`, so a second, simultaneous severity for
+  staleness would have had to overwrite or blend with a judgement the reader
+  already trusts; the pod table's twin cells carry no severity at all yet,
+  for the reason "What 'hot' means for a pod against its own request" below is
+  still open, and answering that question by accident here would have been
+  worse than not answering it. Text sidesteps both: it is legible under any
+  `Palette`, including `Plain`. `k8s::metrics::Sample::is_stale` is
+  `Freshness::is_stale` asked of one sample rather than a second rule, and
+  `k8s::metrics::mark_stale` is the one wording both tables append through —
+  a no-op when `stale` is `false`, which is what keeps a listing where nothing
+  is stale unchanged to the byte. Getting a sample's own timestamp to a row
+  meant `PodRow::from_pod` and `NodeRow::from_node` taking the whole
+  `Option<Sample>` metrics-server returned rather than only its `Usage`, since
+  the row needed the two stamps `Usage` does not carry; `cpu_used`/`memory_used`
+  are read out of `sample.usage` exactly as before; `usage_stale` is the new
+  field beside them, `false` whenever there is no sample at all so an absent
+  figure is never also flagged stale. The dashboard's node-pane bars read
+  `Share` directly rather than through this cell text, so they carry no marker
+  yet — a real gap, and its own entry below rather than a guess at whether a
+  bar takes a suffix, a colour, or something else a label cannot.
+
+- [ ] **Carry the per-row staleness marker into the node pane's bars.**
+  `eks nodes`' `CPU USE`/`MEM USE` cells now say `(stale)` when metrics-server's
+  reading for that node is over two windows old; the node pane's utilisation
+  bars read `NodeRow::usage_stale` too, but draw a bar rather than text, and a
+  bar has no obvious place to put a parenthetical. Separate because it is a
+  real design question the CLI table never had to answer: whether a stale bar
+  gets a label beside it, a dimmed or hatched fill, or a mark in its own
+  border, and the pane's existing colour already carries the utilisation
+  judgement the way the node table's `CPU USE` cell does — so this is the same
+  "a second, simultaneous signal on one reading" problem the marker task
+  above worked around with plain text, and a bar cannot fall back to text the
+  way a table cell can.
+  *Acceptance:* whichever shape it takes, it reads `NodeRow::usage_stale`
+  rather than a second staleness computation; a bar behind a fresh sample is
+  unchanged.
 
 - [x] **Carry the freshness and unsampled notes into the dashboard's panes.**
   The third of the notes that will want a pane's header rather than a footnote
@@ -1194,6 +1237,33 @@ cluster.
 ---
 
 ## Done
+
+- **A row whose sample is old, rather than a listing that is** (2026-08-31) —
+  `eks nodes` and `eks pods` mark the one figure a stale sample is behind
+  rather than leaving the whole table to read as current or as stale
+  together: `392m (10%) (stale)` on a node whose kubelet stopped reporting,
+  `262m (52%) (stale)` on a pod metrics-server has not scraped in a while,
+  beside neighbours with nothing appended. The listing-wide freshness note
+  under the table is unchanged — it still dates the table from its oldest
+  sample — this is the per-row half that says *which* row that was.
+  `k8s::metrics::Sample::is_stale` asks `Freshness::is_stale` of one sample
+  rather than restating "a couple of windows" as a second rule, and
+  `k8s::metrics::mark_stale` is the one wording both tables append a marker
+  through, a no-op when the sample is not stale so an ordinary listing is
+  unchanged to the byte. A marker rather than a column, and text rather than
+  colour: the node table's usage cells are already coloured by
+  `Severity::from_utilisation`, and the pod table's carry no severity yet
+  pending "What 'hot' means for a pod against its own request" below, so
+  layering a second, simultaneous judgement onto either would have either
+  collided with a reading the user already trusts or answered a question this
+  change was not the one to answer. Getting there meant widening
+  `PodRow::from_pod`'s and `NodeRow::from_node`'s `used` parameter from
+  `Option<Usage>` to `Option<Sample>`, since a row now needs the sample's
+  stamps as well as its figures; `cpu_used`/`memory_used` still read from
+  `sample.usage` exactly as before. The dashboard's node-pane bars read
+  `Share` rather than this cell text, so they gained no marker — a design
+  question of their own, left as a follow-up rather than guessed at, since a
+  bar has no parenthetical to fall back on the way a table cell does.
 
 - **Recent events in the pod-detail view** (2026-08-29) — the pod-containers
   pane now ends with an `EVENTS` section: one row per `(reason, message)`,
