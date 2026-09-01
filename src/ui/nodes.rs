@@ -9,6 +9,7 @@ use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Wrap};
 
+use crate::k8s::metrics;
 use crate::k8s::nodes::{
     Capacity, Missing, NodeRow, Order, Share, cause, distinguishes, ranks_any,
     usage_missing_explained,
@@ -203,12 +204,20 @@ fn node_line(row: &NodeRow, selected: bool, theme: Theme) -> Line<'static> {
         Span::styled(row.status.clone(), theme.severity(row.severity)),
         Span::raw("  "),
     ];
-    spans.extend(bar("CPU", row.cpu_used, row.cpu, quantity::cpu, theme));
+    spans.extend(bar(
+        "CPU",
+        row.cpu_used,
+        row.cpu,
+        row.usage_stale,
+        quantity::cpu,
+        theme,
+    ));
     spans.push(Span::raw("  "));
     spans.extend(bar(
         "MEM",
         row.memory_used,
         row.memory,
+        row.usage_stale,
         quantity::memory,
         theme,
     ));
@@ -233,17 +242,24 @@ fn node_line(row: &NodeRow, selected: bool, theme: Theme) -> Line<'static> {
 /// headroom nothing can schedule into. The figure printed beside the bar is
 /// still `share.amount` — the two readings never disagree about what is
 /// actually being used, only about what it is a share of.
+///
+/// `stale` marks the figure through [`metrics::mark_stale`] — the same
+/// `(stale)` suffix the CLI table appends to `CPU USE`/`MEM USE` — rather
+/// than a second signal on the bar itself: the fill and colour already carry
+/// the utilisation judgement, and a stale reading is still that reading, only
+/// aged.
 fn bar(
     label: &'static str,
     share: Share,
     capacity: Capacity,
+    stale: bool,
     show: fn(Quantity) -> String,
     theme: Theme,
 ) -> Vec<Span<'static>> {
     let ratio = share.ratio_of(capacity.capacity);
     let filled = filled_cells(ratio, BAR_WIDTH);
     let empty = BAR_WIDTH - filled;
-    let text = share.amount.map_or_else(|| "-".to_owned(), show);
+    let text = metrics::mark_stale(share.amount.map_or_else(|| "-".to_owned(), show), stale);
 
     vec![
         Span::styled(format!("{label} "), theme.dim()),
@@ -420,6 +436,7 @@ mod tests {
             "CPU",
             used,
             hot_by_allocatable,
+            false,
             quantity::cpu,
             Theme::dark(),
         );
@@ -430,6 +447,50 @@ mod tests {
             "5.5/8 = 69%, rounds to 7 of 10 cells, not 9 of 10 for 5.5/6"
         );
         assert_eq!(spans[1].style, Theme::dark().severity(Severity::Ok));
+    }
+
+    #[test]
+    fn a_stale_bar_marks_its_figure_the_same_way_the_cli_table_does() {
+        let spans = bar(
+            "CPU",
+            share("1", "4"),
+            capacity("4", "4"),
+            true,
+            quantity::cpu,
+            Theme::dark(),
+        );
+
+        assert_eq!(spans.last().unwrap().content, "1 (stale)");
+    }
+
+    #[test]
+    fn a_fresh_bar_carries_no_stale_marker() {
+        let spans = bar(
+            "CPU",
+            share("1", "4"),
+            capacity("4", "4"),
+            false,
+            quantity::cpu,
+            Theme::dark(),
+        );
+
+        assert_eq!(spans.last().unwrap().content, "1");
+    }
+
+    #[test]
+    fn a_stale_reading_carries_the_marker_all_the_way_into_the_rendered_pane() {
+        let mut worker = node("worker-1");
+        worker.usage_stale = true;
+
+        let rendered = render(&loaded(vec![worker]));
+
+        assert!(rendered.contains("(stale)"), "{rendered}");
+    }
+
+    #[test]
+    fn a_fresh_reading_renders_with_no_stale_marker_in_the_pane() {
+        let rendered = render(&loaded(vec![node("worker-1")]));
+        assert!(!rendered.contains("(stale)"), "{rendered}");
     }
 
     #[test]

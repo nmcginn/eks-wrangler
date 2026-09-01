@@ -2796,3 +2796,31 @@ CLI cell's — it is the *only* way a bar says anything — so the same "two
 judgements, one signal" problem applies there with no text fallback to reach
 for. That is its own roadmap entry rather than a guess at whether a stale bar
 wants a label, a hatch pattern, or a border mark.
+
+### 83. The node pane's bars get the same text marker, on the figure they already print
+
+Decision 82 left the node pane's bars unmarked on the premise that a bar has
+no text to fall back on the way a table cell does — its colour is the only
+signal it has, and colour was already ruled out for the reason decision 82
+gives at length. That premise does not hold for `ui::nodes::bar` specifically:
+it draws the fill, then a separate `Span` carrying the figure itself — `1.5`,
+or `-` when there is no reading — beside it. That span is exactly the kind of
+cell `mark_stale` was written for.
+
+So the fix is the same one decision 82 chose, reached the same way: `bar` now
+takes the row's `usage_stale` and passes its trailing figure through
+`k8s::metrics::mark_stale` before drawing it, giving `1.5 (stale)` beside an
+unchanged fill and colour. One `bool` argument, no new field, no second
+staleness rule — `NodeRow::usage_stale` is still the one fact both surfaces
+read, and `mark_stale` is still the one wording that decorates it. A node
+whose sample is fresh renders exactly as it did before this change; the CPU
+and memory bars take the same flag independently, since one sample governs
+both figures on a node and `usage_stale` is already true or false for the
+row as a whole, not per resource.
+
+The follow-on cost decision 82 wrote down for this task — "a bar's colour is
+even more fully spent... with no text fallback to reach for" — turns out to
+have been about a bar's *fill*, which is still true and still untouched here;
+it was not about the bar as a whole, which had a text component the whole
+time. Worth naming so a future reader does not read decision 82 as having
+already ruled this shape out.
