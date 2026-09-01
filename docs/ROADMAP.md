@@ -465,7 +465,7 @@ cluster.
   yet — a real gap, and its own entry below rather than a guess at whether a
   bar takes a suffix, a colour, or something else a label cannot.
 
-- [ ] **Carry the per-row staleness marker into the node pane's bars.**
+- [x] **Carry the per-row staleness marker into the node pane's bars.**
   `eks nodes`' `CPU USE`/`MEM USE` cells now say `(stale)` when metrics-server's
   reading for that node is over two windows old; the node pane's utilisation
   bars read `NodeRow::usage_stale` too, but draw a bar rather than text, and a
@@ -480,6 +480,16 @@ cluster.
   *Acceptance:* whichever shape it takes, it reads `NodeRow::usage_stale`
   rather than a second staleness computation; a bar behind a fresh sample is
   unchanged.
+  Landed as text after all: the premise that "a bar cannot fall back to text
+  the way a table cell can" turned out to be wrong for this bar specifically.
+  `ui::nodes::bar` already prints a text span beside the fill — the figure
+  itself, `1.5` or `-` — so the parenthetical the CLI cells use had somewhere
+  to land without inventing a new signal. `ui::nodes::bar` now takes the row's
+  `usage_stale` and marks that trailing figure through the very same
+  `k8s::metrics::mark_stale` the CLI table calls, so `392m (10%) (stale)` on
+  `eks nodes` and a bar reading `1.5 (stale)` are one wording, not two. The
+  fill and its colour are untouched — staleness rides beside the number, not
+  into the judgement the bar already makes. See decision 83.
 
 - [x] **Carry the freshness and unsampled notes into the dashboard's panes.**
   The third of the notes that will want a pane's header rather than a footnote
