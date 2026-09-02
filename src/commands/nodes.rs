@@ -24,13 +24,21 @@ use crate::theme::Palette;
 /// a row of same-typed positional arguments is how an ordering quietly ends up
 /// in the direction's slot. Every field is applied to the finished rows, so
 /// none of them changes what is fetched — only how it is read back.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct Request {
     /// `--sort`.
     pub order: k8s_nodes::Order,
     /// `--sort-reverse`, which flips `order` without moving the rows the
     /// ordering has nothing to rank — those stay in the tail.
     pub direction: Direction,
+    /// `--sort-resource`: sort by this extended resource's booked share
+    /// instead of `order`. A resource name is not one of `--sort`'s fixed
+    /// values because it is whatever the cluster's device plugins invented,
+    /// and is not known until the nodes have been fetched — see
+    /// `k8s::nodes::order`'s module docs. Mutually exclusive with a
+    /// non-default `order`, enforced by `list`'s own `ordering_for` before
+    /// anything connects.
+    pub resource: Option<String>,
     /// `--wide`, or the width of the terminal this is being printed into.
     /// Every column it adds arrived with the nodes, so it costs no request.
     pub width: Width,
@@ -188,6 +196,37 @@ async fn gather(
     })
 }
 
+/// What to sort a node listing by, `--sort` and `--sort-resource` resolved
+/// into one answer.
+///
+/// The two flags are mutually exclusive rather than composable: a resource's
+/// own column is a full ordering on its own, not a modifier on one of the
+/// fixed ones, and there is no way to validate a resource name against
+/// `--sort`'s own — it is not known until the nodes have been fetched. See
+/// [`ordering_for`] and `k8s::nodes::order`'s module docs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SortBy {
+    Order(k8s_nodes::Order),
+    Resource(String),
+}
+
+/// Resolve `--sort` and `--sort-resource` into one ordering, before any
+/// network call — the same "reject before anything connects" bargain
+/// `--sort`, `--color`, and `--timeout` already make on a bad value.
+fn ordering_for(order: k8s_nodes::Order, resource: Option<String>) -> Result<SortBy> {
+    let Some(resource) = resource else {
+        return Ok(SortBy::Order(order));
+    };
+    if order != k8s_nodes::Order::default() {
+        return Err(anyhow!(
+            "`--sort` and `--sort-resource` ask for different things.\n\
+             Drop one: `--sort-resource {resource}` for that device's own column, \
+             `--sort <order>` for one of the fixed orderings."
+        ));
+    }
+    Ok(SortBy::Resource(resource))
+}
+
 /// Fetch and render the node table for the selected cluster.
 ///
 /// `selector` is whatever the user passed to `--context`: a full context name,
@@ -202,11 +241,14 @@ pub async fn list(
     let Request {
         order,
         direction,
+        resource,
         width,
         palette,
         budget,
         login,
     } = request;
+
+    let ordering = ordering_for(order, resource)?;
 
     let Gathered {
         label,
@@ -222,7 +264,10 @@ pub async fn list(
     // rules — and so both can be tested on rows alone. The default is still by
     // name, which the API server happens to return today; sorting makes that a
     // promise rather than an accident.
-    k8s_nodes::sort(&mut rows, order, direction);
+    match &ordering {
+        SortBy::Order(order) => k8s_nodes::sort(&mut rows, *order, direction),
+        SortBy::Resource(resource) => k8s_nodes::sort_by_device(&mut rows, resource, direction),
+    }
 
     let mut footnotes = Vec::new();
 
@@ -260,18 +305,9 @@ pub async fn list(
     // that is there and is quietly smaller than the hardware behind it.
     footnotes.extend(k8s_nodes::devices_withheld(&rows));
 
-    // Last of the footnotes, under whatever went wrong: a table nobody could
-    // fill in is more urgent news than the order it came out in. The note is
-    // silent unless `--sort` or `--sort-reverse` was given, so a plain
-    // `eks nodes` prints exactly what it printed before.
-    footnotes.extend(k8s::order::note(order, direction));
-    // And immediately under it, the case where that line on its own misleads:
-    // `--sort cpu` against a cluster with no metrics-server names an ordering
-    // over a column this table does not have. Both halves the note cannot work
-    // out for itself come from the listing: which orderings these rows can be
-    // ranked by, and whether one of the footnotes above already accounts for
-    // the column that came up empty — in which case the note points at it
-    // rather than repeating the advice a paragraph later.
+    // Both halves of the ordering note below want to know which columns a
+    // failure above already emptied, so this is worked out once regardless of
+    // which of `order`/`resource` is in play.
     let missing = k8s_nodes::Missing {
         requests: requests.is_err(),
         // The columns being gone, rather than the read having failed: both
@@ -279,12 +315,37 @@ pub async fn list(
         // point back at.
         usage: usage_columns.is_missing(),
     };
-    footnotes.extend(k8s::order::unranked_note(
-        order,
-        k8s_nodes::cause(order, missing),
-        |candidate| k8s_nodes::ranks_any(&rows, candidate),
-        |candidate| k8s_nodes::distinguishes(&rows, candidate),
-    ));
+
+    // Last of the footnotes, under whatever went wrong: a table nobody could
+    // fill in is more urgent news than the order it came out in. The note is
+    // silent unless `--sort`, `--sort-reverse`, or `--sort-resource` was
+    // given, so a plain `eks nodes` prints exactly what it printed before.
+    match &ordering {
+        SortBy::Order(order) => {
+            footnotes.extend(k8s::order::note(*order, direction));
+            // And immediately under it, the case where that line on its own
+            // misleads: `--sort cpu` against a cluster with no metrics-server
+            // names an ordering over a column this table does not have. Both
+            // halves the note cannot work out for itself come from the
+            // listing: which orderings these rows can be ranked by, and
+            // whether one of the footnotes above already accounts for the
+            // column that came up empty — in which case the note points at it
+            // rather than repeating the advice a paragraph later.
+            footnotes.extend(k8s::order::unranked_note(
+                *order,
+                k8s_nodes::cause(*order, missing),
+                |candidate| k8s_nodes::ranks_any(&rows, candidate),
+                |candidate| k8s_nodes::distinguishes(&rows, candidate),
+            ));
+        }
+        // The free-form counterpart: always named — there is no default
+        // resource to compare against and stay silent about — and, when
+        // nothing reported it, why.
+        SortBy::Resource(resource) => {
+            footnotes.push(k8s_nodes::device_note(resource, direction));
+            footnotes.extend(k8s_nodes::device_unranked_note(resource, &rows, missing));
+        }
+    }
 
     Ok(k8s_nodes::render(&rows, &label, &footnotes, width, palette))
 }
@@ -376,6 +437,39 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
+
+    #[test]
+    fn no_sort_resource_leaves_the_fixed_ordering_in_charge() {
+        assert_eq!(
+            ordering_for(k8s_nodes::Order::Cpu, None).unwrap(),
+            SortBy::Order(k8s_nodes::Order::Cpu)
+        );
+    }
+
+    #[test]
+    fn a_sort_resource_alone_is_a_device_ordering() {
+        // `--sort` was never given, so it is still its default, and a
+        // resource name on its own is not a conflict.
+        assert_eq!(
+            ordering_for(
+                k8s_nodes::Order::default(),
+                Some("nvidia.com/gpu".to_owned())
+            )
+            .unwrap(),
+            SortBy::Resource("nvidia.com/gpu".to_owned())
+        );
+    }
+
+    #[test]
+    fn sort_and_sort_resource_together_are_rejected_before_anything_connects() {
+        let error = ordering_for(k8s_nodes::Order::Cpu, Some("nvidia.com/gpu".to_owned()))
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("--sort"), "{error}");
+        assert!(error.contains("--sort-resource"), "{error}");
+        assert!(error.contains("nvidia.com/gpu"), "{error}");
+    }
 
     const CONFIG: &str = r"
 apiVersion: v1
