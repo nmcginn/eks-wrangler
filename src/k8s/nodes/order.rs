@@ -23,6 +23,19 @@
 //! rank by percentage, and a node whose allocatable the API server has not
 //! reported yet — a figure with nothing to divide it by — falls to the tail
 //! ahead of the nodes with no figure at all.
+//!
+//! # Sorting by an extended resource
+//!
+//! `--sort` is a fixed, `--help`-listed vocabulary on purpose — [`Order`] is a
+//! `clap::ValueEnum`, so a bad value is rejected with the good ones named,
+//! before anything connects. A GPU's fully-qualified name does not fit that:
+//! it is whatever the cluster's device plugins invented, and is not known
+//! until the nodes have been fetched, which is after `--sort` has already been
+//! parsed. [`sort_by_device`] is the second flag, `--sort-resource`, rather
+//! than a free-form `--sort` value: it ranks a device's booked share exactly
+//! as [`sort`]'s own booked orderings do, but takes the name at fetch time
+//! instead of parse time, and cannot offer `--help` a list of names to
+//! validate against or suggest.
 
 use std::cmp::{Ordering, Reverse};
 
@@ -92,6 +105,84 @@ fn rank(a: &NodeRow, b: &NodeRow, order: Order, direction: Direction) -> Orderin
         Order::Pods => compare(&busiest(a.pods), &busiest(b.pods), direction),
         Order::Age => compare(&youngest(a), &youngest(b), direction),
     }
+}
+
+/// Sort a listing by its booked share of one extended resource, named freely
+/// by the user rather than fixed in [`Order`] — see the module docs on
+/// `--sort-resource`.
+pub fn sort_by_device(rows: &mut [NodeRow], resource: &str, direction: Direction) {
+    // Same tie-break as `sort`, for the same reason: total and stable across
+    // two runs of one command.
+    rows.sort_by(|a, b| {
+        compare(
+            &device_share(a, resource),
+            &device_share(b, resource),
+            direction,
+        )
+        .then_with(|| a.name.cmp(&b.name))
+    });
+}
+
+/// Where a row sits under a device ordering: busiest first, then everything
+/// there is nothing to rank — a node whose booking is unknown, and a node
+/// that does not report the device at all, land in the same tail tier.
+///
+/// A device present in [`NodeRow::devices`] shares its `Share`'s shape with
+/// every other booked figure, so `busiest` already tells a genuine reading
+/// apart from one with no allocatable to divide it by. Whether a device is
+/// missing because [`super::Device::booked`] is `None` — the pod listing
+/// failed — or because the node never advertised the resource at all is not a
+/// distinction `busiest` needs to make for its other callers, every one of
+/// which sorts a resource every node reports; here, where that is no longer
+/// true, both read as "nothing to rank this row by" rather than earning a
+/// tier of their own.
+fn device_share(row: &NodeRow, resource: &str) -> Rank<Reverse<Ratio>> {
+    match row.devices.get(resource) {
+        Some(device) => busiest(device.share()),
+        None => Rank::Unranked(1),
+    }
+}
+
+/// The line naming the resource a `--sort-resource` listing is in — the
+/// free-form counterpart to [`crate::k8s::order::note`].
+///
+/// Always `Some`, unlike `note`: there is no default resource to compare
+/// against and stay silent about, so typing `--sort-resource` at all is
+/// always a listing the reader would not otherwise have gotten.
+#[must_use]
+pub fn device_note(resource: &str, direction: Direction) -> String {
+    match direction {
+        Direction::Natural => format!("Sorted by {resource}."),
+        Direction::Reversed => format!("Sorted by {resource}, reversed."),
+    }
+}
+
+/// Whether any row has something to rank by this resource — the free-form
+/// counterpart to [`ranks_any`].
+#[must_use]
+pub fn device_ranks_any(rows: &[NodeRow], resource: &str) -> bool {
+    rows.iter()
+        .any(|row| device_share(row, resource).is_ranked())
+}
+
+/// The note for a `--sort-resource` that ranked nothing — the free-form
+/// counterpart to [`crate::k8s::order::unranked_note`].
+///
+/// No alternatives are suggested, unlike `unranked_note`: the advice there is
+/// built from `Order::value_variants()`, a fixed vocabulary `--help` already
+/// lists, and a resource name is the opposite of that by design.
+#[must_use]
+pub fn device_unranked_note(resource: &str, rows: &[NodeRow], missing: Missing) -> Option<String> {
+    if device_ranks_any(rows, resource) {
+        return None;
+    }
+
+    Some(match Cause::explained(missing.requests) {
+        Cause::Explained => {
+            format!("Nothing here has {resource} to sort by, for the reason above.")
+        }
+        Cause::Unexplained => format!("Nothing here has {resource} to sort by."),
+    })
 }
 
 /// Whether an ordering has anything at all to rank in these rows.
@@ -252,7 +343,7 @@ mod tests {
     use k8s_openapi::jiff::SignedDuration;
 
     use super::*;
-    use crate::k8s::nodes::Capacity;
+    use crate::k8s::nodes::{Capacity, Device};
     use crate::k8s::quantity::Quantity;
 
     /// Every ordering, for the tests that must hold of all of them.
@@ -343,6 +434,30 @@ mod tests {
                 amount: pods.map(Quantity::from_count),
                 allocatable: Some(quantity(limit)),
             },
+            ..row(name)
+        }
+    }
+
+    /// A node reporting one device, `nvidia.com/gpu`, booked as given — or with
+    /// no such entry at all when `booked` and `allocatable` are both `None`,
+    /// which is the "does not have this hardware" case rather than a real
+    /// zero.
+    fn device_row(name: &str, booked: Option<&str>, allocatable: Option<&str>) -> NodeRow {
+        let mut devices = std::collections::BTreeMap::new();
+        if booked.is_some() || allocatable.is_some() {
+            devices.insert(
+                "nvidia.com/gpu".to_owned(),
+                Device {
+                    capacity: Capacity {
+                        allocatable: allocatable.map(quantity),
+                        capacity: allocatable.map(quantity),
+                    },
+                    booked: booked.map(quantity),
+                },
+            );
+        }
+        NodeRow {
+            devices,
             ..row(name)
         }
     }
@@ -998,6 +1113,212 @@ mod tests {
                 }
             ),
             Cause::Unexplained
+        );
+    }
+
+    /// Sort a copy under `--sort-resource` and report the names, mirroring
+    /// [`sorted`] for the fixed orderings above.
+    fn sorted_by_device(rows: &[NodeRow], resource: &str, direction: Direction) -> Vec<String> {
+        let mut rows = rows.to_vec();
+        sort_by_device(&mut rows, resource, direction);
+        rows.iter().map(|row| row.name.clone()).collect()
+    }
+
+    #[test]
+    fn device_order_ranks_by_share_rather_than_by_the_raw_figure() {
+        // The same reading node usage takes: a node offering sixteen GPUs and
+        // two booked has plenty of room next to one with two GPUs and both
+        // spoken for, even though the second node's raw figure is smaller.
+        let rows = vec![
+            device_row("roomy", Some("2"), Some("16")),
+            device_row("tight", Some("2"), Some("2")),
+        ];
+
+        assert_eq!(
+            sorted_by_device(&rows, "nvidia.com/gpu", Direction::Natural),
+            ["tight", "roomy"]
+        );
+    }
+
+    #[test]
+    fn a_node_that_does_not_report_the_device_sorts_last_either_way() {
+        // The case the whole task exists for: hardware a node simply does not
+        // have must not be confused with a real zero, which would put an
+        // ordinary CPU-only node ahead of a GPU node quietly running idle.
+        let rows = vec![
+            device_row("no-gpu", None, None),
+            device_row("busy", Some("6"), Some("8")),
+            device_row("idle", Some("0"), Some("8")),
+        ];
+
+        for direction in DIRECTIONS {
+            let sorted = sorted_by_device(&rows, "nvidia.com/gpu", direction);
+            assert_eq!(
+                sorted.last().map(String::as_str),
+                Some("no-gpu"),
+                "{direction:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_node_whose_booking_is_unknown_sorts_last_either_way() {
+        // The device is there — the node reports a capacity — but the pod
+        // listing that would say how much is booked failed, which is a
+        // different blank from a node with no such hardware, and the same
+        // blank either way.
+        let rows = vec![
+            device_row("unknown", None, Some("8")),
+            device_row("busy", Some("6"), Some("8")),
+        ];
+
+        for direction in DIRECTIONS {
+            let sorted = sorted_by_device(&rows, "nvidia.com/gpu", direction);
+            assert_eq!(
+                sorted.last().map(String::as_str),
+                Some("unknown"),
+                "{direction:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn reversing_a_device_order_asks_which_node_is_idlest_not_which_is_unmeasured() {
+        let rows = vec![
+            device_row("no-gpu", None, None),
+            device_row("busy", Some("6"), Some("8")),
+            device_row("idle", Some("0"), Some("8")),
+        ];
+
+        assert_eq!(
+            sorted_by_device(&rows, "nvidia.com/gpu", Direction::Reversed),
+            ["idle", "busy", "no-gpu"]
+        );
+    }
+
+    #[test]
+    fn the_alphabet_breaks_every_tie_under_a_device_order() {
+        let rows = vec![
+            device_row("charlie", None, None),
+            device_row("alpha", None, None),
+            device_row("bravo", None, None),
+        ];
+
+        for direction in DIRECTIONS {
+            assert_eq!(
+                sorted_by_device(&rows, "nvidia.com/gpu", direction),
+                ["alpha", "bravo", "charlie"],
+                "{direction:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_device_order_survives_an_empty_and_a_single_row_listing() {
+        for direction in DIRECTIONS {
+            let mut none: Vec<NodeRow> = Vec::new();
+            sort_by_device(&mut none, "nvidia.com/gpu", direction);
+            assert!(none.is_empty(), "{direction:?}");
+
+            let mut one = vec![device_row("only", Some("1"), Some("4"))];
+            sort_by_device(&mut one, "nvidia.com/gpu", direction);
+            assert_eq!(names(&one), ["only"], "{direction:?}");
+        }
+    }
+
+    #[test]
+    fn a_second_device_asked_for_by_name_reads_that_column_and_not_the_first() {
+        // `--sort-resource` takes a name, not a position, so a node with two
+        // devices must be ranked by the one the user actually typed.
+        let mut node = device_row("mixed", Some("1"), Some("4"));
+        node.devices.insert(
+            "amd.com/gpu".to_owned(),
+            Device {
+                capacity: Capacity {
+                    allocatable: Some(quantity("2")),
+                    capacity: Some(quantity("2")),
+                },
+                booked: Some(quantity("2")),
+            },
+        );
+        let other = device_row("other", Some("3"), Some("4"));
+
+        assert_eq!(
+            sorted_by_device(
+                &[node.clone(), other.clone()],
+                "nvidia.com/gpu",
+                Direction::Natural
+            ),
+            ["other", "mixed"]
+        );
+        assert_eq!(
+            sorted_by_device(&[node, other], "amd.com/gpu", Direction::Natural),
+            ["mixed", "other"]
+        );
+    }
+
+    #[test]
+    fn device_note_names_the_resource_the_way_the_user_typed_it() {
+        assert_eq!(
+            device_note("nvidia.com/gpu", Direction::Natural),
+            "Sorted by nvidia.com/gpu."
+        );
+        assert_eq!(
+            device_note("nvidia.com/gpu", Direction::Reversed),
+            "Sorted by nvidia.com/gpu, reversed."
+        );
+    }
+
+    #[test]
+    fn device_ranks_any_is_false_until_one_node_reports_the_resource() {
+        let rows = [device_row("a", None, None), device_row("b", None, None)];
+        assert!(!device_ranks_any(&rows, "nvidia.com/gpu"));
+
+        let rows = [
+            device_row("a", None, None),
+            device_row("b", Some("1"), Some("4")),
+        ];
+        assert!(device_ranks_any(&rows, "nvidia.com/gpu"));
+    }
+
+    #[test]
+    fn a_device_that_ranked_nothing_says_so() {
+        let rows = [device_row("a", None, None), device_row("b", None, None)];
+
+        assert_eq!(
+            device_unranked_note("nvidia.com/gpu", &rows, Missing::default()).as_deref(),
+            Some("Nothing here has nvidia.com/gpu to sort by.")
+        );
+    }
+
+    #[test]
+    fn a_device_that_ranked_nothing_points_at_the_failed_pod_listing_when_that_is_why() {
+        // The booked half of a device column comes from the same pod listing
+        // `CPU REQ` and `MEM REQ` do, so a failed listing is the same
+        // explanation here.
+        let rows = [device_row("a", None, None)];
+
+        assert_eq!(
+            device_unranked_note(
+                "nvidia.com/gpu",
+                &rows,
+                Missing {
+                    requests: true,
+                    usage: false,
+                }
+            )
+            .as_deref(),
+            Some("Nothing here has nvidia.com/gpu to sort by, for the reason above.")
+        );
+    }
+
+    #[test]
+    fn a_device_that_ranked_something_says_nothing_extra() {
+        let rows = [device_row("a", Some("1"), Some("4"))];
+
+        assert_eq!(
+            device_unranked_note("nvidia.com/gpu", &rows, Missing::default()),
+            None
         );
     }
 }

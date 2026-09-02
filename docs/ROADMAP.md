@@ -520,7 +520,7 @@ cluster.
   kubelet has and will not offer — so `devices_withheld` names the node with the
   widest gap and says to check its device plugin.
 
-- [ ] **Sort the node table by an extended resource.**
+- [x] **Sort the node table by an extended resource.**
   `eks nodes --sort cpu` finds the node closest to full and there is no way to
   ask the same of the GPU column, which on a training cluster is the only column
   anyone is reading. Separate because it turns on a decision the reviewer should
@@ -534,6 +534,61 @@ cluster.
   *Acceptance:* whichever shape it takes, the ordering ranks by share as the
   other node orders do, and a node that does not report the resource sorts into
   the unrankable tail under `k8s::order`'s existing rule rather than as a zero.
+  Landed as the second flag: `--sort-resource <RESOURCE>` takes a device's
+  fully-qualified name outright, e.g. `nvidia.com/gpu`, rather than growing
+  `--sort` into a free-form value `clap` cannot validate — decision 28's own
+  reasoning (a bad `--sort` is rejected with the good ones listed) is worth
+  keeping for the fixed orderings, and a `--sort-resource` conflicting with a
+  non-default `--sort` is one sentence (`ordering_for` in `commands::nodes`,
+  checked before any network call, the same "reject before anything connects"
+  bargain `--sort`, `--color`, and `--timeout` already make) rather than a
+  parser trying to be two grammars at once. `k8s::nodes::order::sort_by_device`
+  ranks a device's booked share exactly as the fixed booked orderings do,
+  reusing `busiest` for a device the row reports; a device the row does not
+  report at all reads the same "nothing to rank this by" as a booking `--sort
+  cpu-requested` etc. already treats as unranked, rather than a third tail
+  tier — the acceptance criteria's own wording turned out to already be
+  `busiest`'s rule once a missing device and an unbooked one were read as the
+  same blank. `device_note`/`device_unranked_note` mirror `k8s::order::note`/
+  `unranked_note` for a name `clap` never validated, reusing `Cause` so a
+  failed pod listing explains an empty device ordering exactly as it explains
+  `CPU REQ`; they do not offer `unranked_note`'s alternatives-suggestion half,
+  since that list is built from `Order::value_variants()` — a fixed,
+  `--help`-listed vocabulary a resource name is deliberately not — and
+  extending that answer to the pod side, and to the dashboard's own `s`
+  cycling, are their own entries below rather than guesses this task's
+  acceptance criteria never asked for. See decision 84.
+
+- [ ] **Carry `--sort-resource` into the dashboard's node pane.**
+  `s` cycles `Order::value_variants()` one press at a time (decision 58), and a
+  device ordering has no place in that cycle: it takes a name `--sort-resource`
+  supplies on the command line, and a single key press has nowhere to type one.
+  Separate because it is a real surface `--sort-resource` was never built for —
+  the CLI flag's whole design leaned on being parsed once, up front, which the
+  pane's cycling model does not do for any of its orderings — and it is the
+  kind of question "Edit the dashboard's selector without restarting it",
+  above, already left open for `-l`/`--field-selector`: whether a resource name
+  is typed through the pane's one text-input mechanism (`/`, behind fuzzy
+  search) or arrives some other way is the reviewer's call, not a guess this
+  task's acceptance criteria has anything to say about.
+  *Acceptance:* whichever shape it takes, the ranking goes through
+  `k8s::nodes::order::sort_by_device` rather than a second reading of a
+  device's share; a pane nobody has asked to sort this way is unchanged.
+
+- [ ] **Sort `eks pods` by an extended resource too.**
+  "Sort the node table by an extended resource", above, settled the design
+  question its own acceptance criteria left to the reviewer — `--sort-resource`
+  as a second flag, conflicting with a non-default `--sort` — for the node
+  table only; the task's own wording expected the answer to apply to `eks pods`
+  at the same time, and a pod's device column already exists (`Column::Device`,
+  decision 79) with a different reading than a node's: absence is a real zero
+  there, not the "does not have this hardware" blank `k8s::nodes::order`
+  reads it as, so `k8s::pods::order` wants its own `sort_by_device` rather than
+  the node one reused. Separate because it is a second command's flag and a
+  second row type, not a decision left open by tonight's change.
+  *Acceptance:* `--sort-resource` parses the same way on both subcommands; a
+  pod that never asked for the resource sorts as `0`, not into the unranked
+  tail, matching `Column::Device`'s own reading of an absent entry.
 
 - [x] **Native resources that still have no column: `ephemeral-storage` and
   `hugepages-*`.**
@@ -1247,6 +1302,28 @@ cluster.
 ---
 
 ## Done
+
+- **Sort the node table by an extended resource** (2026-09-02) — `eks nodes
+  --sort-resource nvidia.com/gpu` ranks nodes by a device's booked share, the
+  same reading `--sort cpu-requested` gives CPU, for a name `--sort` itself
+  cannot validate: it is whatever the cluster's device plugins invented, and
+  is not known until the nodes have been fetched. `--sort-resource` is a
+  second flag rather than a free-form `--sort` value, so `--sort`'s own
+  vocabulary keeps rejecting a bad value with the good ones listed (decision
+  28); combining the two is rejected by `commands::nodes::ordering_for` before
+  any network call, the same bargain `--sort`, `--color`, and `--timeout`
+  already make. `k8s::nodes::order::sort_by_device` reuses `busiest` for a
+  device a node reports, and reads a device the node does not report at all
+  the same "nothing to rank this by" as a booking figure with no sample —
+  the acceptance criteria's own "not a zero" turned out to already be
+  `busiest`'s rule once both blanks landed in the one tail tier.
+  `device_note`/`device_unranked_note` mirror `k8s::order`'s own two notes for
+  a name `clap` never validated, reusing `Cause` so a failed pod listing
+  explains an empty device ordering exactly as it explains `CPU REQ` — without
+  the alternatives-suggestion half, which is built from a fixed, `--help`-
+  listed vocabulary a resource name is deliberately not. Extending the same
+  answer to `eks pods` and to the dashboard's `s` cycling are their own
+  entries, left open rather than guessed at. See decision 84.
 
 - **A row whose sample is old, rather than a listing that is** (2026-08-31) —
   `eks nodes` and `eks pods` mark the one figure a stale sample is behind

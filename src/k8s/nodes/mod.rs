@@ -17,7 +17,10 @@ use kube::api::{Api, ListParams};
 
 pub mod order;
 
-pub use order::{Missing, Order, cause, distinguishes, ranks_any, sort};
+pub use order::{
+    Missing, Order, cause, device_note, device_unranked_note, distinguishes, ranks_any, sort,
+    sort_by_device,
+};
 
 use crate::format;
 use crate::k8s::metrics::{self, Sample};

@@ -2824,3 +2824,67 @@ have been about a bar's *fill*, which is still true and still untouched here;
 it was not about the bar as a whole, which had a text component the whole
 time. Worth naming so a future reader does not read decision 82 as having
 already ruled this shape out.
+
+### 84. `--sort-resource` is a second flag, not a free-form `--sort` value
+
+`eks nodes --sort` is a `clap::ValueEnum` (decision 28) precisely so a bad
+value is rejected with the good ones listed, before anything connects. A
+GPU's fully-qualified name — `nvidia.com/gpu`, `amd.com/gpu`, whatever a
+cluster's device plugins invent — cannot join that vocabulary: it is not
+known until the nodes have been fetched, which is after `--sort` has already
+been parsed. The roadmap task left the shape to the reviewer: a free-form
+`--sort` value validated against the rows after the fact, or a second flag.
+
+A free-form value was rejected because it would have made `--sort` two
+different grammars wearing one flag: every other value is checked by `clap`
+and rejected before the process does anything else, and a resource name would
+be checked later, against rows the command has not fetched yet, with a
+different kind of error at a different point in the command's life. `--help`
+would have had to describe both halves of that at once.
+
+`--sort-resource <RESOURCE>` is the second flag instead, and it is mutually
+exclusive with a non-default `--sort` — a resource already answers "sort by
+what", so a fixed ordering alongside it is a contradiction, not a modifier.
+That conflict is caught by `commands::nodes::ordering_for`, a pure function
+run before `gather` connects to anything, printing `` `--sort` and
+`--sort-resource` ask for different things. Drop one: ... `` — the same
+"reject before anything connects" bargain `--sort`, `--color`, and `--timeout`
+already make, and the same shape `commands::pods::scope_for` uses for
+`--namespace` versus `--all-namespaces`. It is enforced in Rust rather than
+through clap's `conflicts_with`, since `--sort` carries a `default_value` and
+mixing a default-value argument into a conflict group is exactly the kind of
+"is it present or not" ambiguity `ordering_for`'s explicit check sidesteps
+without having to find out which way clap resolves it.
+
+Ranking a device reuses `k8s::nodes::order`'s existing `busiest`, over
+`Device::share()`, rather than a new comparison — the two failure tiers
+`busiest` already draws (a measured figure with no allocatable, and no figure
+at all) collapse a device's two blanks onto the second tier without a third
+tier of their own: a node whose booking is unknown because the pod listing
+failed, and a node that never advertised the hardware, both read as "nothing
+to rank this row by". The distinction never mattered to any other caller of
+`busiest` because every other resource it ranks is one every node reports;
+here, where that stops being true, both blanks earning the same tail spot is
+the simpler answer and the one the roadmap task's own "not a zero" wording
+was already asking for.
+
+`device_note` and `device_unranked_note`, in the same module, mirror
+`k8s::order::note`/`unranked_note` for a name that never passed through
+`clap::ValueEnum`. They reuse `Cause` — the pod listing that would explain an
+empty device ordering is the same one `CpuRequested`/`MemoryRequested`/`Pods`
+already point at — but they do not offer `unranked_note`'s alternatives
+suggestion: that list is generated from `Order::value_variants()`, a fixed,
+`--help`-listed vocabulary, and a resource name is deliberately outside it.
+Building that half for a free-form flag is its own design question, left to a
+roadmap follow-up rather than guessed at here — matching how the original,
+`Order`-based version of this note shipped without alternatives first and
+grew them in a later, deliberate change.
+
+Scope stayed at the node table for the same reason: the roadmap task's own
+acceptance criteria named only `eks nodes`, and a pod's device column reads
+absence as a real zero rather than the "no such hardware" blank a node's does
+(decision 79) — porting `--sort-resource` there wants its own `sort_by_device`
+in `k8s::pods::order`, not the node one reused, and is its own roadmap entry.
+The dashboard's node pane, whose `s` key cycles `Order::value_variants()`
+(decision 58), has no way to type a resource name at all yet — also left open,
+alongside the pod-drilldown pane's own still-open device-sorting gap.

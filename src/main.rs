@@ -73,6 +73,7 @@ fn run(cli: Cli) -> Result<()> {
         Command::Nodes {
             sort,
             sort_reverse,
+            sort_resource,
             wide,
         } => {
             // The only command so far that needs a runtime; it builds one for
@@ -84,6 +85,7 @@ fn run(cli: Cli) -> Result<()> {
                 nodes::Request {
                     order: sort,
                     direction: Direction::reversed(sort_reverse),
+                    resource: sort_resource,
                     width: Width::for_terminal(wide, stdout_terminal_cols()),
                     palette: stdout_palette(cli.global.color),
                     budget: cli.global.timeout,
