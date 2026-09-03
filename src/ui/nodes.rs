@@ -11,8 +11,8 @@ use ratatui::widgets::{Paragraph, Wrap};
 
 use crate::k8s::metrics;
 use crate::k8s::nodes::{
-    Capacity, Missing, NodeRow, Order, Share, cause, distinguishes, ranks_any,
-    usage_missing_explained,
+    Capacity, Missing, NodeRow, Order, Share, cause, device_note, device_unranked_note,
+    distinguishes, ranks_any, usage_missing_explained,
 };
 use crate::k8s::order::{self, Direction};
 use crate::k8s::quantity::{self, Quantity};
@@ -76,28 +76,43 @@ fn hint_lines(hint: Option<&str>, theme: Theme) -> Vec<Line<'static>> {
         .collect()
 }
 
+/// What is currently driving the node pane's ordering: the fixed `s`/`S`
+/// cycle over [`Order`], or an applied `--sort-resource` prompt — mutually
+/// exclusive, the same way `commands::nodes::SortBy` resolves `--sort` and
+/// `--sort-resource` on the command line. `App::node_sort` is the only place
+/// that decides which; this only draws whichever it is handed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Sort<'a> {
+    Order(Order),
+    Resource(&'a str),
+}
+
 /// Draw whatever the node pane currently knows.
 ///
 /// `selected` highlights a row — `None` when the pane does not currently
 /// hold keyboard focus, so the highlight disappears the moment `Tab` moves
-/// it back to the sidebar. `order` and `direction` are the pane's own
-/// ordering, `s`/`S` in [`super::App`] rather than a request — the note they
-/// produce is silent on the default order, exactly as it is under the CLI
-/// table, and it disappears along with the rest of the pane's chrome when
-/// there are no rows to be sorted. `filter` is the `/` query, empty when no
-/// filter is active — every footnote above still reads off the full `rows`,
-/// since what a listing's ordering could and could not rank is a fact about
-/// the whole pane rather than about whatever it is narrowed to right now;
-/// only which rows are actually drawn, through
-/// [`crate::fuzzy::rank`], changes with it.
+/// it back to the sidebar. `sort` and `direction` are the pane's own
+/// ordering, `s`/`S`/`R` in [`super::App`] rather than a request — the note
+/// they produce is silent on the default order, exactly as it is under the
+/// CLI table, and it disappears along with the rest of the pane's chrome
+/// when there are no rows to be sorted. `resource_prompt` is the
+/// `--sort-resource` prompt's own text while `R` is capturing keystrokes for
+/// it — `None` once nothing is being typed, whether or not a resource
+/// ordering is applied, since `sort` already carries the applied name.
+/// `filter` is the `/` query, empty when no filter is active — every
+/// footnote above still reads off the full `rows`, since what a listing's
+/// ordering could and could not rank is a fact about the whole pane rather
+/// than about whatever it is narrowed to right now; only which rows are
+/// actually drawn, through [`crate::fuzzy::rank`], changes with it.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn draw(
     frame: &mut Frame,
     area: Rect,
     state: &NodesState,
     selected: Option<usize>,
-    order: Order,
+    sort: Sort<'_>,
     direction: Direction,
+    resource_prompt: Option<&str>,
     filter: &str,
     login_hint: Option<&str>,
     theme: Theme,
@@ -152,29 +167,55 @@ pub(super) fn draw(
                         .map(|line| Line::styled(line.to_owned(), theme.dim())),
                 );
             }
-            if let Some(note) = order::note(order, direction) {
-                lines.push(Line::styled(note, theme.dim()));
+            // The prompt's own line, shown only while `R` is capturing
+            // keystrokes for it — before anything below has something to
+            // say about a name nobody has committed yet.
+            if let Some(prompt) = resource_prompt {
+                lines.push(Line::styled(
+                    format!("Sort by resource: \"{prompt}\""),
+                    theme.dim(),
+                ));
             }
-            // The case where that line on its own misleads: an ordering that
-            // ranked nothing at all describes a listing the alphabet
-            // arranged. `Missing::requests` stays `false` deliberately — the
-            // CLI's `requests_unavailable` footnote has nowhere to live in
-            // this pane yet, so the booked orderings never claim to be
+            // `Missing::requests` stays `false` deliberately in both arms —
+            // the CLI's `requests_unavailable` footnote has nowhere to live
+            // in this pane yet, so the booked orderings never claim to be
             // explained by a note that was never printed.
             let missing = Missing {
                 requests: false,
                 usage: usage_missing_explained(rows, usage_note.as_deref()),
             };
-            if let Some(note) = order::unranked_note(
-                order,
-                cause(order, missing),
-                |candidate| ranks_any(rows, candidate),
-                |candidate| distinguishes(rows, candidate),
-            ) {
-                lines.extend(
-                    note.lines()
-                        .map(|line| Line::styled(line.to_owned(), theme.dim())),
-                );
+            match sort {
+                Sort::Order(order) => {
+                    if let Some(note) = order::note(order, direction) {
+                        lines.push(Line::styled(note, theme.dim()));
+                    }
+                    // The case where that line on its own misleads: an
+                    // ordering that ranked nothing at all describes a
+                    // listing the alphabet arranged.
+                    if let Some(note) = order::unranked_note(
+                        order,
+                        cause(order, missing),
+                        |candidate| ranks_any(rows, candidate),
+                        |candidate| distinguishes(rows, candidate),
+                    ) {
+                        lines.extend(
+                            note.lines()
+                                .map(|line| Line::styled(line.to_owned(), theme.dim())),
+                        );
+                    }
+                }
+                // The free-form counterpart: always named, unlike `order::note`
+                // — there is no default resource to compare against and stay
+                // silent about — and, when nothing reported it, why.
+                Sort::Resource(resource) => {
+                    lines.push(Line::styled(device_note(resource, direction), theme.dim()));
+                    if let Some(note) = device_unranked_note(resource, rows, missing) {
+                        lines.extend(
+                            note.lines()
+                                .map(|line| Line::styled(line.to_owned(), theme.dim())),
+                        );
+                    }
+                }
             }
             let visible = crate::fuzzy::rank(filter, rows, |row| row.name.as_str());
             if !filter.is_empty() && visible.is_empty() {
@@ -351,6 +392,24 @@ mod tests {
         }
     }
 
+    /// A node reporting one booked device, for the `--sort-resource` tests.
+    fn node_with_device(name: &str, resource: &str, booked: &str, allocatable: &str) -> NodeRow {
+        use crate::k8s::nodes::Device;
+
+        let mut devices = BTreeMap::new();
+        devices.insert(
+            resource.to_owned(),
+            Device {
+                capacity: capacity(allocatable, allocatable),
+                booked: Some(Quantity::parse(booked).unwrap()),
+            },
+        );
+        NodeRow {
+            devices,
+            ..node(name)
+        }
+    }
+
     fn loaded(rows: Vec<NodeRow>) -> NodesState {
         NodesState::Loaded {
             rows,
@@ -394,10 +453,59 @@ mod tests {
                     area,
                     state,
                     None,
-                    order,
+                    Sort::Order(order),
                     direction,
+                    None,
                     filter,
                     login_hint,
+                    Theme::dark(),
+                );
+            })
+            .unwrap();
+        terminal.backend().to_string()
+    }
+
+    /// The `--sort-resource` counterpart to [`render_ordered`].
+    fn render_resource_sorted(state: &NodesState, resource: &str, direction: Direction) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(90, 20)).unwrap();
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                draw(
+                    frame,
+                    area,
+                    state,
+                    None,
+                    Sort::Resource(resource),
+                    direction,
+                    None,
+                    "",
+                    None,
+                    Theme::dark(),
+                );
+            })
+            .unwrap();
+        terminal.backend().to_string()
+    }
+
+    /// The prompt-in-progress counterpart to [`render_ordered`]: `R` is
+    /// capturing keystrokes but nothing has been committed yet, so the fixed
+    /// default order still governs what the rows are sorted by.
+    fn render_resource_prompt(state: &NodesState, prompt: &str) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(90, 20)).unwrap();
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                draw(
+                    frame,
+                    area,
+                    state,
+                    None,
+                    Sort::Order(Order::default()),
+                    Direction::default(),
+                    Some(prompt),
+                    "",
+                    None,
                     Theme::dark(),
                 );
             })
@@ -595,8 +703,9 @@ mod tests {
                         area,
                         &state,
                         None,
-                        Order::default(),
+                        Sort::Order(Order::default()),
                         Direction::default(),
+                        None,
                         "",
                         None,
                         Theme::dark(),
@@ -648,8 +757,9 @@ mod tests {
                     area,
                     &state,
                     None,
-                    Order::default(),
+                    Sort::Order(Order::default()),
                     Direction::default(),
+                    None,
                     "",
                     None,
                     Theme::dark(),
@@ -885,8 +995,9 @@ mod tests {
                     area,
                     &state,
                     Some(0),
-                    Order::default(),
+                    Sort::Order(Order::default()),
                     Direction::default(),
+                    None,
                     "",
                     None,
                     Theme::dark(),
@@ -937,5 +1048,103 @@ mod tests {
     fn no_filter_line_is_shown_when_the_filter_is_empty() {
         let rendered = render(&loaded(vec![node("worker-1")]));
         assert!(!rendered.contains("Filter:"), "{rendered}");
+    }
+
+    #[test]
+    fn a_resource_ordering_names_itself_the_way_the_cli_table_does() {
+        let rendered = render_resource_sorted(
+            &loaded(vec![node_with_device(
+                "worker-1",
+                "nvidia.com/gpu",
+                "2",
+                "4",
+            )]),
+            "nvidia.com/gpu",
+            Direction::Natural,
+        );
+        assert!(rendered.contains("Sorted by nvidia.com/gpu."), "{rendered}");
+    }
+
+    #[test]
+    fn a_reversed_resource_ordering_says_which_way_round_it_ran() {
+        let rendered = render_resource_sorted(
+            &loaded(vec![node_with_device(
+                "worker-1",
+                "nvidia.com/gpu",
+                "2",
+                "4",
+            )]),
+            "nvidia.com/gpu",
+            Direction::Reversed,
+        );
+        assert!(
+            rendered.contains("Sorted by nvidia.com/gpu, reversed."),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn a_resource_ordering_that_ranked_nothing_says_so() {
+        // No node in this listing reports the resource at all — the pane's
+        // counterpart to `eks nodes --sort-resource` against a CPU-only
+        // cluster.
+        let rendered = render_resource_sorted(
+            &loaded(vec![node("worker-1")]),
+            "nvidia.com/gpu",
+            Direction::Natural,
+        );
+        assert!(
+            rendered.contains("Nothing here has nvidia.com/gpu to sort by."),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn a_resource_ordering_that_ranked_something_says_nothing_extra() {
+        let rendered = render_resource_sorted(
+            &loaded(vec![node_with_device(
+                "worker-1",
+                "nvidia.com/gpu",
+                "2",
+                "4",
+            )]),
+            "nvidia.com/gpu",
+            Direction::Natural,
+        );
+        assert!(!rendered.contains("Nothing here"), "{rendered}");
+    }
+
+    #[test]
+    fn an_empty_pane_says_nothing_about_a_resource_ordering_it_was_asked_for() {
+        let rendered =
+            render_resource_sorted(&loaded(Vec::new()), "nvidia.com/gpu", Direction::Natural);
+        assert!(!rendered.contains("Sorted by"), "{rendered}");
+        assert!(!rendered.contains("Nothing here"), "{rendered}");
+    }
+
+    #[test]
+    fn a_resource_prompt_being_typed_names_itself_above_the_rows() {
+        let rendered = render_resource_prompt(&loaded(vec![node("worker-1")]), "nvidia.com/g");
+        assert!(
+            rendered.contains("Sort by resource: \"nvidia.com/g\""),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn no_resource_prompt_line_is_shown_once_nothing_is_being_typed() {
+        // Applying a name clears the prompt text (`App::node_resource_prompt`
+        // returns `None` again); the applied ordering's own note takes over.
+        let rendered = render_resource_sorted(
+            &loaded(vec![node_with_device(
+                "worker-1",
+                "nvidia.com/gpu",
+                "2",
+                "4",
+            )]),
+            "nvidia.com/gpu",
+            Direction::Natural,
+        );
+        assert!(!rendered.contains("Sort by resource:"), "{rendered}");
     }
 }

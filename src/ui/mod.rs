@@ -258,6 +258,55 @@ impl Filter {
     }
 }
 
+/// The node pane's `--sort-resource` prompt.
+///
+/// A free-form counterpart to `s`/`S`'s fixed cycle over [`k8s_nodes::Order`],
+/// mirroring [`Filter`]'s life cycle for the same reason: a device's name is
+/// not known until the nodes have been fetched, so it has to be typed rather
+/// than picked from a `clap::ValueEnum` the way `--sort` is (see
+/// `k8s::nodes::order`'s module docs). `Editing` captures every keystroke as
+/// text; `Enter` applies it, collapsing an empty query back to `Inactive`
+/// rather than leaving an `Applied("")` with nothing to rank by; `Esc`
+/// cancels outright. Applying or clearing it, unlike a filter, changes what
+/// the pane's rows are actually sorted by, so both are followed by a re-sort
+/// rather than only a redraw.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+enum ResourceSort {
+    /// No `--sort-resource` prompt has ever been applied; the fixed `s`/`S`
+    /// cycle is in charge. The common case, costing nothing extra to draw.
+    #[default]
+    Inactive,
+    /// The resource name is being typed.
+    Editing(String),
+    /// The name was committed with `Enter` and governs the pane's ordering
+    /// until `s`, an empty commit, or an `Esc` clears it.
+    Applied(String),
+}
+
+impl ResourceSort {
+    /// The text to seed a fresh edit with — whatever was last applied, or
+    /// empty when nothing was.
+    fn query(&self) -> &str {
+        match self {
+            Self::Inactive => "",
+            Self::Editing(text) | Self::Applied(text) => text,
+        }
+    }
+
+    fn is_editing(&self) -> bool {
+        matches!(self, Self::Editing(_))
+    }
+
+    /// The applied resource name, or `None` while inactive or still being
+    /// typed — a prompt is not a `--sort-resource` until `Enter` commits it.
+    fn applied(&self) -> Option<&str> {
+        match self {
+            Self::Applied(text) => Some(text),
+            Self::Inactive | Self::Editing(_) => None,
+        }
+    }
+}
+
 /// Dashboard state.
 #[derive(Debug, Clone)]
 pub struct App {
@@ -288,6 +337,11 @@ pub struct App {
     /// two ways depending on which screen printed it.
     node_order: k8s_nodes::Order,
     node_direction: SortDirection,
+    /// The node pane's `--sort-resource` prompt — `R` in place of `s`'s fixed
+    /// cycle. `node_direction` still governs its reversal: the two flags
+    /// share one direction on the command line, and the pane follows suit
+    /// rather than tracking a second one nothing composes with.
+    node_resource_sort: ResourceSort,
     /// The pod-drilldown pane's ordering, independent of the node pane's:
     /// the two panes hold different rows and `s`/`S` act on whichever one
     /// [`View`] is currently showing.
@@ -329,6 +383,7 @@ impl App {
             filter: Filter::default(),
             node_order: k8s_nodes::Order::default(),
             node_direction: SortDirection::default(),
+            node_resource_sort: ResourceSort::default(),
             pod_order: k8s_pods::Order::default(),
             pod_direction: SortDirection::default(),
             quit_armed_at: None,
@@ -430,6 +485,38 @@ impl App {
         self.node_direction
     }
 
+    /// The node pane's active ordering: the applied `--sort-resource`
+    /// prompt, if there is one, else the fixed `s`/`S` cycle — mirrors
+    /// `commands::nodes::SortBy`, which resolves the same two flags the same
+    /// way on the command line.
+    #[must_use]
+    fn node_sort(&self) -> nodes::Sort<'_> {
+        match self.node_resource_sort.applied() {
+            Some(resource) => nodes::Sort::Resource(resource),
+            None => nodes::Sort::Order(self.node_order),
+        }
+    }
+
+    /// The text currently being typed into the node pane's `--sort-resource`
+    /// prompt, or `None` when nothing is being edited right now — distinct
+    /// from [`Self::node_sort`]'s `Resource` case, which only appears once
+    /// `Enter` commits this.
+    #[must_use]
+    fn node_resource_prompt(&self) -> Option<&str> {
+        match &self.node_resource_sort {
+            ResourceSort::Editing(text) => Some(text.as_str()),
+            ResourceSort::Inactive | ResourceSort::Applied(_) => None,
+        }
+    }
+
+    /// Whether the `R` prompt is currently capturing keystrokes, for the
+    /// footer's hints — the resource-sort counterpart to
+    /// [`Self::is_filtering`].
+    #[must_use]
+    pub fn is_typing_resource_sort(&self) -> bool {
+        self.node_resource_sort.is_editing()
+    }
+
     /// The pod-drilldown pane's current ordering.
     #[must_use]
     pub fn pod_order(&self) -> k8s_pods::Order {
@@ -462,18 +549,13 @@ impl App {
     /// the pane should not read as "the cluster lost every node" over one
     /// missed poll.
     pub fn apply_nodes(&mut self, result: Result<NodesFetch, FetchError>) {
-        let (order, direction) = (self.node_order, self.node_direction);
         self.credentials_lost = result.as_ref().is_err_and(|error| error.credentials);
         self.nodes = match (result, std::mem::take(&mut self.nodes)) {
-            (Ok(fetch), _) => {
-                let mut rows = fetch.rows;
-                k8s_nodes::sort(&mut rows, order, direction);
-                NodesState::Loaded {
-                    rows,
-                    usage_note: fetch.usage_note,
-                    refresh_error: None,
-                }
-            }
+            (Ok(fetch), _) => NodesState::Loaded {
+                rows: fetch.rows,
+                usage_note: fetch.usage_note,
+                refresh_error: None,
+            },
             (
                 Err(error),
                 NodesState::Loaded {
@@ -486,6 +568,23 @@ impl App {
             },
             (Err(error), _) => NodesState::Error(error.message),
         };
+        self.sort_nodes();
+    }
+
+    /// Re-sort the node pane's already-fetched rows under whichever ordering
+    /// is current: the applied `--sort-resource` prompt, if there is one,
+    /// else the fixed `s`/`S` cycle. Called after anything changes what
+    /// "current" means — a fetch landing, `s`, `S`, or the prompt being
+    /// applied or cleared — never as a fetch of its own, the same rule
+    /// [`Self::cycle_sort`] already followed.
+    fn sort_nodes(&mut self) {
+        let NodesState::Loaded { rows, .. } = &mut self.nodes else {
+            return;
+        };
+        match self.node_resource_sort.applied() {
+            Some(resource) => k8s_nodes::sort_by_device(rows, resource, self.node_direction),
+            None => k8s_nodes::sort(rows, self.node_order, self.node_direction),
+        }
     }
 
     /// Whether the failure on screen is one a fresh AWS login could fix.
@@ -619,9 +718,14 @@ impl App {
         match &self.view {
             View::Overview => {
                 self.node_order = next_variant(self.node_order);
-                if let NodesState::Loaded { rows, .. } = &mut self.nodes {
-                    k8s_nodes::sort(rows, self.node_order, self.node_direction);
-                }
+                // `s` reclaims the fixed cycle from any `--sort-resource`
+                // prompt in effect. Leaving the prompt applied and doing
+                // nothing would make the key read as broken rather than as
+                // superseded — the same reason a key that cannot help is
+                // dropped from the footer rather than kept and silently
+                // ignored.
+                self.node_resource_sort = ResourceSort::Inactive;
+                self.sort_nodes();
             }
             View::NodePods { .. } => {
                 self.pod_order = next_variant(self.pod_order);
@@ -643,10 +747,13 @@ impl App {
     pub fn reverse_sort(&mut self) {
         match &self.view {
             View::Overview => {
+                // Unlike `s`, this leaves an applied `--sort-resource`
+                // prompt in charge — `direction` is the one thing the fixed
+                // cycle and the prompt already share, so reversing it should
+                // not also cancel whichever of the two is governing the
+                // rows right now.
                 self.node_direction = reverse(self.node_direction);
-                if let NodesState::Loaded { rows, .. } = &mut self.nodes {
-                    k8s_nodes::sort(rows, self.node_order, self.node_direction);
-                }
+                self.sort_nodes();
             }
             View::NodePods { .. } => {
                 self.pod_direction = reverse(self.pod_direction);
@@ -718,6 +825,61 @@ impl App {
             _ => {}
         }
         self.detail_selected = 0;
+        Flow::Continue
+    }
+
+    /// `R`: begin typing a `--sort-resource` name for the node pane, seeded
+    /// with whatever was already applied so a second press refines it — the
+    /// same seeding [`Self::start_filter`] does for `/`.
+    ///
+    /// A no-op outside [`View::Overview`]: `k8s::nodes::sort_by_device` is
+    /// the only `sort_by_device` this tool has today, so there is nothing
+    /// for the key to do against the pod-drilldown or pod-containers panes.
+    fn start_resource_sort(&mut self) {
+        if self.view != View::Overview {
+            return;
+        }
+        self.focus = Focus::Detail;
+        self.node_resource_sort = ResourceSort::Editing(self.node_resource_sort.query().to_owned());
+    }
+
+    /// Handle a key press while the node pane's `--sort-resource` prompt is
+    /// capturing text — the resource-sort counterpart to
+    /// [`Self::edit_filter`], and just as exclusive: [`Self::on_key`] only
+    /// reaches this while [`Filter::is_editing`] is false, so the two are
+    /// never both capturing keystrokes at once. `Enter` commits the name
+    /// (collapsing an empty one back to [`ResourceSort::Inactive`], the same
+    /// rule `edit_filter` follows); `Esc` cancels outright. Unlike a filter,
+    /// committing or cancelling changes what the rows are actually sorted
+    /// by, so both re-sort rather than only redraw.
+    fn edit_resource_sort(&mut self, key: KeyEvent) -> Flow {
+        let ResourceSort::Editing(text) = &self.node_resource_sort else {
+            return Flow::Continue;
+        };
+        let mut text = text.clone();
+        match key.code {
+            KeyCode::Enter => {
+                self.node_resource_sort = if text.is_empty() {
+                    ResourceSort::Inactive
+                } else {
+                    ResourceSort::Applied(text)
+                };
+                self.sort_nodes();
+            }
+            KeyCode::Esc => {
+                self.node_resource_sort = ResourceSort::Inactive;
+                self.sort_nodes();
+            }
+            KeyCode::Backspace => {
+                text.pop();
+                self.node_resource_sort = ResourceSort::Editing(text);
+            }
+            KeyCode::Char(c) => {
+                text.push(c);
+                self.node_resource_sort = ResourceSort::Editing(text);
+            }
+            _ => {}
+        }
         Flow::Continue
     }
 
@@ -1148,6 +1310,10 @@ impl App {
             return self.edit_filter(key);
         }
 
+        if self.node_resource_sort.is_editing() {
+            return self.edit_resource_sort(key);
+        }
+
         // Any key other than the quit-family ones clears a pending quit arm,
         // so a stray press elsewhere doesn't leave a dangling "press again"
         // state for a much later, unrelated Esc/q to confirm.
@@ -1173,6 +1339,7 @@ impl App {
             KeyCode::Enter => self.drill_in(),
             KeyCode::Char('s') => self.cycle_sort(),
             KeyCode::Char('S') => self.reverse_sort(),
+            KeyCode::Char('R') => self.start_resource_sort(),
             // Only when there is something for it to fix. A key that silently
             // does nothing is worse than one that is not offered, so the
             // footer hint appears under exactly this condition too.
@@ -1764,8 +1931,9 @@ fn draw_detail(frame: &mut Frame, area: Rect, app: &App) {
             sections[1],
             app.nodes(),
             highlighted,
-            app.node_order(),
+            app.node_sort(),
             app.node_direction(),
+            app.node_resource_prompt(),
             app.filter_query(),
             app.login_hint(),
             theme,
@@ -1819,11 +1987,15 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
         return;
     }
 
-    let hints: &[(&str, &str)] = if app.is_filtering() {
+    let hints: Vec<(&str, &str)> = if app.is_filtering() {
         // Every other key below is filter text while this is showing — see
         // `App::on_key` — so the hints say that instead of listing keys that
         // do not mean what they usually do right now.
-        &[("type", "filter"), ("enter", "apply"), ("esc", "cancel")]
+        vec![("type", "filter"), ("enter", "apply"), ("esc", "cancel")]
+    } else if app.is_typing_resource_sort() {
+        // The `R` counterpart to the branch above: every key is resource-name
+        // text while this is showing, through `App::edit_resource_sort`.
+        vec![("type", "resource"), ("enter", "apply"), ("esc", "cancel")]
     } else if app.credentials_lost() {
         // Its own list rather than one more hint on the end of the others,
         // for the reason the two branches around it are: this is a state that
@@ -1832,7 +2004,7 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
         // hints that survive are the ones that lead somewhere. Keeping the
         // list short is also what keeps `q quit` on screen at eighty columns,
         // which the default list below is deliberately ordered to protect.
-        &[
+        vec![
             ("L", "log in"),
             ("tab/→", "switch"),
             ("←/esc", "back"),
@@ -1843,7 +2015,7 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
         // A log has nothing to `enter` further into and no ordering `s`/`S`
         // could apply to — `f`/`w`/`p` take their place, the three things
         // this pane's own keys change.
-        &[
+        vec![
             ("tab/→", "switch"),
             ("j/k", "scroll"),
             ("f", "follow"),
@@ -1853,7 +2025,7 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
             ("q", "quit"),
         ]
     } else {
-        &[
+        let mut hints = vec![
             ("tab/→", "switch/drill"),
             ("j/k", "move"),
             ("enter", "open"),
@@ -1865,11 +2037,20 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
             // clips the newest hint before it clips `q quit` — the one this
             // tool can least afford to hide.
             ("/", "filter"),
-        ]
+        ];
+        // `R` only does anything against the node pane (see
+        // `App::start_resource_sort`), so it is offered only there rather
+        // than advertised as a key that silently does nothing on the other
+        // two. Dropped first of all under a narrow terminal: it is the
+        // newest and the narrowest-scoped of the hints here.
+        if *app.view() == View::Overview {
+            hints.push(("R", "sort resource"));
+        }
+        hints
     };
 
     let mut spans = vec![Span::raw(" ")];
-    for &(key, action) in hints {
+    for &(key, action) in &hints {
         spans.push(Span::styled(key, theme.heading()));
         spans.push(Span::styled(format!(" {action}   "), theme.dim()));
     }
@@ -2536,6 +2717,47 @@ mod tests {
 
         let rendered = terminal.backend().to_string();
         assert!(rendered.contains("press esc/q again to quit"), "{rendered}");
+    }
+
+    #[test]
+    fn the_footer_offers_r_only_over_the_node_pane() {
+        // Wide enough that the footer's last hint — `R`, deliberately the
+        // first to clip on a narrow terminal (see `draw_footer`) — is not
+        // truncated away before this test gets to look for it.
+        let mut terminal = Terminal::new(TestBackend::new(200, 20)).unwrap();
+        let app_initial = app();
+
+        terminal.draw(|frame| draw(frame, &app_initial)).unwrap();
+        assert!(
+            terminal.backend().to_string().contains("sort resource"),
+            "{}",
+            terminal.backend().to_string()
+        );
+
+        let mut app = app_with_node();
+        app.on_key(press(KeyCode::Enter));
+        assert!(matches!(app.view(), View::NodePods { .. }));
+
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+        assert!(
+            !terminal.backend().to_string().contains("sort resource"),
+            "{}",
+            terminal.backend().to_string()
+        );
+    }
+
+    #[test]
+    fn the_footer_switches_to_resource_hints_while_the_prompt_is_editing() {
+        let mut terminal = Terminal::new(TestBackend::new(90, 20)).unwrap();
+        let mut app = app();
+
+        app.on_key(press(KeyCode::Char('R')));
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+
+        let rendered = terminal.backend().to_string();
+        assert!(rendered.contains("resource"), "{rendered}");
+        assert!(rendered.contains("apply"), "{rendered}");
+        assert!(rendered.contains("cancel"), "{rendered}");
     }
 
     #[test]
@@ -3580,6 +3802,231 @@ mod tests {
             terminal.backend().to_string().contains("Sorted by cpu."),
             "{}",
             terminal.backend().to_string()
+        );
+    }
+
+    /// A node reporting one booked device, for the `--sort-resource` tests.
+    fn node_row_with_device(
+        name: &str,
+        resource: &str,
+        booked: &str,
+        allocatable: &str,
+    ) -> crate::k8s::nodes::NodeRow {
+        use crate::k8s::nodes::{Capacity, Device};
+        use crate::k8s::quantity::Quantity;
+
+        let mut devices = std::collections::BTreeMap::new();
+        devices.insert(
+            resource.to_owned(),
+            Device {
+                capacity: Capacity {
+                    allocatable: Some(Quantity::parse(allocatable).unwrap()),
+                    capacity: Some(Quantity::parse(allocatable).unwrap()),
+                },
+                booked: Some(Quantity::parse(booked).unwrap()),
+            },
+        );
+        crate::k8s::nodes::NodeRow {
+            devices,
+            ..node_row(name)
+        }
+    }
+
+    #[test]
+    fn r_opens_a_resource_sort_prompt_and_switches_focus_to_the_detail_pane() {
+        let mut app = app();
+        assert_eq!(app.focus(), Focus::Sidebar);
+
+        app.on_key(press(KeyCode::Char('R')));
+
+        assert_eq!(app.focus(), Focus::Detail);
+        assert!(app.is_typing_resource_sort());
+        assert_eq!(app.node_resource_prompt(), Some(""));
+    }
+
+    #[test]
+    fn typing_after_r_builds_up_the_resource_prompts_text() {
+        let mut app = app();
+        app.on_key(press(KeyCode::Char('R')));
+
+        for c in "nvidia.com/gpu".chars() {
+            app.on_key(press(KeyCode::Char(c)));
+        }
+
+        assert_eq!(app.node_resource_prompt(), Some("nvidia.com/gpu"));
+    }
+
+    #[test]
+    fn enter_applies_the_resource_prompt_and_re_sorts_the_already_loaded_rows() {
+        let mut app = app();
+        app.apply_nodes(Ok(NodesFetch {
+            rows: vec![
+                node_row_with_device("roomy", "nvidia.com/gpu", "2", "16"),
+                node_row_with_device("tight", "nvidia.com/gpu", "2", "2"),
+            ],
+            usage_note: None,
+        }));
+
+        app.on_key(press(KeyCode::Char('R')));
+        for c in "nvidia.com/gpu".chars() {
+            app.on_key(press(KeyCode::Char(c)));
+        }
+        app.on_key(press(KeyCode::Enter));
+
+        assert!(!app.is_typing_resource_sort());
+        assert_eq!(app.node_resource_prompt(), None);
+        let names: Vec<&str> = app
+            .nodes()
+            .rows()
+            .iter()
+            .map(|row| row.name.as_str())
+            .collect();
+        assert_eq!(
+            names,
+            ["tight", "roomy"],
+            "no fetch happened; the rows already on screen were re-sorted by device share"
+        );
+    }
+
+    #[test]
+    fn committing_an_empty_resource_prompt_leaves_it_inactive() {
+        let mut app = app();
+        app.on_key(press(KeyCode::Char('R')));
+        app.on_key(press(KeyCode::Enter));
+
+        assert_eq!(app.node_resource_prompt(), None);
+        assert!(!app.is_typing_resource_sort());
+    }
+
+    #[test]
+    fn esc_while_editing_the_resource_prompt_cancels_it_and_restores_the_fixed_order() {
+        let mut app = app();
+        app.apply_nodes(Ok(NodesFetch {
+            rows: vec![
+                node_row_with_device("roomy", "nvidia.com/gpu", "2", "16"),
+                node_row_with_device("tight", "nvidia.com/gpu", "2", "2"),
+            ],
+            usage_note: None,
+        }));
+        app.on_key(press(KeyCode::Char('R')));
+        for c in "nvidia.com/gpu".chars() {
+            app.on_key(press(KeyCode::Char(c)));
+        }
+        app.on_key(press(KeyCode::Enter));
+
+        // Re-open the prompt, seeded with the applied name, and cancel it.
+        app.on_key(press(KeyCode::Char('R')));
+        assert_eq!(app.node_resource_prompt(), Some("nvidia.com/gpu"));
+        app.on_key(press(KeyCode::Esc));
+
+        assert_eq!(app.node_resource_prompt(), None);
+        let names: Vec<&str> = app
+            .nodes()
+            .rows()
+            .iter()
+            .map(|row| row.name.as_str())
+            .collect();
+        assert_eq!(
+            names,
+            ["roomy", "tight"],
+            "cancelling the prompt must fall back to the fixed order (by name)"
+        );
+    }
+
+    #[test]
+    fn backspace_edits_the_resource_prompts_text() {
+        let mut app = app();
+        app.on_key(press(KeyCode::Char('R')));
+        app.on_key(press(KeyCode::Char('x')));
+        app.on_key(press(KeyCode::Char('y')));
+        app.on_key(press(KeyCode::Backspace));
+
+        assert_eq!(app.node_resource_prompt(), Some("x"));
+    }
+
+    #[test]
+    fn s_reclaims_the_fixed_cycle_from_an_applied_resource_sort() {
+        let mut app = app();
+        app.apply_nodes(Ok(NodesFetch {
+            rows: vec![node_row_with_device("worker-1", "nvidia.com/gpu", "2", "4")],
+            usage_note: None,
+        }));
+        app.on_key(press(KeyCode::Char('R')));
+        for c in "nvidia.com/gpu".chars() {
+            app.on_key(press(KeyCode::Char(c)));
+        }
+        app.on_key(press(KeyCode::Enter));
+
+        app.on_key(press(KeyCode::Char('s')));
+
+        assert_eq!(app.node_resource_prompt(), None);
+        assert_eq!(app.node_order(), k8s_nodes::Order::Status);
+    }
+
+    #[test]
+    fn shift_s_reverses_an_applied_resource_sort_without_clearing_it() {
+        let mut app = app();
+        app.apply_nodes(Ok(NodesFetch {
+            rows: vec![
+                node_row_with_device("roomy", "nvidia.com/gpu", "2", "16"),
+                node_row_with_device("tight", "nvidia.com/gpu", "2", "2"),
+            ],
+            usage_note: None,
+        }));
+        app.on_key(press(KeyCode::Char('R')));
+        for c in "nvidia.com/gpu".chars() {
+            app.on_key(press(KeyCode::Char(c)));
+        }
+        app.on_key(press(KeyCode::Enter));
+
+        app.on_key(press(KeyCode::Char('S')));
+
+        assert_eq!(app.node_direction(), SortDirection::Reversed);
+        let names: Vec<&str> = app
+            .nodes()
+            .rows()
+            .iter()
+            .map(|row| row.name.as_str())
+            .collect();
+        assert_eq!(
+            names,
+            ["roomy", "tight"],
+            "reversing must keep the device ordering in charge rather than falling back to the \
+             fixed cycle"
+        );
+    }
+
+    #[test]
+    fn r_is_harmless_outside_the_node_pane() {
+        let mut app = app_with_pod();
+        app.on_key(press(KeyCode::Enter));
+        assert!(matches!(app.view(), View::PodContainers { .. }));
+
+        app.on_key(press(KeyCode::Char('R')));
+
+        assert!(!app.is_typing_resource_sort());
+        assert_eq!(app.node_resource_prompt(), None);
+    }
+
+    #[test]
+    fn a_quit_key_while_editing_the_resource_prompt_is_added_to_it_instead_of_arming_a_quit() {
+        let mut app = app();
+        app.on_key(press(KeyCode::Char('R')));
+
+        assert_eq!(app.on_key(press(KeyCode::Char('q'))), Flow::Continue);
+
+        assert_eq!(app.node_resource_prompt(), Some("q"));
+        assert!(!app.quit_pending());
+    }
+
+    #[test]
+    fn ctrl_c_still_quits_immediately_while_editing_the_resource_prompt() {
+        let mut app = app();
+        app.on_key(press(KeyCode::Char('R')));
+
+        assert_eq!(
+            app.on_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+            Flow::Quit
         );
     }
 

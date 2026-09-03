@@ -559,7 +559,7 @@ cluster.
   cycling, are their own entries below rather than guesses this task's
   acceptance criteria never asked for. See decision 84.
 
-- [ ] **Carry `--sort-resource` into the dashboard's node pane.**
+- [x] **Carry `--sort-resource` into the dashboard's node pane.**
   `s` cycles `Order::value_variants()` one press at a time (decision 58), and a
   device ordering has no place in that cycle: it takes a name `--sort-resource`
   supplies on the command line, and a single key press has nowhere to type one.
@@ -574,6 +574,30 @@ cluster.
   *Acceptance:* whichever shape it takes, the ranking goes through
   `k8s::nodes::order::sort_by_device` rather than a second reading of a
   device's share; a pane nobody has asked to sort this way is unchanged.
+  Landed as its own prompt rather than folded into `/`: reusing the fuzzy
+  filter for a second, unrelated purpose would have made one key mean two
+  things depending on context, so `R` opens a second, independent text input,
+  `ResourceSort`, mirroring `Filter`'s own `Inactive`/`Editing`/`Applied` life
+  cycle exactly rather than inventing a second shape for the same kind of
+  keystroke capture. `App::sort_nodes` is the new seam every transition that
+  changes what the rows are actually sorted by goes through — a fetch
+  landing, `s`, `S`, or the prompt being applied or cleared — mirroring
+  `commands::nodes::SortBy`'s own resolution of `--sort` versus
+  `--sort-resource`: an applied resource ordering always wins over the fixed
+  one, and `node_direction` still governs both, exactly as `--sort-reverse`
+  composes with either flag on the command line. With no error path to
+  enforce the CLI's mutual exclusivity in a pane where there is nothing to
+  reject, only a key to press, `s` reclaims the fixed cycle by clearing any
+  applied resource prompt — leaving one in effect while `s` silently did
+  nothing would read as a broken key — while `S` never does, since reversing
+  should not have to fight `R` for control. `ui::nodes::Sort` (`Order`/
+  `Resource`) is the new type the pane's header reads to choose between
+  `order::note`/`unranked_note` and `device_note`/`device_unranked_note`
+  without the two ever needing to agree on a shared shape. Scope stopped at
+  the node pane, matching the node-only scope decision 84 drew for
+  `--sort-resource` itself: the pod-drilldown pane has no `sort_by_device` to
+  carry yet, and stays with the CLI task below rather than being guessed at
+  here. See decision 85.
 
 - [ ] **Sort `eks pods` by an extended resource too.**
   "Sort the node table by an extended resource", above, settled the design

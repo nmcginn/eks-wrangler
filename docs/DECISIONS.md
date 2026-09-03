@@ -2888,3 +2888,52 @@ in `k8s::pods::order`, not the node one reused, and is its own roadmap entry.
 The dashboard's node pane, whose `s` key cycles `Order::value_variants()`
 (decision 58), has no way to type a resource name at all yet — also left open,
 alongside the pod-drilldown pane's own still-open device-sorting gap.
+
+### 85. `--sort-resource` in the node pane is a second prompt, `R`, mirroring `/`'s life cycle — and `s` reclaims it
+
+Decision 84 left the node pane's own `--sort-resource` open: `s` cycles a
+fixed, `--help`-listed vocabulary a key press can select from
+(`Order::value_variants()`, decision 58), and a device's name is the opposite
+of that by design — not known until the nodes have been fetched, and typed
+freely rather than chosen. The pane's only existing text-input mechanism was
+`/`, the fuzzy row filter, and reusing it for a second, unrelated purpose was
+rejected outright: `/` already means "narrow what's on screen", and folding
+"pick what sorts it" into the same keystroke would make one key mean two
+things depending on context nothing on screen explains.
+
+`R` opens a second, independent prompt instead, and `ResourceSort` — a new
+`App` field — mirrors `Filter`'s own three-state life cycle exactly:
+`Inactive`, `Editing(String)` capturing keystrokes, `Applied(String)`
+governing the pane once `Enter` commits it. Copying `Filter`'s shape rather
+than inventing a new one was deliberate — a second, differently-behaved text
+input beside the first would have cost the reader a second mental model for
+no real difference in what either one is doing keystroke by keystroke.
+
+Unlike a filter, applying or clearing a resource name changes what the rows
+are actually sorted by, not just what is drawn — so `App::sort_nodes` is a new
+seam both `apply_nodes` and every `ResourceSort` transition go through,
+matching `commands::nodes::SortBy`'s own resolution of `--sort` versus
+`--sort-resource`: a resource ordering, if applied, always wins over the
+fixed one. `node_direction` stays the one field both share, exactly as
+`--sort-reverse` composes with either flag on the command line — a second
+direction nothing could disagree with would only be a second thing to keep in
+sync.
+
+The mutual exclusivity the CLI enforces by rejecting `--sort` and
+`--sort-resource` together has no error path in the pane — there is nothing
+to reject, only a key to press — so it is enforced by what each key does
+instead: `s` (cycling the fixed order) clears any applied resource prompt,
+since leaving it in effect while `s` silently did nothing would read as a
+broken key; `S` (reversing) does not, since reversing is the one thing that
+should never need to fight `R` for control. Whichever ordering is active is
+exposed to `ui::nodes::draw` as a new `Sort` enum, `Order`/`Resource`, so the
+pane's header can print `device_note`/`device_unranked_note` for a resource
+ordering and `order::note`/`unranked_note` for a fixed one without the two
+notes ever needing to agree on a shared shape — the same split
+`commands::nodes::list` already draws between its two footnote branches.
+
+Scope stopped at the node pane, matching decision 84's own stopping point:
+`k8s::pods::order` has no `sort_by_device` yet (a pod's absent entry is a
+real zero rather than a node's "no such hardware" blank, so it needs its own
+function rather than the node one reused), and porting `R` to the
+pod-drilldown pane is that task's to open, not this one's to guess at.
