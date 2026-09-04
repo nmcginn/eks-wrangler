@@ -30,6 +30,20 @@
 //! denominator rather than a node's allocatable. A pod nobody has sampled, or
 //! one that asked for nothing, has no fraction to rank it by and falls to the
 //! tail exactly as it does under the plain `cpu`/`memory` orders.
+//!
+//! # Sorting by an extended resource
+//!
+//! [`sort_by_device`] is the pod table's counterpart to
+//! [`crate::k8s::nodes::order::sort_by_device`], reached the same way — a
+//! second, free-form flag rather than a `--sort` value, because a device's
+//! name is whatever the cluster invented and is not known until the pods have
+//! been fetched. What it ranks is not the same reading, though: a node either
+//! has a piece of hardware or it does not, so a node that never advertised a
+//! resource is unranked rather than a zero. A pod's device column has no such
+//! blank — the pod table already reads an absent entry in
+//! [`PodRow::extended_requested`] as `0`, a real fact about a container's
+//! resource requests rather than a reading nobody took — so [`sort_by_device`]
+//! ranks that quantity outright, with no unranked tail to fall into at all.
 
 use std::cmp::{Ordering, Reverse};
 
@@ -197,6 +211,46 @@ pub fn cause(order: Order, missing: Missing) -> Cause {
     })
 }
 
+/// Sort a listing by its booked amount of one extended resource, named freely
+/// by the user rather than fixed in [`Order`] — see the module docs on
+/// `--sort-resource`.
+pub fn sort_by_device(rows: &mut [PodRow], resource: &str, direction: Direction) {
+    // Same tie-break as `sort`, for the same reason: total and stable across
+    // two runs of one command.
+    rows.sort_by(|a, b| {
+        direction
+            .apply(device_amount(a, resource).cmp(&device_amount(b, resource)))
+            .then_with(|| by_name(a, b))
+    });
+}
+
+/// What a row asks for under a device ordering: the raw quantity, largest
+/// first — a pod that never named the resource reads a real `0` rather than
+/// falling into a tail, matching the pod table's own `Column::Device` reading.
+fn device_amount(row: &PodRow, resource: &str) -> Reverse<Quantity> {
+    Reverse(
+        row.extended_requested
+            .get(resource)
+            .copied()
+            .unwrap_or_default(),
+    )
+}
+
+/// The line naming the resource a `--sort-resource` listing is in — the
+/// pod table's counterpart to [`crate::k8s::nodes::order::device_note`].
+///
+/// Always returned, unlike [`crate::k8s::order::note`]: there is no default
+/// resource to compare against and stay silent about, so typing
+/// `--sort-resource` at all is always a listing the reader would not
+/// otherwise have gotten.
+#[must_use]
+pub fn device_note(resource: &str, direction: Direction) -> String {
+    match direction {
+        Direction::Natural => format!("Sorted by {resource}."),
+        Direction::Reversed => format!("Sorted by {resource}, reversed."),
+    }
+}
+
 /// Namespace, then name.
 ///
 /// Namespace leads because that is what the `NAMESPACE` column implies about
@@ -341,6 +395,24 @@ mod tests {
     fn aged(name: &str, minutes: Option<i64>) -> PodRow {
         PodRow {
             created_at: minutes.map(minutes_ago),
+            ..row(name, 0, None)
+        }
+    }
+
+    /// A row that asked for `amount` of `nvidia.com/gpu`, or did not ask for
+    /// the resource at all when `amount` is `None` — the pod-table shape of
+    /// `eks nodes`' own `device_row` fixture, minus the "does not have this
+    /// hardware" case a pod's requests have no room for.
+    fn wanting(name: &str, amount: Option<&str>) -> PodRow {
+        let mut extended_requested = std::collections::BTreeMap::new();
+        if let Some(amount) = amount {
+            extended_requested.insert(
+                "nvidia.com/gpu".to_owned(),
+                Quantity::parse(amount).unwrap(),
+            );
+        }
+        PodRow {
+            extended_requested,
             ..row(name, 0, None)
         }
     }
@@ -1254,5 +1326,123 @@ mod tests {
                 "{direction:?}"
             );
         }
+    }
+
+    // --- sort-resource ---
+
+    /// Sort a copy under `--sort-resource` and report the names, mirroring
+    /// [`sorted`] for the fixed orderings above.
+    fn sorted_by_device(rows: &[PodRow], resource: &str, direction: Direction) -> Vec<String> {
+        let mut rows = rows.to_vec();
+        sort_by_device(&mut rows, resource, direction);
+        rows.iter().map(|row| row.name.clone()).collect()
+    }
+
+    #[test]
+    fn device_order_ranks_the_largest_request_first() {
+        let rows = vec![wanting("small", Some("1")), wanting("big", Some("4"))];
+
+        assert_eq!(
+            sorted_by_device(&rows, "nvidia.com/gpu", Direction::Natural),
+            ["big", "small"]
+        );
+    }
+
+    #[test]
+    fn a_pod_that_never_asked_for_the_device_sorts_as_a_real_zero() {
+        // The case the whole task exists for: unlike a node, a pod has no
+        // "does not have this hardware" blank — every pod could in principle
+        // have asked, so not asking is the same honest `0` `Column::Device`
+        // already prints, and it takes its place among the ranked rows rather
+        // than falling into a tail.
+        let rows = vec![
+            wanting("none", None),
+            wanting("some", Some("2")),
+            wanting("zero", Some("0")),
+        ];
+
+        assert_eq!(
+            sorted_by_device(&rows, "nvidia.com/gpu", Direction::Natural),
+            ["some", "none", "zero"]
+        );
+    }
+
+    #[test]
+    fn reversing_a_device_order_puts_the_unrequested_pods_first_not_last() {
+        // The opposite of every other ordering's reversal rule, and correctly
+        // so: a `0` here is a real measurement, not a blank, so "least
+        // requested" is allowed to mean exactly the pods that asked for
+        // nothing at all.
+        let rows = vec![wanting("none", None), wanting("some", Some("2"))];
+
+        assert_eq!(
+            sorted_by_device(&rows, "nvidia.com/gpu", Direction::Reversed),
+            ["none", "some"]
+        );
+    }
+
+    #[test]
+    fn the_alphabet_breaks_every_tie_under_a_device_order() {
+        let rows = vec![
+            wanting("charlie", None),
+            wanting("alpha", None),
+            wanting("bravo", None),
+        ];
+
+        for direction in DIRECTIONS {
+            assert_eq!(
+                sorted_by_device(&rows, "nvidia.com/gpu", direction),
+                ["alpha", "bravo", "charlie"],
+                "{direction:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_device_order_survives_an_empty_and_a_single_row_listing() {
+        for direction in DIRECTIONS {
+            let mut none: Vec<PodRow> = Vec::new();
+            sort_by_device(&mut none, "nvidia.com/gpu", direction);
+            assert!(none.is_empty(), "{direction:?}");
+
+            let mut one = vec![wanting("only", Some("1"))];
+            sort_by_device(&mut one, "nvidia.com/gpu", direction);
+            assert_eq!(names(&one), ["only"], "{direction:?}");
+        }
+    }
+
+    #[test]
+    fn a_second_device_asked_for_by_name_reads_that_column_and_not_the_first() {
+        // `--sort-resource` takes a name, not a position, so a pod that asked
+        // for two devices must be ranked by the one the user actually typed.
+        let mut pod = wanting("mixed", Some("1"));
+        pod.extended_requested
+            .insert("amd.com/gpu".to_owned(), Quantity::parse("2").unwrap());
+        let other = wanting("other", Some("3"));
+
+        assert_eq!(
+            sorted_by_device(
+                &[pod.clone(), other.clone()],
+                "nvidia.com/gpu",
+                Direction::Natural
+            ),
+            ["other", "mixed"]
+        );
+        assert_eq!(
+            sorted_by_device(&[pod, other], "amd.com/gpu", Direction::Natural),
+            ["mixed", "other"]
+        );
+    }
+
+    #[test]
+    fn device_note_names_the_resource_the_way_the_user_typed_it() {
+        assert_eq!(
+            device_note("nvidia.com/gpu", Direction::Natural),
+            "Sorted by nvidia.com/gpu."
+        );
+        assert_eq!(
+            device_note("nvidia.com/gpu", Direction::Reversed),
+            "Sorted by nvidia.com/gpu, reversed."
+        );
     }
 }

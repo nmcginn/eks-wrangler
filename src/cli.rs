@@ -185,6 +185,18 @@ pub enum Command {
         #[arg(long)]
         sort_reverse: bool,
 
+        /// Sort by an extended resource's requested amount instead — a GPU's
+        /// fully-qualified name, e.g. `nvidia.com/gpu`, exactly as its column
+        /// heading spells it. Not one of `--sort`'s values, for the same
+        /// reason `eks nodes --sort-resource` is not: a device name is
+        /// whatever the cluster invented, and is not known until the pods are
+        /// read. Mutually exclusive with `--sort`. Unlike the node table, a
+        /// pod that never asked for the resource sorts as `0` rather than
+        /// dropping out of the ordering — every pod could in principle have
+        /// asked, so not asking is a real amount, not a missing one.
+        #[arg(long, value_name = "RESOURCE")]
+        sort_resource: Option<String>,
+
         /// Add the pod IP, the nominated node, and the readiness gates, as
         /// `kubectl get pods -o wide` does.
         #[arg(long)]
@@ -462,6 +474,53 @@ mod tests {
 
             assert!(sort_reverse, "{args:?}");
         }
+    }
+
+    #[test]
+    fn pods_sort_resource_defaults_to_absent() {
+        let Some(Command::Pods { sort_resource, .. }) = parse(&["eks", "pods"]).command else {
+            panic!("expected a Pods command");
+        };
+
+        assert_eq!(sort_resource, None);
+    }
+
+    #[test]
+    fn pods_sort_resource_takes_any_name_the_cluster_might_have_invented() {
+        // As for `eks nodes`: not a fixed, `--help`-listed vocabulary, so clap
+        // has to accept it whatever it is.
+        let Some(Command::Pods { sort_resource, .. }) =
+            parse(&["eks", "pods", "--sort-resource", "nvidia.com/gpu"]).command
+        else {
+            panic!("expected a Pods command");
+        };
+
+        assert_eq!(sort_resource.as_deref(), Some("nvidia.com/gpu"));
+    }
+
+    #[test]
+    fn pods_sort_resource_composes_with_a_reversal_and_with_wide() {
+        let cli = parse(&[
+            "eks",
+            "pods",
+            "--sort-resource",
+            "nvidia.com/gpu",
+            "--sort-reverse",
+            "--wide",
+        ]);
+        let Some(Command::Pods {
+            sort_resource,
+            sort_reverse,
+            wide,
+            ..
+        }) = cli.command
+        else {
+            panic!("expected a Pods command");
+        };
+
+        assert_eq!(sort_resource.as_deref(), Some("nvidia.com/gpu"));
+        assert!(sort_reverse);
+        assert!(wide);
     }
 
     #[test]
@@ -768,6 +827,7 @@ mod tests {
             sort,
             sort_reverse,
             wide,
+            ..
         }) = cli.command
         else {
             panic!("expected a Pods command");
