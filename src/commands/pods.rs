@@ -48,6 +48,13 @@ pub struct Request<'a> {
     /// `--sort-reverse`, which flips `order` without changing which rows the
     /// ordering has nothing to rank — those stay in the tail.
     pub direction: Direction,
+    /// `--sort-resource`: sort by this extended resource's requested amount
+    /// instead of `order`. A resource name is not one of `--sort`'s fixed
+    /// values for the same reason it is not on `eks nodes` — it is whatever
+    /// the cluster's device plugins invented, and is not known until the pods
+    /// have been fetched. Mutually exclusive with a non-default `order`,
+    /// enforced by `list`'s own `ordering_for` before anything connects.
+    pub resource: Option<&'a str>,
     /// `--wide`. Like `order`, applied to the finished rows: every column it
     /// adds arrived with the pods, so it costs no extra request.
     pub width: Width,
@@ -68,6 +75,30 @@ pub struct Request<'a> {
     pub login: LoginMode,
 }
 
+/// What to sort a pod listing by, `--sort` and `--sort-resource` resolved into
+/// one answer — the pod table's counterpart to `commands::nodes::SortBy`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SortBy {
+    Order(Order),
+    Resource(String),
+}
+
+/// Resolve `--sort` and `--sort-resource` into one ordering, before any
+/// network call — the same bargain `commands::nodes::ordering_for` makes.
+fn ordering_for(order: Order, resource: Option<String>) -> Result<SortBy> {
+    let Some(resource) = resource else {
+        return Ok(SortBy::Order(order));
+    };
+    if order != Order::default() {
+        return Err(anyhow!(
+            "`--sort` and `--sort-resource` ask for different things.\n\
+             Drop one: `--sort-resource {resource}` for that device's own column, \
+             `--sort <order>` for one of the fixed orderings."
+        ));
+    }
+    Ok(SortBy::Resource(resource))
+}
+
 /// Fetch and render the pod table for the selected cluster and scope.
 ///
 /// `context` is whatever the user passed to `--context`, resolved exactly as
@@ -80,6 +111,10 @@ pub async fn list(
 ) -> Result<String> {
     let target = target_cluster(config, context)?;
     let label = target.label();
+    // Resolved before connecting, the same "reject before anything connects"
+    // bargain the selectors below make: a `--sort`/`--sort-resource` conflict
+    // should fail instantly, not after a credential helper has run.
+    let ordering = ordering_for(request.order, request.resource.map(ToOwned::to_owned))?;
     // Resolved before connecting: a contradictory pair of flags, or a selector
     // the user mistyped, should be rejected instantly, not after a credential
     // helper has run and a request has gone out.
@@ -157,7 +192,12 @@ pub async fn list(
     // Ordering lives in `k8s::pods::order` rather than here, so the default and
     // the one `--sort` asks for are decided in the same place and by the same
     // rules — and so both can be tested on rows alone.
-    k8s_pods::sort(&mut rows, request.order, request.direction);
+    match &ordering {
+        SortBy::Order(order) => k8s_pods::sort(&mut rows, *order, request.direction),
+        SortBy::Resource(resource) => {
+            k8s_pods::sort_by_device(&mut rows, resource, request.direction);
+        }
+    }
 
     // What became of the usage columns, decided and worded exactly as
     // `commands::nodes` decides and words it: the two tables read the same
@@ -178,26 +218,41 @@ pub async fn list(
     // Last of the notes, under whatever went wrong, and worded and positioned
     // exactly as `eks nodes` does it — the two tables answer "which order is
     // this?" the same way because it is the same question. Silent unless
-    // `--sort` or `--sort-reverse` was given.
-    notes.extend(k8s::order::note(request.order, request.direction));
-    // And under it, the case where that line on its own misleads: an ordering
-    // that ranked no row at all — `--sort cpu` with no metrics-server, `--sort
-    // restarts` where nothing has ever crashed — describes a listing the
-    // alphabet arranged. Again worded once, in `k8s::order`, for both tables,
-    // with the listing supplying the two things the wording turns on: what
-    // these rows could be sorted by instead, and whether the note above already
-    // explains the empty column.
-    let missing = k8s_pods::Missing {
-        // The columns being gone, rather than the read having failed: both
-        // reasons for their absence now have a note above to point back at.
-        usage: usage_columns.is_missing(),
-    };
-    notes.extend(k8s::order::unranked_note(
-        request.order,
-        k8s_pods::cause(request.order, missing),
-        |candidate| k8s_pods::ranks_any(&rows, candidate),
-        |candidate| k8s_pods::distinguishes(&rows, candidate),
-    ));
+    // `--sort`, `--sort-reverse`, or `--sort-resource` was given.
+    match &ordering {
+        SortBy::Order(order) => {
+            notes.extend(k8s::order::note(*order, request.direction));
+            // And under it, the case where that line on its own misleads: an
+            // ordering that ranked no row at all — `--sort cpu` with no
+            // metrics-server, `--sort restarts` where nothing has ever
+            // crashed — describes a listing the alphabet arranged. Again
+            // worded once, in `k8s::order`, for both tables, with the listing
+            // supplying the two things the wording turns on: what these rows
+            // could be sorted by instead, and whether the note above already
+            // explains the empty column.
+            let missing = k8s_pods::Missing {
+                // The columns being gone, rather than the read having failed:
+                // both reasons for their absence now have a note above to
+                // point back at.
+                usage: usage_columns.is_missing(),
+            };
+            notes.extend(k8s::order::unranked_note(
+                *order,
+                k8s_pods::cause(*order, missing),
+                |candidate| k8s_pods::ranks_any(&rows, candidate),
+                |candidate| k8s_pods::distinguishes(&rows, candidate),
+            ));
+        }
+        // The free-form counterpart: always named, since there is no default
+        // resource to compare against and stay silent about. There is no
+        // unranked half to add beside it — unlike a node, a pod that never
+        // asked for the resource sorts as a real `0` rather than falling out
+        // of the ordering, so this can never rank nothing the way `--sort
+        // cpu` can.
+        SortBy::Resource(resource) => {
+            notes.push(k8s_pods::device_note(resource, request.direction));
+        }
+    }
 
     Ok(k8s_pods::render(
         &rows,
@@ -651,6 +706,35 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
+
+    #[test]
+    fn no_sort_resource_leaves_the_fixed_ordering_in_charge() {
+        assert_eq!(
+            ordering_for(Order::Cpu, None).unwrap(),
+            SortBy::Order(Order::Cpu)
+        );
+    }
+
+    #[test]
+    fn a_sort_resource_alone_is_a_device_ordering() {
+        // `--sort` was never given, so it is still its default, and a
+        // resource name on its own is not a conflict.
+        assert_eq!(
+            ordering_for(Order::default(), Some("nvidia.com/gpu".to_owned())).unwrap(),
+            SortBy::Resource("nvidia.com/gpu".to_owned())
+        );
+    }
+
+    #[test]
+    fn sort_and_sort_resource_together_are_rejected_before_anything_connects() {
+        let error = ordering_for(Order::Cpu, Some("nvidia.com/gpu".to_owned()))
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("--sort"), "{error}");
+        assert!(error.contains("--sort-resource"), "{error}");
+        assert!(error.contains("nvidia.com/gpu"), "{error}");
+    }
 
     const CONFIG: &str = r"
 apiVersion: v1

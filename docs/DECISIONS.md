@@ -2937,3 +2937,41 @@ Scope stopped at the node pane, matching decision 84's own stopping point:
 real zero rather than a node's "no such hardware" blank, so it needs its own
 function rather than the node one reused), and porting `R` to the
 pod-drilldown pane is that task's to open, not this one's to guess at.
+
+### 86. `eks pods --sort-resource` ranks a real zero directly, with no tail and no
+unranked note
+
+Decision 84 left this as its own roadmap entry, because a pod's device column
+reads an absent entry as a real `0` (decision 79) rather than the "no such
+hardware" blank a node's does — `k8s::nodes::order::sort_by_device` ranks
+`Device::share()` through `busiest`, which puts an unmeasured or
+hardware-absent node in the tail behind every ranked one, and neither tier
+applies to a pod that simply never asked for a GPU.
+
+`k8s::pods::order::sort_by_device` therefore does not reuse `busiest`, `Rank`,
+or `compare` at all: it ranks `Reverse<Quantity>` directly, reading a missing
+`extended_requested` entry as `Quantity::default()` the same way
+`Column::Device::text` already does, then falls back to the namespace/name
+tie-break every other pod ordering uses. There is no `Rank::Unranked` tier
+because there is nothing here that can fail to be known — every pod's request
+is a fact the pod listing already carries, unlike a live usage sample or a
+node's allocatable, which really can be absent.
+
+That absence of a tail also meant leaving out `device_unranked_note`. The
+node one exists to say "nothing here has this resource to sort by" when no
+node advertises it at all — a real gap in the data. A pod-side equivalent
+would fire only when every pod in the listing asked for exactly the same
+amount (usually zero), which is not a missing column, just an uninteresting
+one; inventing a note for it would be answering a question nobody asked with
+a made-up justification. `device_note` — the unconditional "Sorted by
+nvidia.com/gpu." line — is kept, matching the node table and giving the same
+answer to "why does this table look unsorted": there was nothing to
+distinguish, not a flag that silently failed.
+
+`commands::pods::ordering_for` and `SortBy` are close copies of
+`commands::nodes`' versions, rejecting `--sort` and `--sort-resource`
+together before `list` connects to anything, in the same wording. Carrying
+`--sort-resource` into the dashboard's pod-drilldown pane — the gap decision
+85 left open on the node side's `R` key — is its own roadmap entry: a second
+surface this change does not touch, and the same "what does `R` mean here"
+design question the node pane's own prompt already had to answer once.

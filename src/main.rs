@@ -99,6 +99,7 @@ fn run(cli: Cli) -> Result<()> {
             all_namespaces,
             sort,
             sort_reverse,
+            sort_resource,
             wide,
         } => {
             let output = commands::block_on(pods::list(
@@ -112,6 +113,7 @@ fn run(cli: Cli) -> Result<()> {
                     field_selector: cli.global.field_selector.as_deref(),
                     order: sort,
                     direction: Direction::reversed(sort_reverse),
+                    resource: sort_resource.as_deref(),
                     width: Width::for_terminal(wide, stdout_terminal_cols()),
                     palette: stdout_palette(cli.global.color),
                     budget: cli.global.timeout,

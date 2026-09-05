@@ -42,7 +42,9 @@ pub mod row;
 pub use containers::ContainerRow;
 pub use events::EventRow;
 pub use logs::LogEvent;
-pub use order::{Missing, Order, cause, distinguishes, ranks_any, sort};
+pub use order::{
+    Missing, Order, cause, device_note, distinguishes, ranks_any, sort, sort_by_device,
+};
 pub use row::{PodRow, render, selector_note, shows_usage, usage_unavailable, usage_unsampled};
 pub(crate) use row::{nominated_node, pod_ip, readiness_gates};
 

@@ -599,7 +599,7 @@ cluster.
   carry yet, and stays with the CLI task below rather than being guessed at
   here. See decision 85.
 
-- [ ] **Sort `eks pods` by an extended resource too.**
+- [x] **Sort `eks pods` by an extended resource too.**
   "Sort the node table by an extended resource", above, settled the design
   question its own acceptance criteria left to the reviewer — `--sort-resource`
   as a second flag, conflicting with a non-default `--sort` — for the node
@@ -613,6 +613,32 @@ cluster.
   *Acceptance:* `--sort-resource` parses the same way on both subcommands; a
   pod that never asked for the resource sorts as `0`, not into the unranked
   tail, matching `Column::Device`'s own reading of an absent entry.
+  Landed as `k8s::pods::order::sort_by_device`, ranking `Reverse<Quantity>`
+  directly rather than through `busiest`/`Rank`: a pod's request is a fact the
+  pod listing already carries, so there is no reading nobody took for a tail
+  tier to catch, and a missing entry falls back to `Quantity::default()` the
+  same way `Column::Device::text` already does. `commands::pods::ordering_for`
+  and `SortBy` mirror the node command's, rejecting `--sort` and
+  `--sort-resource` together before connecting, in the same wording.
+  `device_note` is kept — the same unconditional "Sorted by …" line the node
+  table prints — but `device_unranked_note` is not: with no tail tier, the
+  only thing it could ever report is every pod tying on the same figure,
+  which is not a missing column and not worth inventing a sentence for. See
+  decision 86.
+
+- [ ] **Carry `--sort-resource` into the dashboard's pod-drilldown pane.**
+  The node pane got this as `R`, a second prompt mirroring `/`'s life cycle
+  (decision 85); the pod-drilldown pane has no equivalent, and now that
+  `k8s::pods::order::sort_by_device` exists there is a real function for a key
+  to call. Separate because it is a second pane the node change never touched,
+  and it inherits the same open design question decision 85 answered for the
+  node pane on its own terms — whether `R` is the right key here too, and
+  whether the pane's existing `/` filter and any future ordering UI want to
+  agree on one mechanism before a second pane copies the first's answer.
+  *Acceptance:* whichever shape it takes, the ranking goes through
+  `k8s::pods::order::sort_by_device` rather than a second reading of a
+  device's requested amount; a pane nobody has asked to sort this way is
+  unchanged.
 
 - [x] **Native resources that still have no column: `ephemeral-storage` and
   `hugepages-*`.**
