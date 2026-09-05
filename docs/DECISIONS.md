@@ -2975,3 +2975,56 @@ together before `list` connects to anything, in the same wording. Carrying
 85 left open on the node side's `R` key — is its own roadmap entry: a second
 surface this change does not touch, and the same "what does `R` mean here"
 design question the node pane's own prompt already had to answer once.
+
+### 87. `R` in the pod-drilldown pane answers the same as decision 85 did for the node pane
+
+The roadmap entry left the question open on its own terms — whether `R` is
+the right key here too, and whether the pane's own `/` filter and `s`/`S`
+want to agree with a second pane's ordering UI before it copies the first's
+answer. Nothing about the pod-drilldown pane's `s`/`S`/`/` turned out to
+disagree with the node pane's: both panes already hold their own independent
+`order`/`direction` pair (`pod_order`/`pod_direction` beside
+`node_order`/`node_direction`) because the two never share a screen, and a
+`--sort-resource` prompt is the same kind of pane-local state — so it gets
+the same answer, `pod_resource_sort` beside `node_resource_sort`, both
+`ResourceSort`. That type's own doc comment no longer calls itself "the node
+pane's prompt" now that a second pane holds one.
+
+`ui::pods::Sort` (`Order`/`Resource`) is the new type `ui::pods::draw` reads,
+mirroring `ui::nodes::Sort` exactly — `App::pod_sort` resolves the applied
+prompt against the fixed cycle the same way `App::node_sort` and
+`commands::pods::ordering_for` both already do. The pane's device ordering
+draws through `k8s_pods::sort_by_device` and `k8s_pods::device_note` only:
+unlike the node pane, there is no `device_unranked_note` to call, because
+decision 86 never built one — a pod's absent device request reads as a real
+`0` rather than an unranked blank, so there is nothing here for an "unranked"
+line to say.
+
+`s` reclaims the fixed cycle from an applied resource prompt in either pane,
+matching decision 85's reasoning exactly: leaving one in effect while `s`
+silently did nothing would read as a broken key. `S` reverses whichever
+ordering is active in either pane without clearing it, for the same reason
+decision 85 gave — reversing should not have to fight `R` for control. The
+footer's `R sort resource` hint now gates on `Overview | NodePods` rather
+than `Overview` alone, and the `the_footer_offers_r_only_over_the_node_pane`
+test became `the_footer_offers_r_over_both_panes_with_a_device_ordering`,
+now also asserting the hint disappears again over the pod-containers pane —
+the one detail-pane level down from `NodePods` that still has no ordering of
+its own.
+
+The one piece with no node-pane precedent: `App::edit_resource_sort` used to
+be one `match` arm's worth of keystroke handling, all of it for
+`node_resource_sort`. With a second field needing the identical `Enter`/
+`Esc`/`Backspace`/`Char` handling, the choice was between two near-duplicate
+arms or factoring the keystroke logic itself out from the two-arm dispatch —
+taken here as `advance_resource_sort`, a free function over `(text, key)`
+returning the next `ResourceSort`, with `edit_resource_sort` left to decide
+which field it writes into and which pane's rows it re-sorts. `Filter` and
+`ResourceSort` stayed two separate types rather than one shared shape
+despite looking alike (both `Inactive`/`Editing`/`Applied`) — a search query
+and a sort key are different things that happen to share a life cycle, and
+collapsing them would have made a filter answer to `R` or a resource prompt
+answer to `/` a type-level possibility that never should have been one. The
+keystroke *step*, unlike the concept, had no such reason to diverge: `Filter`
+has no second copy of itself to keep in sync with, so `edit_filter` stays as
+it was.

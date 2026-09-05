@@ -626,7 +626,7 @@ cluster.
   which is not a missing column and not worth inventing a sentence for. See
   decision 86.
 
-- [ ] **Carry `--sort-resource` into the dashboard's pod-drilldown pane.**
+- [x] **Carry `--sort-resource` into the dashboard's pod-drilldown pane.**
   The node pane got this as `R`, a second prompt mirroring `/`'s life cycle
   (decision 85); the pod-drilldown pane has no equivalent, and now that
   `k8s::pods::order::sort_by_device` exists there is a real function for a key
@@ -639,6 +639,19 @@ cluster.
   `k8s::pods::order::sort_by_device` rather than a second reading of a
   device's requested amount; a pane nobody has asked to sort this way is
   unchanged.
+  Landed as the same answer decision 85 gave the node pane: `R` opens a
+  second prompt, `pod_resource_sort`, mirroring `node_resource_sort`'s own
+  `ResourceSort` life cycle exactly, seeded and cancelled the same way `/`
+  already is for a filter. `ui::pods::Sort` (`Order`/`Resource`) is the new
+  type `ui::pods::draw` reads, mirroring `ui::nodes::Sort`; `App::pod_sort`
+  resolves the prompt against the fixed cycle the way `App::node_sort` and
+  `commands::pods::ordering_for` already do. `s` reclaims the fixed cycle
+  from an applied resource prompt in either pane and `S` reverses whichever
+  is active without clearing it, both for the reasons decision 85 already
+  gave; the footer's `R` hint now gates on `Overview | NodePods`. No
+  `device_unranked_note` call, unlike the node pane's: decision 86 never
+  built one, since a pod's absent device request reads as a real `0` rather
+  than an unranked blank. See decision 87.
 
 - [x] **Native resources that still have no column: `ephemeral-storage` and
   `hugepages-*`.**
