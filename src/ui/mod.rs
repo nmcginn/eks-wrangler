@@ -258,13 +258,16 @@ impl Filter {
     }
 }
 
-/// The node pane's `--sort-resource` prompt.
+/// A `--sort-resource` prompt: the node pane's own, in [`App::node_resource_sort`],
+/// and the pod-drilldown pane's own copy in [`App::pod_resource_sort`] — the
+/// two panes never share a screen, so each holds its own rather than one
+/// shared between rows of two different shapes.
 ///
-/// A free-form counterpart to `s`/`S`'s fixed cycle over [`k8s_nodes::Order`],
-/// mirroring [`Filter`]'s life cycle for the same reason: a device's name is
-/// not known until the nodes have been fetched, so it has to be typed rather
-/// than picked from a `clap::ValueEnum` the way `--sort` is (see
-/// `k8s::nodes::order`'s module docs). `Editing` captures every keystroke as
+/// A free-form counterpart to `s`/`S`'s fixed cycle over an `Order`, mirroring
+/// [`Filter`]'s life cycle for the same reason: a device's name is not known
+/// until the rows have been fetched, so it has to be typed rather than picked
+/// from a `clap::ValueEnum` the way `--sort` is (see `k8s::nodes::order`'s
+/// module docs). `Editing` captures every keystroke as
 /// text; `Enter` applies it, collapsing an empty query back to `Inactive`
 /// rather than leaving an `Applied("")` with nothing to rank by; `Esc`
 /// cancels outright. Applying or clearing it, unlike a filter, changes what
@@ -347,6 +350,12 @@ pub struct App {
     /// [`View`] is currently showing.
     pod_order: k8s_pods::Order,
     pod_direction: SortDirection,
+    /// The pod-drilldown pane's `--sort-resource` prompt — [`Self::node_resource_sort`]'s
+    /// own copy for this pane, independent for the same reason `pod_order`
+    /// is: the two panes never share a screen, and a device ordering typed
+    /// against one node's pods has nothing to say about the next one drilled
+    /// into.
+    pod_resource_sort: ResourceSort,
     /// When the last unconfirmed `Esc`/`q` at the top level was pressed —
     /// `None` when no quit is pending. A second press of either key within
     /// [`QUIT_CONFIRM_WINDOW`] confirms it; any other key clears it.
@@ -386,6 +395,7 @@ impl App {
             node_resource_sort: ResourceSort::default(),
             pod_order: k8s_pods::Order::default(),
             pod_direction: SortDirection::default(),
+            pod_resource_sort: ResourceSort::default(),
             quit_armed_at: None,
             credentials_lost: false,
         }
@@ -509,18 +519,41 @@ impl App {
         }
     }
 
-    /// Whether the `R` prompt is currently capturing keystrokes, for the
-    /// footer's hints — the resource-sort counterpart to
-    /// [`Self::is_filtering`].
+    /// Whether either pane's `R` prompt is currently capturing keystrokes,
+    /// for the footer's hints — the resource-sort counterpart to
+    /// [`Self::is_filtering`]. Only one can ever be editing at once: `R`
+    /// opens exactly one of the two for a given [`View`].
     #[must_use]
     pub fn is_typing_resource_sort(&self) -> bool {
-        self.node_resource_sort.is_editing()
+        self.node_resource_sort.is_editing() || self.pod_resource_sort.is_editing()
     }
 
     /// The pod-drilldown pane's current ordering.
     #[must_use]
     pub fn pod_order(&self) -> k8s_pods::Order {
         self.pod_order
+    }
+
+    /// The pod-drilldown pane's active ordering: the applied
+    /// `--sort-resource` prompt, if there is one, else the fixed `s`/`S`
+    /// cycle — [`Self::node_sort`]'s counterpart for this pane.
+    #[must_use]
+    fn pod_sort(&self) -> pods::Sort<'_> {
+        match self.pod_resource_sort.applied() {
+            Some(resource) => pods::Sort::Resource(resource),
+            None => pods::Sort::Order(self.pod_order),
+        }
+    }
+
+    /// The text currently being typed into the pod-drilldown pane's
+    /// `--sort-resource` prompt — [`Self::node_resource_prompt`]'s
+    /// counterpart for this pane.
+    #[must_use]
+    fn pod_resource_prompt(&self) -> Option<&str> {
+        match &self.pod_resource_sort {
+            ResourceSort::Editing(text) => Some(text.as_str()),
+            ResourceSort::Inactive | ResourceSort::Applied(_) => None,
+        }
     }
 
     /// The pod-drilldown pane's current direction.
@@ -660,16 +693,27 @@ impl App {
     pub fn apply_pods(&mut self, result: Result<PodsFetch, FetchError>) {
         self.credentials_lost = result.as_ref().is_err_and(|error| error.credentials);
         self.pods = match result {
-            Ok(fetch) => {
-                let mut rows = fetch.rows;
-                k8s_pods::sort(&mut rows, self.pod_order, self.pod_direction);
-                PodsState::Loaded {
-                    rows,
-                    selector_note: fetch.selector_note,
-                }
-            }
+            Ok(fetch) => PodsState::Loaded {
+                rows: fetch.rows,
+                selector_note: fetch.selector_note,
+            },
             Err(error) => PodsState::Error(error.message),
         };
+        self.sort_pods();
+    }
+
+    /// Re-sort the pod-drilldown pane's already-fetched rows under whichever
+    /// ordering is current — [`Self::sort_nodes`]'s counterpart for this
+    /// pane, called for the same reasons: a fetch landing, `s`, `S`, or the
+    /// pane's own `--sort-resource` prompt being applied or cleared.
+    fn sort_pods(&mut self) {
+        let PodsState::Loaded { rows, .. } = &mut self.pods else {
+            return;
+        };
+        match self.pod_resource_sort.applied() {
+            Some(resource) => k8s_pods::sort_by_device(rows, resource, self.pod_direction),
+            None => k8s_pods::sort(rows, self.pod_order, self.pod_direction),
+        }
     }
 
     /// Apply the outcome of a fetch for one pod's containers.
@@ -729,9 +773,10 @@ impl App {
             }
             View::NodePods { .. } => {
                 self.pod_order = next_variant(self.pod_order);
-                if let PodsState::Loaded { rows, .. } = &mut self.pods {
-                    k8s_pods::sort(rows, self.pod_order, self.pod_direction);
-                }
+                // The same reclaiming `View::Overview` does above, now that
+                // this pane has a `--sort-resource` prompt of its own.
+                self.pod_resource_sort = ResourceSort::Inactive;
+                self.sort_pods();
             }
             // No ordering yet: a pod rarely has more than a handful of
             // containers, already in the spec's own order, and `s` has
@@ -757,9 +802,7 @@ impl App {
             }
             View::NodePods { .. } => {
                 self.pod_direction = reverse(self.pod_direction);
-                if let PodsState::Loaded { rows, .. } = &mut self.pods {
-                    k8s_pods::sort(rows, self.pod_order, self.pod_direction);
-                }
+                self.sort_pods();
             }
             View::PodContainers { .. } | View::ContainerLogs { .. } => {}
         }
@@ -828,57 +871,64 @@ impl App {
         Flow::Continue
     }
 
-    /// `R`: begin typing a `--sort-resource` name for the node pane, seeded
-    /// with whatever was already applied so a second press refines it — the
-    /// same seeding [`Self::start_filter`] does for `/`.
+    /// `R`: begin typing a `--sort-resource` name for whichever pane [`View`]
+    /// is currently showing a device-sortable listing — the node pane under
+    /// [`View::Overview`], the pod-drilldown pane under [`View::NodePods`] —
+    /// seeded with whatever was already applied so a second press refines
+    /// it, the same seeding [`Self::start_filter`] does for `/`.
     ///
-    /// A no-op outside [`View::Overview`]: `k8s::nodes::sort_by_device` is
-    /// the only `sort_by_device` this tool has today, so there is nothing
-    /// for the key to do against the pod-drilldown or pod-containers panes.
+    /// A no-op from [`View::PodContainers`] or [`View::ContainerLogs`]:
+    /// neither pane has a `sort_by_device` of its own to rank by.
     fn start_resource_sort(&mut self) {
-        if self.view != View::Overview {
-            return;
+        match &self.view {
+            View::Overview => {
+                self.focus = Focus::Detail;
+                self.node_resource_sort =
+                    ResourceSort::Editing(self.node_resource_sort.query().to_owned());
+            }
+            View::NodePods { .. } => {
+                self.focus = Focus::Detail;
+                self.pod_resource_sort =
+                    ResourceSort::Editing(self.pod_resource_sort.query().to_owned());
+            }
+            View::PodContainers { .. } | View::ContainerLogs { .. } => {}
         }
-        self.focus = Focus::Detail;
-        self.node_resource_sort = ResourceSort::Editing(self.node_resource_sort.query().to_owned());
     }
 
-    /// Handle a key press while the node pane's `--sort-resource` prompt is
+    /// Handle a key press while either pane's `--sort-resource` prompt is
     /// capturing text — the resource-sort counterpart to
     /// [`Self::edit_filter`], and just as exclusive: [`Self::on_key`] only
-    /// reaches this while [`Filter::is_editing`] is false, so the two are
-    /// never both capturing keystrokes at once. `Enter` commits the name
-    /// (collapsing an empty one back to [`ResourceSort::Inactive`], the same
-    /// rule `edit_filter` follows); `Esc` cancels outright. Unlike a filter,
-    /// committing or cancelling changes what the rows are actually sorted
-    /// by, so both re-sort rather than only redraw.
+    /// reaches this while one of the two is [`ResourceSort::Editing`], and
+    /// [`Self::start_resource_sort`] never opens more than one for a given
+    /// [`View`]. `Enter` commits the name (collapsing an empty one back to
+    /// [`ResourceSort::Inactive`], the same rule `edit_filter` follows);
+    /// `Esc` cancels outright. Unlike a filter, committing or cancelling
+    /// changes what the rows are actually sorted by, so both re-sort rather
+    /// than only redraw — [`advance_resource_sort`] is the pure step shared
+    /// between the two arms below, which differ only in which prompt and
+    /// which pane's rows that re-sort touches.
     fn edit_resource_sort(&mut self, key: KeyEvent) -> Flow {
-        let ResourceSort::Editing(text) = &self.node_resource_sort else {
-            return Flow::Continue;
-        };
-        let mut text = text.clone();
-        match key.code {
-            KeyCode::Enter => {
-                self.node_resource_sort = if text.is_empty() {
-                    ResourceSort::Inactive
-                } else {
-                    ResourceSort::Applied(text)
+        let resort = matches!(key.code, KeyCode::Enter | KeyCode::Esc);
+        match &self.view {
+            View::Overview => {
+                let ResourceSort::Editing(text) = &self.node_resource_sort else {
+                    return Flow::Continue;
                 };
-                self.sort_nodes();
+                self.node_resource_sort = advance_resource_sort(text, key);
+                if resort {
+                    self.sort_nodes();
+                }
             }
-            KeyCode::Esc => {
-                self.node_resource_sort = ResourceSort::Inactive;
-                self.sort_nodes();
+            View::NodePods { .. } => {
+                let ResourceSort::Editing(text) = &self.pod_resource_sort else {
+                    return Flow::Continue;
+                };
+                self.pod_resource_sort = advance_resource_sort(text, key);
+                if resort {
+                    self.sort_pods();
+                }
             }
-            KeyCode::Backspace => {
-                text.pop();
-                self.node_resource_sort = ResourceSort::Editing(text);
-            }
-            KeyCode::Char(c) => {
-                text.push(c);
-                self.node_resource_sort = ResourceSort::Editing(text);
-            }
-            _ => {}
+            View::PodContainers { .. } | View::ContainerLogs { .. } => {}
         }
         Flow::Continue
     }
@@ -1310,7 +1360,7 @@ impl App {
             return self.edit_filter(key);
         }
 
-        if self.node_resource_sort.is_editing() {
+        if self.node_resource_sort.is_editing() || self.pod_resource_sort.is_editing() {
             return self.edit_resource_sort(key);
         }
 
@@ -1787,6 +1837,32 @@ fn reverse(direction: SortDirection) -> SortDirection {
     }
 }
 
+/// One key's effect on a `--sort-resource` prompt already [`ResourceSort::Editing`]
+/// `text` — the pure step [`App::edit_resource_sort`] shares between the node
+/// pane's prompt and the pod-drilldown pane's own copy, which differ only in
+/// which field this is assigned back into and whose rows get re-sorted
+/// afterward. `Enter` commits (collapsing an empty query back to `Inactive`
+/// rather than leaving an `Applied("")` with nothing to rank by); `Esc`
+/// cancels outright; `Backspace` and any other character edit the text; any
+/// other key leaves it as it was.
+fn advance_resource_sort(text: &str, key: KeyEvent) -> ResourceSort {
+    let mut text = text.to_owned();
+    match key.code {
+        KeyCode::Enter if text.is_empty() => ResourceSort::Inactive,
+        KeyCode::Enter => ResourceSort::Applied(text),
+        KeyCode::Esc => ResourceSort::Inactive,
+        KeyCode::Backspace => {
+            text.pop();
+            ResourceSort::Editing(text)
+        }
+        KeyCode::Char(c) => {
+            text.push(c);
+            ResourceSort::Editing(text)
+        }
+        _ => ResourceSort::Editing(text),
+    }
+}
+
 /// Draw one frame.
 pub fn draw(frame: &mut Frame, app: &App) {
     let chunks = Layout::default()
@@ -1944,8 +2020,9 @@ fn draw_detail(frame: &mut Frame, area: Rect, app: &App) {
             app.pods(),
             app.drilled_node(),
             highlighted,
-            app.pod_order(),
+            app.pod_sort(),
             app.pod_direction(),
+            app.pod_resource_prompt(),
             app.filter_query(),
             theme,
         ),
@@ -2038,12 +2115,13 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
             // tool can least afford to hide.
             ("/", "filter"),
         ];
-        // `R` only does anything against the node pane (see
-        // `App::start_resource_sort`), so it is offered only there rather
+        // `R` only does anything against a pane with a `sort_by_device` of
+        // its own — the node pane and, now, the pod-drilldown pane (see
+        // `App::start_resource_sort`) — so it is offered only there rather
         // than advertised as a key that silently does nothing on the other
         // two. Dropped first of all under a narrow terminal: it is the
         // newest and the narrowest-scoped of the hints here.
-        if *app.view() == View::Overview {
+        if matches!(app.view(), View::Overview | View::NodePods { .. }) {
             hints.push(("R", "sort resource"));
         }
         hints
@@ -2720,7 +2798,7 @@ mod tests {
     }
 
     #[test]
-    fn the_footer_offers_r_only_over_the_node_pane() {
+    fn the_footer_offers_r_over_both_panes_with_a_device_ordering() {
         // Wide enough that the footer's last hint — `R`, deliberately the
         // first to clip on a narrow terminal (see `draw_footer`) — is not
         // truncated away before this test gets to look for it.
@@ -2728,10 +2806,10 @@ mod tests {
         let app_initial = app();
 
         terminal.draw(|frame| draw(frame, &app_initial)).unwrap();
+        let over_node_pane = terminal.backend().to_string();
         assert!(
-            terminal.backend().to_string().contains("sort resource"),
-            "{}",
-            terminal.backend().to_string()
+            over_node_pane.contains("sort resource"),
+            "over the node pane: {over_node_pane}"
         );
 
         let mut app = app_with_node();
@@ -2739,10 +2817,25 @@ mod tests {
         assert!(matches!(app.view(), View::NodePods { .. }));
 
         terminal.draw(|frame| draw(frame, &app)).unwrap();
+        let over_pod_drilldown_pane = terminal.backend().to_string();
         assert!(
-            !terminal.backend().to_string().contains("sort resource"),
-            "{}",
-            terminal.backend().to_string()
+            over_pod_drilldown_pane.contains("sort resource"),
+            "over the pod-drilldown pane: {over_pod_drilldown_pane}"
+        );
+
+        app.apply_pods(Ok(PodsFetch {
+            rows: vec![pod_row("api-1")],
+            selector_note: None,
+        }));
+        app.on_key(press(KeyCode::Enter));
+        assert!(matches!(app.view(), View::PodContainers { .. }));
+
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+        let over_pod_containers_pane = terminal.backend().to_string();
+        assert!(
+            !over_pod_containers_pane.contains("sort resource"),
+            "over the pod-containers pane, which has no device ordering: \
+             {over_pod_containers_pane}"
         );
     }
 
@@ -3996,8 +4089,168 @@ mod tests {
         );
     }
 
+    /// A pod reporting one requested device, for the pod-drilldown pane's
+    /// `--sort-resource` tests — the pod-panel counterpart to
+    /// `node_row_with_device`.
+    fn pod_row_with_device(name: &str, resource: &str, requested: &str) -> k8s_pods::PodRow {
+        use crate::k8s::quantity::Quantity;
+
+        let mut extended_requested = std::collections::BTreeMap::new();
+        extended_requested.insert(resource.to_owned(), Quantity::parse(requested).unwrap());
+        k8s_pods::PodRow {
+            extended_requested,
+            ..pod_row(name)
+        }
+    }
+
     #[test]
-    fn r_is_harmless_outside_the_node_pane() {
+    fn r_opens_a_resource_sort_prompt_for_the_pod_drilldown_pane_too() {
+        let mut app = app_with_node();
+        app.on_key(press(KeyCode::Enter));
+        assert!(matches!(app.view(), View::NodePods { .. }));
+        app.apply_pods(Ok(PodsFetch {
+            rows: vec![pod_row("api-1")],
+            selector_note: None,
+        }));
+
+        app.on_key(press(KeyCode::Char('R')));
+
+        assert!(app.is_typing_resource_sort());
+        assert_eq!(app.pod_resource_prompt(), Some(""));
+        assert_eq!(
+            app.node_resource_prompt(),
+            None,
+            "the node pane's own prompt must not also open"
+        );
+    }
+
+    #[test]
+    fn enter_applies_the_pod_panes_resource_prompt_and_re_sorts_the_already_loaded_rows() {
+        let mut app = app_with_node();
+        app.on_key(press(KeyCode::Enter));
+        app.apply_pods(Ok(PodsFetch {
+            rows: vec![
+                pod_row_with_device("alpha", "nvidia.com/gpu", "1"),
+                pod_row_with_device("bravo", "nvidia.com/gpu", "2"),
+            ],
+            selector_note: None,
+        }));
+
+        app.on_key(press(KeyCode::Char('R')));
+        for c in "nvidia.com/gpu".chars() {
+            app.on_key(press(KeyCode::Char(c)));
+        }
+        app.on_key(press(KeyCode::Enter));
+
+        assert!(!app.is_typing_resource_sort());
+        assert_eq!(app.pod_resource_prompt(), None);
+        let names: Vec<&str> = app
+            .pods()
+            .rows()
+            .iter()
+            .map(|row| row.name.as_str())
+            .collect();
+        assert_eq!(
+            names,
+            ["bravo", "alpha"],
+            "no fetch happened; the rows already on screen were re-sorted by device request"
+        );
+    }
+
+    #[test]
+    fn esc_while_editing_the_pod_panes_resource_prompt_cancels_it_and_restores_the_fixed_order() {
+        let mut app = app_with_node();
+        app.on_key(press(KeyCode::Enter));
+        app.apply_pods(Ok(PodsFetch {
+            rows: vec![
+                pod_row_with_device("alpha", "nvidia.com/gpu", "1"),
+                pod_row_with_device("bravo", "nvidia.com/gpu", "2"),
+            ],
+            selector_note: None,
+        }));
+        app.on_key(press(KeyCode::Char('R')));
+        for c in "nvidia.com/gpu".chars() {
+            app.on_key(press(KeyCode::Char(c)));
+        }
+        app.on_key(press(KeyCode::Enter));
+
+        // Re-open the prompt, seeded with the applied name, and cancel it.
+        app.on_key(press(KeyCode::Char('R')));
+        assert_eq!(app.pod_resource_prompt(), Some("nvidia.com/gpu"));
+        app.on_key(press(KeyCode::Esc));
+
+        assert_eq!(app.pod_resource_prompt(), None);
+        let names: Vec<&str> = app
+            .pods()
+            .rows()
+            .iter()
+            .map(|row| row.name.as_str())
+            .collect();
+        assert_eq!(
+            names,
+            ["alpha", "bravo"],
+            "cancelling the prompt must fall back to the fixed order (by name)"
+        );
+    }
+
+    #[test]
+    fn s_reclaims_the_pod_panes_fixed_cycle_from_an_applied_resource_sort() {
+        let mut app = app_with_node();
+        app.on_key(press(KeyCode::Enter));
+        app.apply_pods(Ok(PodsFetch {
+            rows: vec![pod_row_with_device("alpha", "nvidia.com/gpu", "1")],
+            selector_note: None,
+        }));
+        app.on_key(press(KeyCode::Char('R')));
+        for c in "nvidia.com/gpu".chars() {
+            app.on_key(press(KeyCode::Char(c)));
+        }
+        app.on_key(press(KeyCode::Enter));
+
+        app.on_key(press(KeyCode::Char('s')));
+
+        assert_eq!(app.pod_resource_prompt(), None);
+        assert_eq!(app.pod_order(), k8s_pods::Order::Restarts);
+    }
+
+    #[test]
+    fn shift_s_reverses_the_pod_panes_applied_resource_sort_without_clearing_it() {
+        let mut app = app_with_node();
+        app.on_key(press(KeyCode::Enter));
+        app.apply_pods(Ok(PodsFetch {
+            rows: vec![
+                pod_row_with_device("alpha", "nvidia.com/gpu", "1"),
+                pod_row_with_device("bravo", "nvidia.com/gpu", "2"),
+            ],
+            selector_note: None,
+        }));
+        app.on_key(press(KeyCode::Char('R')));
+        for c in "nvidia.com/gpu".chars() {
+            app.on_key(press(KeyCode::Char(c)));
+        }
+        app.on_key(press(KeyCode::Enter));
+
+        app.on_key(press(KeyCode::Char('S')));
+
+        assert_eq!(app.pod_direction(), SortDirection::Reversed);
+        let names: Vec<&str> = app
+            .pods()
+            .rows()
+            .iter()
+            .map(|row| row.name.as_str())
+            .collect();
+        assert_eq!(
+            names,
+            ["alpha", "bravo"],
+            "reversing must keep the device ordering in charge rather than falling back to the \
+             fixed cycle"
+        );
+    }
+
+    #[test]
+    fn r_is_harmless_in_the_pod_containers_pane() {
+        // Neither pane with a device ordering — the node pane and the
+        // pod-drilldown pane — is what is showing here.
         let mut app = app_with_pod();
         app.on_key(press(KeyCode::Enter));
         assert!(matches!(app.view(), View::PodContainers { .. }));
@@ -4006,6 +4259,7 @@ mod tests {
 
         assert!(!app.is_typing_resource_sort());
         assert_eq!(app.node_resource_prompt(), None);
+        assert_eq!(app.pod_resource_prompt(), None);
     }
 
     #[test]
