@@ -11,7 +11,7 @@ use ratatui::widgets::{Paragraph, Wrap};
 
 use crate::k8s::nodes::{self as k8s_nodes, NodeRow};
 use crate::k8s::order::{self, Direction};
-use crate::k8s::pods::{Missing, Order, PodRow, cause, distinguishes, ranks_any};
+use crate::k8s::pods::{Missing, Order, PodRow, cause, device_note, distinguishes, ranks_any};
 use crate::theme::{Severity, Theme};
 
 /// What the pod-drilldown pane is showing, independent of how it is drawn.
@@ -48,6 +48,17 @@ impl PodsState {
     }
 }
 
+/// What is currently driving the pod-drilldown pane's ordering: the fixed
+/// `s`/`S` cycle over [`Order`], or an applied `--sort-resource` prompt —
+/// [`super::nodes::Sort`]'s counterpart for this pane, mutually exclusive the
+/// same way. `App::pod_sort` is the only place that decides which; this only
+/// draws whichever it is handed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Sort<'a> {
+    Order(Order),
+    Resource(&'a str),
+}
+
 /// Draw whatever the pod pane currently knows.
 ///
 /// `node` is the [`NodeRow`] behind the node drilled into, from the node
@@ -58,12 +69,14 @@ impl PodsState {
 /// pane's own fetch started, and there is no reason to make them wait on a
 /// second request. `selected` highlights a row — `None` when the pane does
 /// not currently hold keyboard focus, so the highlight disappears the moment
-/// `Tab` moves it back to the sidebar. `order` and `direction` are the pane's
-/// own ordering, changed by `s`/`S` in [`super::App`] rather than by a
-/// request — see [`super::nodes::draw`], whose node-pane counterpart this
-/// mirrors. `filter` is the `/` query, empty when no filter is active — see
-/// that same doc comment for why every footnote above still reads off the
-/// full `rows` and only the drawn rows themselves narrow.
+/// `Tab` moves it back to the sidebar. `sort` and `direction` are the pane's
+/// own ordering, `s`/`S`/`R` in [`super::App`] rather than a request — see
+/// [`super::nodes::draw`], whose node-pane counterpart this mirrors.
+/// `resource_prompt` is the `--sort-resource` prompt's own text while `R` is
+/// capturing keystrokes for it, the same as it is there. `filter` is the `/`
+/// query, empty when no filter is active — see that same doc comment for why
+/// every footnote above still reads off the full `rows` and only the drawn
+/// rows themselves narrow.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn draw(
     frame: &mut Frame,
@@ -71,8 +84,9 @@ pub(super) fn draw(
     state: &PodsState,
     node: Option<&NodeRow>,
     selected: Option<usize>,
-    order: Order,
+    sort: Sort<'_>,
     direction: Direction,
+    resource_prompt: Option<&str>,
     filter: &str,
     theme: Theme,
 ) {
@@ -102,24 +116,49 @@ pub(super) fn draw(
             if !filter.is_empty() {
                 lines.push(Line::styled(format!("Filter: \"{filter}\""), theme.dim()));
             }
-            if let Some(note) = order::note(order, direction) {
-                lines.push(Line::styled(note, theme.dim()));
+            // The prompt's own line, shown only while `R` is capturing
+            // keystrokes for it — before anything below has something to say
+            // about a name nobody has committed yet. Mirrors `nodes::draw`.
+            if let Some(prompt) = resource_prompt {
+                lines.push(Line::styled(
+                    format!("Sort by resource: \"{prompt}\""),
+                    theme.dim(),
+                ));
             }
-            // This pane never samples usage for its own rows yet (see
-            // `spawn_gather_for_node`), so `Missing::default()` — `usage:
-            // false` — is always the honest reading: nothing above these
-            // rows explains why `cpu`/`memory` ranked nothing, because
-            // nothing is printed about metrics here at all.
-            if let Some(note) = order::unranked_note(
-                order,
-                cause(order, Missing::default()),
-                |candidate| ranks_any(rows, candidate),
-                |candidate| distinguishes(rows, candidate),
-            ) {
-                lines.extend(
-                    note.lines()
-                        .map(|line| Line::styled(line.to_owned(), theme.dim())),
-                );
+            match sort {
+                Sort::Order(order) => {
+                    if let Some(note) = order::note(order, direction) {
+                        lines.push(Line::styled(note, theme.dim()));
+                    }
+                    // This pane never samples usage for its own rows yet (see
+                    // `spawn_gather_for_node`), so `Missing::default()` —
+                    // `usage: false` — is always the honest reading: nothing
+                    // above these rows explains why `cpu`/`memory` ranked
+                    // nothing, because nothing is printed about metrics here
+                    // at all.
+                    if let Some(note) = order::unranked_note(
+                        order,
+                        cause(order, Missing::default()),
+                        |candidate| ranks_any(rows, candidate),
+                        |candidate| distinguishes(rows, candidate),
+                    ) {
+                        lines.extend(
+                            note.lines()
+                                .map(|line| Line::styled(line.to_owned(), theme.dim())),
+                        );
+                    }
+                }
+                // The free-form counterpart: always named, unlike
+                // `order::note` — there is no default resource to compare
+                // against and stay silent about. No unranked half beside it:
+                // unlike a node, a pod that never asked for the resource
+                // sorts as a real `0` rather than falling out of the
+                // ordering, so `commands::pods::list` never pairs
+                // `device_note` with an unranked note either, and this pane
+                // does not either.
+                Sort::Resource(resource) => {
+                    lines.push(Line::styled(device_note(resource, direction), theme.dim()));
+                }
             }
             let visible = crate::fuzzy::rank(filter, rows, |row| row.name.as_str());
             if !filter.is_empty() && visible.is_empty() {
@@ -270,7 +309,7 @@ mod tests {
         direction: Direction,
         filter: &str,
     ) -> String {
-        render_full(state, None, selected, order, direction, filter)
+        render_full(state, None, selected, Sort::Order(order), direction, filter)
     }
 
     fn render_with_node(state: &PodsState, node: Option<&NodeRow>) -> String {
@@ -278,10 +317,40 @@ mod tests {
             state,
             node,
             None,
-            Order::default(),
+            Sort::Order(Order::default()),
             Direction::default(),
             "",
         )
+    }
+
+    /// The `--sort-resource` counterpart to [`render_ordered`].
+    fn render_resource_sorted(state: &PodsState, resource: &str, direction: Direction) -> String {
+        render_full(state, None, None, Sort::Resource(resource), direction, "")
+    }
+
+    /// The prompt-in-progress counterpart to [`render_ordered`]: `R` is
+    /// capturing keystrokes but nothing has been committed yet, so the fixed
+    /// default order still governs what the rows are sorted by.
+    fn render_resource_prompt(state: &PodsState, prompt: &str) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(90, 20)).unwrap();
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                draw(
+                    frame,
+                    area,
+                    state,
+                    None,
+                    None,
+                    Sort::Order(Order::default()),
+                    Direction::default(),
+                    Some(prompt),
+                    "",
+                    Theme::dark(),
+                );
+            })
+            .unwrap();
+        terminal.backend().to_string()
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -289,7 +358,7 @@ mod tests {
         state: &PodsState,
         node: Option<&NodeRow>,
         selected: Option<usize>,
-        order: Order,
+        sort: Sort<'_>,
         direction: Direction,
         filter: &str,
     ) -> String {
@@ -303,8 +372,9 @@ mod tests {
                     state,
                     node,
                     selected,
-                    order,
+                    sort,
                     direction,
+                    None,
                     filter,
                     Theme::dark(),
                 );
@@ -543,8 +613,9 @@ mod tests {
                         &state,
                         Some(&node),
                         Some(0),
-                        Order::default(),
+                        Sort::Order(Order::default()),
                         Direction::default(),
+                        None,
                         "",
                         Theme::dark(),
                     );
@@ -668,5 +739,98 @@ mod tests {
         // five dashes — there is a real difference between "this node has
         // reported none of its wide facts" and "there is no node to ask".
         assert!(node_facts_lines(None, Theme::dark()).is_empty());
+    }
+
+    /// A pod reporting one requested device, for the `--sort-resource` tests.
+    fn pod_with_device(name: &str, resource: &str, requested: &str) -> PodRow {
+        let mut extended_requested = std::collections::BTreeMap::new();
+        extended_requested.insert(resource.to_owned(), Quantity::parse(requested).unwrap());
+        PodRow {
+            extended_requested,
+            ..pod(name)
+        }
+    }
+
+    #[test]
+    fn a_resource_ordering_names_itself_the_way_the_cli_table_does() {
+        let state = PodsState::Loaded {
+            rows: vec![pod_with_device("api-1", "nvidia.com/gpu", "2")],
+            selector_note: None,
+        };
+
+        let rendered = render_resource_sorted(&state, "nvidia.com/gpu", Direction::Natural);
+
+        assert!(rendered.contains("Sorted by nvidia.com/gpu."), "{rendered}");
+    }
+
+    #[test]
+    fn a_reversed_resource_ordering_says_which_way_round_it_ran() {
+        let state = PodsState::Loaded {
+            rows: vec![pod_with_device("api-1", "nvidia.com/gpu", "2")],
+            selector_note: None,
+        };
+
+        let rendered = render_resource_sorted(&state, "nvidia.com/gpu", Direction::Reversed);
+
+        assert!(
+            rendered.contains("Sorted by nvidia.com/gpu, reversed."),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn an_empty_pane_says_nothing_about_a_resource_ordering_it_was_asked_for() {
+        let state = PodsState::Loaded {
+            rows: Vec::new(),
+            selector_note: None,
+        };
+
+        let rendered = render_resource_sorted(&state, "nvidia.com/gpu", Direction::Natural);
+
+        assert!(!rendered.contains("Sorted by"), "{rendered}");
+    }
+
+    #[test]
+    fn a_pod_that_never_asked_for_the_resource_reads_as_a_real_zero_not_an_unranked_row() {
+        // Unlike the node pane, there is no "Nothing here has … to sort by"
+        // for a device ordering — a pod that never named the resource still
+        // ranks, at zero, the same reading `k8s::pods::order::sort_by_device`
+        // gives the CLI table.
+        let state = PodsState::Loaded {
+            rows: vec![pod("api-1")],
+            selector_note: None,
+        };
+
+        let rendered = render_resource_sorted(&state, "nvidia.com/gpu", Direction::Natural);
+
+        assert!(!rendered.contains("Nothing here"), "{rendered}");
+        assert!(rendered.contains("api-1"), "{rendered}");
+    }
+
+    #[test]
+    fn a_resource_prompt_being_typed_names_itself_above_the_rows() {
+        let state = PodsState::Loaded {
+            rows: vec![pod("api-1")],
+            selector_note: None,
+        };
+
+        let rendered = render_resource_prompt(&state, "nvidia.com/g");
+
+        assert!(
+            rendered.contains("Sort by resource: \"nvidia.com/g\""),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn no_resource_prompt_line_is_shown_once_nothing_is_being_typed() {
+        let state = PodsState::Loaded {
+            rows: vec![pod_with_device("api-1", "nvidia.com/gpu", "2")],
+            selector_note: None,
+        };
+
+        let rendered = render_resource_sorted(&state, "nvidia.com/gpu", Direction::Natural);
+
+        assert!(!rendered.contains("Sort by resource:"), "{rendered}");
     }
 }
