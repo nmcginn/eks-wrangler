@@ -717,7 +717,7 @@ cluster.
   `format::column_widths` and `format::row_width`, the pair the renderer itself
   pads and separates by, rather than a copy of its arithmetic per table.
 
-- [ ] **A sort note that names a column the terminal dropped.**
+- [x] **A sort note that names a column the terminal dropped.**
   `eks nodes --sort cpu` and `eks pods --sort cpu` print `Sorted by cpu.` under
   the table, and on a terminal narrow enough the column that ordering ranks is
   one of the ones the drop rule took away — so the listing names an ordering
@@ -741,6 +741,43 @@ cluster.
   listings, through `k8s::order::note` as now; the same answer reaches
   `requests_unavailable`, which knows the rows but not the width today; a
   listing wide enough to keep every column says exactly what it says today.
+  Landed as the note, not the exemption: `DROP_ORDER` is untouched, because
+  protecting one ordering's column does not stop at one column — keeping
+  `CPU USE` without `CPU` is the same broken pairing the drop rule was built to
+  prevent, so exempting it would have dragged a second column back into a row
+  that had already been measured to not fit it. `k8s::order::hidden_note` is
+  the new function: a second line under `note`'s own — `That column is not
+  shown at this width; run with --wide or widen the terminal to see it.` —
+  joined into one paragraph at the call site rather than a footnote of its
+  own, so a listing wide enough to keep every column reads exactly as it did
+  before. `k8s::nodes::order_hidden` and `k8s::pods::row::order_hidden` are the
+  listing-specific half it needs: each compares its own columns at the
+  listing's actual width against the same listing at `Width::Default`, so a
+  column absent because nothing here has been sampled — `order::cause`'s
+  question — is never also blamed on `--wide`. `requests_unavailable` took a
+  `width` parameter for the same comparison and gained one more line, "Some"
+  or "None of those columns are shown at this width," when narrowing has
+  already taken part or all of `CPU REQ`, `MEM REQ`, `PODS`, or a device column
+  out of the very sentence naming them as empty. Scope stopped at the fixed
+  orderings `k8s::order::note` already covers, matching the acceptance
+  criteria's own wording — `--sort-resource`'s `device_note` is a second
+  mechanism this task never mentioned, and it is the entry below. See
+  decision 88.
+
+- [ ] **The same hidden-column note for `--sort-resource`.**
+  `hidden_note` answers this for every ordering `k8s::order::note` names, and
+  `--sort-resource`'s `device_note` is a second, deliberately separate
+  mechanism (decision 84) that prints its own unconditional "Sorted by …"
+  line outside that path — so a device column a narrow terminal drops is the
+  same misleading note, unanswered. Separate because it is a real decision,
+  not a guess this task's acceptance criteria settled: `device_unranked_note`
+  already dropped `unranked_note`'s advice half by design (decision 86), and
+  whether the hidden-column line belongs on `device_note` too, worded the same
+  way or differently, is the reviewer's call over a mechanism this task never
+  touched.
+  *Acceptance:* whichever shape it takes, it reads `k8s::nodes::order_hidden`/
+  `k8s::pods::row::order_hidden` rather than a second comparison; a device
+  ordering nobody narrowed the terminal on is unchanged.
 
 ### Follow-ups from the request columns
 

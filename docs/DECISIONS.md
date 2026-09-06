@@ -3028,3 +3028,72 @@ answer to `/` a type-level possibility that never should have been one. The
 keystroke *step*, unlike the concept, had no such reason to diverge: `Filter`
 has no second copy of itself to keep in sync with, so `edit_filter` stays as
 it was.
+
+### 88. A hidden column gets a second line under the sort note, not an exemption from `DROP_ORDER`
+
+The roadmap entry left two readings open: exempt an ordering's own column
+from narrowing, or say the column is hidden and leave the drop rule alone.
+The exemption reading does not stop at one column. `--sort cpu` ranks `CPU
+USE`, and `CPU USE` is meaningless without the `CPU` it is a share of — so
+protecting `CPU USE` from `DROP_ORDER` means protecting `CPU` too, which is
+exactly the "request or usage figure left without the capacity it is a share
+of" pairing `DROP_ORDER`'s own module docs already forbid. Answering the
+first case would have meant re-deriving that rule for every ordering rather
+than leaving it as the one thing `DROP_ORDER` states. The note reading has no
+such cascade: it changes what a listing says, never what it drops.
+
+`k8s::order::hidden_note` is the new function, deliberately not a parameter
+added to `note` itself: `note` is called from the dashboard's panes too
+(`ui::nodes`, `ui::pods`), which never narrow a column away, so folding the
+question into `note`'s own signature would have made every one of those call
+sites answer a question that can never be true for them. `hidden_note` takes
+the same `(order, direction)` `note` does, plus a `hidden: bool` the listing
+already knows the answer to, and returns a second line — `That column is not
+shown at this width; run with --wide or widen the terminal to see it.` — or
+`None` under the identical silence rule `note` follows, asserted by a test
+that walks every `(order, direction)` pair and checks the two agree. The two
+lines join into one footnote paragraph at the CLI call sites
+(`commands::nodes::list`, `commands::pods::list`) rather than printing as a
+second, independent footnote — a listing wide enough to have kept every
+column is unchanged to the byte, and the two sentences read as one thought
+about one line under the table rather than as two footnotes that happen to
+agree.
+
+Telling `hidden` from "nothing to rank" needed its own function, because from
+inside `k8s::order` the two look identical: an ordering with nothing to rank
+already has `unranked_note` explaining it, and blaming a column's absence on
+`--wide` when the real cause is that metrics-server never sampled anything
+would be a second, contradictory diagnosis for the same blank. `k8s::nodes::
+order_hidden` and `k8s::pods::row::order_hidden` are the listing-specific
+answer: each asks its own `columns()` twice, once at the listing's actual
+width and once at `Width::Default`, and calls a column hidden only when it
+was in the first set and is not in the second. A column absent from both was
+never going to be there regardless of the terminal, so narrowing gets no
+credit — or blame — for it. Each carries its own small `order_column` match,
+deliberately exhaustive and beside the existing `ranked`/`cause` matches, for
+the same reason those are: an ordering added without saying which column it
+needs should fail to compile rather than silently answer `false` forever.
+
+`requests_unavailable` gained the same comparison for a different footnote.
+Its `CPU REQ, MEM REQ, and the booked half of PODS are empty because …`
+sentence already names columns that, unlike the usage pair, can never be
+missing for want of a figure — they are unconditional in the node table's own
+column set — so an absence in the actually-printed columns is always
+narrowing's doing and needed no `order::cause`-style disambiguation. It took
+a `width: format::Width` parameter rather than a precomputed column list, so
+every existing call site — five of them, all tests — only had to add the
+width they were already rendering at. The added line says "Some" or "None of
+those columns are shown at this width" rather than re-naming which ones,
+since the sentence directly above it already did that; a two-way count
+(`0`, "all of them", or "some of them") was enough, and re-deriving the exact
+subset a second time would have said nothing the reader could not already
+work out.
+
+Left out: the same treatment for `--sort-resource`'s `device_note` and
+`device_unranked_note`, which decision 84 built as a deliberately separate
+mechanism from `k8s::order::note`/`unranked_note` and which the roadmap
+entry's own acceptance criteria — "through `k8s::order::note` as now" — never
+asked this change to touch. It is its own roadmap entry rather than a guess
+at whether `device_note`'s unconditional wording wants the same second line,
+worded the same way, given decision 86 already chose to leave that note
+lighter than its fixed-ordering counterpart on purpose.

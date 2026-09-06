@@ -381,6 +381,46 @@ where
     })
 }
 
+/// A second line for [`note`], for the case a narrow terminal has taken the
+/// very column an ordering names out of the table.
+///
+/// `note` says which ordering a listing is in without knowing whether that
+/// column reached the screen at all: [`crate::format::Width::Narrow`] can
+/// drop it for the same reason [`unranked_note`] exists in the other
+/// direction — naming an ordering by a column the reader cannot see is
+/// exactly as misleading as staying silent about one that ranked nothing.
+/// Returned as its own line rather than folded into `note`'s own string, so a
+/// call site joins the two only where there is a second line to join; a
+/// table wide enough to have kept every column reads exactly as it did
+/// before this existed.
+///
+/// `hidden` is the listing's own answer to a question this module cannot ask
+/// on its own — whether the column is missing because of the terminal rather
+/// than because nothing here has that figure. The two look identical from
+/// here: an ordering that ranked nothing already has [`unranked_note`] to
+/// explain it, and a column absent for that reason must not also be blamed
+/// on `--wide`, so a listing passes `hidden` only when the column would have
+/// been on screen at its full width and narrowing is what took it out.
+///
+/// Silent whenever [`note`] itself would be, for the same reason
+/// [`unranked_note`] is: nobody reordered the listing, so there is no line
+/// above this one to qualify.
+#[must_use]
+pub fn hidden_note<O>(order: O, direction: Direction, hidden: bool) -> Option<String>
+where
+    O: ValueEnum + Copy + Default + PartialEq,
+{
+    if !hidden || (order == O::default() && direction == Direction::Natural) {
+        return None;
+    }
+
+    Some(
+        "That column is not shown at this width; run with --wide or widen the terminal \
+         to see it."
+            .to_owned(),
+    )
+}
+
 /// The orderings that would both rank and actually rearrange at least one pair
 /// of these rows, written out as `a`, `a or b`, or `a, b, or c`.
 ///
@@ -875,6 +915,56 @@ mod tests {
                 assert_eq!(
                     note(order, direction).is_none(),
                     quiet,
+                    "{order:?} {direction:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_visible_column_gets_no_hidden_note() {
+        // The ordinary case, and the far more common one: a table wide enough
+        // to have kept every column must read exactly as it did before this
+        // existed.
+        assert_eq!(
+            hidden_note(TestOrder::CpuRequested, Direction::Natural, false),
+            None
+        );
+    }
+
+    #[test]
+    fn a_hidden_column_earns_a_second_line() {
+        assert_eq!(
+            hidden_note(TestOrder::CpuRequested, Direction::Natural, true).as_deref(),
+            Some(
+                "That column is not shown at this width; run with --wide or widen the \
+                 terminal to see it."
+            )
+        );
+    }
+
+    #[test]
+    fn the_untouched_default_says_nothing_even_if_told_its_column_is_hidden() {
+        // `Name` never drops in either table, so this never happens for real —
+        // but the guard is the same one `note` itself follows, and it is
+        // asserted here so the two cannot drift apart.
+        assert_eq!(hidden_note(TestOrder::Name, Direction::Natural, true), None);
+    }
+
+    #[test]
+    fn reversing_the_default_ordering_can_still_be_told_its_column_is_hidden() {
+        // `note` has something to say once `--sort-reverse` is given on its
+        // own, even with no `--sort`; `hidden_note` follows the same rule.
+        assert!(hidden_note(TestOrder::Name, Direction::Reversed, true).is_some());
+    }
+
+    #[test]
+    fn hidden_note_is_silent_exactly_where_note_is() {
+        for direction in DIRECTIONS {
+            for &order in TestOrder::value_variants() {
+                assert_eq!(
+                    hidden_note(order, direction, true).is_none(),
+                    note(order, direction).is_none(),
                     "{order:?} {direction:?}"
                 );
             }

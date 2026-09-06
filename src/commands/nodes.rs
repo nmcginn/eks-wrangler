@@ -275,7 +275,7 @@ pub async fn list(
     // first of them names the columns the failure emptied and a device column
     // is one of them. They stay in the order they always came in.
     if let Err(explanation) = &requests {
-        footnotes.push(k8s_nodes::requests_unavailable(&rows, explanation));
+        footnotes.push(k8s_nodes::requests_unavailable(&rows, explanation, width));
     }
     if let Err(explanation) = &usage {
         footnotes.push(k8s_nodes::usage_unavailable(explanation));
@@ -322,13 +322,27 @@ pub async fn list(
     // given, so a plain `eks nodes` prints exactly what it printed before.
     match &ordering {
         SortBy::Order(order) => {
-            footnotes.extend(k8s::order::note(*order, direction));
-            // And immediately under it, the case where that line on its own
-            // misleads: `--sort cpu` against a cluster with no metrics-server
-            // names an ordering over a column this table does not have. Both
-            // halves the note cannot work out for itself come from the
-            // listing: which orderings these rows can be ranked by, and
-            // whether one of the footnotes above already accounts for the
+            // `note` and the case where its own line on a narrow terminal
+            // misleads — naming a column that narrowing already took off the
+            // table — share one paragraph: the second is a continuation of
+            // the first, not a footnote of its own, so a wide-enough listing
+            // reads exactly as it did before `hidden_note` existed.
+            if let Some(mut line) = k8s::order::note(*order, direction) {
+                if let Some(hidden) = k8s::order::hidden_note(
+                    *order,
+                    direction,
+                    k8s_nodes::order_hidden(*order, &rows, width),
+                ) {
+                    line = format!("{line}\n{hidden}");
+                }
+                footnotes.push(line);
+            }
+            // And immediately under it, the case where the line on its own
+            // misleads a different way: `--sort cpu` against a cluster with no
+            // metrics-server names an ordering over a column this table does
+            // not have. Both halves the note cannot work out for itself come
+            // from the listing: which orderings these rows can be ranked by,
+            // and whether one of the footnotes above already accounts for the
             // column that came up empty — in which case the note points at it
             // rather than repeating the advice a paragraph later.
             footnotes.extend(k8s::order::unranked_note(
