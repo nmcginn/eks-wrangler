@@ -963,6 +963,44 @@ pub(crate) fn columns<'a>(
     }
 }
 
+/// Whether a narrow terminal, rather than a missing sample, is why `order`'s
+/// own column is not in this listing — the pod table's counterpart to
+/// `k8s::nodes::order_hidden`.
+///
+/// Compares this listing's columns at their full width against the same
+/// listing's columns at `width`: a column absent from both — no
+/// metrics-server sampling anything, say — is [`order::cause`]'s question,
+/// not narrowing's, and must not be blamed on `--wide` here too. Only a
+/// column present at full width and gone at `width` is narrowing's doing.
+///
+/// [`order::cause`]: super::order::cause
+#[must_use]
+pub(crate) fn order_hidden(
+    order: super::Order,
+    scope: &super::Scope,
+    rows: &[PodRow],
+    width: format::Width,
+) -> bool {
+    let shown_at = |at: format::Width| order_column(order, &columns(scope, rows, at));
+    shown_at(format::Width::Default) && !shown_at(width)
+}
+
+/// Whether the column `order` ranks on is among `printed` — the mapping
+/// [`order_hidden`] needs, kept as an exhaustive match beside `order`'s own
+/// `ranked` and [`cause`](super::order::cause) for the same reason: an
+/// ordering added without saying which column it needs should fail to
+/// compile rather than silently answer `false` for it forever.
+fn order_column(order: super::Order, printed: &[Column<'_>]) -> bool {
+    let is_it: fn(&Column<'_>) -> bool = match order {
+        super::Order::Name => |c| matches!(c, Column::Name),
+        super::Order::Restarts => |c| matches!(c, Column::Restarts),
+        super::Order::Age => |c| matches!(c, Column::Age),
+        super::Order::Cpu | super::Order::CpuShare => |c| matches!(c, Column::Cpu),
+        super::Order::Memory | super::Order::MemoryShare => |c| matches!(c, Column::Memory),
+    };
+    printed.iter().any(is_it)
+}
+
 /// The order columns get dropped in when [`Width::Narrow`] cannot fit them all.
 ///
 /// A list of predicates rather than a ranking, like the node table's, because
@@ -1209,7 +1247,7 @@ mod tests {
     use k8s_openapi::apimachinery::pkg::apis::meta::v1::{ObjectMeta, Time};
     use k8s_openapi::jiff::SignedDuration;
 
-    use super::super::{Scope, Selectors};
+    use super::super::{Order, Scope, Selectors};
     use super::*;
     use crate::k8s::metrics::Usage;
 
@@ -3682,6 +3720,63 @@ mod tests {
         );
         assert_eq!(headings_at(&scope, &rows, 30), ["NAME", "READY", "STATUS"]);
         assert_eq!(headings_at(&scope, &rows, 22), ["NAME", "STATUS"]);
+    }
+
+    #[test]
+    fn a_column_still_on_screen_is_not_order_hidden() {
+        let scope = one_namespace();
+        let rows = requesting_rows();
+
+        assert!(!order_hidden(Order::Age, &scope, &rows, Width::Default));
+        assert!(!order_hidden(Order::Age, &scope, &rows, Width::Narrow(200)));
+    }
+
+    #[test]
+    fn a_column_narrowing_took_out_is_order_hidden() {
+        // 115 cols drops `AGE` first — `a_row_that_barely_overflows_drops_
+        // age_first` above — so it was there at full width and is not here.
+        let scope = one_namespace();
+        let rows = requesting_rows();
+
+        assert!(order_hidden(Order::Age, &scope, &rows, Width::Narrow(115)));
+        // 30 cols is past the health columns leaving one at a time —
+        // `the_health_columns_go_last_and_status_goes_after_ready` above —
+        // and `RESTARTS` is already gone by then.
+        assert!(order_hidden(
+            Order::Restarts,
+            &scope,
+            &rows,
+            Width::Narrow(30)
+        ));
+    }
+
+    #[test]
+    fn a_column_absent_for_want_of_a_sample_is_never_order_hidden() {
+        // No metrics-server sampled this pod, so `CPU`/`MEMORY` are not in the
+        // column set at any width — they were never there to begin with, and
+        // narrowing did not take them away. `order::cause`, not `--wide`, is
+        // the right answer here, at every width including the narrowest one.
+        let scope = one_namespace();
+        let rows = [PodRow::from_pod(&healthy(), None, now())];
+
+        for width in [Width::Default, Width::Narrow(200), Width::Narrow(1)] {
+            assert!(!order_hidden(Order::Cpu, &scope, &rows, width), "{width:?}");
+            assert!(
+                !order_hidden(Order::Memory, &scope, &rows, width),
+                "{width:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_name_column_is_never_order_hidden() {
+        // `NAME` never drops, at any width `DROP_ORDER` can reach.
+        assert!(!order_hidden(
+            Order::Name,
+            &one_namespace(),
+            &requesting_rows(),
+            Width::Narrow(1)
+        ));
     }
 
     #[test]

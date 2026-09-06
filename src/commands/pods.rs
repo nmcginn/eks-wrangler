@@ -221,15 +221,29 @@ pub async fn list(
     // `--sort`, `--sort-reverse`, or `--sort-resource` was given.
     match &ordering {
         SortBy::Order(order) => {
-            notes.extend(k8s::order::note(*order, request.direction));
-            // And under it, the case where that line on its own misleads: an
-            // ordering that ranked no row at all — `--sort cpu` with no
-            // metrics-server, `--sort restarts` where nothing has ever
-            // crashed — describes a listing the alphabet arranged. Again
-            // worded once, in `k8s::order`, for both tables, with the listing
-            // supplying the two things the wording turns on: what these rows
-            // could be sorted by instead, and whether the note above already
-            // explains the empty column.
+            // `note` and the case where its own line on a narrow terminal
+            // misleads — naming a column narrowing already took off the
+            // table — share one paragraph, exactly as `commands::nodes`
+            // joins them: a continuation of the first line, not a footnote
+            // of its own, so a wide-enough listing is unchanged.
+            if let Some(mut line) = k8s::order::note(*order, request.direction) {
+                if let Some(hidden) = k8s::order::hidden_note(
+                    *order,
+                    request.direction,
+                    k8s_pods::order_hidden(*order, &scope, &rows, request.width),
+                ) {
+                    line = format!("{line}\n{hidden}");
+                }
+                notes.push(line);
+            }
+            // And under it, the case where the line on its own misleads a
+            // different way: an ordering that ranked no row at all — `--sort
+            // cpu` with no metrics-server, `--sort restarts` where nothing
+            // has ever crashed — describes a listing the alphabet arranged.
+            // Again worded once, in `k8s::order`, for both tables, with the
+            // listing supplying the two things the wording turns on: what
+            // these rows could be sorted by instead, and whether the note
+            // above already explains the empty column.
             let missing = k8s_pods::Missing {
                 // The columns being gone, rather than the read having failed:
                 // both reasons for their absence now have a note above to

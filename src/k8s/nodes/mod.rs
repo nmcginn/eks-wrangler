@@ -1173,15 +1173,23 @@ pub fn render(
 /// of those cells survives: the pod limit and the device count came back with
 /// the nodes, and only the numerator is missing, so they read `-/58` rather
 /// than emptying. Saying they were empty would be visibly untrue on screen.
+///
+/// `width` is what decides whether the columns just named actually reached the
+/// screen: a narrow terminal can already have dropped some of them, in which
+/// case saying they are merely "empty" points the reader at a column they
+/// cannot find at all. Unlike the usage columns, none of `CPU REQ`, `MEM REQ`,
+/// `PODS`, or a device named here can be missing for want of a figure — they
+/// are unconditional in this table's own column set — so an absence at
+/// `width` is always the drop rule's doing, never [`order::cause`]'s question.
 #[must_use]
-pub fn requests_unavailable(rows: &[NodeRow], explanation: &str) -> String {
+pub fn requests_unavailable(rows: &[NodeRow], explanation: &str, width: format::Width) -> String {
     // PODS first and always: it is on every listing, where a device column is
     // on the ones somebody put hardware in.
     let counted: Vec<String> = std::iter::once("PODS".to_owned())
         .chain(device_names(rows).into_iter().map(resource::heading))
         .collect();
 
-    let columns = match format::list(&counted, "and") {
+    let columns_text = match format::list(&counted, "and") {
         Some(counted) => format!("CPU REQ, MEM REQ, and the booked half of {counted} are empty"),
         // Unreachable while PODS is unconditional, and written as the honest
         // fallback anyway rather than as an `expect` that would take a
@@ -1189,7 +1197,62 @@ pub fn requests_unavailable(rows: &[NodeRow], explanation: &str) -> String {
         None => "CPU REQ and MEM REQ are empty".to_owned(),
     };
 
-    format!("{columns} because the pods could not be listed.\n{explanation}")
+    let base = format!("{columns_text} because the pods could not be listed.\n{explanation}");
+
+    let printed = columns(rows, width);
+    let named: Vec<Column<'_>> = [Column::CpuRequested, Column::MemoryRequested, Column::Pods]
+        .into_iter()
+        .chain(device_names(rows).into_iter().map(Column::Device))
+        .collect();
+    let hidden = named
+        .iter()
+        .filter(|column| !printed.contains(column))
+        .count();
+
+    match hidden {
+        0 => base,
+        n if n == named.len() => format!(
+            "{base}\nNone of those columns are shown at this width; run with --wide or widen \
+             the terminal to see them."
+        ),
+        _ => format!(
+            "{base}\nSome of those columns are not shown at this width; run with --wide or \
+             widen the terminal to see them."
+        ),
+    }
+}
+
+/// Whether a narrow terminal, rather than a missing figure, is why `order`'s
+/// own column is not in this listing.
+///
+/// Compares this listing's columns at their full width against the same
+/// listing's columns at `width`: a column absent from both — no
+/// metrics-server sampling anything, say — is [`order::cause`]'s question,
+/// not narrowing's, and must not be blamed on `--wide` here too. Only a
+/// column present at full width and gone at `width` is narrowing's doing.
+#[must_use]
+pub(crate) fn order_hidden(order: Order, rows: &[NodeRow], width: format::Width) -> bool {
+    let shown_at = |at: format::Width| order_column(order, &columns(rows, at));
+    shown_at(format::Width::Default) && !shown_at(width)
+}
+
+/// Whether the column `order` ranks on is among `printed` — the mapping
+/// [`order_hidden`] needs, kept as an exhaustive match beside `order`'s own
+/// `ranked` and [`order::cause`] for the same reason: an ordering added
+/// without saying which column it needs should fail to compile rather than
+/// silently answer `false` for it forever.
+fn order_column(order: Order, printed: &[Column<'_>]) -> bool {
+    let is_it: fn(&Column<'_>) -> bool = match order {
+        Order::Name => |c| matches!(c, Column::Name),
+        Order::Status => |c| matches!(c, Column::Status),
+        Order::Cpu => |c| matches!(c, Column::CpuUsed),
+        Order::Memory => |c| matches!(c, Column::MemoryUsed),
+        Order::CpuRequested => |c| matches!(c, Column::CpuRequested),
+        Order::MemoryRequested => |c| matches!(c, Column::MemoryRequested),
+        Order::Pods => |c| matches!(c, Column::Pods),
+        Order::Age => |c| matches!(c, Column::Age),
+    };
+    printed.iter().any(is_it)
 }
 
 /// The footnote for nodes holding back devices they report.
@@ -2281,7 +2344,7 @@ mod tests {
         // they must not read as one paragraph.
         let rows = [NodeRow::from_node(&healthy_node(), None, None, now())];
         let notes = [
-            requests_unavailable(&rows, "no pods for you"),
+            requests_unavailable(&rows, "no pods for you", Width::Default),
             usage_unavailable("no metrics for you"),
         ];
 
@@ -2305,6 +2368,7 @@ mod tests {
         let note = requests_unavailable(
             &rows,
             "prod (us-east-1) will not let you list this resource.",
+            Width::Default,
         );
 
         let output = render(
@@ -2340,7 +2404,7 @@ mod tests {
         // anywhere in it, and that the table above it is untouched.
         let rows = [NodeRow::from_node(&healthy_node(), None, None, now())];
         let notes = [
-            requests_unavailable(&rows, "no pods for you"),
+            requests_unavailable(&rows, "no pods for you", Width::Default),
             crate::k8s::order::note(Order::Cpu, crate::k8s::order::Direction::Reversed)
                 .expect("a reordered listing should say so"),
         ];
@@ -2680,7 +2744,7 @@ mod tests {
     #[test]
     fn a_cluster_with_no_nodes_skips_the_footnote() {
         // There is a bigger problem than a missing column to explain.
-        let note = requests_unavailable(&[], "nope");
+        let note = requests_unavailable(&[], "nope", Width::Default);
         let message = render(
             &[],
             "prod (us-east-1)",
@@ -3278,7 +3342,11 @@ mod tests {
     fn the_request_footnote_names_the_device_column_it_emptied() {
         let rows = [NodeRow::from_node(&gpu_node(), None, None, now())];
 
-        let note = requests_unavailable(&rows, "prod (us-east-1) will not let you list pods.");
+        let note = requests_unavailable(
+            &rows,
+            "prod (us-east-1) will not let you list pods.",
+            Width::Default,
+        );
 
         assert!(
             note.starts_with(
@@ -3296,10 +3364,95 @@ mod tests {
         let rows = [NodeRow::from_node(&healthy_node(), None, None, now())];
 
         assert_eq!(
-            requests_unavailable(&rows, "why"),
+            requests_unavailable(&rows, "why", Width::Default),
             "CPU REQ, MEM REQ, and the booked half of PODS are empty \
              because the pods could not be listed.\nwhy"
         );
+    }
+
+    #[test]
+    fn a_wide_enough_narrow_leaves_the_request_footnote_untouched() {
+        let rows = one_booked_row();
+
+        assert_eq!(
+            requests_unavailable(&rows, "why", Width::Narrow(200)),
+            requests_unavailable(&rows, "why", Width::Default)
+        );
+    }
+
+    #[test]
+    fn the_request_footnote_says_when_narrowing_has_hidden_some_of_its_columns() {
+        // 90 cols drops PODS but keeps CPU REQ and MEM REQ, per
+        // `the_pod_count_is_the_first_of_the_booked_figures_to_go` above — a
+        // named column gone, and a named pair still on screen.
+        let note = requests_unavailable(&one_booked_row(), "why", Width::Narrow(90));
+
+        assert!(
+            note.ends_with(
+                "Some of those columns are not shown at this width; run with --wide or \
+                 widen the terminal to see them."
+            ),
+            "{note}"
+        );
+    }
+
+    #[test]
+    fn the_request_footnote_says_when_narrowing_has_hidden_every_one_of_its_columns() {
+        // `--width 1`, the acceptance-test extreme: only NAME survives.
+        let note = requests_unavailable(&one_booked_row(), "why", Width::Narrow(1));
+
+        assert!(
+            note.ends_with(
+                "None of those columns are shown at this width; run with --wide or widen \
+                 the terminal to see them."
+            ),
+            "{note}"
+        );
+    }
+
+    #[test]
+    fn a_column_still_on_screen_is_not_order_hidden() {
+        let rows = one_booked_row();
+
+        assert!(!order_hidden(Order::CpuRequested, &rows, Width::Default));
+        assert!(!order_hidden(
+            Order::CpuRequested,
+            &rows,
+            Width::Narrow(200)
+        ));
+    }
+
+    #[test]
+    fn a_column_narrowing_took_out_is_order_hidden() {
+        // 70 cols drops the request pair — `the_pair_columns_leave_together_
+        // rather_than_singly` above — so `CPU REQ` was there at full width and
+        // is not at this one.
+        let rows = one_booked_row();
+
+        assert!(order_hidden(Order::CpuRequested, &rows, Width::Narrow(70)));
+    }
+
+    #[test]
+    fn a_column_absent_for_want_of_data_is_never_order_hidden() {
+        // `one_booked_row` has no metrics-server, so `CPU USE` is not in the
+        // column set at any width — it was never there to begin with, and
+        // narrowing did not take it away. `order::cause`, not `--wide`, is
+        // the right answer here, at every width including the narrowest one.
+        let rows = one_booked_row();
+
+        for width in [Width::Default, Width::Narrow(200), Width::Narrow(1)] {
+            assert!(!order_hidden(Order::Cpu, &rows, width), "{width:?}");
+        }
+    }
+
+    #[test]
+    fn the_name_column_is_never_order_hidden() {
+        // `NAME` never drops, at any width `DROP_ORDER` can reach.
+        assert!(!order_hidden(
+            Order::Name,
+            &one_booked_row(),
+            Width::Narrow(1)
+        ));
     }
 
     #[test]
@@ -3450,7 +3603,7 @@ mod tests {
         assert!(row.devices.is_empty());
         assert_eq!(devices_withheld(std::slice::from_ref(&row)), None);
         assert_eq!(
-            requests_unavailable(std::slice::from_ref(&row), "why"),
+            requests_unavailable(std::slice::from_ref(&row), "why", Width::Default),
             "CPU REQ, MEM REQ, and the booked half of PODS are empty \
              because the pods could not be listed.\nwhy"
         );
