@@ -46,7 +46,7 @@ pub use order::{
     Missing, Order, cause, device_note, distinguishes, ranks_any, sort, sort_by_device,
 };
 pub use row::{PodRow, render, selector_note, shows_usage, usage_unavailable, usage_unsampled};
-pub(crate) use row::{nominated_node, order_hidden, pod_ip, readiness_gates};
+pub(crate) use row::{device_hidden, nominated_node, order_hidden, pod_ip, readiness_gates};
 
 /// Pods that have finished linger in the API server until something collects
 /// them, and they hold nothing on the node. Excluding them server-side keeps a

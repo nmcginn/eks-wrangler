@@ -1222,18 +1222,42 @@ pub fn requests_unavailable(rows: &[NodeRow], explanation: &str, width: format::
     }
 }
 
+/// Whether a column matching `present` was in this listing's columns at full
+/// width and is not at `width` — the shared comparison behind [`order_hidden`]
+/// and [`device_hidden`].
+///
+/// A column absent from both — no metrics-server sampling anything, say — is
+/// [`order::cause`]'s question, not narrowing's, and must not be blamed on
+/// `--wide` here too. Only a column present at full width and gone at `width`
+/// is narrowing's doing.
+fn hidden(rows: &[NodeRow], width: format::Width, present: impl Fn(&[Column<'_>]) -> bool) -> bool {
+    let shown_at = |at: format::Width| present(&columns(rows, at));
+    shown_at(format::Width::Default) && !shown_at(width)
+}
+
 /// Whether a narrow terminal, rather than a missing figure, is why `order`'s
 /// own column is not in this listing.
-///
-/// Compares this listing's columns at their full width against the same
-/// listing's columns at `width`: a column absent from both — no
-/// metrics-server sampling anything, say — is [`order::cause`]'s question,
-/// not narrowing's, and must not be blamed on `--wide` here too. Only a
-/// column present at full width and gone at `width` is narrowing's doing.
 #[must_use]
 pub(crate) fn order_hidden(order: Order, rows: &[NodeRow], width: format::Width) -> bool {
-    let shown_at = |at: format::Width| order_column(order, &columns(rows, at));
-    shown_at(format::Width::Default) && !shown_at(width)
+    hidden(rows, width, |printed| order_column(order, printed))
+}
+
+/// The `--sort-resource` counterpart to [`order_hidden`]: whether a narrow
+/// terminal, rather than no node reporting the resource, is why its device
+/// column is not in this listing.
+///
+/// The same [`hidden`] comparison `order_hidden` makes, over a column
+/// [`order_column`]'s fixed match cannot name — a device's column is keyed by
+/// whatever name `--sort-resource` was given at fetch time, not one of
+/// `Order`'s own variants, so this asks for `Column::Device(resource)`
+/// directly rather than growing that match a case it was never meant to hold.
+#[must_use]
+pub(crate) fn device_hidden(resource: &str, rows: &[NodeRow], width: format::Width) -> bool {
+    hidden(rows, width, |printed| {
+        printed
+            .iter()
+            .any(|column| matches!(column, Column::Device(name) if *name == resource))
+    })
 }
 
 /// Whether the column `order` ranks on is among `printed` — the mapping
@@ -3453,6 +3477,44 @@ mod tests {
             &one_booked_row(),
             Width::Narrow(1)
         ));
+    }
+
+    fn one_gpu_row() -> Vec<NodeRow> {
+        vec![NodeRow::from_node(
+            &gpu_node(),
+            Some(&booked("1500m", "6Gi")),
+            None,
+            now(),
+        )]
+    }
+
+    #[test]
+    fn a_device_column_still_on_screen_is_not_device_hidden() {
+        let rows = one_gpu_row();
+
+        assert!(!device_hidden("nvidia.com/gpu", &rows, Width::Default));
+        assert!(!device_hidden("nvidia.com/gpu", &rows, Width::Narrow(200)));
+    }
+
+    #[test]
+    fn a_device_column_narrowing_took_out_is_device_hidden() {
+        // `DROP_ORDER` takes every device column together, after the resource
+        // pairs and before STATUS — narrow enough and it is gone.
+        let rows = one_gpu_row();
+
+        assert!(device_hidden("nvidia.com/gpu", &rows, Width::Narrow(1)));
+    }
+
+    #[test]
+    fn a_device_nobody_reports_is_never_device_hidden() {
+        // No row in this listing has the hardware at all, so the column was
+        // never in the default column set to begin with — narrowing gets no
+        // credit or blame for an absence it did not cause.
+        let rows = one_booked_row();
+
+        for width in [Width::Default, Width::Narrow(200), Width::Narrow(1)] {
+            assert!(!device_hidden("nvidia.com/gpu", &rows, width), "{width:?}");
+        }
     }
 
     #[test]

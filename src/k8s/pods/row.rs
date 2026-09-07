@@ -963,17 +963,29 @@ pub(crate) fn columns<'a>(
     }
 }
 
+/// Whether a column matching `present` was in this listing's columns at full
+/// width and is not at `width` — the shared comparison behind [`order_hidden`]
+/// and [`device_hidden`].
+///
+/// A column absent from both — no metrics-server sampling this pod, say — is
+/// [`order::cause`]'s question, not narrowing's, and must not be blamed on
+/// `--wide` here too. Only a column present at full width and gone at `width`
+/// is narrowing's doing.
+///
+/// [`order::cause`]: super::order::cause
+fn hidden(
+    scope: &super::Scope,
+    rows: &[PodRow],
+    width: format::Width,
+    present: impl Fn(&[Column<'_>]) -> bool,
+) -> bool {
+    let shown_at = |at: format::Width| present(&columns(scope, rows, at));
+    shown_at(format::Width::Default) && !shown_at(width)
+}
+
 /// Whether a narrow terminal, rather than a missing sample, is why `order`'s
 /// own column is not in this listing — the pod table's counterpart to
 /// `k8s::nodes::order_hidden`.
-///
-/// Compares this listing's columns at their full width against the same
-/// listing's columns at `width`: a column absent from both — no
-/// metrics-server sampling anything, say — is [`order::cause`]'s question,
-/// not narrowing's, and must not be blamed on `--wide` here too. Only a
-/// column present at full width and gone at `width` is narrowing's doing.
-///
-/// [`order::cause`]: super::order::cause
 #[must_use]
 pub(crate) fn order_hidden(
     order: super::Order,
@@ -981,8 +993,30 @@ pub(crate) fn order_hidden(
     rows: &[PodRow],
     width: format::Width,
 ) -> bool {
-    let shown_at = |at: format::Width| order_column(order, &columns(scope, rows, at));
-    shown_at(format::Width::Default) && !shown_at(width)
+    hidden(scope, rows, width, |printed| order_column(order, printed))
+}
+
+/// The `--sort-resource` counterpart to [`order_hidden`]: whether a narrow
+/// terminal, rather than no pod in this listing asking for the resource, is
+/// why its device column is not in this listing.
+///
+/// The same [`hidden`] comparison `order_hidden` makes, over a column
+/// [`order_column`]'s fixed match cannot name — a device's column is keyed by
+/// whatever name `--sort-resource` was given at fetch time, not one of
+/// `Order`'s own variants, so this asks for `Column::Device(resource)`
+/// directly rather than growing that match a case it was never meant to hold.
+#[must_use]
+pub(crate) fn device_hidden(
+    resource: &str,
+    scope: &super::Scope,
+    rows: &[PodRow],
+    width: format::Width,
+) -> bool {
+    hidden(scope, rows, width, |printed| {
+        printed
+            .iter()
+            .any(|column| matches!(column, Column::Device(name) if *name == resource))
+    })
 }
 
 /// Whether the column `order` ranks on is among `printed` — the mapping
@@ -3777,6 +3811,64 @@ mod tests {
             &requesting_rows(),
             Width::Narrow(1)
         ));
+    }
+
+    fn one_device_row() -> Vec<PodRow> {
+        vec![PodRow::from_pod(
+            &asking_device("nvidia.com/gpu", "2"),
+            None,
+            now(),
+        )]
+    }
+
+    #[test]
+    fn a_device_column_still_on_screen_is_not_device_hidden() {
+        let scope = one_namespace();
+        let rows = one_device_row();
+
+        assert!(!device_hidden(
+            "nvidia.com/gpu",
+            &scope,
+            &rows,
+            Width::Default
+        ));
+        assert!(!device_hidden(
+            "nvidia.com/gpu",
+            &scope,
+            &rows,
+            Width::Narrow(200)
+        ));
+    }
+
+    #[test]
+    fn a_device_column_narrowing_took_out_is_device_hidden() {
+        // `DROP_ORDER` takes every device column together, after the resource
+        // pairs and before the health columns — narrow enough and it is gone.
+        let scope = one_namespace();
+        let rows = one_device_row();
+
+        assert!(device_hidden(
+            "nvidia.com/gpu",
+            &scope,
+            &rows,
+            Width::Narrow(1)
+        ));
+    }
+
+    #[test]
+    fn a_device_nobody_asked_for_is_never_device_hidden() {
+        // No pod in this listing asked for the resource at all, so the column
+        // was never in the default column set to begin with — narrowing gets
+        // no credit or blame for an absence it did not cause.
+        let scope = one_namespace();
+        let rows = requesting_rows();
+
+        for width in [Width::Default, Width::Narrow(200), Width::Narrow(1)] {
+            assert!(
+                !device_hidden("nvidia.com/gpu", &scope, &rows, width),
+                "{width:?}"
+            );
+        }
     }
 
     #[test]

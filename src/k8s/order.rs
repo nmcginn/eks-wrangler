@@ -381,6 +381,13 @@ where
     })
 }
 
+/// The sentence [`hidden_note`] and [`device_hidden_note`] both print,
+/// factored out so the two mechanisms — one over `Order`'s fixed vocabulary,
+/// one over a `--sort-resource` name `clap` never sees — cannot drift onto
+/// two wordings of the same fact.
+const HIDDEN_COLUMN: &str =
+    "That column is not shown at this width; run with --wide or widen the terminal to see it.";
+
 /// A second line for [`note`], for the case a narrow terminal has taken the
 /// very column an ordering names out of the table.
 ///
@@ -414,11 +421,70 @@ where
         return None;
     }
 
-    Some(
-        "That column is not shown at this width; run with --wide or widen the terminal \
-         to see it."
-            .to_owned(),
-    )
+    Some(HIDDEN_COLUMN.to_owned())
+}
+
+/// [`note`] and [`hidden_note`], joined into the one paragraph every CLI call
+/// site prints: `None` when `note` itself would be, since there is no first
+/// line for a second one to qualify; otherwise `note`'s line, with
+/// `hidden_note`'s appended beneath it when there is one.
+///
+/// The call site's own version of this join, kept inline until now, cost
+/// `commands::pods::list` its budget under `clippy::too_many_lines` once this
+/// task added a second such join beside it — a sign the fold belonged here,
+/// once for both tables, rather than spelled out at every caller.
+#[must_use]
+pub fn note_with_hidden<O>(order: O, direction: Direction, hidden: bool) -> Option<String>
+where
+    O: ValueEnum + Copy + Default + PartialEq,
+{
+    let line = note(order, direction)?;
+    Some(match hidden_note(order, direction, hidden) {
+        Some(hidden) => format!("{line}\n{hidden}"),
+        None => line,
+    })
+}
+
+/// The `--sort-resource` counterpart to [`hidden_note`], for
+/// [`crate::k8s::nodes::order::device_note`] and
+/// [`crate::k8s::pods::order::device_note`]'s own unconditional "Sorted by …"
+/// line.
+///
+/// `device_note` is a second, deliberately separate mechanism from `note`
+/// (decision 84): a resource name is exactly the free-form value `Order`'s
+/// `ValueEnum` vocabulary excludes, so `hidden_note`'s `O: ValueEnum` bound
+/// cannot cover it. There is also no `order`/`direction` gate to repeat here —
+/// `device_note` has no default resource to compare against and fall silent
+/// about, so typing `--sort-resource` at all is always a line worth printing,
+/// and the same is true of the second line once the column it names is gone.
+///
+/// `hidden` is computed the same way [`hidden_note`]'s is, by
+/// `crate::k8s::nodes::device_hidden`/`crate::k8s::pods::row::device_hidden`
+/// — full width against the listing's actual width — so a device column
+/// absent because no row reports the resource is never confused with one
+/// narrowing took out from under a row that had it.
+#[must_use]
+pub fn device_hidden_note(hidden: bool) -> Option<String> {
+    hidden.then(|| HIDDEN_COLUMN.to_owned())
+}
+
+/// Join `device_note`'s own line with [`device_hidden_note`]'s, the way
+/// [`commands::nodes::list`] and [`commands::pods::list`] both join `note`'s
+/// line with [`hidden_note`]'s.
+///
+/// Factored out here rather than repeated at each call site: `device_note`
+/// has no `Option` to thread the way `note` does, so the join is one line
+/// shorter than the fixed-ordering one, and shorter still worth naming once
+/// than writing twice.
+///
+/// [`commands::nodes::list`]: crate::commands::nodes::list
+/// [`commands::pods::list`]: crate::commands::pods::list
+#[must_use]
+pub fn device_note_with_hidden(line: String, hidden: bool) -> String {
+    match device_hidden_note(hidden) {
+        Some(hidden) => format!("{line}\n{hidden}"),
+        None => line,
+    }
 }
 
 /// The orderings that would both rank and actually rearrange at least one pair
@@ -969,5 +1035,65 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn a_visible_device_column_gets_no_hidden_note() {
+        // Unlike `hidden_note`, there is no default resource to stay silent
+        // about — `device_note` always prints once `--sort-resource` is
+        // given, so the only thing that can silence a second line is the
+        // column not actually being hidden.
+        assert_eq!(device_hidden_note(false), None);
+    }
+
+    #[test]
+    fn a_hidden_device_column_earns_the_same_second_line_as_a_fixed_ordering() {
+        // One wording for both mechanisms: a reader moving from `--sort cpu`
+        // to `--sort-resource nvidia.com/gpu` should not have to learn a
+        // second sentence for the same fact.
+        assert_eq!(
+            device_hidden_note(true).as_deref(),
+            hidden_note(TestOrder::CpuRequested, Direction::Natural, true).as_deref()
+        );
+    }
+
+    #[test]
+    fn note_with_hidden_is_silent_exactly_where_note_is() {
+        assert_eq!(
+            note_with_hidden(TestOrder::Name, Direction::Natural, true),
+            None
+        );
+    }
+
+    #[test]
+    fn note_with_hidden_joins_the_two_lines_the_call_site_used_to() {
+        assert_eq!(
+            note_with_hidden(TestOrder::CpuRequested, Direction::Natural, true).as_deref(),
+            Some(format!("Sorted by cpu-requested.\n{HIDDEN_COLUMN}").as_str())
+        );
+    }
+
+    #[test]
+    fn note_with_hidden_matches_a_plain_note_when_the_column_is_not_hidden() {
+        assert_eq!(
+            note_with_hidden(TestOrder::CpuRequested, Direction::Natural, false),
+            note(TestOrder::CpuRequested, Direction::Natural)
+        );
+    }
+
+    #[test]
+    fn a_visible_device_column_leaves_its_note_untouched() {
+        assert_eq!(
+            device_note_with_hidden("Sorted by nvidia.com/gpu.".to_owned(), false),
+            "Sorted by nvidia.com/gpu."
+        );
+    }
+
+    #[test]
+    fn a_hidden_device_column_gets_a_second_line_joined_under_the_first() {
+        assert_eq!(
+            device_note_with_hidden("Sorted by nvidia.com/gpu.".to_owned(), true),
+            format!("Sorted by nvidia.com/gpu.\n{HIDDEN_COLUMN}")
+        );
     }
 }
