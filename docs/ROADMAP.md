@@ -764,7 +764,7 @@ cluster.
   mechanism this task never mentioned, and it is the entry below. See
   decision 88.
 
-- [ ] **The same hidden-column note for `--sort-resource`.**
+- [x] **The same hidden-column note for `--sort-resource`.**
   `hidden_note` answers this for every ordering `k8s::order::note` names, and
   `--sort-resource`'s `device_note` is a second, deliberately separate
   mechanism (decision 84) that prints its own unconditional "Sorted by …"
@@ -778,6 +778,30 @@ cluster.
   *Acceptance:* whichever shape it takes, it reads `k8s::nodes::order_hidden`/
   `k8s::pods::row::order_hidden` rather than a second comparison; a device
   ordering nobody narrowed the terminal on is unchanged.
+  Landed worded exactly like `hidden_note`'s own line, through a shared
+  `k8s::order::HIDDEN_COLUMN` constant the two mechanisms both build their
+  sentence from, so a reader moving from `--sort cpu` to `--sort-resource
+  nvidia.com/gpu` learns one sentence rather than two for the same fact.
+  `device_hidden_note(hidden: bool) -> Option<String>` is `device_note`'s
+  counterpart to `hidden_note`, with no `order`/`direction` to gate on: unlike
+  a fixed ordering, `device_note` has no default resource to fall silent
+  about, so the only question left is whether the column is hidden.
+  `k8s::nodes::device_hidden` and `k8s::pods::row::device_hidden` answer that,
+  keyed on `Column::Device(resource)` rather than `order_column`'s exhaustive
+  `Order` match, which has no variant a resource name could occupy — and both
+  now share their own `hidden(rows, width, predicate)` with `order_hidden`
+  rather than each repeating the "ask `columns()` at `Default` and at `width`,
+  compare" shape a second time. The join itself moved out of both call sites
+  entirely: `k8s::order::note_with_hidden` replaces the `SortBy::Order` arm's
+  inline `if let Some(mut line) = note(…) { if let Some(hidden) =
+  hidden_note(…) { … } }` block from decision 88 with one function call, and
+  `device_note_with_hidden` is its `device_note` counterpart — a bare
+  `String` in and out, since `device_note` has no `Option` to thread the way
+  `note` does. Both call sites now read one line per arm. Found because the
+  new `SortBy::Resource` join, written inline the way the `Order` arm's
+  already was, pushed `commands::pods::list` over `clippy::too_many_lines` —
+  the second copy of that shape was the sign it belonged in `k8s::order`
+  rather than at either call site. See decision 89.
 
 ### Follow-ups from the request columns
 

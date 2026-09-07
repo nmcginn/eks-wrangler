@@ -3097,3 +3097,69 @@ asked this change to touch. It is its own roadmap entry rather than a guess
 at whether `device_note`'s unconditional wording wants the same second line,
 worded the same way, given decision 86 already chose to leave that note
 lighter than its fixed-ordering counterpart on purpose.
+
+### 89. `device_note` gets the same hidden-column line, worded the same way, through its own function
+
+Decision 88 stopped at `k8s::order::note`'s fixed orderings because
+`device_note` is a deliberately separate mechanism (decision 84) that
+`hidden_note`'s `O: ValueEnum` bound cannot reach — a `--sort-resource` name
+is exactly the free-form value `Order`'s vocabulary excludes. The roadmap
+entry this time asked the question decision 88 left open on purpose: whether
+the second line belongs on `device_note` too, and whether it is worded the
+same way or differently.
+
+Worded the same way, and factored so the two cannot drift onto two sentences
+for one fact: the misleading case is identical — a column present at full
+width and gone at the terminal's actual width — so a reader moving from
+`--sort cpu` to `--sort-resource nvidia.com/gpu` has no reason to learn a
+second sentence for it. `k8s::order::HIDDEN_COLUMN` is the shared constant
+`hidden_note` now builds its `Some` from, and `device_hidden_note(hidden:
+bool) -> Option<String>` is `device_note`'s counterpart to it — no
+`order`/`direction` parameters, because unlike `hidden_note` there is no
+default resource for `device_note` to compare against and fall silent
+about; the caller passes only whether the column is hidden, and gets the
+sentence or nothing.
+
+This is not decision 86's question again. Decision 86 dropped
+`unranked_note`'s *advice* half from `device_unranked_note` because that
+list is built from `Order::value_variants()`, a fixed vocabulary a resource
+name is deliberately not — there was no way to build the equivalent
+advice for a free-form name, so leaving it out was the only honest answer.
+The hidden-column line names no alternative ordering; it states a fact about
+one column at one width, which a resource name is just as able to carry as a
+fixed one, so there was no equivalent gap here to leave open.
+
+`k8s::nodes::device_hidden` and `k8s::pods::row::device_hidden` are the
+listing-specific half, keyed on `Column::Device(resource)` rather than
+routed through `order_column`'s exhaustive match — a device's column is not
+one of `Order`'s own variants, so extending that match was never the right
+shape for it. Writing them surfaced a second, private `hidden` in each
+module: `order_hidden` and `device_hidden` both ask `columns()` twice, once
+at `Width::Default` and once at the listing's actual width, and call the
+column hidden only when it was in the first set and not the second, and
+that comparison was worth naming once rather than copying — `order_hidden`
+now calls it with `order_column`'s match, `device_hidden` with a `Column::
+Device(resource)` one, and neither repeats the "ask twice, compare" shape
+the other already had. A resource nobody in the listing reports is absent
+from both calls, so `device_hidden` correctly leaves that case to
+`device_unranked_note` rather than also blaming it on `--wide`.
+
+The join itself moved out of both call sites entirely, for both arms.
+`k8s::order::note_with_hidden(order, direction, hidden) -> Option<String>`
+replaces the `if let Some(mut line) = note(…) { if let Some(hidden) =
+hidden_note(…) { line = format!(…) } … }` block the `SortBy::Order` arm had
+spelled out inline since decision 88; `device_note_with_hidden(line, hidden)
+-> String` is its `device_note` counterpart, taking the line rather than
+computing it, since `device_note` returns a bare `String` and has one fewer
+case to handle than `note`'s `Option<String>` does. Both now live in
+`k8s::order` beside `hidden_note` and `device_hidden_note`, and
+`commands::nodes::list`/`commands::pods::list` call whichever matches the
+arm in one line apiece.
+
+This was not a style preference: `commands::pods::list` failed
+`clippy::too_many_lines` once this task's inline join sat beside the
+existing one, and the fix was to notice both call sites were already
+writing the same fold `k8s::order` had already named half of
+(`hidden_note`) but never finished (the join with `note`) — so the second
+copy of that block was the sign the whole thing belonged in one place, not
+that the function needed trimming elsewhere.

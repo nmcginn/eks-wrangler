@@ -327,16 +327,11 @@ pub async fn list(
             // table — share one paragraph: the second is a continuation of
             // the first, not a footnote of its own, so a wide-enough listing
             // reads exactly as it did before `hidden_note` existed.
-            if let Some(mut line) = k8s::order::note(*order, direction) {
-                if let Some(hidden) = k8s::order::hidden_note(
-                    *order,
-                    direction,
-                    k8s_nodes::order_hidden(*order, &rows, width),
-                ) {
-                    line = format!("{line}\n{hidden}");
-                }
-                footnotes.push(line);
-            }
+            footnotes.extend(k8s::order::note_with_hidden(
+                *order,
+                direction,
+                k8s_nodes::order_hidden(*order, &rows, width),
+            ));
             // And immediately under it, the case where the line on its own
             // misleads a different way: `--sort cpu` against a cluster with no
             // metrics-server names an ordering over a column this table does
@@ -356,7 +351,10 @@ pub async fn list(
         // resource to compare against and stay silent about — and, when
         // nothing reported it, why.
         SortBy::Resource(resource) => {
-            footnotes.push(k8s_nodes::device_note(resource, direction));
+            footnotes.push(k8s::order::device_note_with_hidden(
+                k8s_nodes::device_note(resource, direction),
+                k8s_nodes::device_hidden(resource, &rows, width),
+            ));
             footnotes.extend(k8s_nodes::device_unranked_note(resource, &rows, missing));
         }
     }

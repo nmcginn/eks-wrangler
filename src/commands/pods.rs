@@ -226,16 +226,11 @@ pub async fn list(
             // table — share one paragraph, exactly as `commands::nodes`
             // joins them: a continuation of the first line, not a footnote
             // of its own, so a wide-enough listing is unchanged.
-            if let Some(mut line) = k8s::order::note(*order, request.direction) {
-                if let Some(hidden) = k8s::order::hidden_note(
-                    *order,
-                    request.direction,
-                    k8s_pods::order_hidden(*order, &scope, &rows, request.width),
-                ) {
-                    line = format!("{line}\n{hidden}");
-                }
-                notes.push(line);
-            }
+            notes.extend(k8s::order::note_with_hidden(
+                *order,
+                request.direction,
+                k8s_pods::order_hidden(*order, &scope, &rows, request.width),
+            ));
             // And under it, the case where the line on its own misleads a
             // different way: an ordering that ranked no row at all — `--sort
             // cpu` with no metrics-server, `--sort restarts` where nothing
@@ -264,7 +259,10 @@ pub async fn list(
         // of the ordering, so this can never rank nothing the way `--sort
         // cpu` can.
         SortBy::Resource(resource) => {
-            notes.push(k8s_pods::device_note(resource, request.direction));
+            notes.push(k8s::order::device_note_with_hidden(
+                k8s_pods::device_note(resource, request.direction),
+                k8s_pods::device_hidden(resource, &scope, &rows, request.width),
+            ));
         }
     }
 
