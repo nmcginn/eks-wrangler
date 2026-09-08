@@ -730,6 +730,19 @@ fn usage_cell(used: Option<Quantity>, requested: Quantity, show: fn(Quantity) ->
     }
 }
 
+/// How alarming a usage cell's own percentage is, reading the same ratio the
+/// cell's text does.
+///
+/// `None` whenever the cell itself has no percentage to show — no sample yet,
+/// or a pod that asked for nothing to be a share of — so an unmeasured pod
+/// carries no judgement rather than a borrowed "fine". Where there is a
+/// ratio, [`Severity::from_request_share`] is the rule, not
+/// [`Severity::from_utilisation`]: see [`Column::severity`] for why the two
+/// do not agree.
+fn usage_severity(used: Option<Quantity>, requested: Quantity) -> Option<Severity> {
+    Some(Severity::from_request_share(used?.ratio_of(requested)?))
+}
+
 /// One column of the pod table.
 ///
 /// The column set is a value rather than two parallel lists of headers and
@@ -855,32 +868,29 @@ impl Column<'_> {
     /// [`severity`] — so colouring it too would paint one
     /// judgement across two columns and say nothing new in the second.
     ///
-    /// `CPU` and `MEMORY` are not graded either, and that is a gap rather than
-    /// a rule: those cells carry a percentage, and there is a perfectly good
-    /// [`Severity`] waiting to be applied to it — but not
-    /// [`Severity::from_utilisation`]'s. Its thresholds are about a *node's*
-    /// allocatable, where 90% booked is nearly full; a pod at 90% of the CPU
-    /// it asked for is a well-sized pod, and one at 400% of a 10m request is
-    /// burning 40m and is nobody's emergency. Colouring them on the node's
-    /// thresholds would tell the reader something untrue, in red, on most of
-    /// their rows. What "hot" means for a pod against its own request is a
-    /// decision, and it is the reviewer's to make before this column takes a
-    /// colour. `CPU REQ`, `MEMORY REQ`, and the device columns carry no
-    /// percentage at all — they are a plain fact about the pod, like `AGE` —
-    /// so there is nothing pending for them to grade.
+    /// `CPU` and `MEMORY` are graded now too, but not on
+    /// [`Severity::from_utilisation`]'s thresholds: those are about a *node's*
+    /// allocatable, where 90% booked is nearly full, and a pod at 90% of the
+    /// CPU it asked for is a well-sized pod. [`Severity::from_request_share`]
+    /// is the rule built for this ratio instead — see its own doc comment for
+    /// why 150% and 300% are where it starts to care. `CPU REQ`, `MEMORY
+    /// REQ`, and the device columns carry no percentage at all — they are a
+    /// plain fact about the pod, like `AGE` — so there is nothing for them to
+    /// grade.
     ///
     /// [`Severity::from_utilisation`]: crate::theme::Severity::from_utilisation
+    /// [`Severity::from_request_share`]: crate::theme::Severity::from_request_share
     fn severity(self, row: &PodRow) -> Option<Severity> {
         match self {
             Self::Status => Some(row.severity),
+            Self::Cpu => usage_severity(row.cpu_used, row.cpu_requested),
+            Self::Memory => usage_severity(row.memory_used, row.memory_requested),
             Self::Namespace
             | Self::Name
             | Self::Ready
             | Self::Restarts
             | Self::CpuRequested
-            | Self::Cpu
             | Self::MemoryRequested
-            | Self::Memory
             | Self::Device(_)
             | Self::Age
             | Self::Ip
@@ -4007,11 +4017,10 @@ mod tests {
     }
 
     #[test]
-    fn status_is_the_only_graded_column_in_this_table() {
-        // `READY` is not a second one: `0/1` is *why* a `Running` pod grades
+    fn only_status_cpu_and_memory_are_graded_columns_in_this_table() {
+        // `READY` is not a fourth one: `0/1` is *why* a `Running` pod grades
         // `Warn`, so colouring it too would paint one judgement across two
-        // columns. And the usage pair is not a third — see `Column::severity`
-        // for why it is waiting on a decision rather than on an implementation.
+        // columns.
         let row = PodRow::from_pod(
             &asking(&[("cpu", "500m"), ("memory", "1Gi")]),
             Some(used("450m", "990Mi")),
@@ -4019,15 +4028,18 @@ mod tests {
         );
 
         assert_eq!(Column::Status.severity(&row), Some(row.severity));
+        // Well within either request — `Ok`, not absent: see the next test
+        // for why a graded `Ok` and an ungraded column read identically on
+        // screen but are not the same claim.
+        assert_eq!(Column::Cpu.severity(&row), Some(Severity::Ok));
+        assert_eq!(Column::Memory.severity(&row), Some(Severity::Ok));
         for column in [
             Column::Namespace,
             Column::Name,
             Column::Ready,
             Column::Restarts,
             Column::CpuRequested,
-            Column::Cpu,
             Column::MemoryRequested,
-            Column::Memory,
             Column::Device("nvidia.com/gpu"),
             Column::Age,
             Column::Ip,
@@ -4045,17 +4057,44 @@ mod tests {
     }
 
     #[test]
-    fn a_pod_at_ninety_percent_of_its_own_request_is_not_painted_as_a_full_node() {
-        // The reason the usage columns are ungraded, stated as an assertion:
-        // this pod is at 90% of what it asked for, which
-        // `Severity::from_utilisation` calls `Critical` for a node's
-        // allocatable and which is a well-sized pod. Until "hot" is defined
-        // for a request, colouring it would be telling the reader something
-        // untrue in red on most of their rows.
+    fn a_pod_at_ninety_percent_of_its_own_request_reads_ok_not_critical() {
+        // 90% of what it asked for is `Critical` on `Severity::from_utilisation`
+        // — a node's own reading of a nearly-full allocatable — and a
+        // well-sized pod on `Severity::from_request_share`, the rule this
+        // column actually uses.
         let row = PodRow::from_pod(&asking(&[("cpu", "500m")]), Some(used("450m", "0")), now());
 
         assert_eq!(Column::Cpu.text(&row), "450m (90%)");
-        assert_eq!(Column::Cpu.severity(&row), None);
+        assert_eq!(Column::Cpu.severity(&row), Some(Severity::Ok));
+    }
+
+    #[test]
+    fn a_pod_well_over_its_own_request_is_graded_warn_then_critical() {
+        // Clear of the 150%/300% boundaries rather than sitting on them: the
+        // ratio here comes from dividing two real `Quantity`s, and floating
+        // point can land a hair either side of a boundary a literal
+        // comparison in `theme::tests` hits exactly.
+        let warn = PodRow::from_pod(&asking(&[("cpu", "100m")]), Some(used("160m", "0")), now());
+        assert_eq!(Column::Cpu.text(&warn), "160m (160%)");
+        assert_eq!(Column::Cpu.severity(&warn), Some(Severity::Warn));
+
+        let critical = PodRow::from_pod(&asking(&[("cpu", "10m")]), Some(used("40m", "0")), now());
+        assert_eq!(Column::Cpu.text(&critical), "40m (400%)");
+        assert_eq!(Column::Cpu.severity(&critical), Some(Severity::Critical));
+    }
+
+    #[test]
+    fn a_usage_cell_with_no_percentage_carries_no_severity() {
+        // No request to be a share of: the same zero-denominator case
+        // `usage_cell`'s own text falls back to the bare figure for.
+        let no_request = PodRow::from_pod(&asking(&[]), Some(used("450m", "0")), now());
+        assert_eq!(Column::Cpu.text(&no_request), "450m");
+        assert_eq!(Column::Cpu.severity(&no_request), None);
+
+        // No sample yet: nothing measured, so nothing to grade.
+        let unsampled = PodRow::from_pod(&asking(&[("cpu", "500m")]), None, now());
+        assert_eq!(Column::Cpu.text(&unsampled), UNKNOWN);
+        assert_eq!(Column::Cpu.severity(&unsampled), None);
     }
 
     #[test]

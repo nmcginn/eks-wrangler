@@ -862,7 +862,7 @@ cluster.
 
 ### Follow-ups from the CLI colour
 
-- [ ] **What "hot" means for a pod against its own request.**
+- [x] **What "hot" means for a pod against its own request.**
   `eks pods` now colours `STATUS` and nothing else. `CPU/REQ` and `MEMORY/REQ`
   carry a percentage and no `Severity`, because `Severity::from_utilisation`'s
   thresholds are about a node's allocatable: 90% booked is nearly full there, and
@@ -880,6 +880,49 @@ cluster.
   `Severity::from_utilisation` rather than a second set of numbers at the call
   site, and `Column::severity` in `k8s::pods::row` reads it; the node columns are
   unchanged.
+  Landed as `Severity::from_request_share`, beside `from_utilisation` in
+  `theme.rs`: `Warn` at 150% of what the pod asked for, `Critical` at 300%,
+  `Ok` everywhere at or above zero and below that — including everything up to
+  and a little past 100%, on purpose, since a request is a floor a scheduler
+  holds open rather than a ceiling a pod is expected to stay under. Direction
+  is deliberately one-sided: nothing under 100% earns a colour no matter how
+  idle the pod is, the same shape `from_utilisation` already has for a node
+  nowhere near full. `k8s::pods::row::usage_severity` reads the exact
+  `used.ratio_of(requested)` the cell's own text already computes, so the
+  colour and the number on screen cannot drift apart, and it returns `None` —
+  no judgement, not a false `Ok` — for precisely the two cases the text itself
+  falls back to a bare figure for: no sample yet, and a pod that asked for
+  nothing to be a share of. `Column::severity` now grades `Cpu` and `Memory`
+  through it; `CPU REQ`, `MEMORY REQ`, and the device columns stay ungraded,
+  since none of them carry a percentage to judge in the first place. The
+  ordering symmetry question the roadmap wording raised — "one answer should
+  settle both" — turned out not to apply: `--sort cpu-share`/`--sort
+  memory-share` already landed (decision 81) ranking the raw ratio, which
+  needs no threshold at all, so there was nothing in that task left for this
+  one to touch. The limit question is left open below: this tool reads a
+  container's `resources.limits` only in the pod-detail view's per-container
+  drill-down, never as a pod-wide total the way a listing row would need, and
+  wiring that in is a fetch this task did not need to build. See decision 90.
+
+- [ ] **Grade a pod's usage against its own limit, once it is over its
+  request.**
+  `Severity::from_request_share` grades `CPU`/`MEMORY` on the request alone,
+  because that is the only denominator a pod-listing row carries today —
+  `PodRow` never reads `resources.limits`; only the pod-detail view's
+  per-container drill-down does, for one container at a time rather than the
+  pod-wide sum this column would need. A pod at 150% of its request earns a
+  `Warn` on the request's own terms, but the number that actually predicts an
+  OOM-kill or CPU throttling is how close it is to its *limit* — a pod with a
+  10x limit at 150% of request is nowhere near trouble, and a pod with no
+  headroom above its request at all is closer than a request-only reading can
+  say. Separate because it needs a new fetch (a pod-wide limit total, summed
+  the way `effective_requests` sums requests) and turns on a real design
+  question this task's acceptance criteria left open: whether a limit changes
+  `CPU`/`MEMORY`'s severity rule outright, adds a third grading tier once one
+  is set, or wants its own column instead of folding into the existing cell.
+  *Acceptance:* whichever shape it takes, it reads a pod-wide limit total
+  built the way `effective_requests` builds its request total, not a second
+  ad-hoc sum; a pod with no limit set reads exactly as it does today.
 
 ### Follow-ups from the client bootstrap
 
@@ -1426,6 +1469,28 @@ cluster.
 ---
 
 ## Done
+
+- **What "hot" means for a pod against its own request** (2026-09-08) — `eks
+  pods`' `CPU`/`MEMORY` cells now carry a colour: `Ok` up to and a little past
+  100% of what the pod asked for, `Warn` at 150%, `Critical` at 300%.
+  `theme::Severity::from_request_share` is the rule, beside
+  `from_utilisation` rather than reusing its node-shaped thresholds — 90%
+  booked is nearly full for a node's allocatable and a well-sized pod for its
+  own request, so the two questions needed two functions, not one function
+  asked twice. The direction is deliberately one-sided: a request is a floor
+  a scheduler holds open, not a ceiling a pod should stay under, so nothing
+  under 100% is graded no matter how idle the pod is. `k8s::pods::row::
+  usage_severity` reads the exact `used.ratio_of(requested)` the cell's own
+  text already computes, so the colour and the number on screen cannot come
+  to disagree, and returns `None` — no judgement, not a borrowed `Ok` — for
+  the same two cases the text falls back to a bare figure for: no sample yet,
+  and a pod that asked for nothing to be a share of. `CPU REQ`, `MEMORY REQ`,
+  and the device columns stay ungraded, since none of them carry a percentage
+  to begin with. Left open: whether a container's *limit*, which this tool
+  reads only per-container in the pod-detail view and never as a pod-wide
+  total, is the more honest denominator once a pod is over its request — its
+  own roadmap entry rather than a guess this task's acceptance criteria never
+  asked for. See decision 90.
 
 - **Sort the node table by an extended resource** (2026-09-02) — `eks nodes
   --sort-resource nvidia.com/gpu` ranks nodes by a device's booked share, the

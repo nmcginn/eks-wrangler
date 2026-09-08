@@ -3163,3 +3163,55 @@ writing the same fold `k8s::order` had already named half of
 (`hidden_note`) but never finished (the join with `note`) — so the second
 copy of that block was the sign the whole thing belonged in one place, not
 that the function needed trimming elsewhere.
+
+### 90. A pod's own request gets its own severity thresholds: `Warn` at 150%, `Critical` at 300%
+
+`eks pods`' `CPU`/`MEMORY` cells carried a percentage and no colour since the
+CLI-colour work landed, because `Severity::from_utilisation`'s thresholds —
+`Warn` at 75% of a node's allocatable, `Critical` at 90% — answer "how full is
+this node", and a pod at 90% of its own request is a well-sized pod, not
+nearly full. Colouring the cell on the node's numbers would have told the
+reader something untrue, in red, on most rows of a healthy listing, so the
+roadmap left the column ungraded until "hot" meant something for a request.
+
+No cluster to calibrate against and no existing convention in the codebase to
+lean on, so the thresholds are a judgement call rather than a measurement:
+`1.5` (150% of request) is where a burst stops looking ordinary — CPU is
+compressible, so running above a request some of the time is exactly what
+headroom is for, and punishing that with colour would repeat the "90% is
+fine, not full" mistake in the other direction. `3.0` (300%) is a request
+undersized enough that the pod is running on borrowed capacity most of the
+time, which is the point a burstable pod becomes the first thing evicted
+under memory pressure or throttled under CPU contention. Both numbers can
+move if real usage says otherwise; what should not move without a second
+decision is the shape — one pure function over a ratio, tested at its
+boundaries, the same contract `from_utilisation` already keeps.
+
+The direction is deliberately one-sided. `from_utilisation` only grades
+upward too, but a node has no symmetrical "too empty" to worry about either,
+so this was not a new asymmetry so much as the same one restated: a request
+is a floor a scheduler holds open on the pod's behalf, not a ceiling it is
+expected to stay under, so nothing under 100% earns a colour no matter how
+idle the pod is. A pod using 5% of a 10m request is not "cold"; it is a
+request that was never going to be the tight one.
+
+`k8s::pods::row::usage_severity(used, requested)` is the seam:
+`Some(Severity::from_request_share(used?.ratio_of(requested)?))`, reading the
+exact `Option<f64>` `usage_cell`'s own text is built from rather than a
+second computation of the same ratio, so the number printed and the colour
+painted around it cannot drift apart. Returning `None` rather than
+`Some(Severity::Unknown)` for a pod with no sample or no request matters:
+`Unknown` paints muted ink, which would tell the reader "this figure could
+not be read" about a cell that is not showing a figure at all — the same
+"no judgement, not a false answer" reasoning `Column::severity` already
+applies to every other ungraded column.
+
+Left open, and written up as its own roadmap entry rather than guessed at
+here: whether a container's *limit* — read today only per-container in the
+pod-detail view, never as a pod-wide total — is the more honest denominator
+once a pod is over its request. A pod at 150% of a 10m request and a 10x
+limit is nowhere near an OOM-kill; this task's thresholds cannot see that
+difference, because a listing row does not carry a limit to compare against.
+Building that fetch and deciding how a limit changes the rule (a third tier,
+a different threshold, its own column) is a decision this task had no reason
+to make on its way to giving the column a colour at all.
