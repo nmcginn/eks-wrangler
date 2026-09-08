@@ -162,6 +162,40 @@ impl Severity {
             Self::Ok
         }
     }
+
+    /// Classify a pod's usage against its own request, rather than a node's
+    /// allocatable.
+    ///
+    /// [`from_utilisation`](Self::from_utilisation) answers "how full is this
+    /// node", where approaching capacity is the whole risk. A pod's own
+    /// request has no such ceiling: CPU is compressible, so running above a
+    /// request is exactly what a burst spends, and a pod sitting at 90% of
+    /// what it asked for is well sized, not nearly full. Those thresholds
+    /// would tell the reader something untrue, in red, on most rows of a
+    /// healthy listing.
+    ///
+    /// The question worth colouring is not "is this over 100%" but "is this
+    /// meaningfully over, for long enough to matter" — a burstable pod that
+    /// outgrew its own request is the first thing evicted under memory
+    /// pressure and the first throttled under CPU contention, so the request
+    /// it is drifting from is a real number to be behind. `1.5` (150% of
+    /// request) is where that drift stops looking like an ordinary burst;
+    /// `3.0` (300%) is a request so undersized the pod is running on borrowed
+    /// capacity most of the time. Everything at or a little above 100% stays
+    /// `Ok`, deliberately: a request is a floor a scheduler holds open, not a
+    /// ceiling a pod is expected to stay under.
+    #[must_use]
+    pub fn from_request_share(ratio: f64) -> Self {
+        if !ratio.is_finite() || ratio < 0.0 {
+            Self::Unknown
+        } else if ratio >= 3.0 {
+            Self::Critical
+        } else if ratio >= 1.5 {
+            Self::Warn
+        } else {
+            Self::Ok
+        }
+    }
 }
 
 /// What the user asked for with `--color`.
@@ -358,6 +392,26 @@ mod tests {
     fn nonsense_utilisation_is_unknown_not_alarming() {
         assert_eq!(Severity::from_utilisation(f64::NAN), Severity::Unknown);
         assert_eq!(Severity::from_utilisation(-0.1), Severity::Unknown);
+    }
+
+    #[test]
+    fn request_share_thresholds_are_inclusive_at_the_boundary() {
+        assert_eq!(Severity::from_request_share(0.0), Severity::Ok);
+        // A pod at 90% of its own request is well sized, not nearly full —
+        // the reading `from_utilisation` would give it is the wrong one.
+        assert_eq!(Severity::from_request_share(0.90), Severity::Ok);
+        assert_eq!(Severity::from_request_share(1.0), Severity::Ok);
+        assert_eq!(Severity::from_request_share(1.499), Severity::Ok);
+        assert_eq!(Severity::from_request_share(1.5), Severity::Warn);
+        assert_eq!(Severity::from_request_share(2.999), Severity::Warn);
+        assert_eq!(Severity::from_request_share(3.0), Severity::Critical);
+        assert_eq!(Severity::from_request_share(4.5), Severity::Critical);
+    }
+
+    #[test]
+    fn nonsense_request_share_is_unknown_not_alarming() {
+        assert_eq!(Severity::from_request_share(f64::NAN), Severity::Unknown);
+        assert_eq!(Severity::from_request_share(-0.1), Severity::Unknown);
     }
 
     #[test]
