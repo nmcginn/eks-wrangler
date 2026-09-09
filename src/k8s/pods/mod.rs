@@ -275,6 +275,120 @@ pub fn effective_requests(pod: &Pod) -> Requests {
     running.max(init_peak).plus(overhead(spec))
 }
 
+/// What a pod's containers cap themselves at — the limit counterpart to
+/// [`Requests`].
+///
+/// A container that named no request asked for a real zero; a container that
+/// named no *limit* is not bounded at zero, it is not bounded at all. So each
+/// field is `Option<Quantity>` rather than [`Requests`]'s bare `Quantity`:
+/// `None` means at least one container in the relevant group left that
+/// resource unbounded, which makes the group's total unbounded too — one
+/// uncapped container is enough to make "how much can this pod use" the same
+/// unanswerable question the group asked before it. No `extended` map: nothing
+/// grades a device against its own limit yet, and one that answered a question
+/// nobody asks would only be a second thing to keep in step with `Requests`'s.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Limits {
+    pub cpu: Option<Quantity>,
+    pub memory: Option<Quantity>,
+}
+
+impl Limits {
+    /// The identity for [`Self::plus`]: no containers folded in yet, a bound
+    /// of zero rather than [`Self::default`]'s "no bound at all" — the same
+    /// distinction a fold over [`Requests`] draws by starting from
+    /// `Requests::default`, which is already the identity it needs.
+    fn zero() -> Self {
+        Self {
+            cpu: Some(Quantity::default()),
+            memory: Some(Quantity::default()),
+        }
+    }
+
+    /// Componentwise sum. `None` beats `Some` on either side: a total that
+    /// includes an unbounded container is unbounded, whatever the bounded ones
+    /// added up to.
+    #[must_use]
+    fn plus(self, other: Self) -> Self {
+        Self {
+            cpu: combine(self.cpu, other.cpu, std::ops::Add::add),
+            memory: combine(self.memory, other.memory, std::ops::Add::add),
+        }
+    }
+
+    /// Componentwise maximum, `None` propagating on the same terms as
+    /// [`Self::plus`]: a peak that includes an unbounded container has no
+    /// ceiling either.
+    #[must_use]
+    fn max(self, other: Self) -> Self {
+        Self {
+            cpu: combine(self.cpu, other.cpu, Quantity::max),
+            memory: combine(self.memory, other.memory, Quantity::max),
+        }
+    }
+
+    /// Add the runtime sandbox's own overhead, when a `RuntimeClass` declares
+    /// one. A limit already unbounded stays unbounded — the overhead does not
+    /// invent a ceiling that was never there.
+    fn plus_overhead(self, overhead: &Requests) -> Self {
+        Self {
+            cpu: self.cpu.map(|cpu| cpu + overhead.cpu),
+            memory: self.memory.map(|memory| memory + overhead.memory),
+        }
+    }
+}
+
+/// Fold two limits that must both be set for the result to be, propagating
+/// `None` — "unbounded" — from either side.
+fn combine(
+    a: Option<Quantity>,
+    b: Option<Quantity>,
+    fold: fn(Quantity, Quantity) -> Quantity,
+) -> Option<Quantity> {
+    Some(fold(a?, b?))
+}
+
+/// What one pod's containers cap themselves at, on the node it landed on.
+///
+/// [`effective_requests`]'s own fold, term for term — the init phase's peak,
+/// sidecars added to the steady-state sum, pod overhead on top — with
+/// `Limits`'s own `plus` and `max` standing in for [`Requests`]'s so an
+/// unbounded container propagates instead of vanishing into a sum that no
+/// longer means what it says it does.
+#[must_use]
+pub fn effective_limits(pod: &Pod) -> Limits {
+    let Some(spec) = pod.spec.as_ref() else {
+        return Limits::default();
+    };
+
+    let mut sidecars = Limits::zero();
+    let mut init_peak = Limits::zero();
+    for container in spec.init_containers.iter().flatten() {
+        let limits = container_limits(container);
+        init_peak = init_peak.max(sidecars.plus(limits));
+        if is_sidecar(container) {
+            sidecars = sidecars.plus(limits);
+        }
+    }
+
+    let running = spec.containers.iter().fold(sidecars, |total, container| {
+        total.plus(container_limits(container))
+    });
+
+    running.max(init_peak).plus_overhead(&overhead(spec))
+}
+
+fn container_limits(container: &Container) -> Limits {
+    let limits = container
+        .resources
+        .as_ref()
+        .and_then(|resources| resources.limits.as_ref());
+    Limits {
+        cpu: Quantity::lookup(limits, "cpu"),
+        memory: Quantity::lookup(limits, "memory"),
+    }
+}
+
 /// An init container that never exits, so it is charged like an app container.
 ///
 /// `restartPolicy: Always` on an init container is the only thing that makes it
@@ -606,6 +720,153 @@ mod tests {
     #[test]
     fn a_pod_with_no_spec_at_all_asks_for_nothing() {
         assert_eq!(effective_requests(&Pod::default()), Requests::default());
+    }
+
+    /// A container with a limit set for `cpu` and/or `memory`, and no
+    /// request — these tests are not about what the container asked for.
+    fn limited(name: &str, cpu: Option<&str>, memory: Option<&str>) -> Container {
+        let mut limits = BTreeMap::new();
+        if let Some(cpu) = cpu {
+            limits.insert("cpu".to_owned(), ApiQuantity(cpu.to_owned()));
+        }
+        if let Some(memory) = memory {
+            limits.insert("memory".to_owned(), ApiQuantity(memory.to_owned()));
+        }
+        Container {
+            name: name.to_owned(),
+            resources: Some(ResourceRequirements {
+                limits: Some(limits),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    fn limited_sidecar(name: &str, cpu: Option<&str>, memory: Option<&str>) -> Container {
+        Container {
+            restart_policy: Some("Always".to_owned()),
+            ..limited(name, cpu, memory)
+        }
+    }
+
+    fn limits(cpu: &str, memory: &str) -> Limits {
+        Limits {
+            cpu: Some(quantity(cpu)),
+            memory: Some(quantity(memory)),
+        }
+    }
+
+    #[test]
+    fn a_pods_limit_is_the_sum_of_its_containers_limits() {
+        let pod = pod(
+            "node-a",
+            spec(vec![
+                limited("app", Some("500m"), Some("1Gi")),
+                limited("log-shipper", Some("100m"), Some("128Mi")),
+            ]),
+        );
+
+        assert_eq!(effective_limits(&pod), limits("600m", "1152Mi"));
+    }
+
+    #[test]
+    fn a_container_with_no_limit_leaves_that_resource_of_the_pod_unbounded() {
+        // The request reading of an absent entry — a real zero — is exactly
+        // wrong here: a container nothing caps means the pod as a whole has
+        // no ceiling for that resource, whatever its neighbours declared.
+        let pod = pod("node-a", spec(vec![limited("app", Some("500m"), None)]));
+
+        assert_eq!(
+            effective_limits(&pod),
+            Limits {
+                cpu: Some(quantity("500m")),
+                memory: None,
+            }
+        );
+    }
+
+    #[test]
+    fn a_container_with_no_resources_block_at_all_is_unbounded_on_both() {
+        let pod = pod("node-a", spec(vec![container("app", "250m", "512Mi")]));
+
+        assert_eq!(effective_limits(&pod), Limits::default());
+    }
+
+    #[test]
+    fn one_unlimited_container_makes_the_whole_pods_total_unbounded() {
+        // A pod is only as bounded as its least-bounded container: summing
+        // the ones that did set a limit and ignoring the one that did not
+        // would claim a ceiling nothing actually enforces.
+        let pod = pod(
+            "node-a",
+            spec(vec![
+                limited("app", Some("500m"), Some("1Gi")),
+                container("sidecar", "100m", "128Mi"),
+            ]),
+        );
+
+        assert_eq!(effective_limits(&pod), Limits::default());
+    }
+
+    #[test]
+    fn init_containers_limits_follow_the_same_peak_rule_requests_do() {
+        let pod = pod(
+            "node-a",
+            PodSpec {
+                init_containers: Some(vec![
+                    limited("migrate", Some("1"), Some("256Mi")),
+                    limited("seed", Some("1"), Some("128Mi")),
+                ]),
+                ..spec(vec![limited("app", Some("250m"), Some("512Mi"))])
+            },
+        );
+
+        // max(app 250m/512Mi, peak init 1/256Mi) — componentwise.
+        assert_eq!(effective_limits(&pod), limits("1", "512Mi"));
+    }
+
+    #[test]
+    fn a_limited_sidecar_is_added_to_the_running_containers_rather_than_maxed() {
+        let pod = pod(
+            "node-a",
+            PodSpec {
+                init_containers: Some(vec![limited_sidecar("proxy", Some("100m"), Some("128Mi"))]),
+                ..spec(vec![limited("app", Some("250m"), Some("512Mi"))])
+            },
+        );
+
+        assert_eq!(effective_limits(&pod), limits("350m", "640Mi"));
+    }
+
+    #[test]
+    fn pod_overhead_is_added_to_a_bounded_limit() {
+        let pod = pod(
+            "node-a",
+            PodSpec {
+                overhead: Some(resources("50m", "64Mi")),
+                ..spec(vec![limited("app", Some("250m"), Some("512Mi"))])
+            },
+        );
+
+        assert_eq!(effective_limits(&pod), limits("300m", "576Mi"));
+    }
+
+    #[test]
+    fn pod_overhead_does_not_invent_a_ceiling_for_an_unbounded_resource() {
+        let pod = pod(
+            "node-a",
+            PodSpec {
+                overhead: Some(resources("50m", "64Mi")),
+                ..spec(vec![container("app", "250m", "512Mi")])
+            },
+        );
+
+        assert_eq!(effective_limits(&pod), Limits::default());
+    }
+
+    #[test]
+    fn a_pod_with_no_spec_at_all_has_no_limit_to_speak_of() {
+        assert_eq!(effective_limits(&Pod::default()), Limits::default());
     }
 
     #[test]

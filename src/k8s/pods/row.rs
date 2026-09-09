@@ -125,6 +125,16 @@ pub struct PodRow {
     /// as [`Self::cpu_requested`]: whatever this pod's containers did not ask
     /// for is simply absent, which is a real zero rather than an unknown.
     pub extended_requested: BTreeMap<String, Quantity>,
+    /// The pod-wide CPU limit — [`crate::k8s::pods::effective_limits`]'s
+    /// figure, built the way [`Self::cpu_requested`] is.
+    ///
+    /// `None` when any container that counts towards it left CPU unbounded,
+    /// which leaves the pod as a whole with no ceiling to grade usage
+    /// against — the same reading a pod that set no limit at all gets, since
+    /// neither has one.
+    pub cpu_limit: Option<Quantity>,
+    /// Memory's counterpart to [`Self::cpu_limit`].
+    pub memory_limit: Option<Quantity>,
     /// The node the pod landed on, or `-` while it is still unscheduled.
     pub node: String,
     /// The address the pod answers on, or `-` before the CNI has assigned one.
@@ -169,6 +179,7 @@ impl PodRow {
         // `eks nodes` totals exactly this number per node, and the two commands
         // must not be able to disagree about what one pod asked for.
         let requested = super::effective_requests(pod);
+        let limits = super::effective_limits(pod);
         // Read once and used for both cells, so the formatted age and the
         // instant the ordering sorts on cannot describe different moments.
         let created_at = pod
@@ -207,6 +218,8 @@ impl PodRow {
             cpu_requested: requested.cpu,
             memory_requested: requested.memory,
             extended_requested: requested.extended,
+            cpu_limit: limits.cpu,
+            memory_limit: limits.memory,
             node: pod
                 .spec
                 .as_ref()
@@ -735,12 +748,32 @@ fn usage_cell(used: Option<Quantity>, requested: Quantity, show: fn(Quantity) ->
 ///
 /// `None` whenever the cell itself has no percentage to show — no sample yet,
 /// or a pod that asked for nothing to be a share of — so an unmeasured pod
-/// carries no judgement rather than a borrowed "fine". Where there is a
-/// ratio, [`Severity::from_request_share`] is the rule, not
-/// [`Severity::from_utilisation`]: see [`Column::severity`] for why the two
-/// do not agree.
-fn usage_severity(used: Option<Quantity>, requested: Quantity) -> Option<Severity> {
-    Some(Severity::from_request_share(used?.ratio_of(requested)?))
+/// carries no judgement rather than a borrowed "fine". Below its own request,
+/// [`Severity::from_request_share`] is the whole answer — there is nothing yet
+/// to be closer to. Once a pod is over its request, a *known* `limit`
+/// answers the sharper question a request-only reading cannot: a pod at 150%
+/// of request with a 10x limit is nowhere near trouble, and a pod with no
+/// headroom above its request at all is closer than "150%" can say. That
+/// reading uses [`Severity::from_utilisation`] — the same "how full is the
+/// hard ceiling" thresholds a node's allocatable is graded on, because a
+/// limit is exactly that kind of ceiling and a request is not — rather than
+/// [`Severity::from_request_share`], which has no ceiling to be full of. A pod
+/// whose containers left the limit unbounded stays on
+/// [`Severity::from_request_share`] alone, reading exactly as it did before
+/// this existed.
+fn usage_severity(
+    used: Option<Quantity>,
+    requested: Quantity,
+    limit: Option<Quantity>,
+) -> Option<Severity> {
+    let used = used?;
+    let request_ratio = used.ratio_of(requested)?;
+    if request_ratio > 1.0
+        && let Some(limit_ratio) = limit.and_then(|limit| used.ratio_of(limit))
+    {
+        return Some(Severity::from_utilisation(limit_ratio));
+    }
+    Some(Severity::from_request_share(request_ratio))
 }
 
 /// One column of the pod table.
@@ -869,22 +902,23 @@ impl Column<'_> {
     /// judgement across two columns and say nothing new in the second.
     ///
     /// `CPU` and `MEMORY` are graded now too, but not on
-    /// [`Severity::from_utilisation`]'s thresholds: those are about a *node's*
-    /// allocatable, where 90% booked is nearly full, and a pod at 90% of the
-    /// CPU it asked for is a well-sized pod. [`Severity::from_request_share`]
-    /// is the rule built for this ratio instead — see its own doc comment for
-    /// why 150% and 300% are where it starts to care. `CPU REQ`, `MEMORY
-    /// REQ`, and the device columns carry no percentage at all — they are a
-    /// plain fact about the pod, like `AGE` — so there is nothing for them to
-    /// grade.
+    /// [`Severity::from_utilisation`]'s thresholds alone: below its own
+    /// request, a pod is graded on [`Severity::from_request_share`] — 90%
+    /// booked is nearly full for a *node's* allocatable, not for a
+    /// well-sized pod's request. Once a pod is over its request, a known
+    /// `cpu_limit`/`memory_limit` switches the reading to
+    /// `from_utilisation` against that limit instead — see [`usage_severity`]
+    /// for why. `CPU REQ`, `MEMORY REQ`, and the device columns carry no
+    /// percentage at all — they are a plain fact about the pod, like `AGE` —
+    /// so there is nothing for them to grade.
     ///
     /// [`Severity::from_utilisation`]: crate::theme::Severity::from_utilisation
     /// [`Severity::from_request_share`]: crate::theme::Severity::from_request_share
     fn severity(self, row: &PodRow) -> Option<Severity> {
         match self {
             Self::Status => Some(row.severity),
-            Self::Cpu => usage_severity(row.cpu_used, row.cpu_requested),
-            Self::Memory => usage_severity(row.memory_used, row.memory_requested),
+            Self::Cpu => usage_severity(row.cpu_used, row.cpu_requested, row.cpu_limit),
+            Self::Memory => usage_severity(row.memory_used, row.memory_requested, row.memory_limit),
             Self::Namespace
             | Self::Name
             | Self::Ready
@@ -2599,6 +2633,26 @@ mod tests {
         pod
     }
 
+    /// [`asking`]'s pod, with its container also capped at `limits`.
+    fn limited(requests: &[(&str, &str)], limits: &[(&str, &str)]) -> Pod {
+        let mut pod = asking(requests);
+        if let Some(spec) = pod.spec.as_mut() {
+            for container in &mut spec.containers {
+                if let Some(resources) = container.resources.as_mut() {
+                    resources.limits = Some(
+                        limits
+                            .iter()
+                            .map(|(name, value)| {
+                                ((*name).to_owned(), ApiQuantity((*value).to_owned()))
+                            })
+                            .collect(),
+                    );
+                }
+            }
+        }
+        pod
+    }
+
     /// The two rows of [`sampled_rows`], each pod asking for something — the
     /// shape nearly every real deployment has.
     fn requesting_rows() -> Vec<PodRow> {
@@ -4095,6 +4149,74 @@ mod tests {
         let unsampled = PodRow::from_pod(&asking(&[("cpu", "500m")]), None, now());
         assert_eq!(Column::Cpu.text(&unsampled), UNKNOWN);
         assert_eq!(Column::Cpu.severity(&unsampled), None);
+    }
+
+    #[test]
+    fn a_pod_over_request_with_plenty_of_headroom_under_its_limit_reads_ok() {
+        // 160% of request is `Warn` on `from_request_share` alone — see
+        // `a_pod_well_over_its_own_request_is_graded_warn_then_critical` — but
+        // a limit twelve times the usage says this pod is nowhere near
+        // trouble, which is the reading that should win once one is known.
+        let row = PodRow::from_pod(
+            &limited(&[("cpu", "100m")], &[("cpu", "2")]),
+            Some(used("160m", "0")),
+            now(),
+        );
+
+        assert_eq!(Column::Cpu.severity(&row), Some(Severity::Ok));
+    }
+
+    #[test]
+    fn a_pod_over_request_with_no_headroom_under_its_limit_reads_critical() {
+        // 115% of request is `Ok` on `from_request_share` alone — nowhere
+        // near its 150% boundary — but a limit only just above what is
+        // already being used is exactly the pod about to be throttled or
+        // OOM-killed, and the request-only reading has no way to say so.
+        let row = PodRow::from_pod(
+            &limited(&[("cpu", "100m")], &[("cpu", "120m")]),
+            Some(used("115m", "0")),
+            now(),
+        );
+
+        assert_eq!(Column::Cpu.severity(&row), Some(Severity::Critical));
+    }
+
+    #[test]
+    fn a_pod_exactly_at_its_request_stays_on_the_request_reading() {
+        // Usage no greater than the request has nothing to be "over" yet, so
+        // the limit — however tight — never enters into it: switching readings
+        // here would grade a well-sized pod on a ceiling it has not
+        // approached.
+        let row = PodRow::from_pod(
+            &limited(&[("cpu", "100m")], &[("cpu", "100m")]),
+            Some(used("100m", "0")),
+            now(),
+        );
+
+        assert_eq!(Column::Cpu.severity(&row), Some(Severity::Ok));
+    }
+
+    #[test]
+    fn a_pod_with_no_limit_set_is_graded_exactly_as_before_this_existed() {
+        let row = PodRow::from_pod(&asking(&[("cpu", "100m")]), Some(used("160m", "0")), now());
+
+        assert_eq!(row.cpu_limit, None);
+        assert_eq!(Column::Cpu.severity(&row), Some(Severity::Warn));
+    }
+
+    #[test]
+    fn one_resources_limit_grades_it_without_touching_the_others_reading() {
+        // Both columns are over their own request; only CPU has a limit to be
+        // graded against, and MEMORY must keep the request-only reading
+        // rather than borrow CPU's.
+        let row = PodRow::from_pod(
+            &limited(&[("cpu", "100m"), ("memory", "100Mi")], &[("cpu", "2")]),
+            Some(used("160m", "170Mi")),
+            now(),
+        );
+
+        assert_eq!(Column::Cpu.severity(&row), Some(Severity::Ok));
+        assert_eq!(Column::Memory.severity(&row), Some(Severity::Warn));
     }
 
     #[test]

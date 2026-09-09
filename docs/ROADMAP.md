@@ -904,7 +904,7 @@ cluster.
   drill-down, never as a pod-wide total the way a listing row would need, and
   wiring that in is a fetch this task did not need to build. See decision 90.
 
-- [ ] **Grade a pod's usage against its own limit, once it is over its
+- [x] **Grade a pod's usage against its own limit, once it is over its
   request.**
   `Severity::from_request_share` grades `CPU`/`MEMORY` on the request alone,
   because that is the only denominator a pod-listing row carries today —
@@ -923,6 +923,16 @@ cluster.
   *Acceptance:* whichever shape it takes, it reads a pod-wide limit total
   built the way `effective_requests` builds its request total, not a second
   ad-hoc sum; a pod with no limit set reads exactly as it does today.
+  Landed as a straight swap, not a column or a third tier: below 100% of
+  request `Severity::from_request_share` is the whole answer, unchanged;
+  over 100%, a known pod-wide limit switches the reading to
+  `Severity::from_utilisation` against that limit instead, since a limit is
+  the "how full is the hard ceiling" question that rule was already built
+  for. `k8s::pods::Limits`/`effective_limits` mirror `Requests`/
+  `effective_requests`'s fold term for term, but with `Option<Quantity>`
+  fields that propagate `None` — "unbounded" — from any single uncapped
+  container, because a limit nobody set is not the same zero a request
+  nobody made is. See decision 91.
 
 ### Follow-ups from the client bootstrap
 
