@@ -3215,3 +3215,60 @@ difference, because a listing row does not carry a limit to compare against.
 Building that fetch and deciding how a limit changes the rule (a third tier,
 a different threshold, its own column) is a decision this task had no reason
 to make on its way to giving the column a colour at all.
+
+### 91. A known limit replaces the request-share reading once a pod is over its request, rather than adding a tier or a column
+
+Decision 90 left three shapes open for the day a pod-wide limit total
+existed: a third grading tier, a different set of thresholds, or a column of
+its own. A column was the first one out: `CPU`/`MEMORY` already carry a
+percentage of the request in their text, and a second percentage in the same
+cell — or a fourth and fifth column beside `CPU REQ`/`MEMORY REQ` — answers a
+question ("how close to the limit") most rows have no limit to ask, on a
+table already dense enough that a whole "Suggest orderings that tell the rows
+apart" entry exists to keep `--sort` from pointing at columns that say
+nothing. Nothing in `PodRow` needed a place to put a limit's own text; only
+its *colour* needed a place to put a verdict, so the fetch (`Limits`,
+`effective_limits`, `k8s::pods::mod.rs`) went in beside `effective_requests`
+and the verdict went into the cell's existing severity, not a new cell.
+
+That left a tier or a swap. A third tier — `Ok`/`Warn`/`Critical` staying the
+request-based rule below some boundary and a limit-based one taking over
+above it — would need its own boundary chosen with no more to go on than
+decision 90 had for 150%/300%, and would still leave the request-based
+`Warn` at 150%/300% sitting underneath a limit reading of the same pod, two
+verdicts computed and one silently discarded. A straight swap needs no new
+number: `Severity::from_utilisation` already exists, already means "how full
+is a hard ceiling", and a limit *is* that ceiling in a way a request is not
+— the two facts decision 90 built `from_request_share` specifically to keep
+separate from `from_utilisation`'s "nearly full" reading. So the rule is a
+swap, gated on the one condition the roadmap task's own title named: "once
+it is over its request". Below 100% of request, `from_request_share` is the
+whole answer and a limit is not consulted at all — a pod nowhere near its
+request has nothing to be closer to. Over 100%, a known limit takes over
+outright; an unknown one leaves `from_request_share` exactly as decision 90
+built it, byte for byte, which is what "a pod with no limit set reads
+exactly as it does today" in the roadmap's acceptance criteria was asking
+for.
+
+The `Limits` fetch mirrors `effective_requests`' fold on purpose — init
+peak, sidecars into the steady-state sum, overhead on top — but cannot reuse
+its `Requests` type, because a request nobody made is a real zero and a
+limit nobody set is not a limit at all; conflating the two the way `Requests`
+does would report a pod with one uncapped container as capped at whatever
+its neighbours declared. `Limits`' fields are `Option<Quantity>`, and `plus`
+and `max` propagate `None` from either side — one unbounded container is
+enough to make the pod's own total for that resource unbounded, on the
+identical principle `ContainerRow::resources_summary` already applies
+per-container with its own `unlimited`. `Limits::zero()` (`Some(0)`,
+`Some(0)`), not `Limits::default()` (`None`, `None`), is the fold's seed:
+the identity for "nothing summed yet" is a bound of zero, and starting from
+"unbounded" would make the very first container's own limit vanish behind
+`None`'s propagation rule before it had a chance to count.
+
+The threshold for "over its request" is `> 1.0`, not `>= 1.5`: a pod sitting
+exactly at its request is not yet over it, and the two readings agree there
+regardless — `from_request_share(1.0)` is already `Ok` and no limit reading
+below `from_utilisation`'s own 90% boundary would say otherwise for a
+sanely-set limit — so the boundary only matters for the pods in between, and
+the roadmap's own wording ("once it is over its request") settled it rather
+than this task inventing a second number decision 90 did not ask for.

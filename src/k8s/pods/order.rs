@@ -377,6 +377,8 @@ mod tests {
             cpu_requested: Quantity::default(),
             memory_requested: Quantity::default(),
             extended_requested: std::collections::BTreeMap::new(),
+            cpu_limit: None,
+            memory_limit: None,
             node: "ip-10-0-1-9.ec2.internal".to_owned(),
             ip: "10.0.1.42".to_owned(),
             nominated_node: "-".to_owned(),
