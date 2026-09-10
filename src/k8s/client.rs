@@ -46,6 +46,7 @@ use kube::{Client, Config};
 use crate::cluster::ClusterView;
 use crate::format;
 use crate::k8s::page::{self, Budget};
+use crate::progress::Progress;
 
 /// Failures from building a client, before any resource is requested.
 #[derive(Debug, thiserror::Error)]
@@ -140,9 +141,10 @@ pub async fn connect(
     paths: &[PathBuf],
     cluster: &ClusterView,
     budget: Budget,
+    progress: &Progress,
 ) -> Result<Client, Error> {
     let config = resolve(paths, cluster).await?;
-    build(config, &cluster.label(), budget).await
+    build(config, &cluster.label(), budget, progress).await
 }
 
 /// Read the kubeconfig and settle which cluster, user, and auth a context
@@ -181,11 +183,27 @@ pub async fn resolve(paths: &[PathBuf], cluster: &ClusterView) -> Result<Config,
 /// that has already looked at the `Config` — and possibly logged the user in
 /// since — can try it twice without resolving twice; `label` is the human name
 /// for the cluster, the same one [`ClusterView::label`] gives.
-pub async fn build(config: Config, label: &str, budget: Budget) -> Result<Client, Error> {
+pub async fn build(
+    config: Config,
+    label: &str,
+    budget: Budget,
+    progress: &Progress,
+) -> Result<Client, Error> {
     let label = label.to_owned();
     // Read before `config` moves onto the blocking task, because the message
     // for a helper that never answers has to name the command to run by hand.
     let helper = helper_command(&config.auth_info);
+
+    // The step the whole progress line exists for. A user waiting thirty
+    // seconds on a laptop that has lost its route to the SSO endpoint is
+    // waiting on a subprocess nothing on screen has ever mentioned; naming it
+    // here is what turns that into something they can act on before the
+    // timeout does it for them. A context with no `exec` block has no
+    // subprocess to name, and says what it is doing instead.
+    let step = match helper_name(&config.auth_info) {
+        Some(command) => progress.waiting(&format!("running {command}")),
+        None => progress.waiting(&format!("connecting to {label}")),
+    };
 
     // The one blocking call in the tool, and the reason it is on a blocking
     // task: `Client::try_from` resolves the auth layer, which runs the
@@ -195,12 +213,12 @@ pub async fn build(config: Config, label: &str, budget: Budget) -> Result<Client
 
     let finished = match budget.limit() {
         // `--timeout 0`: the user asked to wait, so wait.
-        None => task.await,
+        None => step.tick(task).await,
         Some(limit) => {
             // Dropping the join handle abandons the task; it does not stop it,
             // and nothing here can kill a subprocess `kube` owns. Declining to
             // wait for it is `commands::block_on`'s half of this.
-            let Ok(finished) = tokio::time::timeout(limit, task).await else {
+            let Ok(finished) = step.tick(tokio::time::timeout(limit, task)).await else {
                 tracing::debug!(?limit, "the credential helper outlived the budget");
                 return Err(Error::HelperStalled(stalled_helper(
                     &label,
@@ -211,6 +229,11 @@ pub async fn build(config: Config, label: &str, budget: Budget) -> Result<Client
             finished
         }
     };
+
+    // Off the screen before anything below can print — the sentence explaining
+    // a refused credential, or the second login offer `commands::credentials`
+    // makes after one.
+    drop(step);
 
     finished
         .map_err(|source| Error::Interrupted {
@@ -244,11 +267,9 @@ pub async fn build(config: Config, label: &str, budget: Budget) -> Result<Client
 /// `aws eks get-token`.
 #[must_use]
 pub fn helper_command(auth: &AuthInfo) -> Option<String> {
-    let exec = auth.exec.as_ref()?;
-    let command = exec.command.as_deref()?;
+    let command = helper_name(auth)?;
 
     let mut line = String::new();
-
     for (name, value) in exec_env(auth) {
         // The name is written bare. A shell will not accept a quoted one on
         // the left of `=`, and a name that would need quoting is not a
@@ -258,8 +279,28 @@ pub fn helper_command(auth: &AuthInfo) -> Option<String> {
         line.push_str(&shell_word(value));
         line.push(' ');
     }
+    line.push_str(&command);
+    Some(line)
+}
 
-    line.push_str(&shell_word(command));
+/// The same command without the environment assignments in front of it.
+///
+/// [`helper_command`] exists to be pasted into a shell, so it carries
+/// everything needed to reproduce the run. This one exists to be *recognised*,
+/// on a progress line with one terminal row to spend: an EKS `exec` block
+/// routinely sets `AWS_PROFILE` and `AWS_STS_REGIONAL_ENDPOINTS`, and those
+/// would push `aws eks get-token` off the right-hand edge of the very line
+/// that is there to name it.
+///
+/// Split out of [`helper_command`] rather than written beside it, so the two
+/// can never come to disagree about how a command with a space in an argument
+/// is spelled.
+#[must_use]
+pub fn helper_name(auth: &AuthInfo) -> Option<String> {
+    let exec = auth.exec.as_ref()?;
+    let command = exec.command.as_deref()?;
+
+    let mut line = shell_word(command);
     for argument in exec.args.iter().flatten() {
         line.push(' ');
         line.push_str(&shell_word(argument));
@@ -563,6 +604,27 @@ users:
         interactiveMode: Never
 ";
 
+    /// A kubeconfig whose user authenticates with a bare token — no `exec`
+    /// block, so nothing to name while a client is being built.
+    const NO_HELPER: &str = r"
+apiVersion: v1
+kind: Config
+current-context: prod
+clusters:
+  - name: prod
+    cluster:
+      server: https://127.0.0.1:6443
+contexts:
+  - name: prod
+    context:
+      cluster: prod
+      user: prod
+users:
+  - name: prod
+    user:
+      token: not-a-real-token
+";
+
     /// An `AuthInfo` carrying the exec block a kubeconfig would have parsed.
     fn exec_auth(command: Option<&str>, args: &[&str]) -> AuthInfo {
         AuthInfo {
@@ -771,7 +833,14 @@ users:
         let paths = vec![write_kubeconfig(dir.path(), MISSING_HELPER)];
 
         // `Client` is not `Debug`, so unwrap the result by hand.
-        let Err(error) = connect(&paths, &view("prod"), Budget::unlimited()).await else {
+        let Err(error) = connect(
+            &paths,
+            &view("prod"),
+            Budget::unlimited(),
+            &Progress::none(),
+        )
+        .await
+        else {
             panic!("a helper that does not exist cannot be run");
         };
 
@@ -793,7 +862,13 @@ users:
         let dir = tempfile::tempdir().unwrap();
         let paths = vec![write_kubeconfig(dir.path(), MISSING_HELPER)];
 
-        let Err(error) = connect(&paths, &view("prod"), Budget::of(Duration::from_secs(30))).await
+        let Err(error) = connect(
+            &paths,
+            &view("prod"),
+            Budget::of(Duration::from_secs(30)),
+            &Progress::none(),
+        )
+        .await
         else {
             panic!("a helper that does not exist cannot be run");
         };
@@ -811,7 +886,14 @@ users:
         let dir = tempfile::tempdir().unwrap();
         let paths = vec![write_kubeconfig(dir.path(), MISSING_HELPER)];
 
-        let Err(error) = connect(&paths, &view("staging"), Budget::default()).await else {
+        let Err(error) = connect(
+            &paths,
+            &view("staging"),
+            Budget::default(),
+            &Progress::none(),
+        )
+        .await
+        else {
             panic!("there is no staging context in that file");
         };
 
@@ -1045,6 +1127,7 @@ users:
                 &paths,
                 &view("prod"),
                 Budget::of(Duration::from_millis(250)),
+                &Progress::none(),
             )
             .await
             {
@@ -1071,5 +1154,140 @@ users:
             elapsed < Duration::from_secs(5),
             "waited {elapsed:?} for a helper nothing should have waited for"
         );
+    }
+
+    #[test]
+    fn the_credential_helper_is_named_on_screen_while_it_runs() {
+        // The whole reason the progress line exists. Thirty seconds of
+        // `aws eks get-token` is thirty seconds a user has no way to attribute
+        // to anything, and the tool knows exactly what it is waiting for.
+        //
+        // `sleep 30` under a quarter-second budget stands in for it, so this
+        // is the same fixture the abandonment test uses and needs no AWS CLI,
+        // no SSO endpoint, and no cluster.
+        let dir = tempfile::tempdir().unwrap();
+        let paths = vec![write_kubeconfig(dir.path(), SLOW_HELPER)];
+        let recorder = crate::progress::Recorder::default();
+
+        let written = {
+            let recorder = recorder.clone();
+            crate::commands::block_on(async move {
+                let progress = Progress::to(Box::new(recorder.clone()), 80);
+                let _ = connect(
+                    &paths,
+                    &view("prod"),
+                    Budget::of(Duration::from_millis(250)),
+                    &progress,
+                )
+                .await
+                .map(|_| ());
+                Ok(recorder.written())
+            })
+            .unwrap()
+        };
+
+        assert!(
+            written.contains("running sleep 30"),
+            "the line never said what it was waiting for: {written:?}"
+        );
+        assert!(
+            recorder.is_erased(),
+            "the line was still on screen when the error was about to be \
+             printed under it: {written:?}"
+        );
+    }
+
+    #[test]
+    fn a_context_with_no_credential_helper_says_what_it_is_doing_instead() {
+        // A bare token, a client certificate, an in-cluster service account:
+        // there is no subprocess to name, and "connecting to prod" is still
+        // more than the silence this replaces.
+        let dir = tempfile::tempdir().unwrap();
+        let paths = vec![write_kubeconfig(dir.path(), NO_HELPER)];
+        let recorder = crate::progress::Recorder::default();
+
+        let written = {
+            let recorder = recorder.clone();
+            crate::commands::block_on(async move {
+                let progress = Progress::to(Box::new(recorder.clone()), 80);
+                // Building a client for an unreachable server does not connect
+                // to it, so this succeeds; the step is drawn and erased either
+                // way.
+                let _ = connect(&paths, &view("prod"), Budget::default(), &progress)
+                    .await
+                    .map(|_| ());
+                Ok(recorder.written())
+            })
+            .unwrap()
+        };
+
+        assert!(
+            written.contains("connecting to prod (us-east-1)"),
+            "nothing said what the command was doing: {written:?}"
+        );
+        assert!(!written.contains("running"), "{written:?}");
+        assert!(recorder.is_erased(), "{written:?}");
+    }
+
+    #[test]
+    fn a_piped_command_writes_no_progress_line_anywhere() {
+        // `Progress::none()` is what `main` hands a redirected listing, and it
+        // has to be a complete no-op rather than a quieter one — proven here
+        // on the path that draws the most, the credential helper.
+        let dir = tempfile::tempdir().unwrap();
+        let paths = vec![write_kubeconfig(dir.path(), SLOW_HELPER)];
+
+        let elapsed = crate::commands::block_on(async move {
+            let started = Instant::now();
+            let _ = connect(
+                &paths,
+                &view("prod"),
+                Budget::of(Duration::from_millis(250)),
+                &Progress::none(),
+            )
+            .await
+            .map(|_| ());
+            Ok(started.elapsed())
+        })
+        .unwrap();
+
+        // Nothing was written, and nothing ticked either: a detached task
+        // awaits its future and starts no timer.
+        assert!(elapsed < Duration::from_secs(5), "{elapsed:?}");
+    }
+
+    #[test]
+    fn the_helper_is_named_without_the_environment_the_pasteable_line_carries() {
+        // Two spellings of one command, and the difference is what each is
+        // for. `helper_command` is pasted into a shell, so it carries the
+        // `exec` block's environment; `helper_name` is read off a progress
+        // line one row tall, where `AWS_PROFILE=...` in front would push the
+        // recognisable part off the edge.
+        let auth = exec_auth_with_env("aws", &["eks", "get-token"], &[("AWS_PROFILE", "prod")]);
+
+        assert_eq!(helper_name(&auth).as_deref(), Some("aws eks get-token"));
+        assert_eq!(
+            helper_command(&auth).as_deref(),
+            Some("AWS_PROFILE=prod aws eks get-token")
+        );
+    }
+
+    #[test]
+    fn a_helper_argument_that_needs_quoting_is_quoted_in_both_spellings() {
+        // The two must never come to disagree about how a command is spelled,
+        // which is why one is built out of the other.
+        let auth = exec_auth(Some("aws"), &["--role", "arn:aws:iam::1/a b"]);
+
+        assert_eq!(
+            helper_name(&auth).as_deref(),
+            Some("aws --role 'arn:aws:iam::1/a b'")
+        );
+        assert_eq!(helper_command(&auth), helper_name(&auth));
+    }
+
+    #[test]
+    fn a_context_that_runs_nothing_has_no_helper_to_name() {
+        assert_eq!(helper_name(&AuthInfo::default()), None);
+        assert_eq!(helper_name(&exec_auth(None, &[])), None);
     }
 }

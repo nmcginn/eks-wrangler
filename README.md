@@ -483,6 +483,11 @@ on either listing and on either side of the subcommand.
 there is nothing there to colour. The dashboard has its own palette and is not
 governed by these flags.
 
+These switches also govern the progress line described below, on the principle
+that movement is ink: a `--color never`, a `NO_COLOR`, or a `TERM=dumb` that
+asks for plain output gets plain output, not a plain table with a spinner over
+it.
+
 ### Big clusters, and slow ones
 
 Listings are read in pages of 500 — the same chunk size `kubectl` uses — so a
@@ -507,6 +512,35 @@ credential helper as well as the requests after it, spent per step rather than
 per command. What it deliberately does *not* cover is `aws sso login`: that one
 is waiting for a human at a browser, and cutting it off after thirty seconds
 would be cutting off the thing you asked for.
+
+While all that is happening, one line on stderr says what it is waiting for:
+
+```
+$ eks nodes
+running aws eks get-token… 3s
+reading 1,500 nodes, 12,000 pods, node metrics… 6s
+```
+
+Each line replaces the one before it, and the last of them is erased before the
+table is printed. The credential helper is named because a command that sits
+there for thirty seconds is usually sitting in `aws eks get-token` — a laptop
+that has lost its route to its SSO endpoint waits there rather than failing —
+and knowing that is the difference between waiting and going to look.
+
+It is written **only when both stdout and stderr are terminals**. Pipe or
+redirect a listing and there is no progress line anywhere: `eks nodes | grep
+NotReady` and `eks nodes > nodes.txt` are the same bytes on stdout as before,
+and stderr stays empty, so nothing has to be filtered out of a log. That holds
+under `--color always` too — that flag is about how bytes are written, not
+about who is reading them.
+
+`-v` and `RUST_LOG` turn it off too. Those put a stream of log lines on stderr,
+and a line that rewrites itself cannot share a row with them — so a run you are
+debugging prints the logs you asked for and nothing over the top of them.
+
+One thing it does not survive is Ctrl-C: interrupting a listing leaves its last
+row on screen above your prompt. Nothing is left wedged — no colour, no mode
+change, and the next command prints normally underneath it.
 
 ### Keys
 

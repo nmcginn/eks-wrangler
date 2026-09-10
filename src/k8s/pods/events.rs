@@ -20,6 +20,7 @@ use kube::api::{Api, ListParams};
 
 use crate::format;
 use crate::k8s::page;
+use crate::progress::Task;
 
 /// Kubernetes' own default retention for the events API —
 /// `kube-controller-manager`'s `--event-ttl`, an hour unless a cluster
@@ -68,6 +69,11 @@ fn field_selector(namespace: &str, pod: &str) -> String {
 }
 
 /// Ask the API server for one pod's own events.
+///
+/// No progress step: this listing is only ever read into the dashboard's
+/// pod-detail pane, which draws its own loading state on a screen a
+/// background thread has no business writing to. Every listing a *command*
+/// prints takes a [`crate::progress::Task`] here instead.
 pub async fn fetch(
     client: Client,
     namespace: &str,
@@ -76,7 +82,7 @@ pub async fn fetch(
 ) -> Result<Vec<Event>, page::Error> {
     let api: Api<Event> = Api::namespaced(client, namespace);
     let params = ListParams::default().fields(&field_selector(namespace, pod));
-    page::collect(&api, &params, budget).await
+    page::collect(&api, &params, budget, Task::default()).await
 }
 
 /// Group a pod's events the way `kubectl describe pod` presents them: one row

@@ -28,6 +28,7 @@ use crate::k8s::page;
 use crate::k8s::pods::{Placed, Requests};
 use crate::k8s::quantity::{self, Quantity};
 use crate::k8s::resource;
+use crate::progress::Progress;
 use crate::theme::{Palette, Severity};
 
 /// Ask the API server for every node in the cluster.
@@ -36,9 +37,24 @@ use crate::theme::{Palette, Severity};
 /// more nodes than one response should carry is read in pages — see
 /// [`crate::k8s::page`] — and `budget` limits how long each of those pages may
 /// take.
-pub async fn fetch(client: Client, budget: page::Budget) -> Result<Vec<Node>, page::Error> {
+///
+/// `progress` is where those pages are counted out loud. The noun is named
+/// here rather than by the caller so the word on screen comes from the
+/// function that knows what it is fetching; a `Progress::none` costs nothing
+/// and says nothing, which is what the dashboard's own fetch passes.
+pub async fn fetch(
+    client: Client,
+    budget: page::Budget,
+    progress: &Progress,
+) -> Result<Vec<Node>, page::Error> {
     let api: Api<Node> = Api::all(client);
-    page::collect(&api, &ListParams::default(), budget).await
+    page::collect(
+        &api,
+        &ListParams::default(),
+        budget,
+        progress.reading("nodes"),
+    )
+    .await
 }
 
 /// One node, reduced to what a person wants to see.

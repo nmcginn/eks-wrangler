@@ -20,6 +20,7 @@ use eks::k8s::order::Direction;
 use eks::k8s::page::Budget;
 use eks::k8s::pods::Selectors;
 use eks::kubeconfig::KubeConfig;
+use eks::progress::{self, Progress};
 use eks::theme::{ColourChoice, Palette};
 use eks::ui::{self, App, RefreshInterval};
 
@@ -90,6 +91,7 @@ fn run(cli: Cli) -> Result<()> {
                     palette: stdout_palette(cli.global.color),
                     budget: cli.global.timeout,
                     login: cli.global.login,
+                    progress: stderr_progress(&cli.global),
                 },
             ))?;
             print_line(&output);
@@ -118,6 +120,7 @@ fn run(cli: Cli) -> Result<()> {
                     palette: stdout_palette(cli.global.color),
                     budget: cli.global.timeout,
                     login: cli.global.login,
+                    progress: stderr_progress(&cli.global),
                 },
             ))?;
             print_line(&output);
@@ -320,6 +323,42 @@ fn stdout_palette(choice: ColourChoice) -> Palette {
         std::io::stdout().is_terminal(),
         std::env::var_os("NO_COLOR").as_deref(),
         std::env::var_os("TERM").as_deref(),
+    )
+}
+
+/// Where this run says how far it has got, while it is still getting there.
+///
+/// The impure answers `progress::wanted` needs, gathered here beside
+/// `stdout_palette` for the same reason: what a terminal is belongs in
+/// `main.rs`, and the rule itself is a pure function tested without one.
+///
+/// Both ends are asked about, unlike the palette's one: stdout because a
+/// listing being piped is one nobody is watching arrive, stderr because that
+/// is where the line is drawn and a line drawn into a file cannot be rewritten
+/// in place. The width comes from the same ioctl `--wide` narrows the table by,
+/// with `progress::width` deciding what a terminal that declines to answer it
+/// means.
+///
+/// `Progress::none()` is not a degraded mode. It is the ordinary one: every
+/// piped listing, every `--color never`, every `-v`, and every fetch the
+/// dashboard runs gets it, and nothing about those paths costs a lock, a
+/// timer, or a byte.
+fn stderr_progress(global: &GlobalArgs) -> Progress {
+    let allowed = progress::wanted(
+        global.color,
+        std::io::stdout().is_terminal(),
+        std::io::stderr().is_terminal(),
+        progress::logging_to_stderr(global.verbose, std::env::var_os("RUST_LOG").as_deref()),
+        std::env::var_os("NO_COLOR").as_deref(),
+        std::env::var_os("TERM").as_deref(),
+    );
+
+    if !allowed {
+        return Progress::none();
+    }
+    Progress::to(
+        Box::new(std::io::stderr()),
+        progress::width(stdout_terminal_cols()),
     )
 }
 

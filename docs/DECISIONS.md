@@ -3272,3 +3272,98 @@ below `from_utilisation`'s own 90% boundary would say otherwise for a
 sanely-set limit — so the boundary only matters for the pods in between, and
 the roadmap's own wording ("once it is over its request") settled it rather
 than this task inventing a second number decision 90 did not ask for.
+
+### 92. The progress line is governed by the colour switches, not by one of its own
+
+`eks nodes` on a large cluster now spends real time in several places — a
+credential helper on the same clock as a request, then a listing read in
+pages — and said nothing about any of it. The roadmap entry that asked for a
+progress line left one question open deliberately: `theme::Palette` already
+answers "is anybody watching this", but it answers it about **stdout**, and
+this line is written to **stderr**, where that answer does not transfer.
+
+Two switches, then, and they are asked in a fixed order. The first is not a
+preference at all: **both** stdout and stderr have to be terminals, or nothing
+is drawn. Stdout because a listing being piped or redirected is one nobody is
+watching arrive, and because `eks nodes | grep NotReady` with a spinner on
+stderr is two programs drawing on one row of the same screen. Stderr because
+the whole line depends on being rewritable in place — written into a file it
+would be a column of half-erased duplicates. That first rule is what makes the
+roadmap's acceptance criterion absolute: a piped listing is unchanged to the
+byte, and `--color always` does not override it, because `--color` is about how
+bytes are written and this is about who is reading them.
+
+The second is the one that was open: **movement is ink**. `--color never` and
+`NO_COLOR` turn the progress line off, and `TERM=dumb` does too. The
+alternative was a `--progress` flag of its own, and it was rejected on the
+ground that it invents a second three-way switch for the same underlying
+question — "should this tool decorate a terminal, or write plainly?" — that a
+user would have to discover separately and set twice. `NO_COLOR`'s own spec is
+narrower than this reading, and there is no settled convention either way; the
+tie was broken by which answer is easier to explain in one sentence and
+impossible to get half-right. The known cost is that colour and movement cannot
+be had one without the other, which is a real if small loss for somebody who
+wants a coloured table and no spinner. `progress::wanted` is the whole rule as
+one pure function, reusing `Palette::choose` rather than restating it, so the
+two can never come to disagree about what `NO_COLOR=` set-but-empty means.
+
+There is a third condition, and it is not a preference either: **`-v` and
+`RUST_LOG` turn the line off**, because they turn stderr into a stream of log
+lines and the two cannot share a row. A log line lands wherever the cursor was
+left and the next redraw writes back over it, so `eks nodes -vv` on a large
+cluster came out with every row shredded from both directions — found by
+running it, not by reasoning about it. Between a line the tool decided to draw
+and lines the user explicitly asked for, the user's win: a tool being debugged
+should print what it is being debugged for. The quiet default is deliberately
+not included, even though a `warn!` can still fire there — one of them does, in
+`page::collect`, when a server repeats its page marker — because that is a
+once-in-a-listing event that leaves a single row behind an erase, against a
+`-v` that leaves every row that way.
+
+A terminal that reports **zero** columns is treated as one that did not answer,
+not as one with no room: `progress::width` falls back to eighty. This is not
+hypothetical — a pty opened without a window size does it, and the first run of
+this feature under `script` drew five erases and no words, which is exactly
+what "believing the zero" looks like from the outside.
+
+### 93. A progress step is a handle that ends when it is dropped, and it is counted inside the paging loop
+
+The count has to come from `k8s::page::collect`, because that is the only place
+that knows a page has landed; `k8s::nodes::fetch` knows only that it asked for
+nodes. So `collect` takes a `progress::Task` — by value, because the step is
+*that listing's* and ends with it.
+
+By value and not by reference because of the error path. A listing that fails
+at its third page has to take its line off the screen just as surely as one
+that finishes, and the sentence explaining the failure is printed to the same
+stderr the line is on; an erase written by hand would have to appear at every
+`?` in the module, and would be missing from the next one somebody adds.
+Dropping is the one thing that cannot be forgotten. `Progress::none()` hands
+back a detached `Task` whose every method is a no-op, so the dashboard's
+background fetches — which have no business writing to a screen `ui` owns —
+and every piped command pay nothing at all: no lock, no timer, no allocation.
+
+The elapsed count needs a different driver, because the credential helper
+produces no events at all between "started" and "answered": `Task::tick` races
+the awaited future against a 250 ms timer and redraws. A redraw whose text is
+identical to what is on screen writes nothing, so the ticks between two
+seconds cost a string comparison rather than four flickers. `tick` boxes the
+future it is given — a `kube` request future is measured in kilobytes, and
+holding one inline inside every `collect` frame pushed `eks nodes`' joined
+three-listing future past `clippy::large_futures`; the allocation is one per
+page, against a page that is an HTTP round trip.
+
+The wording is a spinner's job done by the numbers instead: no frames, no
+animation, and nothing that has to be timed to look right. `reading 1,500
+nodes, 12,000 pods… 4s` moves because the figures do. The one step with
+nothing to count is the credential helper, and it is named rather than
+animated — `running aws eks get-token`, from `client::helper_name`, which is
+`helper_command` without the environment assignments in front of it, because
+that line is there to be *recognised* on a row eighty columns wide rather than
+pasted into a shell.
+
+The width is read once, at construction, rather than tracked. A terminal
+resized in the middle of a three-second listing would get one wrapped line, and
+noticing that would mean either a signal handler this tool does not have or an
+ioctl inside the redraw loop — both a poor trade against how rarely it happens
+and how completely the next erase recovers from it.
