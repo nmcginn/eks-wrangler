@@ -1069,7 +1069,7 @@ cluster.
   the failure still words itself through `k8s::client::stalled_helper` and names
   the command through `helper_command` rather than a second spelling.
 
-- [ ] **Leave the terminal tidy when a command is interrupted.**
+- [x] **Leave the terminal tidy when a command is interrupted.**
   `eks nodes` now draws a progress line, and Ctrl-C during one kills the process
   with the default `SIGINT` handler — so the last row it drew (`reading 1,500
   nodes… 4s`) stays on screen above the shell's next prompt. Nothing is left
@@ -1088,6 +1088,26 @@ cluster.
   *Acceptance:* Ctrl-C during a listing leaves the cursor at the start of a
   clean row with nothing of the progress line on it, on every path that draws
   one; the dashboard's existing teardown is unchanged or better.
+  Landed as `commands::block_on_interruptible`, used only by `eks nodes` and
+  `eks pods` — the two commands `progress` draws for — rather than a change to
+  `block_on` itself, so the dashboard's `preflight`/`retry_login` calls, which
+  still go through plain `block_on`, are untouched rather than merely
+  unaffected by construction: this answers "should a one-shot CLI trap
+  `SIGINT`" with "yes, exactly where it draws something worth cleaning up
+  after, and nowhere else." No erase is written by hand: `tokio::select!`
+  racing the listing against `tokio::signal::ctrl_c()` drops the losing future
+  when Ctrl-C wins, and a `progress::Task` still outstanding at that point is a
+  local alive across an `.await`, so it is torn down by the same `Drop` a
+  listing that fails partway already relies on — proven in
+  `commands::race`'s own tests with a future that holds a drop-flagging guard
+  and never touches a signal. `eks nodes`/`eks pods` exit `130` (128 + `SIGINT`)
+  on interruption, print nothing after the erase, and `run()`'s return type
+  moved from `Result<()>` to `Result<ExitCode>` to carry that out cleanly
+  through the existing `?`-based dispatch rather than a `std::process::exit` in
+  the middle of it. A handler that fails to install — no controlling terminal,
+  a platform this has never been tried on — leaves Ctrl-C running the command
+  the old way rather than turning it into an instant no-op. `SIGWINCH` is left
+  alone, as decision 93 already had it: nothing here changes that trade.
 
 - [ ] **Make a listing's footnotes a pure function.**
   Every footnote's *wording* is a tested pure function; the list they are

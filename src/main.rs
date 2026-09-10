@@ -24,12 +24,21 @@ use eks::progress::{self, Progress};
 use eks::theme::{ColourChoice, Palette};
 use eks::ui::{self, App, RefreshInterval};
 
+/// What a listing exits with when the user's own Ctrl-C ended it, rather than
+/// the process finishing on its own — the conventional 128 + `SIGINT`'s number,
+/// the same code a shell reports for a foreground job the terminal itself
+/// killed. Only `eks nodes` and `eks pods` can produce this: see
+/// [`commands::block_on_interruptible`].
+fn interrupted() -> ExitCode {
+    ExitCode::from(130)
+}
+
 fn main() -> ExitCode {
     let cli = Cli::parse();
     init_tracing(&cli.global);
 
     match run(cli) {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(code) => code,
         Err(error) => {
             // `{:#}` prints the whole anyhow context chain on one line, which is
             // what a CLI user wants; backtraces stay behind RUST_BACKTRACE.
@@ -39,7 +48,7 @@ fn main() -> ExitCode {
     }
 }
 
-fn run(cli: Cli) -> Result<()> {
+fn run(cli: Cli) -> Result<ExitCode> {
     let paths = cli.global.kubeconfig_paths()?;
     let config = KubeConfig::load_from(&paths)?;
 
@@ -61,7 +70,8 @@ fn run(cli: Cli) -> Result<()> {
                 cli.global.refresh,
                 &selectors,
                 cli.global.login,
-            )
+            )?;
+            Ok(ExitCode::SUCCESS)
         }
         Command::Contexts { quiet } => {
             print_line(&contexts::list(
@@ -69,7 +79,7 @@ fn run(cli: Cli) -> Result<()> {
                 quiet,
                 stdout_palette(cli.global.color),
             ));
-            Ok(())
+            Ok(ExitCode::SUCCESS)
         }
         Command::Nodes {
             sort,
@@ -77,9 +87,12 @@ fn run(cli: Cli) -> Result<()> {
             sort_resource,
             wide,
         } => {
-            // The only command so far that needs a runtime; it builds one for
-            // itself so the filesystem-only commands stay as cheap as they are.
-            let output = commands::block_on(nodes::list(
+            // The only commands that need a runtime; each builds one for
+            // itself so the filesystem-only commands stay as cheap as they
+            // are. `_interruptible`, unlike the dashboard's own `block_on`
+            // calls, because this is one of the two commands that draw
+            // `progress`'s line — see that function's doc comment.
+            match commands::block_on_interruptible(nodes::list(
                 &config,
                 &paths,
                 cli.global.context.as_deref(),
@@ -93,9 +106,13 @@ fn run(cli: Cli) -> Result<()> {
                     login: cli.global.login,
                     progress: stderr_progress(&cli.global),
                 },
-            ))?;
-            print_line(&output);
-            Ok(())
+            ))? {
+                commands::Interruptible::Finished(output) => {
+                    print_line(&output);
+                    Ok(ExitCode::SUCCESS)
+                }
+                commands::Interruptible::Interrupted => Ok(interrupted()),
+            }
         }
         Command::Pods {
             all_namespaces,
@@ -104,7 +121,7 @@ fn run(cli: Cli) -> Result<()> {
             sort_resource,
             wide,
         } => {
-            let output = commands::block_on(pods::list(
+            match commands::block_on_interruptible(pods::list(
                 &config,
                 &paths,
                 cli.global.context.as_deref(),
@@ -122,17 +139,21 @@ fn run(cli: Cli) -> Result<()> {
                     login: cli.global.login,
                     progress: stderr_progress(&cli.global),
                 },
-            ))?;
-            print_line(&output);
-            Ok(())
+            ))? {
+                commands::Interruptible::Finished(output) => {
+                    print_line(&output);
+                    Ok(ExitCode::SUCCESS)
+                }
+                commands::Interruptible::Interrupted => Ok(interrupted()),
+            }
         }
         Command::Use { name } => {
             print_line(&contexts::switch(&config, &name)?);
-            Ok(())
+            Ok(ExitCode::SUCCESS)
         }
         Command::Current => {
             print_line(&contexts::current(&config)?);
-            Ok(())
+            Ok(ExitCode::SUCCESS)
         }
     }
 }
