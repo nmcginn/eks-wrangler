@@ -945,7 +945,7 @@ cluster.
   The spinner half became its own entry below; it is a surface this tool does
   not have yet rather than the rest of this task.
 
-- [ ] **Say that a listing is still arriving.**
+- [x] **Say that a listing is still arriving.**
   Paging turned a slow listing into several requests, and `eks nodes` on a very
   large cluster now spends that time as silently as it spent it before. A
   spinner, or a `read 1,500 nodes…` counter on stderr, was the other half of the
@@ -965,6 +965,23 @@ cluster.
   *Acceptance:* nothing is written when stdout is not a terminal, so a piped
   listing is unchanged to the byte; the progress line goes to stderr and is
   erased before the table is printed.
+  Landed as `src/progress.rs`. The open decision was taken both ways at once
+  and in a fixed order: *both* ends must be terminals or nothing is drawn —
+  which is what makes the piped listing unchanged even under `--color always` —
+  and beyond that movement is ink, so `--color never`, `NO_COLOR`, and
+  `TERM=dumb` each turn the line off, rather than a `--progress` flag being
+  invented beside them. See decisions 92 and 93. The counter lives in
+  `page::collect`, since that is the only place that knows a page has landed;
+  it reaches there as a `progress::Task` taken by value, so a listing that
+  fails at its third page erases its line on the way out without an erase
+  having to be written at every `?`. The credential helper gets the same line
+  with its command named on it — `client::helper_name`, which is
+  `helper_command` without the environment assignments that would push
+  `aws eks get-token` off an eighty-column row — and an elapsed count driven by
+  `Task::tick`, because that step produces no events of its own to redraw on.
+  One condition beyond the acceptance criteria: `-v` and `RUST_LOG` turn the
+  line off as well, since they put log lines on the same stderr and a row
+  cannot carry both — found by running `eks nodes -vv` and reading the result.
 
 - [x] **A timeout that covers the credential helper.**
   `--timeout` bounds requests to the cluster, and cannot bound what happens
@@ -1051,6 +1068,26 @@ cluster.
   *Acceptance:* the helper is gone by the time the process is; whatever runs it,
   the failure still words itself through `k8s::client::stalled_helper` and names
   the command through `helper_command` rather than a second spelling.
+
+- [ ] **Leave the terminal tidy when a command is interrupted.**
+  `eks nodes` now draws a progress line, and Ctrl-C during one kills the process
+  with the default `SIGINT` handler — so the last row it drew (`reading 1,500
+  nodes… 4s`) stays on screen above the shell's next prompt. Nothing is left
+  *wedged*: the only sequences written are `\r` and erase-to-end-of-line, no
+  mode is changed and no ink is left on. It is one stale row, which is what
+  every other tool with a progress line does, and it is the reason this is an
+  entry rather than a line in that change. Separate because the only fix is a
+  signal handler, and this tool has never had one anywhere: the dashboard reads
+  Ctrl-C as a *key* — raw mode means no signal is delivered — so installing one
+  raises a question about the dashboard's own teardown at the same time, and
+  whether a one-shot CLI should trap `SIGINT` at all is the reviewer's call
+  rather than a consequence of adding a progress line. A `SIGWINCH` handler
+  would fall out of the same work, and with it the one other thing the line
+  cannot see today: a terminal resized mid-listing, which gets one wrapped row
+  until the next erase (decision 93).
+  *Acceptance:* Ctrl-C during a listing leaves the cursor at the start of a
+  clean row with nothing of the progress line on it, on every path that draws
+  one; the dashboard's existing teardown is unchanged or better.
 
 - [ ] **Make a listing's footnotes a pure function.**
   Every footnote's *wording* is a tested pure function; the list they are

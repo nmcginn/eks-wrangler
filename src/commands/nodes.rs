@@ -15,6 +15,7 @@ use crate::k8s::order::Direction;
 use crate::k8s::page;
 use crate::k8s::{self, nodes as k8s_nodes, pods as k8s_pods};
 use crate::kubeconfig::KubeConfig;
+use crate::progress::Progress;
 use crate::theme::Palette;
 
 /// What the user asked `eks nodes` for, as it came off the command line.
@@ -56,6 +57,13 @@ pub struct Request {
     /// budget because it belongs to the same step — the one before the first
     /// request.
     pub login: LoginMode,
+    /// Where this command says how far it has got, while it is still getting
+    /// there. Decided in `main` beside `palette`, and for the same reason: it
+    /// turns on whether anybody is watching, which is a question about
+    /// terminals rather than about nodes. The [`Default`] is
+    /// `Progress::none()`, so a caller that does not set it — the dashboard's
+    /// own fetch — writes nothing anywhere.
+    pub progress: Progress,
 }
 
 /// What one fetch found, before either renderer decides what to do with it.
@@ -88,18 +96,21 @@ async fn gather(
     selector: Option<&str>,
     budget: page::Budget,
     login: LoginMode,
+    progress: &Progress,
 ) -> Result<Gathered> {
     let target = target_cluster(config, selector)?;
     let label = target.label();
 
-    let client = credentials::connect(paths, &target, budget, login).await?;
+    let client = credentials::connect(paths, &target, budget, login, progress).await?;
 
     // Concurrently, not in sequence: the three requests are independent, and the
     // command should cost one round trip's worth of waiting rather than three.
+    // They share one progress line for the same reason: three counts moving
+    // side by side is what the wait actually looks like.
     let (nodes, pods, usage) = tokio::join!(
-        k8s_nodes::fetch(client.clone(), budget),
-        k8s_pods::fetch(client.clone(), budget),
-        k8s_metrics::usage_by_node(&client, budget),
+        k8s_nodes::fetch(client.clone(), budget, progress),
+        k8s_pods::fetch(client.clone(), budget, progress),
+        k8s_metrics::usage_by_node(&client, budget, progress),
     );
 
     let nodes = nodes.map_err(|error| {
@@ -246,6 +257,7 @@ pub async fn list(
         palette,
         budget,
         login,
+        progress,
     } = request;
 
     let ordering = ordering_for(order, resource)?;
@@ -257,7 +269,7 @@ pub async fn list(
         usage,
         samples,
         now,
-    } = gather(config, paths, selector, budget, login).await?;
+    } = gather(config, paths, selector, budget, login, &progress).await?;
 
     // Ordering lives in `k8s::nodes::order` rather than here, so the default and
     // the one `--sort` asks for are decided in the same place and by the same
@@ -391,17 +403,20 @@ pub fn spawn_gather(
     budget: page::Budget,
 ) -> mpsc::Receiver<Result<NodesFetch, commands::FetchError>> {
     commands::spawn(async move {
-        // `Never`, always. This runs on a background thread that does not own
-        // the terminal, so it must never stop to ask a question or hand a
-        // browser prompt to a screen the dashboard is drawing on. The
-        // dashboard's own login paths are `credentials::preflight` before the
-        // terminal opens, and the `L` key once it has.
+        // `Never`, always, and `Progress::none()` for the same reason. This
+        // runs on a background thread that does not own the terminal, so it
+        // must never stop to ask a question, hand a browser prompt to a screen
+        // the dashboard is drawing on, or write a progress line across a pane.
+        // The dashboard's own login paths are `credentials::preflight` before
+        // the terminal opens, and the `L` key once it has; its own "still
+        // loading" is the pane's, drawn by `ui`.
         gather(
             &config,
             &paths,
             selector.as_deref(),
             budget,
             LoginMode::Never,
+            &Progress::none(),
         )
         .await
         .map(|gathered| {

@@ -32,6 +32,7 @@ use kube::api::{Api, ListParams};
 use crate::k8s::page;
 use crate::k8s::quantity::Quantity;
 use crate::k8s::resource;
+use crate::progress::Progress;
 
 pub mod containers;
 pub mod events;
@@ -61,10 +62,14 @@ const LIVE_PODS: &str = "status.phase!=Succeeded,status.phase!=Failed";
 /// on any real cluster: every pod on every node, to total what each has booked.
 /// It is read in pages — see [`crate::k8s::page`] — with `budget` limiting how
 /// long each page may take.
-pub async fn fetch(client: Client, budget: page::Budget) -> Result<Vec<Pod>, page::Error> {
+pub async fn fetch(
+    client: Client,
+    budget: page::Budget,
+    progress: &Progress,
+) -> Result<Vec<Pod>, page::Error> {
     let api: Api<Pod> = Api::all(client);
     let params = ListParams::default().fields(LIVE_PODS);
-    page::collect(&api, &params, budget).await
+    page::collect(&api, &params, budget, progress.reading("pods")).await
 }
 
 /// Which pods a listing is about.
@@ -105,13 +110,20 @@ pub async fn fetch_scope(
     scope: &Scope,
     selectors: &Selectors,
     budget: page::Budget,
+    progress: &Progress,
 ) -> Result<Vec<Pod>, page::Error> {
     let api: Api<Pod> = match scope {
         Scope::Namespace(name) => Api::namespaced(client, name),
         Scope::All => Api::all(client),
     };
 
-    page::collect(&api, &selectors.to_params(), budget).await
+    page::collect(
+        &api,
+        &selectors.to_params(),
+        budget,
+        progress.reading("pods"),
+    )
+    .await
 }
 
 /// Server-side selectors for a pod listing, already validated.

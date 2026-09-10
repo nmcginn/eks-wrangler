@@ -11,6 +11,7 @@ pub mod format;
 pub mod fuzzy;
 pub mod k8s;
 pub mod kubeconfig;
+pub mod progress;
 pub mod theme;
 pub mod ui;
 

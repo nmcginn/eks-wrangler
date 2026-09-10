@@ -197,6 +197,34 @@ pub fn percentage(ratio: f64) -> String {
     format!("{:.0}%", ratio * 100.0)
 }
 
+/// A count of objects, with its thousands separated: `1500` reads `1,500`.
+///
+/// Written for the progress line, where the figure is read at a glance while
+/// it is still moving — `12000` and `1200` are one keystroke apart to look at,
+/// and a reader trying to tell whether a listing is nearly done should not have
+/// to count digits. Kept here rather than in `crate::progress` because it is a
+/// formatting rule about numbers, not about terminals, and the next table that
+/// wants a total should find it in the same place every other figure lives.
+///
+/// English grouping, unconditionally. This tool writes its sentences in one
+/// language and a locale-aware separator would put a decimal point in the
+/// middle of a count for half the people reading it.
+#[must_use]
+pub fn count(count: usize) -> String {
+    let digits = count.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+
+    for (index, digit) in digits.chars().enumerate() {
+        // A separator goes before every digit that starts a group of three,
+        // counting from the right — which is what the remaining length says.
+        if index > 0 && (digits.len() - index).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(digit);
+    }
+    out
+}
+
 /// Write a list of items out as prose: `a`, `a or b`, `a, b, or c`.
 ///
 /// One function rather than a `join` at each call site, because the awkward
@@ -564,6 +592,24 @@ mod tests {
         // wants the number.
         assert_eq!(percentage(1.04), "104%");
         assert_eq!(percentage(4.5), "450%");
+    }
+
+    #[test]
+    fn a_count_groups_its_digits_in_threes() {
+        assert_eq!(count(1_500), "1,500");
+        assert_eq!(count(12_000), "12,000");
+        assert_eq!(count(120_000), "120,000");
+        assert_eq!(count(1_234_567), "1,234,567");
+    }
+
+    #[test]
+    fn a_count_too_small_to_group_is_left_alone() {
+        // The ordinary cluster: three digits or fewer, and no separator to
+        // put anywhere.
+        assert_eq!(count(0), "0");
+        assert_eq!(count(1), "1");
+        assert_eq!(count(999), "999");
+        assert_eq!(count(1_000), "1,000");
     }
 
     #[test]

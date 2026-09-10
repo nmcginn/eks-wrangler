@@ -49,6 +49,7 @@ use crate::k8s::client;
 use crate::k8s::page;
 use crate::k8s::pods::{Scope, Selectors};
 use crate::k8s::quantity::Quantity;
+use crate::progress::Progress;
 
 /// One node's sampled usage, as `metrics.k8s.io/v1beta1` reports it.
 ///
@@ -640,6 +641,7 @@ pub trait Source {
     fn node_usage(
         &self,
         budget: page::Budget,
+        progress: &Progress,
     ) -> impl Future<Output = Result<Vec<NodeMetrics>, page::Error>> + Send;
 
     /// Usage for the pods in `scope`, narrowed by the label half of
@@ -649,6 +651,7 @@ pub trait Source {
         scope: &Scope,
         selectors: &Selectors,
         budget: page::Budget,
+        progress: &Progress,
     ) -> impl Future<Output = Result<Vec<PodMetrics>, page::Error>> + Send;
 }
 
@@ -666,9 +669,14 @@ impl Source for Client {
     fn node_usage(
         &self,
         budget: page::Budget,
+        progress: &Progress,
     ) -> impl Future<Output = Result<Vec<NodeMetrics>, page::Error>> + Send {
         let api: Api<NodeMetrics> = Api::all(self.clone());
-        async move { page::collect(&api, &ListParams::default(), budget).await }
+        // Started here rather than inside the `async move`, so the step is on
+        // screen from the moment the caller asks for it rather than from
+        // whenever `tokio::join!` first polls this arm.
+        let task = progress.reading("node metrics");
+        async move { page::collect(&api, &ListParams::default(), budget, task).await }
     }
 
     fn pod_usage(
@@ -676,13 +684,15 @@ impl Source for Client {
         scope: &Scope,
         selectors: &Selectors,
         budget: page::Budget,
+        progress: &Progress,
     ) -> impl Future<Output = Result<Vec<PodMetrics>, page::Error>> + Send {
         let api: Api<PodMetrics> = match scope {
             Scope::Namespace(name) => Api::namespaced(self.clone(), name),
             Scope::All => Api::all(self.clone()),
         };
         let params = pod_params(selectors);
-        async move { page::collect(&api, &params, budget).await }
+        let task = progress.reading("pod metrics");
+        async move { page::collect(&api, &params, budget, task).await }
     }
 }
 
@@ -693,8 +703,9 @@ impl Source for Client {
 pub async fn usage_by_node<S: Source>(
     source: &S,
     budget: page::Budget,
+    progress: &Progress,
 ) -> Result<BTreeMap<String, Sample>, page::Error> {
-    Ok(by_node(&source.node_usage(budget).await?))
+    Ok(by_node(&source.node_usage(budget, progress).await?))
 }
 
 /// Fetch pod usage for `scope` and index it by namespace and name.
@@ -706,8 +717,11 @@ pub async fn usage_by_pod<S: Source>(
     scope: &Scope,
     selectors: &Selectors,
     budget: page::Budget,
+    progress: &Progress,
 ) -> Result<BTreeMap<PodKey, Sample>, page::Error> {
-    Ok(by_pod(&source.pod_usage(scope, selectors, budget).await?))
+    Ok(by_pod(
+        &source.pod_usage(scope, selectors, budget, progress).await?,
+    ))
 }
 
 /// Index a usage listing by node name.
@@ -863,6 +877,7 @@ mod tests {
         fn node_usage(
             &self,
             _budget: page::Budget,
+            _progress: &Progress,
         ) -> impl Future<Output = Result<Vec<NodeMetrics>, page::Error>> + Send {
             let answer = match &self.nodes {
                 Ok(samples) => Ok(samples.clone()),
@@ -876,6 +891,7 @@ mod tests {
             _scope: &Scope,
             _selectors: &Selectors,
             _budget: page::Budget,
+            _progress: &Progress,
         ) -> impl Future<Output = Result<Vec<PodMetrics>, page::Error>> + Send {
             let answer = match &self.pods {
                 Ok(samples) => Ok(samples.clone()),
@@ -968,7 +984,7 @@ mod tests {
     #[tokio::test]
     async fn a_source_that_answers_is_indexed_straight_through() {
         let source = Fake::nodes(Ok(vec![sample("node-a", "412m", "3925716Ki")]));
-        let index = usage_by_node(&source, page::Budget::default())
+        let index = usage_by_node(&source, page::Budget::default(), &Progress::none())
             .await
             .unwrap();
 
@@ -981,7 +997,7 @@ mod tests {
     #[tokio::test]
     async fn a_source_that_fails_hands_the_error_back_for_explaining() {
         let source = Fake::nodes(Err(404));
-        let error = usage_by_node(&source, page::Budget::default())
+        let error = usage_by_node(&source, page::Budget::default(), &Progress::none())
             .await
             .expect_err("a 404 is not a usage listing");
 
@@ -1225,6 +1241,7 @@ mod tests {
             &Scope::All,
             &Selectors::default(),
             page::Budget::default(),
+            &Progress::none(),
         )
         .await
         .unwrap();
@@ -1247,6 +1264,7 @@ mod tests {
             &scope,
             &Selectors::default(),
             page::Budget::default(),
+            &Progress::none(),
         )
         .await
         .expect_err("a 404 is not a usage listing");

@@ -12,6 +12,8 @@ src/
   format.rs            Ages and aligned tables — pure string formatting.
   theme.rs             The entire colour palette, the severity thresholds, and
                        the CLI's colour palette and escape sequences.
+  progress.rs          The one line on stderr saying what a command is still
+                       waiting for, and the rules for when to draw it at all.
   aws/                 Which AWS profile a context uses, whether its IAM
                        Identity Center session is still alive, and running
                        `aws sso login` when it is not.
@@ -439,7 +441,16 @@ that is a property to defend rather than a coincidence.
   tiny-terminal case; a panic mid-render leaves a real user in raw mode.
 - **Input** — construct `KeyEvent`s and feed them to `App::on_key`.
 
-Tests that need a fake cluster get fixtures, never live AWS.
+Tests that need a fake cluster get fixtures, never live AWS. Where the claim
+being tested is about a *loop* rather than about either end of it —
+`k8s::page::collect` reading a listing page by page — the fixture is served
+over a loopback socket by a plain OS thread, which is still canned bytes with
+no credential, name lookup, or cluster anywhere in it.
+
+- **Terminal side effects** — `progress::Recorder` is a `Write` a test can read
+  back, so "the line named the credential helper" and "the line was gone before
+  the table was printed" are assertions rather than things somebody has to
+  watch happen.
 
 ## Error handling
 

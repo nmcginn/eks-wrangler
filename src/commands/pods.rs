@@ -22,6 +22,7 @@ use crate::k8s::pods::logs::{self, LogEvent};
 use crate::k8s::pods::{ContainerRow, Order, PodRow, Scope, Selectors};
 use crate::k8s::{self, pods as k8s_pods, selector};
 use crate::kubeconfig::KubeConfig;
+use crate::progress::Progress;
 use crate::theme::Palette;
 
 /// What the user asked `eks pods` for, as it came off the command line.
@@ -30,7 +31,11 @@ use crate::theme::Palette;
 /// and a row of same-typed positional arguments is how a `--namespace` quietly
 /// ends up in the `--field-selector` slot. Everything here is still raw text —
 /// validating it is [`list`]'s first job, before it connects to anything.
-#[derive(Debug, Clone, Copy, Default)]
+///
+/// `Clone` but not `Copy`: `progress` is a shared handle to one terminal line,
+/// and a type that copied itself implicitly would make it far too easy to end
+/// up with two commands' worth of steps on it.
+#[derive(Debug, Clone, Default)]
 pub struct Request<'a> {
     /// `--namespace`. Without one, the context's own namespace is used, which
     /// is what a bare `kubectl get pods` would do.
@@ -73,6 +78,10 @@ pub struct Request<'a> {
     /// connect through `k8s::connect` directly and the dashboard puts its own
     /// question before the terminal opens (`credentials::preflight`).
     pub login: LoginMode,
+    /// Where this command says how far it has got, while it is still getting
+    /// there — `eks nodes`' own field, for the same reasons. The [`Default`]
+    /// is `Progress::none()`, which writes nothing anywhere.
+    pub progress: Progress,
 }
 
 /// What to sort a pod listing by, `--sort` and `--sort-resource` resolved into
@@ -121,13 +130,17 @@ pub async fn list(
     let scope = scope_for(&target, request.namespace, request.all_namespaces)?;
     let selectors = selectors_for(request.label_selector, request.field_selector)?;
 
-    let client = credentials::connect(paths, &target, request.budget, request.login).await?;
+    let progress = &request.progress;
+    let client =
+        credentials::connect(paths, &target, request.budget, request.login, progress).await?;
 
     // Concurrently, not in sequence: the two requests are independent, and the
     // command should cost one round trip's worth of waiting rather than two.
+    // They share one progress line, so a slow namespace reads as two counts
+    // moving rather than as two commands.
     let (pods, usage) = tokio::join!(
-        k8s_pods::fetch_scope(client.clone(), &scope, &selectors, request.budget),
-        k8s_metrics::usage_by_pod(&client, &scope, &selectors, request.budget),
+        k8s_pods::fetch_scope(client.clone(), &scope, &selectors, request.budget, progress),
+        k8s_metrics::usage_by_pod(&client, &scope, &selectors, request.budget, progress),
     );
 
     let pods = pods.map_err(|error| {
@@ -338,10 +351,10 @@ async fn gather_for_node(
 ) -> Result<PodsFetch> {
     let target = target_cluster(config, cluster)?;
     let label = target.label();
-    let client = k8s::connect(paths, &target, budget).await?;
+    let client = k8s::connect(paths, &target, budget, &Progress::none()).await?;
 
     let scoped = scoped_to_node(node, selectors);
-    let pods = k8s_pods::fetch_scope(client, &Scope::All, &scoped, budget)
+    let pods = k8s_pods::fetch_scope(client, &Scope::All, &scoped, budget, &Progress::none())
         .await
         .map_err(|error| k8s::client::Error::explained(&error, &label))?;
 
@@ -459,7 +472,7 @@ async fn gather_containers(
 ) -> Result<ContainersFetch> {
     let target = target_cluster(config, cluster)?;
     let label = target.label();
-    let client = k8s::connect(paths, &target, budget).await?;
+    let client = k8s::connect(paths, &target, budget, &Progress::none()).await?;
 
     let api: Api<Pod> = Api::namespaced(client.clone(), namespace);
     // Concurrently, not in sequence: the pod and its events are independent
@@ -592,7 +605,7 @@ async fn stream_logs(
     // every variant — including a cluster failure, which it has already run
     // through `explain` internally — so this is a message, not a second
     // classification of one.
-    let client = match k8s::connect(paths, &cluster, budget).await {
+    let client = match k8s::connect(paths, &cluster, budget, &Progress::none()).await {
         Ok(client) => client,
         Err(error) => {
             let _ = tx.send(LogEvent::Ended(Some(error.to_string())));

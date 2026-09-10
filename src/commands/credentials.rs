@@ -41,6 +41,7 @@ use crate::aws::{self, Action, LoginMode};
 use crate::cluster::ClusterView;
 use crate::k8s::client;
 use crate::k8s::page::Budget;
+use crate::progress::Progress;
 
 /// Build a client for one cluster, offering a login first if its AWS profile
 /// needs one.
@@ -53,6 +54,7 @@ pub async fn connect(
     cluster: &ClusterView,
     budget: Budget,
     login: LoginMode,
+    progress: &Progress,
 ) -> Result<Client> {
     let config = client::resolve(paths, cluster).await?;
     let label = cluster.label();
@@ -60,10 +62,16 @@ pub async fn connect(
     // Nothing below this line runs a subprocess or opens a socket unless the
     // user has said yes to one, so a `--login never` command reaches
     // `client::build` having done no more work than it used to.
+    //
+    // `progress` is not passed to the question below, and cannot be: this is
+    // the one place in a listing where the tool waits on the *user* rather
+    // than on a cluster, and a line redrawing itself over the prompt they are
+    // answering would be the tool talking over itself. `client::build` starts
+    // its own step once there is nothing left to ask.
     let context = Context::of(&config, login);
     let before = context.act(&context.before(&label))?;
 
-    match client::build(config.clone(), &label, budget).await {
+    match client::build(config.clone(), &label, budget, progress).await {
         Ok(built) => Ok(built),
         // One retry, and only when the pre-flight neither logged in nor put the
         // question to anybody. A cluster that refuses a token minted seconds
@@ -73,7 +81,7 @@ pub async fn connect(
         // `Declined` is a separate outcome from `NothingToDo`.
         Err(error) if worth_retrying(before, &error) => {
             if context.act(&context.after_refusal(&label))? == Outcome::LoggedIn {
-                Ok(client::build(config, &label, budget).await?)
+                Ok(client::build(config, &label, budget, progress).await?)
             } else {
                 Err(error.into())
             }
