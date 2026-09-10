@@ -3367,3 +3367,56 @@ resized in the middle of a three-second listing would get one wrapped line, and
 noticing that would mean either a signal handler this tool does not have or an
 ioctl inside the redraw loop — both a poor trade against how rarely it happens
 and how completely the next erase recovers from it.
+
+### 94. `SIGINT` is trapped only where `progress` draws — a new `block_on`, not a change to it
+
+`eks nodes` and `eks pods` draw a progress line, and the default `SIGINT`
+disposition kills the process mid-draw: the last row it wrote stays on screen
+above the shell's next prompt, since nothing runs to erase it. Fixing that
+needed this tool's first signal handler anywhere, and the roadmap entry left
+open exactly how far it should reach — the dashboard reads Ctrl-C as a *key*,
+since raw mode disables the terminal's `SIGINT` delivery entirely, so nothing
+there was broken, but `commands::block_on` is the one function every blocking
+command — the two listings and the dashboard's `preflight`/`retry_login` calls
+alike — already goes through.
+
+The choice was between changing `block_on` itself and adding a second function
+next to it. Changing `block_on` would have made every caller interruptible for
+free, including the dashboard's pre-flight login question and `L`'s retry —
+both real terminal states with a case to be made for catching Ctrl-C there too.
+It was rejected because those two run against an *ordinary* terminal, mid
+`std::io::stdin().read_line` for one of them, and racing a blocking read
+against a signal inside `tokio::select!` cannot interrupt it — the read
+itself has to finish before the runtime looks at the other branch again. A
+`block_on` that answers Ctrl-C promptly in the two commands that call it today
+and not at all in a synchronous prompt it does not yet reach would be a
+correctness gap dressed as a feature, discovered by a user mid-keystroke rather
+than by a test. `block_on_interruptible` is the new function instead, called
+only where `progress` draws, so the promise it makes — "the terminal is clean
+the instant Ctrl-C is pressed" — is one it can actually keep everywhere it is
+used. Widening it to the login prompts is left for whoever takes that on
+directly, as its own question about *that* I/O rather than a side effect of
+this one.
+
+No erase is written by hand anywhere in the new code. `tokio::select!` racing
+the listing against `tokio::signal::ctrl_c()` drops the losing future the
+instant Ctrl-C wins, and a `progress::Task` still outstanding at that point is
+a local binding alive across an `.await` — part of the future's own state, so
+it is torn down by the same `Drop` a listing that fails partway already relies
+on (decision 93). The racing itself is pulled into its own function, `race`,
+generic over what it is racing against, specifically so the guarantee that
+matters — losing the race drops the loser — could be proven with a future that
+holds a drop-flagging guard and never touches a signal, a cluster, or a clock,
+rather than by raising a real `SIGINT` at a test and hoping the timing lines
+up. A handler that fails to install — no controlling terminal, a platform this
+has never been exercised on — makes `ctrl_c()` a future that never resolves,
+so a command runs to completion the old way rather than becoming an instant
+no-op everywhere `tokio::signal::ctrl_c()` cannot be installed.
+
+`eks nodes`/`eks pods` exit `130` — the conventional 128 + `SIGINT` — on
+interruption, after printing nothing past the erase. Carrying that out cleanly
+through the existing `?`-based dispatch in `main::run` meant its return type
+moving from `Result<()>` to `Result<ExitCode>`, rather than reaching for
+`std::process::exit` partway through a function that otherwise composes with
+`?`. `SIGWINCH` stays untouched, exactly as decision 93 left it: nothing here
+argues the trade it made should be revisited.

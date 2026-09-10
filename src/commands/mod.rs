@@ -84,6 +84,80 @@ pub fn block_on<T>(future: impl Future<Output = Result<T>>) -> Result<T> {
     outcome
 }
 
+/// Whether [`block_on_interruptible`] ran `future` to completion or the user
+/// pressed Ctrl-C first.
+#[derive(Debug)]
+pub enum Interruptible<T> {
+    /// `future` resolved on its own.
+    Finished(T),
+    /// Ctrl-C won the race. `future` was dropped rather than polled again.
+    Interrupted,
+}
+
+/// [`block_on`], but a Ctrl-C from the user ends `future` early instead of
+/// leaving the default `SIGINT` disposition to kill the process outright.
+///
+/// Only `eks nodes` and `eks pods` call this rather than plain `block_on`: they
+/// are the two commands that draw [`crate::progress`]'s line, and the default
+/// disposition kills the process mid-draw — the last row it wrote stays on
+/// screen above the shell's next prompt, since nothing runs to erase it. The
+/// dashboard never needs this: its raw mode disables the terminal's `SIGINT`
+/// delivery entirely (see `ui::run`), so a Ctrl-C there already arrives as a
+/// key rather than a signal, and every other `block_on` caller is unaffected.
+///
+/// The erase itself is not written here — `race` just drops the losing
+/// future, and that is enough. A [`crate::progress::Task`] still outstanding
+/// at that point is a local binding alive across an `.await`, so it is part of
+/// the future's own state and goes with it, running exactly the `Drop` a
+/// listing that fails partway already relies on to take its line off screen
+/// (see that module's doc comment).
+pub fn block_on_interruptible<T>(
+    future: impl Future<Output = Result<T>>,
+) -> Result<Interruptible<T>> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("could not start the async runtime needed to talk to the cluster")?;
+
+    let outcome = runtime.block_on(race(future, ctrl_c()));
+
+    // Abandoned rather than awaited, for the same reason `block_on` does this:
+    // a credential helper `race` gave up waiting on is a blocking task nothing
+    // here can cancel, and dropping the runtime instead of shutting it down
+    // would wait out the very hang Ctrl-C just asked to leave.
+    runtime.shutdown_background();
+
+    outcome
+}
+
+/// Race `future` against `interrupt`; if `interrupt` wins, `future` is dropped
+/// without being polled again.
+///
+/// Pulled out of [`block_on_interruptible`] so the cancellation itself — the
+/// only part of this with a guarantee worth testing — can be proven with a
+/// future that never touches a signal, a cluster, or a clock.
+async fn race<T>(
+    future: impl Future<Output = Result<T>>,
+    interrupt: impl Future<Output = ()>,
+) -> Result<Interruptible<T>> {
+    tokio::select! {
+        result = future => result.map(Interruptible::Finished),
+        () = interrupt => Ok(Interruptible::Interrupted),
+    }
+}
+
+/// Resolves when the user presses Ctrl-C — or never, if the handler could not
+/// be installed.
+///
+/// Never rather than immediately: a platform or environment this has not been
+/// exercised on failing to install the handler should leave a command running
+/// the old way, not turn every one of them into an instant no-op.
+async fn ctrl_c() {
+    if tokio::signal::ctrl_c().await.is_err() {
+        std::future::pending::<()>().await;
+    }
+}
+
 /// Run one async computation to completion on a background OS thread,
 /// delivering its result over a channel instead of returning it.
 ///
@@ -235,6 +309,92 @@ mod tests {
         .unwrap();
 
         assert_eq!(value, "awake");
+    }
+
+    /// A future that holds a guard and never resolves on its own, so a test
+    /// can prove cancellation rather than merely time it.
+    struct Forever(#[allow(dead_code)] DropGuard);
+
+    impl Future for Forever {
+        type Output = Result<()>;
+
+        fn poll(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<()>> {
+            std::task::Poll::Pending
+        }
+    }
+
+    /// Flags an `Arc<AtomicBool>` when dropped, so a test can tell a
+    /// cancelled future's locals were actually torn down rather than merely
+    /// abandoned mid-poll.
+    struct DropGuard(std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+    impl Drop for DropGuard {
+        fn drop(&mut self) {
+            self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    #[tokio::test]
+    async fn race_returns_what_the_future_resolved_to_when_it_wins() {
+        let outcome = race(async { Ok(42) }, std::future::pending())
+            .await
+            .unwrap();
+        assert!(matches!(outcome, Interruptible::Finished(42)));
+    }
+
+    #[tokio::test]
+    async fn race_propagates_the_futures_own_failure() {
+        let error = race(
+            async { Err::<(), _>(anyhow::anyhow!("nope")) },
+            std::future::pending(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.to_string(), "nope");
+    }
+
+    #[tokio::test]
+    async fn race_reports_interruption_when_the_interrupt_wins() {
+        let outcome = race(std::future::pending::<Result<()>>(), async {})
+            .await
+            .unwrap();
+        assert!(matches!(outcome, Interruptible::Interrupted));
+    }
+
+    #[tokio::test]
+    async fn losing_the_race_drops_the_futures_own_locals() {
+        // The whole reason `block_on_interruptible` needs no erase logic of
+        // its own: a `progress::Task` still outstanding when Ctrl-C wins is a
+        // local alive across an `.await`, so it is torn down exactly the way
+        // this guard is.
+        let dropped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let future = Forever(DropGuard(dropped.clone()));
+
+        let outcome = race(future, async {}).await.unwrap();
+
+        assert!(matches!(outcome, Interruptible::Interrupted));
+        assert!(
+            dropped.load(std::sync::atomic::Ordering::SeqCst),
+            "the losing future's locals were never dropped"
+        );
+    }
+
+    #[test]
+    fn block_on_interruptible_returns_what_the_future_resolved_to() {
+        // No real Ctrl-C is raised here, so this only proves the runtime is
+        // wired correctly; `race`'s own tests prove the cancellation itself.
+        let outcome = block_on_interruptible(async { Ok(21 * 2) }).unwrap();
+        assert!(matches!(outcome, Interruptible::Finished(42)));
+    }
+
+    #[test]
+    fn block_on_interruptible_propagates_failure_rather_than_panicking() {
+        let error =
+            block_on_interruptible(async { Err::<(), _>(anyhow::anyhow!("nope")) }).unwrap_err();
+        assert_eq!(error.to_string(), "nope");
     }
 
     #[test]

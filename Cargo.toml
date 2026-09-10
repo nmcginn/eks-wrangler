@@ -40,8 +40,11 @@ serde_yaml_ng = "0.10.0"
 thiserror = "2.0.20"
 # `sync` adds `tokio::sync::oneshot`, which is what lets a dropped
 # `commands::StreamHandle` interrupt a live log stream's read rather than
-# merely abandoning it — see that module's doc comment.
-tokio = { version = "1.53.1", default-features = false, features = ["rt", "macros", "net", "sync", "time"] }
+# merely abandoning it — see that module's doc comment. `signal` adds
+# `tokio::signal::ctrl_c`, which is what lets `commands::block_on_interruptible`
+# race a listing against the user's own Ctrl-C instead of leaving the default
+# `SIGINT` disposition to kill the process mid-draw.
+tokio = { version = "1.53.1", default-features = false, features = ["rt", "macros", "net", "signal", "sync", "time"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 
