@@ -1109,7 +1109,7 @@ cluster.
   the old way rather than turning it into an instant no-op. `SIGWINCH` is left
   alone, as decision 93 already had it: nothing here changes that trade.
 
-- [ ] **Make a listing's footnotes a pure function.**
+- [x] **Make a listing's footnotes a pure function.**
   Every footnote's *wording* is a tested pure function; the list they are
   assembled into is not, because assembly happens inside `commands::nodes::list`
   between the requests, and that function needs a cluster. So the order the
@@ -1123,6 +1123,31 @@ cluster.
   `Footnotes` builder both commands push into — is the reviewer's call.
   *Acceptance:* the order of the assembled notes is asserted in a test with no
   client; both listings assemble through the same thing.
+  Landed as a private `FootnoteInputs`/`NoteInputs` struct beside each
+  listing's own extracted `footnotes`/`notes` function, rather than a shared
+  `Footnotes` builder: the two tables' notes differ enough in kind — node
+  has `devices_withheld` and a `requests_unavailable` that pods has no
+  counterpart for, pods needs a `Scope` for `order_hidden`/`device_hidden`
+  that node does not — that a builder forcing them through one shape would
+  have grown almost as many command-specific hooks as it removed, while the
+  actual bug this task was about (assembly needing a cluster to run at all)
+  is fully fixed by pulling each command's own block out into a function over
+  already-resolved values, bundled into a struct so the call site reads as
+  one thing rather than nine positional arguments to keep in order — the
+  same too-many-same-typed-arguments trade `Request` and `LogTarget` already
+  make (decision 29). Both commands get exactly the same shape of change,
+  which is "both listings assemble through the same thing" read as
+  literally as the acceptance criteria's own wording allows without
+  inventing content the two tables do not actually share. `commands::pods`'s
+  `usage` also moved from an immediately-unwrapped `Option` with the error
+  pushed on the spot to a held `Result<_, String>`, mirroring
+  `commands::nodes`'s own shape, so the two command modules read alike and
+  the note can be pushed from inside the extracted function rather than
+  before it. Tests build fixture rows directly, the same way
+  `k8s::nodes::order`'s and `k8s::pods::order`'s own tests do, and assert
+  the exact sequence and count of notes for a listing with both column
+  failures and an active sort, for a default (silent) ordering over a
+  failed column, and for a listing with nothing wrong at all.
 
 - [x] **Move `eks contexts` onto the shared table renderer.**
   `format::table` now renders `eks nodes`; `commands::contexts` still has its

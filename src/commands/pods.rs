@@ -108,6 +108,118 @@ fn ordering_for(order: Order, resource: Option<String>) -> Result<SortBy> {
     Ok(SortBy::Resource(resource))
 }
 
+/// Everything a pod listing's notes are assembled from, already resolved by
+/// the time [`list`] builds them.
+///
+/// Bundled into one struct rather than passed as nine positional arguments —
+/// the same trade `commands::nodes`'s own `FootnoteInputs` makes for its
+/// listing, and for the same reason.
+struct NoteInputs<'a> {
+    rows: &'a [PodRow],
+    scope: &'a Scope,
+    usage: &'a Result<std::collections::BTreeMap<k8s_metrics::PodKey, k8s_metrics::Sample>, String>,
+    samples: &'a [Option<k8s_metrics::Sample>],
+    now: Timestamp,
+    label: &'a str,
+    width: Width,
+    ordering: &'a SortBy,
+    direction: Direction,
+}
+
+/// Assemble a pod listing's notes, in the order they print under the table.
+///
+/// Pulled out of [`list`] for the same reason `commands::nodes::footnotes`
+/// is: the order matters, since [`k8s::order::unranked_note`] points back at
+/// "the reason above", and everything [`NoteInputs`] carries is already
+/// resolved by the time `list` calls this — nothing here needs a cluster.
+fn notes(inputs: &NoteInputs<'_>) -> Vec<String> {
+    let rows = inputs.rows;
+    let usage = inputs.usage;
+    let width = inputs.width;
+    let direction = inputs.direction;
+
+    let mut notes = Vec::new();
+
+    // Missing usage costs the user two columns and earns a note, because
+    // metrics-server is an add-on EKS does not install for you and a partial
+    // answer beats no answer.
+    if let Err(explanation) = usage {
+        notes.push(k8s_pods::usage_unavailable(explanation));
+    }
+
+    // What became of the usage columns, decided and worded exactly as
+    // `commands::nodes` decides and words it: the two tables read the same
+    // metrics-server, and a person moving between them should not have to work
+    // out whether two different sentences mean the same thing.
+    let usage_columns = k8s_metrics::Outcome::of(usage.as_ref().ok(), k8s_pods::shows_usage(rows));
+    match usage_columns {
+        k8s_metrics::Outcome::Shown => notes.extend(
+            k8s_metrics::freshness(inputs.samples.iter().flatten(), inputs.now)
+                .map(k8s_metrics::freshness_note),
+        ),
+        k8s_metrics::Outcome::Unsampled => {
+            notes.push(k8s_pods::usage_unsampled(&k8s_metrics::unsampled(
+                inputs.label,
+            )));
+        }
+        // Already noted above, where the error was caught.
+        k8s_metrics::Outcome::Unreadable => {}
+    }
+
+    // Last of the notes, under whatever went wrong, and worded and positioned
+    // exactly as `eks nodes` does it — the two tables answer "which order is
+    // this?" the same way because it is the same question. Silent unless
+    // `--sort`, `--sort-reverse`, or `--sort-resource` was given.
+    match inputs.ordering {
+        SortBy::Order(order) => {
+            // `note` and the case where its own line on a narrow terminal
+            // misleads — naming a column narrowing already took off the
+            // table — share one paragraph, exactly as `commands::nodes`
+            // joins them: a continuation of the first line, not a footnote
+            // of its own, so a wide-enough listing is unchanged.
+            notes.extend(k8s::order::note_with_hidden(
+                *order,
+                direction,
+                k8s_pods::order_hidden(*order, inputs.scope, rows, width),
+            ));
+            // And under it, the case where the line on its own misleads a
+            // different way: an ordering that ranked no row at all — `--sort
+            // cpu` with no metrics-server, `--sort restarts` where nothing
+            // has ever crashed — describes a listing the alphabet arranged.
+            // Again worded once, in `k8s::order`, for both tables, with the
+            // listing supplying the two things the wording turns on: what
+            // these rows could be sorted by instead, and whether the note
+            // above already explains the empty column.
+            let missing = k8s_pods::Missing {
+                // The columns being gone, rather than the read having failed:
+                // both reasons for their absence now have a note above to
+                // point back at.
+                usage: usage_columns.is_missing(),
+            };
+            notes.extend(k8s::order::unranked_note(
+                *order,
+                k8s_pods::cause(*order, missing),
+                |candidate| k8s_pods::ranks_any(rows, candidate),
+                |candidate| k8s_pods::distinguishes(rows, candidate),
+            ));
+        }
+        // The free-form counterpart: always named, since there is no default
+        // resource to compare against and stay silent about. There is no
+        // unranked half to add beside it — unlike a node, a pod that never
+        // asked for the resource sorts as a real `0` rather than falling out
+        // of the ordering, so this can never rank nothing the way `--sort
+        // cpu` can.
+        SortBy::Resource(resource) => {
+            notes.push(k8s::order::device_note_with_hidden(
+                k8s_pods::device_note(resource, direction),
+                k8s_pods::device_hidden(resource, inputs.scope, rows, width),
+            ));
+        }
+    }
+
+    notes
+}
+
 /// Fetch and render the pod table for the selected cluster and scope.
 ///
 /// `context` is whatever the user passed to `--context`, resolved exactly as
@@ -156,18 +268,14 @@ pub async fn list(
 
     // Only the pod listing is fatal. Missing usage costs the user two columns
     // and earns a footnote, because metrics-server is an add-on EKS does not
-    // install for you and a partial answer beats no answer.
-    let mut notes = Vec::new();
-    let usage = match usage {
-        Ok(usage) => Some(usage),
-        Err(error) => {
-            tracing::debug!(%error, "reading pod metrics failed");
-            notes.push(k8s_pods::usage_unavailable(&k8s_metrics::explain(
-                &error, &label,
-            )));
-            None
-        }
-    };
+    // install for you and a partial answer beats no answer. Held as an
+    // explanation here, worded through `k8s_metrics::explain` exactly as
+    // `commands::nodes` holds its own failures, rather than footnoted on the
+    // spot — see `notes`, below.
+    let usage: Result<_, String> = usage.map_err(|error| {
+        tracing::debug!(%error, "reading pod metrics failed");
+        k8s_metrics::explain(&error, &label)
+    });
 
     // One instant for every row, so a slow listing cannot show two pods created
     // together with different ages — and so the freshness note below is measured
@@ -187,7 +295,7 @@ pub async fn list(
             // The join is by namespace and name, which is what makes the
             // usage follow the selectors: only pods the API server already
             // returned get a row, so only they can be given a figure.
-            usage.as_ref().and_then(|samples| {
+            usage.as_ref().ok().and_then(|samples| {
                 let namespace = pod.metadata.namespace.as_deref()?;
                 let name = pod.metadata.name.as_deref()?;
                 samples
@@ -212,72 +320,17 @@ pub async fn list(
         }
     }
 
-    // What became of the usage columns, decided and worded exactly as
-    // `commands::nodes` decides and words it: the two tables read the same
-    // metrics-server, and a person moving between them should not have to work
-    // out whether two different sentences mean the same thing.
-    let usage_columns = k8s_metrics::Outcome::of(usage.as_ref(), k8s_pods::shows_usage(&rows));
-    match usage_columns {
-        k8s_metrics::Outcome::Shown => notes.extend(
-            k8s_metrics::freshness(samples.iter().flatten(), now).map(k8s_metrics::freshness_note),
-        ),
-        k8s_metrics::Outcome::Unsampled => {
-            notes.push(k8s_pods::usage_unsampled(&k8s_metrics::unsampled(&label)));
-        }
-        // Already noted above, where the error was caught.
-        k8s_metrics::Outcome::Unreadable => {}
-    }
-
-    // Last of the notes, under whatever went wrong, and worded and positioned
-    // exactly as `eks nodes` does it — the two tables answer "which order is
-    // this?" the same way because it is the same question. Silent unless
-    // `--sort`, `--sort-reverse`, or `--sort-resource` was given.
-    match &ordering {
-        SortBy::Order(order) => {
-            // `note` and the case where its own line on a narrow terminal
-            // misleads — naming a column narrowing already took off the
-            // table — share one paragraph, exactly as `commands::nodes`
-            // joins them: a continuation of the first line, not a footnote
-            // of its own, so a wide-enough listing is unchanged.
-            notes.extend(k8s::order::note_with_hidden(
-                *order,
-                request.direction,
-                k8s_pods::order_hidden(*order, &scope, &rows, request.width),
-            ));
-            // And under it, the case where the line on its own misleads a
-            // different way: an ordering that ranked no row at all — `--sort
-            // cpu` with no metrics-server, `--sort restarts` where nothing
-            // has ever crashed — describes a listing the alphabet arranged.
-            // Again worded once, in `k8s::order`, for both tables, with the
-            // listing supplying the two things the wording turns on: what
-            // these rows could be sorted by instead, and whether the note
-            // above already explains the empty column.
-            let missing = k8s_pods::Missing {
-                // The columns being gone, rather than the read having failed:
-                // both reasons for their absence now have a note above to
-                // point back at.
-                usage: usage_columns.is_missing(),
-            };
-            notes.extend(k8s::order::unranked_note(
-                *order,
-                k8s_pods::cause(*order, missing),
-                |candidate| k8s_pods::ranks_any(&rows, candidate),
-                |candidate| k8s_pods::distinguishes(&rows, candidate),
-            ));
-        }
-        // The free-form counterpart: always named, since there is no default
-        // resource to compare against and stay silent about. There is no
-        // unranked half to add beside it — unlike a node, a pod that never
-        // asked for the resource sorts as a real `0` rather than falling out
-        // of the ordering, so this can never rank nothing the way `--sort
-        // cpu` can.
-        SortBy::Resource(resource) => {
-            notes.push(k8s::order::device_note_with_hidden(
-                k8s_pods::device_note(resource, request.direction),
-                k8s_pods::device_hidden(resource, &scope, &rows, request.width),
-            ));
-        }
-    }
+    let notes = notes(&NoteInputs {
+        rows: &rows,
+        scope: &scope,
+        usage: &usage,
+        samples: &samples,
+        now,
+        label: &label,
+        width: request.width,
+        ordering: &ordering,
+        direction: request.direction,
+    });
 
     Ok(k8s_pods::render(
         &rows,
@@ -938,5 +991,139 @@ contexts:
             scoped.field.as_deref(),
             Some("spec.nodeName=worker-1,status.phase!=Running")
         );
+    }
+
+    /// A healthy, unmeasured pod — the same minimal fixture
+    /// `k8s::pods::order`'s own tests build, reconstructed here rather than
+    /// shared across the module boundary: each test reads one or two fields,
+    /// and arranging a full `Pod` to produce them would mean writing
+    /// container statuses these tests are not about.
+    fn row(name: &str) -> PodRow {
+        PodRow {
+            namespace: "payments".to_owned(),
+            name: name.to_owned(),
+            ready: "1/1".to_owned(),
+            status: "Running".to_owned(),
+            severity: crate::theme::Severity::Ok,
+            restarts: 0,
+            restart_age: None,
+            last_restart: None,
+            age: "3h".to_owned(),
+            created_at: None,
+            cpu_used: None,
+            memory_used: None,
+            usage_stale: false,
+            cpu_requested: k8s::quantity::Quantity::default(),
+            memory_requested: k8s::quantity::Quantity::default(),
+            extended_requested: std::collections::BTreeMap::new(),
+            cpu_limit: None,
+            memory_limit: None,
+            node: "ip-10-0-1-9.ec2.internal".to_owned(),
+            ip: "10.0.1.42".to_owned(),
+            nominated_node: "-".to_owned(),
+            readiness_gates: None,
+        }
+    }
+
+    fn now() -> Timestamp {
+        "2026-08-19T12:00:00Z".parse().unwrap()
+    }
+
+    #[test]
+    fn column_failures_are_noted_before_the_ordering_note() {
+        let rows = vec![row("a"), row("b")];
+        let usage: Result<
+            std::collections::BTreeMap<k8s_metrics::PodKey, k8s_metrics::Sample>,
+            String,
+        > = Err("metrics-server is unreachable".to_owned());
+        let ordering = SortBy::Order(Order::Cpu);
+
+        let notes = notes(&NoteInputs {
+            rows: &rows,
+            scope: &Scope::Namespace("payments".to_owned()),
+            usage: &usage,
+            samples: &[None, None],
+            now: now(),
+            label: "prod (us-east-1)",
+            width: Width::Default,
+            ordering: &ordering,
+            direction: Direction::Natural,
+        });
+
+        // The one column failure, then the sort note, then the "nothing
+        // ranked" note pointing back at it rather than repeating its advice.
+        assert_eq!(notes.len(), 3, "{notes:#?}");
+        assert!(
+            notes[0].contains("metrics-server is unreachable"),
+            "{notes:#?}"
+        );
+        assert_eq!(notes[1], "Sorted by cpu.");
+        assert!(
+            notes[2].contains("Nothing here has cpu to sort by, for the reason above."),
+            "{notes:#?}"
+        );
+    }
+
+    #[test]
+    fn the_default_ordering_stays_silent_even_when_a_column_failed() {
+        let rows = vec![row("a")];
+        let usage: Result<
+            std::collections::BTreeMap<k8s_metrics::PodKey, k8s_metrics::Sample>,
+            String,
+        > = Ok(std::collections::BTreeMap::new());
+        let ordering = SortBy::Order(Order::default());
+
+        let notes = notes(&NoteInputs {
+            rows: &rows,
+            scope: &Scope::Namespace("payments".to_owned()),
+            usage: &usage,
+            samples: &[None],
+            now: now(),
+            label: "prod (us-east-1)",
+            width: Width::Default,
+            ordering: &ordering,
+            direction: Direction::Natural,
+        });
+
+        // Nobody asked for a sort, so the two ordering notes contribute
+        // nothing — matching the byte for byte output a plain `eks pods`
+        // printed before this existed. The usage read succeeded but sampled
+        // nothing in this namespace, which still earns its own note.
+        assert_eq!(notes.len(), 1, "{notes:#?}");
+        assert!(
+            notes[0].contains("nothing here has been sampled yet"),
+            "{notes:#?}"
+        );
+    }
+
+    #[test]
+    fn a_listing_with_nothing_wrong_and_no_sort_has_no_notes() {
+        let quantity = k8s::quantity::Quantity::parse("500m").unwrap();
+        let rows = vec![PodRow {
+            cpu_used: Some(quantity),
+            ..row("a")
+        }];
+        let usage: Result<
+            std::collections::BTreeMap<k8s_metrics::PodKey, k8s_metrics::Sample>,
+            String,
+        > = Ok(std::collections::BTreeMap::new());
+        let ordering = SortBy::Order(Order::default());
+
+        let notes = notes(&NoteInputs {
+            rows: &rows,
+            scope: &Scope::Namespace("payments".to_owned()),
+            usage: &usage,
+            // No sample behind the figure above, so `freshness` has nothing
+            // to date the table by — isolating the claim this test makes:
+            // nothing here should print a note on its own account.
+            samples: &[None],
+            now: now(),
+            label: "prod (us-east-1)",
+            width: Width::Default,
+            ordering: &ordering,
+            direction: Direction::Natural,
+        });
+
+        assert!(notes.is_empty(), "{notes:#?}");
     }
 }
