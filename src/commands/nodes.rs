@@ -238,6 +238,136 @@ fn ordering_for(order: k8s_nodes::Order, resource: Option<String>) -> Result<Sor
     Ok(SortBy::Resource(resource))
 }
 
+/// Everything a node listing's footnotes are assembled from, already resolved
+/// by the time [`list`] builds them.
+///
+/// Bundled into one struct rather than passed as nine positional arguments —
+/// the same too-many-same-typed-arguments trade [`Request`] itself makes
+/// (decision 29) — so [`footnotes`] reads as one call at its call site rather
+/// than a list of parameters to keep in the right order.
+struct FootnoteInputs<'a> {
+    rows: &'a [k8s_nodes::NodeRow],
+    requests: &'a Result<(), String>,
+    usage: &'a Result<(), String>,
+    samples: &'a [Option<k8s_metrics::Sample>],
+    now: Timestamp,
+    label: &'a str,
+    width: Width,
+    ordering: &'a SortBy,
+    direction: Direction,
+}
+
+/// Assemble a node listing's footnotes, in the order they print under the
+/// table.
+///
+/// Pulled out of [`list`] so the order — which matters, since
+/// [`k8s::order::unranked_note`] points back at "the reason above" — is
+/// guaranteed by a test that feeds this fixture rows, rather than by reading
+/// the lines in `list` in order. Everything [`FootnoteInputs`] carries is
+/// already resolved by the time `list` calls this, so nothing here needs a
+/// cluster.
+fn footnotes(inputs: &FootnoteInputs<'_>) -> Vec<String> {
+    let rows = inputs.rows;
+    let requests = inputs.requests;
+    let usage = inputs.usage;
+    let width = inputs.width;
+    let direction = inputs.direction;
+
+    let mut footnotes = Vec::new();
+
+    // The two columns-are-missing footnotes, held back until now because the
+    // first of them names the columns the failure emptied and a device column
+    // is one of them. They stay in the order they always came in.
+    if let Err(explanation) = requests {
+        footnotes.push(k8s_nodes::requests_unavailable(rows, explanation, width));
+    }
+    if let Err(explanation) = usage {
+        footnotes.push(k8s_nodes::usage_unavailable(explanation));
+    }
+
+    // What became of the usage columns, asked of the rows rather than of the
+    // request: a read that succeeded and returned nothing costs exactly the
+    // columns a failed one does, and the two want opposite advice. Where the
+    // columns did survive, they want a date instead — metrics-server going quiet
+    // does not fail this request, so without one a stale figure and a fresh one
+    // are the same table.
+    let usage_columns = k8s_metrics::Outcome::of(usage.as_ref().ok(), k8s_nodes::shows_usage(rows));
+    match usage_columns {
+        k8s_metrics::Outcome::Shown => footnotes.extend(
+            k8s_metrics::freshness(inputs.samples.iter().flatten(), inputs.now)
+                .map(k8s_metrics::freshness_note),
+        ),
+        k8s_metrics::Outcome::Unsampled => {
+            footnotes.push(k8s_nodes::usage_unsampled(&k8s_metrics::unsampled(
+                inputs.label,
+            )));
+        }
+        // Already footnoted above, where the error was caught and could still be
+        // explained.
+        k8s_metrics::Outcome::Unreadable => {}
+    }
+
+    // Under the notes about the columns that are missing, one about a column
+    // that is there and is quietly smaller than the hardware behind it.
+    footnotes.extend(k8s_nodes::devices_withheld(rows));
+
+    // Both halves of the ordering note below want to know which columns a
+    // failure above already emptied, so this is worked out once regardless of
+    // which of `order`/`resource` is in play.
+    let missing = k8s_nodes::Missing {
+        requests: requests.is_err(),
+        // The columns being gone, rather than the read having failed: both
+        // reasons for their absence now have a footnote above for the note to
+        // point back at.
+        usage: usage_columns.is_missing(),
+    };
+
+    // Last of the footnotes, under whatever went wrong: a table nobody could
+    // fill in is more urgent news than the order it came out in. The note is
+    // silent unless `--sort`, `--sort-reverse`, or `--sort-resource` was
+    // given, so a plain `eks nodes` prints exactly what it printed before.
+    match inputs.ordering {
+        SortBy::Order(order) => {
+            // `note` and the case where its own line on a narrow terminal
+            // misleads — naming a column that narrowing already took off the
+            // table — share one paragraph: the second is a continuation of
+            // the first, not a footnote of its own, so a wide-enough listing
+            // reads exactly as it did before `hidden_note` existed.
+            footnotes.extend(k8s::order::note_with_hidden(
+                *order,
+                direction,
+                k8s_nodes::order_hidden(*order, rows, width),
+            ));
+            // And immediately under it, the case where the line on its own
+            // misleads a different way: `--sort cpu` against a cluster with no
+            // metrics-server names an ordering over a column this table does
+            // not have. Both halves the note cannot work out for itself come
+            // from the listing: which orderings these rows can be ranked by,
+            // and whether one of the footnotes above already accounts for the
+            // column that came up empty — in which case the note points at it
+            // rather than repeating the advice a paragraph later.
+            footnotes.extend(k8s::order::unranked_note(
+                *order,
+                k8s_nodes::cause(*order, missing),
+                |candidate| k8s_nodes::ranks_any(rows, candidate),
+                |candidate| k8s_nodes::distinguishes(rows, candidate),
+            ));
+        }
+        // The free-form counterpart: always named — there is no default
+        // resource to compare against and stay silent about — and, when
+        // nothing reported it, why.
+        SortBy::Resource(resource) => {
+            footnotes.push(k8s::order::device_note_with_hidden(
+                k8s_nodes::device_note(resource, direction),
+                k8s_nodes::device_hidden(resource, rows, width),
+            ));
+            footnotes.extend(k8s_nodes::device_unranked_note(resource, rows, missing));
+        }
+    }
+
+    footnotes
+}
+
 /// Fetch and render the node table for the selected cluster.
 ///
 /// `selector` is whatever the user passed to `--context`: a full context name,
@@ -281,95 +411,17 @@ pub async fn list(
         SortBy::Resource(resource) => k8s_nodes::sort_by_device(&mut rows, resource, direction),
     }
 
-    let mut footnotes = Vec::new();
-
-    // The two columns-are-missing footnotes, held back until now because the
-    // first of them names the columns the failure emptied and a device column
-    // is one of them. They stay in the order they always came in.
-    if let Err(explanation) = &requests {
-        footnotes.push(k8s_nodes::requests_unavailable(&rows, explanation, width));
-    }
-    if let Err(explanation) = &usage {
-        footnotes.push(k8s_nodes::usage_unavailable(explanation));
-    }
-
-    // What became of the usage columns, asked of the rows rather than of the
-    // request: a read that succeeded and returned nothing costs exactly the
-    // columns a failed one does, and the two want opposite advice. Where the
-    // columns did survive, they want a date instead — metrics-server going quiet
-    // does not fail this request, so without one a stale figure and a fresh one
-    // are the same table.
-    let usage_columns =
-        k8s_metrics::Outcome::of(usage.as_ref().ok(), k8s_nodes::shows_usage(&rows));
-    match usage_columns {
-        k8s_metrics::Outcome::Shown => footnotes.extend(
-            k8s_metrics::freshness(samples.iter().flatten(), now).map(k8s_metrics::freshness_note),
-        ),
-        k8s_metrics::Outcome::Unsampled => {
-            footnotes.push(k8s_nodes::usage_unsampled(&k8s_metrics::unsampled(&label)));
-        }
-        // Already footnoted above, where the error was caught and could still be
-        // explained.
-        k8s_metrics::Outcome::Unreadable => {}
-    }
-
-    // Under the notes about the columns that are missing, one about a column
-    // that is there and is quietly smaller than the hardware behind it.
-    footnotes.extend(k8s_nodes::devices_withheld(&rows));
-
-    // Both halves of the ordering note below want to know which columns a
-    // failure above already emptied, so this is worked out once regardless of
-    // which of `order`/`resource` is in play.
-    let missing = k8s_nodes::Missing {
-        requests: requests.is_err(),
-        // The columns being gone, rather than the read having failed: both
-        // reasons for their absence now have a footnote above for the note to
-        // point back at.
-        usage: usage_columns.is_missing(),
-    };
-
-    // Last of the footnotes, under whatever went wrong: a table nobody could
-    // fill in is more urgent news than the order it came out in. The note is
-    // silent unless `--sort`, `--sort-reverse`, or `--sort-resource` was
-    // given, so a plain `eks nodes` prints exactly what it printed before.
-    match &ordering {
-        SortBy::Order(order) => {
-            // `note` and the case where its own line on a narrow terminal
-            // misleads — naming a column that narrowing already took off the
-            // table — share one paragraph: the second is a continuation of
-            // the first, not a footnote of its own, so a wide-enough listing
-            // reads exactly as it did before `hidden_note` existed.
-            footnotes.extend(k8s::order::note_with_hidden(
-                *order,
-                direction,
-                k8s_nodes::order_hidden(*order, &rows, width),
-            ));
-            // And immediately under it, the case where the line on its own
-            // misleads a different way: `--sort cpu` against a cluster with no
-            // metrics-server names an ordering over a column this table does
-            // not have. Both halves the note cannot work out for itself come
-            // from the listing: which orderings these rows can be ranked by,
-            // and whether one of the footnotes above already accounts for the
-            // column that came up empty — in which case the note points at it
-            // rather than repeating the advice a paragraph later.
-            footnotes.extend(k8s::order::unranked_note(
-                *order,
-                k8s_nodes::cause(*order, missing),
-                |candidate| k8s_nodes::ranks_any(&rows, candidate),
-                |candidate| k8s_nodes::distinguishes(&rows, candidate),
-            ));
-        }
-        // The free-form counterpart: always named — there is no default
-        // resource to compare against and stay silent about — and, when
-        // nothing reported it, why.
-        SortBy::Resource(resource) => {
-            footnotes.push(k8s::order::device_note_with_hidden(
-                k8s_nodes::device_note(resource, direction),
-                k8s_nodes::device_hidden(resource, &rows, width),
-            ));
-            footnotes.extend(k8s_nodes::device_unranked_note(resource, &rows, missing));
-        }
-    }
+    let footnotes = footnotes(&FootnoteInputs {
+        rows: &rows,
+        requests: &requests,
+        usage: &usage,
+        samples: &samples,
+        now,
+        label: &label,
+        width,
+        ordering: &ordering,
+        direction,
+    });
 
     Ok(k8s_nodes::render(&rows, &label, &footnotes, width, palette))
 }
@@ -579,5 +631,146 @@ contexts:
 
         assert!(message.contains("\"gone\""), "{message}");
         assert!(message.contains("eks contexts"), "{message}");
+    }
+
+    /// A healthy, unmeasured node — the same minimal fixture
+    /// `k8s::nodes::order`'s own tests build, reconstructed here rather than
+    /// shared across the module boundary: each test reads one or two fields,
+    /// and arranging a full `Node` to produce them would mean writing
+    /// conditions and capacity maps these tests are not about.
+    fn row(name: &str) -> k8s_nodes::NodeRow {
+        k8s_nodes::NodeRow {
+            name: name.to_owned(),
+            status: "Ready".to_owned(),
+            severity: crate::theme::Severity::Ok,
+            version: "v1.30.2-eks-1552ad0".to_owned(),
+            cpu: k8s_nodes::Capacity::default(),
+            memory: k8s_nodes::Capacity::default(),
+            cpu_requested: k8s_nodes::Share::default(),
+            memory_requested: k8s_nodes::Share::default(),
+            cpu_used: k8s_nodes::Share::default(),
+            memory_used: k8s_nodes::Share::default(),
+            usage_stale: false,
+            pods: k8s_nodes::Share::default(),
+            age: "3h".to_owned(),
+            created_at: None,
+            internal_ip: "10.0.1.9".to_owned(),
+            external_ip: "-".to_owned(),
+            os_image: "Amazon Linux 2023.9.20260714".to_owned(),
+            kernel_version: "6.1.148-172.265.amzn2023.x86_64".to_owned(),
+            container_runtime: "containerd://1.7.28".to_owned(),
+            devices: std::collections::BTreeMap::new(),
+            ephemeral_storage: k8s_nodes::Capacity::default(),
+            hugepages: std::collections::BTreeMap::new(),
+        }
+    }
+
+    fn now() -> Timestamp {
+        "2026-08-19T12:00:00Z".parse().unwrap()
+    }
+
+    #[test]
+    fn column_failures_are_footnoted_before_the_ordering_note() {
+        let rows = vec![row("a"), row("b")];
+        let requests: Result<(), String> = Err("the pods could not be listed".to_owned());
+        let usage: Result<(), String> = Err("metrics-server is unreachable".to_owned());
+        let ordering = SortBy::Order(k8s_nodes::Order::Cpu);
+
+        let notes = footnotes(&FootnoteInputs {
+            rows: &rows,
+            requests: &requests,
+            usage: &usage,
+            samples: &[None, None],
+            now: now(),
+            label: "prod (us-east-1)",
+            width: Width::Default,
+            ordering: &ordering,
+            direction: Direction::Natural,
+        });
+
+        // Both column failures, in the order they always printed in; then the
+        // sort note; then the "nothing ranked" note pointing back at the
+        // usage failure above rather than repeating its own advice.
+        assert_eq!(notes.len(), 4, "{notes:#?}");
+        assert!(
+            notes[0].contains("the pods could not be listed"),
+            "{notes:#?}"
+        );
+        assert!(
+            notes[1].contains("metrics-server is unreachable"),
+            "{notes:#?}"
+        );
+        assert_eq!(notes[2], "Sorted by cpu.");
+        assert!(
+            notes[3].contains("Nothing here has cpu to sort by, for the reason above."),
+            "{notes:#?}"
+        );
+    }
+
+    #[test]
+    fn the_default_ordering_stays_silent_even_when_a_column_failed() {
+        let rows = vec![row("a")];
+        let requests: Result<(), String> = Err("the pods could not be listed".to_owned());
+        let usage: Result<(), String> = Ok(());
+        let ordering = SortBy::Order(k8s_nodes::Order::default());
+
+        let notes = footnotes(&FootnoteInputs {
+            rows: &rows,
+            requests: &requests,
+            usage: &usage,
+            samples: &[None],
+            now: now(),
+            label: "prod (us-east-1)",
+            width: Width::Default,
+            ordering: &ordering,
+            direction: Direction::Natural,
+        });
+
+        // The one real failure earns its footnote; nobody asked for a sort,
+        // so the two ordering notes contribute nothing — matching the byte
+        // for byte output a plain `eks nodes` printed before this existed.
+        assert_eq!(notes.len(), 2, "{notes:#?}");
+        assert!(
+            notes[0].contains("the pods could not be listed"),
+            "{notes:#?}"
+        );
+        assert!(
+            notes[1].contains("nothing here has been sampled yet"),
+            "{notes:#?}"
+        );
+    }
+
+    #[test]
+    fn a_listing_with_nothing_wrong_and_no_sort_has_no_footnotes() {
+        let quantity = crate::k8s::quantity::Quantity::parse("500m").unwrap();
+        let rows = vec![k8s_nodes::NodeRow {
+            cpu_used: k8s_nodes::Share {
+                amount: Some(quantity),
+                allocatable: Some(quantity),
+            },
+            ..row("a")
+        }];
+        let requests: Result<(), String> = Ok(());
+        let usage: Result<(), String> = Ok(());
+        let ordering = SortBy::Order(k8s_nodes::Order::default());
+
+        let notes = footnotes(&FootnoteInputs {
+            rows: &rows,
+            requests: &requests,
+            usage: &usage,
+            // No sample behind the figure above, so `freshness` has nothing
+            // to date the table by — the case a listing built for real
+            // could not reach (a shown figure with no sample behind it), but
+            // it isolates the claim this test makes: nothing here should
+            // print a footnote on its own account.
+            samples: &[None],
+            now: now(),
+            label: "prod (us-east-1)",
+            width: Width::Default,
+            ordering: &ordering,
+            direction: Direction::Natural,
+        });
+
+        assert!(notes.is_empty(), "{notes:#?}");
     }
 }

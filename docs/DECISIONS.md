@@ -3420,3 +3420,48 @@ moving from `Result<()>` to `Result<ExitCode>`, rather than reaching for
 `std::process::exit` partway through a function that otherwise composes with
 `?`. `SIGWINCH` stays untouched, exactly as decision 93 left it: nothing here
 argues the trade it made should be revisited.
+
+### 95. A listing's footnotes are assembled by a private function over a bundled params struct, not a shared `Footnotes` builder
+
+`commands::nodes::list` and `commands::pods::list` each assembled their table's
+footnotes inline, between two network calls, which meant the order they came
+out in — and `unranked_note`'s "for the reason above" depends on it — was
+guaranteed only by reading the lines in the right order, not by a test. The
+roadmap task itself left the shape open: a plain function taking every input
+the assembly needs is eight or nine arguments, which it called "not obviously
+better than the ten lines it replaces," and offered a small `Footnotes`
+builder both commands push into as the alternative.
+
+The builder was rejected. The two tables' footnotes are not the same list:
+`commands::nodes` has `devices_withheld` and a `requests_unavailable` that
+takes the rows and a width to know which columns it emptied, neither of which
+`commands::pods` has any use for; `commands::pods`'s `order_hidden` and
+`device_hidden` need a `Scope` that `commands::nodes` has no equivalent of. A
+builder generic enough to hold both shapes would have needed almost as many
+command-specific methods as the plain function had arguments — the "ten
+lines" the roadmap task was already unconvinced a function beat, wearing a
+different name.
+
+The fix instead pulls each command's own assembly block out into a private
+function — `commands::nodes::footnotes`, `commands::pods::notes` — taking a
+`FootnoteInputs`/`NoteInputs` struct rather than positional arguments. The
+struct is not a generic accumulator either; it is the specific handful of
+already-resolved values (`rows`, the two-or-one `Result<_, String>` failures,
+`samples`, `now`, `label`, `width`, the resolved `SortBy`, `direction`) each
+command's own assembly needs, named the way `Request` and `LogTarget` already
+bundle a call site's arguments (decision 29) — one struct literal to build,
+rather than nine parameters to keep in the right order. Both commands get the
+same shape of change: a struct, a function, and a test that builds fixture
+rows and asserts the exact sequence of notes for a listing with column
+failures and an active sort, for a silent default ordering over a failed
+column, and for a listing with nothing to say at all. `commands::pods::list`
+also lost its early, one-off push of `usage_unavailable` — `usage` is now
+held as a `Result<_, String>` the whole way through, the same shape
+`commands::nodes` already used, so both commands' failures reach the
+extracted function the same way instead of one being footnoted on the spot
+and the other later.
+
+Nothing that constructs a `FootnoteInputs`/`NoteInputs` needs a cluster: every
+field is a value `list` already has in hand once its two requests have
+answered, which is what makes the extracted functions testable with fixture
+rows and no client at all.
