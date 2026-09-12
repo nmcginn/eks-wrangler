@@ -74,7 +74,9 @@ impl ContainersState {
 /// of order would cost more than it answered. `filter` is the `/` query,
 /// empty when no filter is active — see [`super::nodes::draw`]'s doc comment
 /// for the same split between what stays over the full `rows` and what
-/// narrows.
+/// narrows. It narrows the `EVENTS` section below the container list too, via
+/// [`events_lines`]: one query for the whole pane rather than a second `/`
+/// for a section nothing here ever highlights or drills into.
 pub(super) fn draw(
     frame: &mut Frame,
     area: Rect,
@@ -126,6 +128,7 @@ pub(super) fn draw(
                 events,
                 events_error.as_deref(),
                 events_empty_note,
+                filter,
                 theme,
             ));
             lines
@@ -214,11 +217,23 @@ fn container_lines(row: &ContainerRow, selected: bool, theme: Theme) -> Vec<Line
 /// missing `events/list` permission is not the same class of problem as a pod
 /// this tool could not find at all. A genuinely empty listing gets
 /// `events_empty_note`'s answer to "did nothing happen, or did something
-/// happen and expire" rather than the same sentence a failure would print.
+/// happen and expire" rather than the same sentence a failure would print —
+/// neither is affected by `filter`, since there is nothing to narrow in
+/// either case.
+///
+/// `filter` is the same `/` query [`draw`] hands the container list above,
+/// reused here rather than a second matcher — events are not a row list an
+/// `App` highlights or drills into the way containers are, so sharing the
+/// query costs nothing beyond ranking a second list against it. Matched
+/// against [`EventRow::reason`], the field an event is named by, exactly the
+/// example the pane's own filter narrows a container list to a name: "narrow
+/// it to `BackOff`" reads the same way here as "narrow it to `sidecar`" does
+/// above.
 fn events_lines(
     events: &[EventRow],
     events_error: Option<&str>,
     events_empty_note: &str,
+    filter: &str,
     theme: Theme,
 ) -> Vec<Line<'static>> {
     if let Some(error) = events_error {
@@ -227,10 +242,25 @@ fn events_lines(
     if events.is_empty() {
         return vec![Line::styled(events_empty_note.to_owned(), theme.dim())];
     }
-    events
-        .iter()
-        .flat_map(|event| event_lines(event, theme))
-        .collect()
+
+    let visible = crate::fuzzy::rank(filter, events, |event| event.reason.as_str());
+    let mut lines = Vec::new();
+    if !filter.is_empty() {
+        lines.push(Line::styled(format!("Filter: \"{filter}\""), theme.dim()));
+    }
+    if !filter.is_empty() && visible.is_empty() {
+        lines.push(Line::styled(
+            format!("No events match \"{filter}\"."),
+            theme.dim(),
+        ));
+    } else {
+        lines.extend(
+            visible
+                .into_iter()
+                .flat_map(|event| event_lines(event, theme)),
+        );
+    }
+    lines
 }
 
 /// The two lines one grouped event occupies, on the same shape
@@ -675,6 +705,80 @@ mod tests {
         );
         let rendered = render(&state, None);
         assert!(rendered.contains("will not let you list"), "{rendered}");
+    }
+
+    #[test]
+    fn a_filter_narrows_the_events_shown_by_reason() {
+        let state = loaded_with_events(
+            vec![container("app")],
+            vec![
+                event("BackOff", "restarting", true),
+                event("Pulled", "pulled image", false),
+            ],
+            None,
+            "",
+        );
+        let rendered = render_filtered(&state, None, "back");
+
+        assert!(rendered.contains("BackOff"), "{rendered}");
+        assert!(!rendered.contains("Pulled"), "{rendered}");
+    }
+
+    #[test]
+    fn a_filter_matching_no_event_says_so_rather_than_the_empty_note() {
+        let state = loaded_with_events(
+            vec![container("app")],
+            vec![event("Pulled", "pulled image", false)],
+            None,
+            "should never show: this pod has events",
+        );
+        let rendered = render_filtered(&state, None, "back");
+
+        assert!(rendered.contains("No events match \"back\"."), "{rendered}");
+        assert!(!rendered.contains("Pulled"), "{rendered}");
+        assert!(
+            !rendered.contains("should never show"),
+            "a filter with no match is not the same as a genuinely empty listing: {rendered}"
+        );
+    }
+
+    #[test]
+    fn a_genuinely_empty_event_list_shows_its_note_even_under_a_filter() {
+        let state = loaded_with_events(
+            vec![container("app")],
+            Vec::new(),
+            None,
+            "No events yet — this pod is only 2m old.",
+        );
+        let rendered = render_filtered(&state, None, "back");
+
+        assert!(rendered.contains("No events yet"), "{rendered}");
+        assert!(!rendered.contains("No events match"), "{rendered}");
+    }
+
+    #[test]
+    fn a_failed_events_listing_ignores_the_filter() {
+        let state = loaded_with_events(
+            vec![container("app")],
+            Vec::new(),
+            Some("prod (us-east-1) will not let you list this resource."),
+            "",
+        );
+        let rendered = render_filtered(&state, None, "back");
+
+        assert!(rendered.contains("will not let you list"), "{rendered}");
+        assert!(!rendered.contains("No events match"), "{rendered}");
+    }
+
+    #[test]
+    fn an_empty_filter_renders_the_events_section_exactly_as_no_filter_does() {
+        let state = loaded_with_events(
+            vec![container("app")],
+            vec![event("BackOff", "restarting", true)],
+            None,
+            "",
+        );
+        assert_eq!(render_filtered(&state, None, ""), render(&state, None));
     }
 
     #[test]
