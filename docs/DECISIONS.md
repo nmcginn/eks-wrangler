@@ -3465,3 +3465,32 @@ Nothing that constructs a `FootnoteInputs`/`NoteInputs` needs a cluster: every
 field is a value `list` already has in hand once its two requests have
 answered, which is what makes the extracted functions testable with fixture
 rows and no client at all.
+
+### 96. The pod-containers pane's events section shares the container list's `/` query, matched against the event's reason
+
+The roadmap task left open whether one `/` query narrowing both the container
+list and the `EVENTS` section beneath it was the right model, since an event
+is not a row `App` highlights or drills into the way a container is — the
+worry being one key press affecting a selectable list and a plain block of
+text at once.
+
+That turned out not to be a real conflict once looked at directly: nothing in
+`App` reads the events list at all — no highlight indexes into it, `Enter`
+from `View::PodContainers` only ever drills through `visible_containers()` —
+so a query narrowing both sections changes what two independent blocks of
+text show, and nothing about selection or drill-down behaviour. Splitting the
+query would have bought a distinction the pane has no way to observe.
+
+`events_lines` now takes the same `filter` `draw` already threads through to
+the container list, ranking events through `crate::fuzzy::rank` against
+`EventRow::reason` — matching a container by name and an event by the field
+that names it (`BackOff`, `Pulled`, `Killing`) reads as the same idea in both
+places, and it is the roadmap task's own example ("narrow it to, say,
+`BackOff`"). The empty-events note and a failed events fetch both stay
+unfiltered: neither has anything for a query to narrow, and a filter that
+happened to make a failure message vanish would read as a bug rather than a
+feature. A filter that matches nothing gets `events`'s own "No events match
+…" line, distinct from `events_empty_note`'s answer to "did nothing happen,
+or did something happen and expire" — the two questions stay separate even
+though a filtered-empty and a genuinely-empty listing now look similar at a
+glance.

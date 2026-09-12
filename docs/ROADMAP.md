@@ -1395,7 +1395,7 @@ cluster.
 
 ### Follow-ups from the pod's events
 
-- [ ] **Filter the pod-detail view's events with `/`, alongside its
+- [x] **Filter the pod-detail view's events with `/`, alongside its
   containers.**
   The pod-containers pane's `/` already narrows the container list; the new
   `EVENTS` section underneath it does not take part, so a pod with a long
@@ -1411,6 +1411,18 @@ cluster.
   *Acceptance:* whichever shape it takes, it reuses `crate::fuzzy::rank`
   rather than a second matcher; a pod with no events, or with an unfiltered
   event list, renders exactly as it does today.
+  Landed as one shared query: `App` never highlights or drills into an event
+  the way it does a container, so nothing observes the two lists being
+  narrowed by the same text — the worry the task raised turned out not to be
+  a real conflict once traced through `App`. `events_lines` ranks through
+  `crate::fuzzy::rank` against `EventRow::reason`, the field an event is
+  named by, matching a container's own name-only match and the task's own
+  `BackOff` example. A failed events fetch and the genuinely-empty-listing
+  note both stay unfiltered — neither has anything for a query to narrow —
+  and a filter matching no event gets its own "No events match …" line
+  rather than borrowing the empty note's wording, so a long history that
+  happens to have nothing named `xyz` does not read as a pod with no events
+  at all. See decision 96.
 
 ### Follow-ups from the node pane
 
