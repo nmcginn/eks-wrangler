@@ -2199,13 +2199,14 @@ mod tests {
     fn node_row(name: &str) -> crate::k8s::nodes::NodeRow {
         use std::collections::BTreeMap;
 
-        use crate::k8s::nodes::{Capacity, Share};
+        use crate::k8s::nodes::{Capacity, Pressure, Share};
 
         crate::k8s::nodes::NodeRow {
             name: name.to_owned(),
             status: "Ready".to_owned(),
             severity: crate::theme::Severity::Ok,
             version: "v1.31".to_owned(),
+            pressure: Pressure::default(),
             cpu: Capacity::default(),
             memory: Capacity::default(),
             cpu_requested: Share::default(),
