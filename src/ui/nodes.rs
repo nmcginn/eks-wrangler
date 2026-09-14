@@ -37,6 +37,11 @@ pub enum NodesState {
         /// when the columns have nothing to date, including when the metrics
         /// read failed outright: a bar reading `-` already says so.
         usage_note: Option<String>,
+        /// Why `PODS` reads `- pods` and the `cpu-requested`/
+        /// `memory-requested`/`pods` orderings have nothing to sort by,
+        /// worded through `k8s::nodes::requests_note`. `None` when the pod
+        /// listing behind this pane's rows succeeded.
+        requests_note: Option<String>,
         /// Set when the most recent *background* refresh failed after an
         /// earlier fetch had already succeeded. The rows shown are still the
         /// last good listing — wiping them because one poll failed would
@@ -138,6 +143,7 @@ pub(super) fn draw(
         NodesState::Loaded {
             rows,
             usage_note,
+            requests_note,
             refresh_error,
         } => {
             let mut lines = vec![Line::styled("NODES", theme.heading())];
@@ -158,6 +164,15 @@ pub(super) fn draw(
             if !filter.is_empty() {
                 lines.push(Line::styled(format!("Filter: \"{filter}\""), theme.dim()));
             }
+            // Split for the same reason `usage_note` below is, and printed
+            // above it to match the CLI footnotes' own order
+            // (`requests_unavailable` then `usage_unavailable`).
+            if let Some(note) = requests_note {
+                lines.extend(
+                    note.lines()
+                        .map(|line| Line::styled(line.to_owned(), theme.dim())),
+                );
+            }
             // Split rather than handed straight to one `Line`: a stale sample
             // earns a second sentence of advice, and `ratatui` does not treat
             // an embedded `\n` as a line break the way a terminal does.
@@ -176,47 +191,11 @@ pub(super) fn draw(
                     theme.dim(),
                 ));
             }
-            // `Missing::requests` stays `false` deliberately in both arms —
-            // the CLI's `requests_unavailable` footnote has nowhere to live
-            // in this pane yet, so the booked orderings never claim to be
-            // explained by a note that was never printed.
             let missing = Missing {
-                requests: false,
+                requests: requests_note.is_some(),
                 usage: usage_missing_explained(rows, usage_note.as_deref()),
             };
-            match sort {
-                Sort::Order(order) => {
-                    if let Some(note) = order::note(order, direction) {
-                        lines.push(Line::styled(note, theme.dim()));
-                    }
-                    // The case where that line on its own misleads: an
-                    // ordering that ranked nothing at all describes a
-                    // listing the alphabet arranged.
-                    if let Some(note) = order::unranked_note(
-                        order,
-                        cause(order, missing),
-                        |candidate| ranks_any(rows, candidate),
-                        |candidate| distinguishes(rows, candidate),
-                    ) {
-                        lines.extend(
-                            note.lines()
-                                .map(|line| Line::styled(line.to_owned(), theme.dim())),
-                        );
-                    }
-                }
-                // The free-form counterpart: always named, unlike `order::note`
-                // — there is no default resource to compare against and stay
-                // silent about — and, when nothing reported it, why.
-                Sort::Resource(resource) => {
-                    lines.push(Line::styled(device_note(resource, direction), theme.dim()));
-                    if let Some(note) = device_unranked_note(resource, rows, missing) {
-                        lines.extend(
-                            note.lines()
-                                .map(|line| Line::styled(line.to_owned(), theme.dim())),
-                        );
-                    }
-                }
-            }
+            lines.extend(sort_lines(sort, direction, rows, missing, theme));
             let visible = crate::fuzzy::rank(filter, rows, |row| row.name.as_str());
             if !filter.is_empty() && visible.is_empty() {
                 lines.push(Line::styled(
@@ -236,6 +215,53 @@ pub(super) fn draw(
     };
 
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), area);
+}
+
+/// The ordering line under a loaded pane's rows, and, when it ranked nothing,
+/// the reason why — pulled out of [`draw`] so that function stays under
+/// `clippy::too_many_lines` rather than growing an `#[allow]` for it.
+fn sort_lines(
+    sort: Sort<'_>,
+    direction: Direction,
+    rows: &[NodeRow],
+    missing: Missing,
+    theme: Theme,
+) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    match sort {
+        Sort::Order(order) => {
+            if let Some(note) = order::note(order, direction) {
+                lines.push(Line::styled(note, theme.dim()));
+            }
+            // The case where that line on its own misleads: an ordering that
+            // ranked nothing at all describes a listing the alphabet
+            // arranged.
+            if let Some(note) = order::unranked_note(
+                order,
+                cause(order, missing),
+                |candidate| ranks_any(rows, candidate),
+                |candidate| distinguishes(rows, candidate),
+            ) {
+                lines.extend(
+                    note.lines()
+                        .map(|line| Line::styled(line.to_owned(), theme.dim())),
+                );
+            }
+        }
+        // The free-form counterpart: always named, unlike `order::note` —
+        // there is no default resource to compare against and stay silent
+        // about — and, when nothing reported it, why.
+        Sort::Resource(resource) => {
+            lines.push(Line::styled(device_note(resource, direction), theme.dim()));
+            if let Some(note) = device_unranked_note(resource, rows, missing) {
+                lines.extend(
+                    note.lines()
+                        .map(|line| Line::styled(line.to_owned(), theme.dim())),
+                );
+            }
+        }
+    }
+    lines
 }
 
 fn node_line(row: &NodeRow, selected: bool, theme: Theme) -> Line<'static> {
@@ -415,6 +441,7 @@ mod tests {
         NodesState::Loaded {
             rows,
             usage_note: None,
+            requests_note: None,
             refresh_error: None,
         }
     }
@@ -668,6 +695,7 @@ mod tests {
         let state = NodesState::Loaded {
             rows: vec![node("worker-1")],
             usage_note: None,
+            requests_note: None,
             refresh_error: Some("prod rejected your credentials.".to_owned()),
         };
 
@@ -721,6 +749,7 @@ mod tests {
         let state = NodesState::Loaded {
             rows: vec![node("worker-1")],
             usage_note: Some("Usage is up to 8s old, averaged over 20s.".to_owned()),
+            requests_note: None,
             refresh_error: None,
         };
 
@@ -744,6 +773,7 @@ mod tests {
                  in kube-system."
                     .to_owned(),
             ),
+            requests_note: None,
             refresh_error: None,
         };
 
@@ -871,6 +901,7 @@ mod tests {
         let state = NodesState::Loaded {
             rows: vec![unsampled],
             usage_note: None,
+            requests_note: None,
             refresh_error: None,
         };
 
@@ -895,6 +926,7 @@ mod tests {
         let state = NodesState::Loaded {
             rows: vec![unsampled],
             usage_note: Some("metrics-server has not sampled anything here yet.".to_owned()),
+            requests_note: None,
             refresh_error: None,
         };
 
@@ -908,15 +940,16 @@ mod tests {
 
     #[test]
     fn a_booked_ordering_never_points_at_the_usage_note() {
-        // Unlike the CLI table, this pane has no footnote explaining a
-        // failed pod listing, so `cpu-requested`/`memory-requested`/`pods`
-        // must never claim one exists — even when a usage note happens to be
-        // on screen for an unrelated reason.
+        // `cpu-requested`/`memory-requested`/`pods` must never claim the
+        // *usage* note explains them — even when one happens to be on screen
+        // for an unrelated reason — because it is `requests_note`, not
+        // `usage_note`, that speaks to a failed pod listing.
         let mut unbooked = node("worker-1");
         unbooked.cpu_requested = Share::default();
         let state = NodesState::Loaded {
             rows: vec![unbooked],
             usage_note: Some("metrics-server has not sampled anything here yet.".to_owned()),
+            requests_note: None,
             refresh_error: None,
         };
 
@@ -930,6 +963,32 @@ mod tests {
     }
 
     #[test]
+    fn a_failed_pod_listing_explains_the_booked_orderings_in_the_pane_too() {
+        // The pane's own counterpart to the CLI table's `requests_unavailable`
+        // footnote: once `requests_note` is set, `cpu-requested`,
+        // `memory-requested`, and `pods` all point at it instead of reading
+        // as an unexplained gap.
+        let mut unbooked = node("worker-1");
+        unbooked.cpu_requested = Share::default();
+        unbooked.pods = Share::default();
+        let state = NodesState::Loaded {
+            rows: vec![unbooked],
+            usage_note: None,
+            requests_note: Some(
+                "Pods could not be listed, so PODS reads \"-\" and cpu-requested/\
+                 memory-requested/pods have nothing to sort by.\nno pods for you."
+                    .to_owned(),
+            ),
+            refresh_error: None,
+        };
+
+        for order in [Order::CpuRequested, Order::MemoryRequested, Order::Pods] {
+            let rendered = render_ordered(&state, order, Direction::Natural);
+            assert!(rendered.contains("for the reason above"), "{rendered}");
+        }
+    }
+
+    #[test]
     fn no_usage_note_is_shown_when_there_is_nothing_to_date() {
         let rendered = render(&loaded(vec![node("worker-1")]));
         assert!(!rendered.contains("Usage is up to"), "{rendered}");
@@ -940,6 +999,7 @@ mod tests {
         let state = NodesState::Loaded {
             rows: Vec::new(),
             usage_note: Some("Usage is up to 8s old, averaged over 20s.".to_owned()),
+            requests_note: None,
             refresh_error: None,
         };
 
@@ -954,6 +1014,7 @@ mod tests {
         let state = NodesState::Loaded {
             rows: vec![node("worker-1")],
             usage_note: None,
+            requests_note: None,
             refresh_error: Some("could not list nodes: nope".to_owned()),
         };
 

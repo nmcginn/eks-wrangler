@@ -587,16 +587,21 @@ impl App {
             (Ok(fetch), _) => NodesState::Loaded {
                 rows: fetch.rows,
                 usage_note: fetch.usage_note,
+                requests_note: fetch.requests_note,
                 refresh_error: None,
             },
             (
                 Err(error),
                 NodesState::Loaded {
-                    rows, usage_note, ..
+                    rows,
+                    usage_note,
+                    requests_note,
+                    ..
                 },
             ) => NodesState::Loaded {
                 rows,
                 usage_note,
+                requests_note,
                 refresh_error: Some(error.message),
             },
             (Err(error), _) => NodesState::Error(error.message),
@@ -649,10 +654,14 @@ impl App {
     pub fn apply_login_failure(&mut self, message: String) {
         self.nodes = match std::mem::take(&mut self.nodes) {
             NodesState::Loaded {
-                rows, usage_note, ..
+                rows,
+                usage_note,
+                requests_note,
+                ..
             } => NodesState::Loaded {
                 rows,
                 usage_note,
+                requests_note,
                 refresh_error: Some(message),
             },
             _ => NodesState::Error(message),
@@ -2278,6 +2287,7 @@ mod tests {
         app.apply_nodes(Ok(NodesFetch {
             rows: vec![node_row("worker-1")],
             usage_note: None,
+            requests_note: None,
         }));
         app.toggle_focus();
         app
@@ -2290,6 +2300,7 @@ mod tests {
         app.apply_nodes(Ok(NodesFetch {
             rows: vec![node_row("worker-1"), node_row("worker-2")],
             usage_note: None,
+            requests_note: None,
         }));
         app.toggle_focus();
         app
@@ -2531,6 +2542,7 @@ mod tests {
             &NodesState::Loaded {
                 rows: Vec::new(),
                 usage_note: None,
+                requests_note: None,
                 refresh_error: None,
             }
         );
@@ -2563,6 +2575,7 @@ mod tests {
             &NodesState::Loaded {
                 rows: Vec::new(),
                 usage_note: None,
+                requests_note: None,
                 refresh_error: Some("could not list nodes: nope".to_owned()),
             }
         );
@@ -2655,6 +2668,7 @@ mod tests {
             &NodesState::Loaded {
                 rows: Vec::new(),
                 usage_note: None,
+                requests_note: None,
                 refresh_error: Some("could not start `aws sso login`".to_owned()),
             }
         );
@@ -2733,6 +2747,7 @@ mod tests {
             &NodesState::Loaded {
                 rows: Vec::new(),
                 usage_note: None,
+                requests_note: None,
                 refresh_error: None,
             }
         );
@@ -2897,6 +2912,7 @@ mod tests {
         app.apply_nodes(Ok(NodesFetch {
             rows: vec![node],
             usage_note: None,
+            requests_note: None,
         }));
         app.toggle_focus();
         app.on_key(press(KeyCode::Enter));
@@ -2941,6 +2957,7 @@ mod tests {
         app.apply_nodes(Ok(NodesFetch {
             rows: vec![node_row("worker-2")],
             usage_note: None,
+            requests_note: None,
         }));
 
         assert_eq!(app.drilled_node(), None);
@@ -3063,6 +3080,7 @@ mod tests {
         app.apply_nodes(Ok(NodesFetch {
             rows: vec![node_row("worker-1")],
             usage_note: None,
+            requests_note: None,
         }));
 
         app.on_key(press(KeyCode::Tab));
@@ -3084,6 +3102,7 @@ mod tests {
         app.apply_nodes(Ok(NodesFetch {
             rows: vec![node_row("worker-1")],
             usage_note: None,
+            requests_note: None,
         }));
 
         app.on_key(press(KeyCode::Right));
@@ -3107,6 +3126,7 @@ mod tests {
             app.apply_nodes(Ok(NodesFetch {
                 rows: vec![node_row("worker-1")],
                 usage_note: None,
+                requests_note: None,
             }));
         }
 
@@ -3140,6 +3160,7 @@ mod tests {
         app.apply_nodes(Ok(NodesFetch {
             rows: vec![node_row("worker-1"), node_row("worker-2")],
             usage_note: None,
+            requests_note: None,
         }));
         let selected_cluster_before = app.selected_index();
 
@@ -3159,6 +3180,7 @@ mod tests {
         app.apply_nodes(Ok(NodesFetch {
             rows: vec![node_row("worker-1")],
             usage_note: None,
+            requests_note: None,
         }));
 
         app.on_key(press(KeyCode::Enter));
@@ -3748,6 +3770,7 @@ mod tests {
                 node_row("worker-3"),
             ],
             usage_note: None,
+            requests_note: None,
         }));
 
         app.on_key(press(KeyCode::End));
@@ -3808,6 +3831,7 @@ mod tests {
                 node_row_with_cpu("busy", "3800m", "4"),
             ],
             usage_note: None,
+            requests_note: None,
         }));
 
         app.on_key(press(KeyCode::Char('s'))); // Status
@@ -3838,6 +3862,7 @@ mod tests {
                 node_row_with_cpu("busy", "3800m", "4"),
             ],
             usage_note: None,
+            requests_note: None,
         }));
 
         let names: Vec<&str> = app
@@ -3886,6 +3911,7 @@ mod tests {
         app.apply_nodes(Ok(NodesFetch {
             rows: vec![node_row("worker-1")],
             usage_note: None,
+            requests_note: None,
         }));
 
         app.on_key(press(KeyCode::Char('s'))); // Status
@@ -3961,6 +3987,7 @@ mod tests {
                 node_row_with_device("tight", "nvidia.com/gpu", "2", "2"),
             ],
             usage_note: None,
+            requests_note: None,
         }));
 
         app.on_key(press(KeyCode::Char('R')));
@@ -4003,6 +4030,7 @@ mod tests {
                 node_row_with_device("tight", "nvidia.com/gpu", "2", "2"),
             ],
             usage_note: None,
+            requests_note: None,
         }));
         app.on_key(press(KeyCode::Char('R')));
         for c in "nvidia.com/gpu".chars() {
@@ -4046,6 +4074,7 @@ mod tests {
         app.apply_nodes(Ok(NodesFetch {
             rows: vec![node_row_with_device("worker-1", "nvidia.com/gpu", "2", "4")],
             usage_note: None,
+            requests_note: None,
         }));
         app.on_key(press(KeyCode::Char('R')));
         for c in "nvidia.com/gpu".chars() {
@@ -4068,6 +4097,7 @@ mod tests {
                 node_row_with_device("tight", "nvidia.com/gpu", "2", "2"),
             ],
             usage_note: None,
+            requests_note: None,
         }));
         app.on_key(press(KeyCode::Char('R')));
         for c in "nvidia.com/gpu".chars() {
