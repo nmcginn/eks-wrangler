@@ -1426,7 +1426,7 @@ cluster.
 
 ### Follow-ups from the node pane
 
-- [ ] **A node's full condition list, not just its derived status.**
+- [x] **A node's full condition list, not just its derived status.**
   The node pane reads "conditions" as `NodeRow::status`/`severity` — the same
   derived `Ready`/`NotReady`/`Unknown`[,`SchedulingDisabled`] the CLI's
   `STATUS` column shows — because that is the data `NodeRow` already carries.
@@ -1443,6 +1443,20 @@ cluster.
   function over a `Node`'s `status.conditions`, tested the way `status_text`
   and `severity` already are; a node reporting none of the four pressure
   conditions is not distinguished from one that has not reported at all.
+  Landed on the pod-drilldown pane, the same view "A node's own detail view,
+  and its `--wide` facts in it" already answered this for: `View::NodePods`
+  commits to one node already, so it is where a node's wider facts go rather
+  than a new key or a header section on the pods list, and the "no wide mode,
+  just say it" answer applies here too — every condition prints unconditionally,
+  `False` included. `k8s::nodes::Pressure` is the new data model, read off
+  `status.conditions` by a `condition_is_true` helper that folds "absent" and
+  "False" into the same `false`, which is what makes the acceptance
+  criteria's "not distinguished" bar hold without a third state to carry
+  around. `k8s::nodes::pressure_facts` mirrors `wide_facts`'s label/value
+  shape with a `Severity` beside each — `Critical` for `True`, `Ok` for
+  everything else — and `ui::pods::node_facts_lines` draws it through
+  `Theme::severity`, the dashboard's own colour for a health reading, right
+  after the wide facts it already draws there. See decision 97.
 
 ### Follow-ups from the panes' "nothing ranked" note
 

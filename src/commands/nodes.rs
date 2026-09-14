@@ -644,6 +644,7 @@ contexts:
             status: "Ready".to_owned(),
             severity: crate::theme::Severity::Ok,
             version: "v1.30.2-eks-1552ad0".to_owned(),
+            pressure: k8s_nodes::Pressure::default(),
             cpu: k8s_nodes::Capacity::default(),
             memory: k8s_nodes::Capacity::default(),
             cpu_requested: k8s_nodes::Share::default(),

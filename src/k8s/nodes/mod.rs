@@ -68,6 +68,10 @@ pub struct NodeRow {
     /// call site so the CLI table and the dashboard cannot disagree about it.
     pub severity: Severity,
     pub version: String,
+    /// The four "pressure" conditions `kubectl describe node` lists beside
+    /// `Ready` — a different, wider fact about a node than the one
+    /// [`status`](Self::status)/[`severity`](Self::severity) derive.
+    pub pressure: Pressure,
     /// Cores the node has, and cores pods may actually ask for.
     pub cpu: Capacity,
     /// Bytes of memory the node has, and bytes pods may actually ask for.
@@ -147,6 +151,55 @@ pub struct NodeRow {
     /// that is honestly zero. What decides whether a size becomes a column is
     /// the *table's* business, not the row's — see `hugepage_names` below.
     pub hugepages: BTreeMap<String, Capacity>,
+}
+
+/// The four "pressure" conditions a node reports on `status.conditions`
+/// alongside `Ready`: `MemoryPressure`, `DiskPressure`, `PIDPressure`, and
+/// `NetworkUnavailable`.
+///
+/// `Ready`'s own absence means "has not registered yet", which is why this
+/// module's own `ready_condition` keeps it a three-way `Option<bool>`. These
+/// four are the opposite shape: a healthy node reports `False` for each, and a
+/// node that has not reported one at all is, for every practical purpose, a
+/// node that is not under that particular pressure — so absence reads exactly
+/// as `False` does, and a node reporting none of the four is not told apart
+/// from one that has reported nothing. Only an explicit `True` is worth a
+/// reader's attention, which is what [`pressure_facts`] grades.
+// Four fixed conditions the Kubernetes API reports independently of one
+// another, not flags accumulating on one type by accident — a state machine
+// would need a fifth case for "more than one at once", which is exactly what
+// a real node can report.
+#[allow(clippy::struct_excessive_bools)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Pressure {
+    pub memory: bool,
+    pub disk: bool,
+    pub pid: bool,
+    pub network_unavailable: bool,
+}
+
+impl Pressure {
+    /// Read the four conditions off a node, one lookup each.
+    fn read(node: &Node) -> Self {
+        Self {
+            memory: condition_is_true(node, "MemoryPressure"),
+            disk: condition_is_true(node, "DiskPressure"),
+            pid: condition_is_true(node, "PIDPressure"),
+            network_unavailable: condition_is_true(node, "NetworkUnavailable"),
+        }
+    }
+}
+
+/// Whether one of a node's conditions is reported `True`. An absent condition
+/// and one explicitly `False` both read `false` here — the right answer for
+/// [`Pressure`], whose whole point is not telling those two apart, and wrong
+/// for `Ready`, which keeps its own three-way [`ready_condition`] instead.
+fn condition_is_true(node: &Node, type_: &str) -> bool {
+    node.status
+        .as_ref()
+        .and_then(|status| status.conditions.as_ref())
+        .and_then(|conditions| conditions.iter().find(|condition| condition.type_ == type_))
+        .is_some_and(|condition| condition.status == "True")
 }
 
 /// One extended resource on one node: how many of them it will hand out, and
@@ -424,6 +477,7 @@ impl NodeRow {
             name,
             status: status_text(ready, cordoned),
             severity: severity(ready, cordoned),
+            pressure: Pressure::read(node),
             cpu,
             memory,
             cpu_requested: Share {
@@ -1014,6 +1068,35 @@ pub fn wide_facts(row: &NodeRow) -> Vec<(String, String)> {
     .collect()
 }
 
+/// One node's four pressure conditions as label/value/severity triples — for
+/// a view that shows a single node's own detail, beside [`wide_facts`].
+///
+/// Unconditional the same way `wide_facts` is: every node prints all four
+/// lines, `False` included, so the first time this section names a `True`
+/// value is not also the first time it has appeared on screen. `False` and an
+/// absent condition both grade [`Severity::Ok`], per [`Pressure`]'s own doc
+/// comment; only a `True` earns [`Severity::Critical`].
+#[must_use]
+pub fn pressure_facts(row: &NodeRow) -> Vec<(String, String, Severity)> {
+    [
+        ("MemoryPressure", row.pressure.memory),
+        ("DiskPressure", row.pressure.disk),
+        ("PIDPressure", row.pressure.pid),
+        ("NetworkUnavailable", row.pressure.network_unavailable),
+    ]
+    .into_iter()
+    .map(|(label, alarmed)| {
+        let severity = if alarmed {
+            Severity::Critical
+        } else {
+            Severity::Ok
+        };
+        let value = if alarmed { "True" } else { "False" };
+        (label.to_owned(), value.to_owned(), severity)
+    })
+    .collect()
+}
+
 /// The order columns get dropped in when [`Width::Narrow`] cannot fit them all.
 ///
 /// A list of predicates rather than a single ranking, because some columns want
@@ -1555,6 +1638,96 @@ mod tests {
         assert_eq!(row.severity, Severity::Ok);
         assert_eq!(row.version, "v1.33.1-eks-1a2b3c4");
         assert_eq!(row.age, "2d2h");
+    }
+
+    #[test]
+    fn a_node_reporting_none_of_the_pressure_conditions_reads_as_no_pressure() {
+        // `healthy_node` reports only `Ready` — the ordinary case on a real
+        // cluster, where the other four are simply absent.
+        let row = NodeRow::from_node(&healthy_node(), Some(&idle()), None, now());
+
+        assert_eq!(row.pressure, Pressure::default());
+    }
+
+    #[test]
+    fn a_pressure_condition_reported_true_is_read() {
+        let node = with_status(
+            &healthy_node(),
+            vec![
+                condition("Ready", "True"),
+                condition("MemoryPressure", "True"),
+                condition("DiskPressure", "False"),
+            ],
+        );
+        let row = NodeRow::from_node(&node, Some(&idle()), None, now());
+
+        assert!(row.pressure.memory);
+        assert!(!row.pressure.disk);
+        assert!(!row.pressure.pid);
+        assert!(!row.pressure.network_unavailable);
+    }
+
+    #[test]
+    fn a_node_reporting_every_pressure_condition_false_reads_the_same_as_one_reporting_none() {
+        let unreported = with_status(&healthy_node(), vec![condition("Ready", "True")]);
+        let reported_false = with_status(
+            &healthy_node(),
+            vec![
+                condition("Ready", "True"),
+                condition("MemoryPressure", "False"),
+                condition("DiskPressure", "False"),
+                condition("PIDPressure", "False"),
+                condition("NetworkUnavailable", "False"),
+            ],
+        );
+
+        assert_eq!(
+            NodeRow::from_node(&unreported, Some(&idle()), None, now()).pressure,
+            NodeRow::from_node(&reported_false, Some(&idle()), None, now()).pressure,
+        );
+    }
+
+    #[test]
+    fn pressure_facts_lists_all_four_conditions_in_order() {
+        let row = NodeRow::from_node(&healthy_node(), Some(&idle()), None, now());
+
+        let facts = pressure_facts(&row);
+        let labels: Vec<&str> = facts.iter().map(|(label, _, _)| label.as_str()).collect();
+        assert_eq!(
+            labels,
+            [
+                "MemoryPressure",
+                "DiskPressure",
+                "PIDPressure",
+                "NetworkUnavailable"
+            ]
+        );
+    }
+
+    #[test]
+    fn pressure_facts_grades_a_true_condition_critical_and_names_it() {
+        let mut row = NodeRow::from_node(&healthy_node(), Some(&idle()), None, now());
+        row.pressure.memory = true;
+
+        assert_eq!(
+            pressure_facts(&row)[0],
+            (
+                "MemoryPressure".to_owned(),
+                "True".to_owned(),
+                Severity::Critical
+            )
+        );
+    }
+
+    #[test]
+    fn pressure_facts_grades_false_and_absent_alike_as_ok() {
+        let row = NodeRow::from_node(&healthy_node(), Some(&idle()), None, now());
+
+        assert!(
+            pressure_facts(&row)
+                .iter()
+                .all(|(_, value, severity)| value == "False" && *severity == Severity::Ok)
+        );
     }
 
     #[test]

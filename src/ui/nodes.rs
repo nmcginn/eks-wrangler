@@ -368,6 +368,7 @@ mod tests {
             status: "Ready".to_owned(),
             severity: Severity::Ok,
             version: "v1.31".to_owned(),
+            pressure: crate::k8s::nodes::Pressure::default(),
             // Allocatable a little below capacity, the ordinary kubelet
             // reserve, so this fixture's bars exercise both denominators
             // rather than only the one every other field happens to share.

@@ -383,6 +383,7 @@ mod tests {
             status: "Ready".to_owned(),
             severity: Severity::Ok,
             version: "v1.30.2-eks-1552ad0".to_owned(),
+            pressure: crate::k8s::nodes::Pressure::default(),
             cpu: Capacity::default(),
             memory: Capacity::default(),
             cpu_requested: Share::default(),

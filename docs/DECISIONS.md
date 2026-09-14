@@ -3494,3 +3494,49 @@ feature. A filter that matches nothing gets `events`'s own "No events match
 or did something happen and expire" — the two questions stay separate even
 though a filtered-empty and a genuinely-empty listing now look similar at a
 glance.
+
+### 97. A node's pressure conditions land on the pod-drilldown pane, unconditionally, coloured by `Theme::severity`
+
+`NodeRow` carried only `Ready`, derived into `status`/`severity`; `kubectl
+describe node` shows four more conditions beside it — `MemoryPressure`,
+`DiskPressure`, `PIDPressure`, `NetworkUnavailable` — that nothing in this
+tool parsed. The roadmap task left two things open: where a node's own
+detail belongs, since `Enter` on one drills into its pods rather than into a
+view of the node itself, and how to read a condition nobody has reported at
+all — its own acceptance criteria required that reading the same as an
+explicit `False`.
+
+The placement question was already answered by decision 78, for "A node's own
+detail view, and its `--wide` facts in it": `View::NodePods`, the
+pod-drilldown pane, commits to one node the moment `Enter` opens it, and its
+wide facts already live there as plain lines above the pod list rather than
+behind a new key or a fifth `View` variant. Pressure conditions are the same
+kind of fact about the same node, so they join the same block rather than
+opening a second surface — a node pane `Enter` press still means exactly one
+thing.
+
+`k8s::nodes::Pressure` is the new struct — four plain `bool`s — read by a
+`condition_is_true` helper that treats a condition's absence and an explicit
+`False` as the same `false`. That is the opposite of `Ready`'s own
+`ready_condition`, which keeps a three-way `Option<bool>` because absence
+there means "not yet registered" and is worth telling apart from a healthy
+`False`; for these four, a node that has never reported `MemoryPressure` and
+one reporting it `False` both mean "not under memory pressure" for every
+practical purpose, and the acceptance criteria said so directly. Folding the
+two into one `bool` up front is what makes that bar hold without a third
+state riding along through every call site that reads it.
+
+`k8s::nodes::pressure_facts` mirrors `wide_facts`'s label/value shape with a
+`Severity` beside each pair — `Critical` for `True`, `Ok` for `False` and
+absence alike — and prints unconditionally, the same rule decision 78 gave
+the node's `--wide` facts in this same pane rather than the pod side's
+any-not-all one: a node reporting nothing alarming still gets all four
+lines, so the first `True` is not also the first time the section has
+appeared. `ui::pods::node_facts_lines`
+draws it through `Theme::severity`, not `Theme::severity_ink`: this is the
+dashboard, where a healthy reading is drawn in its own colour the way a
+`Running` pod's `STATUS` already is (decision 49's table-only reasoning for
+suppressing `Ok` — a healthy cluster is nearly every cell, so painting them
+all green wastes the signal — does not transfer to a pane showing one node's
+own four lines rather than scanning hundreds of rows for the one that
+differs).
