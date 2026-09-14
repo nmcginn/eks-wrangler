@@ -64,19 +64,20 @@ pub(super) enum Sort<'a> {
 /// `node` is the [`NodeRow`] behind the node drilled into, from the node
 /// pane's own listing — `None` when it has since left that listing (a node
 /// that scaled down while its pods were open) or, in a test, was never given
-/// one. Its `--wide` facts are drawn above the pod list regardless of whether
-/// the pod fetch itself has finished: they were already known before this
-/// pane's own fetch started, and there is no reason to make them wait on a
-/// second request. `selected` highlights a row — `None` when the pane does
-/// not currently hold keyboard focus, so the highlight disappears the moment
-/// `Tab` moves it back to the sidebar. `sort` and `direction` are the pane's
-/// own ordering, `s`/`S`/`R` in [`super::App`] rather than a request — see
-/// [`super::nodes::draw`], whose node-pane counterpart this mirrors.
-/// `resource_prompt` is the `--sort-resource` prompt's own text while `R` is
-/// capturing keystrokes for it, the same as it is there. `filter` is the `/`
-/// query, empty when no filter is active — see that same doc comment for why
-/// every footnote above still reads off the full `rows` and only the drawn
-/// rows themselves narrow.
+/// one. Its `--wide` facts and its four pressure conditions are drawn above
+/// the pod list regardless of whether the pod fetch itself has finished: they
+/// were already known before this pane's own fetch started, and there is no
+/// reason to make them wait on a second request. `selected` highlights a row
+/// — `None` when the pane does not currently hold keyboard focus, so the
+/// highlight disappears the moment `Tab` moves it back to the sidebar. `sort`
+/// and `direction` are the pane's own ordering, `s`/`S`/`R` in
+/// [`super::App`] rather than a request — see [`super::nodes::draw`], whose
+/// node-pane counterpart this mirrors. `resource_prompt` is the
+/// `--sort-resource` prompt's own text while `R` is capturing keystrokes for
+/// it, the same as it is there. `filter` is the `/` query, empty when no
+/// filter is active — see that same doc comment for why every footnote above
+/// still reads off the full `rows` and only the drawn rows themselves
+/// narrow.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn draw(
     frame: &mut Frame,
@@ -181,21 +182,31 @@ pub(super) fn draw(
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), area);
 }
 
-/// The node's `--wide` facts above the pod list — empty when `node` is
-/// `None`, so a pane that never had one to draw is unchanged.
+/// The node's `--wide` facts, then its four pressure conditions, above the
+/// pod list — empty when `node` is `None`, so a pane that never had one to
+/// draw is unchanged.
 ///
 /// Unconditional once a `NodeRow` is in hand, the way [`k8s_nodes::wide_facts`]
-/// itself is: every one of the five lines is drawn whatever is in it, `-`
-/// included, rather than the `any`-not-`all` rule the pod-level facts beside
-/// [`super::containers::draw`] follow for the two that are usually absent.
+/// and [`k8s_nodes::pressure_facts`] both are: every line is drawn whatever is
+/// in it, `-`/`False` included, rather than the `any`-not-`all` rule the
+/// pod-level facts beside [`super::containers::draw`] follow for the two that
+/// are usually absent. The wide facts carry no judgement and stay dim; the
+/// pressure conditions carry a [`Severity`] each, coloured through
+/// [`Theme::severity`] the way the pod line below colours `STATUS` — so a
+/// `True` reads in the same alarming ink a reader already trusts.
 fn node_facts_lines(node: Option<&NodeRow>, theme: Theme) -> Vec<Line<'static>> {
     let Some(node) = node else {
         return Vec::new();
     };
-    k8s_nodes::wide_facts(node)
+    let wide = k8s_nodes::wide_facts(node)
         .into_iter()
-        .map(|(label, value)| Line::styled(format!("{label}: {value}"), theme.dim()))
-        .collect()
+        .map(|(label, value)| Line::styled(format!("{label}: {value}"), theme.dim()));
+    let pressure = k8s_nodes::pressure_facts(node)
+        .into_iter()
+        .map(|(label, value, severity)| {
+            Line::styled(format!("{label}: {value}"), theme.severity(severity))
+        });
+    wide.chain(pressure).collect()
 }
 
 fn pod_line(row: &PodRow, selected: bool, theme: Theme) -> Line<'static> {
@@ -270,6 +281,7 @@ mod tests {
             status: "Ready".to_owned(),
             severity: Severity::Ok,
             version: "v1.31".to_owned(),
+            pressure: crate::k8s::nodes::Pressure::default(),
             cpu: crate::k8s::nodes::Capacity::default(),
             memory: crate::k8s::nodes::Capacity::default(),
             cpu_requested: crate::k8s::nodes::Share::default(),
@@ -707,6 +719,53 @@ mod tests {
             "{rendered}"
         );
         assert!(rendered.contains("api-1"), "{rendered}");
+    }
+
+    #[test]
+    fn the_drilled_into_nodes_pressure_conditions_are_drawn_after_its_wide_facts() {
+        let state = PodsState::Loaded {
+            rows: vec![pod("api-1")],
+            selector_note: None,
+        };
+        let node = node_row("worker-1");
+
+        let rendered = render_with_node(&state, Some(&node));
+
+        // `node_row` reports none of the four, which reads exactly like an
+        // explicit `False` — `Pressure`'s own rule.
+        assert!(rendered.contains("MemoryPressure: False"), "{rendered}");
+        assert!(rendered.contains("DiskPressure: False"), "{rendered}");
+        assert!(rendered.contains("PIDPressure: False"), "{rendered}");
+        assert!(rendered.contains("NetworkUnavailable: False"), "{rendered}");
+    }
+
+    #[test]
+    fn a_true_pressure_condition_is_named_and_coloured_critical() {
+        let mut node = node_row("worker-1");
+        node.pressure.disk = true;
+        let theme = Theme::dark();
+
+        let lines = node_facts_lines(Some(&node), theme);
+        let disk_line = lines
+            .iter()
+            .find(|line| line.to_string() == "DiskPressure: True")
+            .expect("a DiskPressure line");
+
+        assert_eq!(disk_line.style, theme.severity(Severity::Critical));
+    }
+
+    #[test]
+    fn a_false_pressure_condition_is_coloured_the_same_as_an_ok_pod_status() {
+        let node = node_row("worker-1");
+        let theme = Theme::dark();
+
+        let lines = node_facts_lines(Some(&node), theme);
+        let memory_line = lines
+            .iter()
+            .find(|line| line.to_string() == "MemoryPressure: False")
+            .expect("a MemoryPressure line");
+
+        assert_eq!(memory_line.style, theme.severity(Severity::Ok));
     }
 
     #[test]
