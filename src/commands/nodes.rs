@@ -437,6 +437,11 @@ pub async fn list(
 pub struct NodesFetch {
     pub rows: Vec<k8s_nodes::NodeRow>,
     pub usage_note: Option<String>,
+    /// The pod-listing failure, worded for this pane by
+    /// [`k8s_nodes::requests_note`] rather than the CLI table's
+    /// [`k8s_nodes::requests_unavailable`] — see that function's own doc
+    /// comment for why the two cannot share one wording.
+    pub requests_note: Option<String>,
 }
 
 /// Fetch this cluster's nodes on a background thread, delivering rows — or a
@@ -479,9 +484,11 @@ pub fn spawn_gather(
                 gathered.now,
                 &gathered.label,
             );
+            let requests_note = k8s_nodes::requests_note(&gathered.requests);
             NodesFetch {
                 rows: gathered.rows,
                 usage_note,
+                requests_note,
             }
         })
         .map_err(|error| commands::FetchError::of(&error))

@@ -1238,6 +1238,27 @@ pub fn requests_unavailable(rows: &[NodeRow], explanation: &str, width: format::
     }
 }
 
+/// The pane's own version of [`requests_unavailable`], for the dashboard's
+/// node pane rather than the CLI table.
+///
+/// The pane never draws `CPU REQ`/`MEM REQ` as columns at all — only the
+/// usage bars and the pod count — so naming them the way the CLI footnote
+/// does would send the reader looking for text the pane never shows. What a
+/// failed pod listing costs the pane is the pod count, which reads `- pods`
+/// instead of a figure, and the three orderings that read the same totals:
+/// `cpu-requested`, `memory-requested`, and `pods`. `None` when the read
+/// succeeded, so a pane that has never failed a pod listing prints nothing
+/// new — the same shape [`usage_note`] already has for its own failure.
+#[must_use]
+pub fn requests_note(requests: &Result<(), String>) -> Option<String> {
+    requests.as_ref().err().map(|explanation| {
+        format!(
+            "Pods could not be listed, so PODS reads \"-\" and cpu-requested/\
+             memory-requested/pods have nothing to sort by.\n{explanation}"
+        )
+    })
+}
+
 /// Whether a column matching `present` was in this listing's columns at full
 /// width and is not at `width` — the shared comparison behind [`order_hidden`]
 /// and [`device_hidden`].
@@ -2435,6 +2456,22 @@ mod tests {
         );
         assert!(footnote.contains("CPU REQ"), "{footnote}");
         assert!(footnote.contains("will not let you list"), "{footnote}");
+    }
+
+    #[test]
+    fn requests_note_is_silent_when_the_pod_listing_succeeded() {
+        assert_eq!(requests_note(&Ok(())), None);
+    }
+
+    #[test]
+    fn requests_note_names_the_pane_facts_a_failed_pod_listing_costs() {
+        let note = requests_note(&Err("no pods for you".to_owned())).expect("a note");
+
+        assert!(note.contains("PODS"), "{note}");
+        assert!(note.contains("cpu-requested"), "{note}");
+        assert!(note.contains("memory-requested"), "{note}");
+        assert!(note.contains("pods"), "{note}");
+        assert!(note.contains("no pods for you"), "{note}");
     }
 
     #[test]

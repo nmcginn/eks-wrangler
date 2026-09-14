@@ -3494,3 +3494,39 @@ feature. A filter that matches nothing gets `events`'s own "No events match
 or did something happen and expire" — the two questions stay separate even
 though a filtered-empty and a genuinely-empty listing now look similar at a
 glance.
+
+### 97. The node pane's failed-pod-listing note is worded for what the pane shows, not the CLI table's column names
+
+The roadmap task pointed at `k8s_nodes::requests_unavailable` as the note's
+neighbour and left open what it should actually say. That footnote names
+`CPU REQ`, `MEM REQ`, and a device column by heading — the right words for a
+table where those are literally the headings above the empty cells. The node
+pane has never drawn any of them: `ui::nodes::node_line` prints a name, a
+status, the two usage bars, and a pod count, and nothing else — `cpu_requested`
+and `memory_requested` reach the pane only as sort keys, never as text on
+screen. A note built by wrapping `requests_unavailable`'s own sentence would
+tell the reader to go looking for a `CPU REQ` cell that does not exist in this
+view.
+
+`k8s_nodes::requests_note` is a second function rather than a second reading
+of the first one, and it names the two things a failed pod listing actually
+costs *this* surface: the `PODS` cell reading `- pods`, and the three
+orderings — `cpu-requested`, `memory-requested`, `pods` — that lose their
+explanation for ranking nothing. It takes the same `Result<(), String>`
+`requests_unavailable` takes a rendered explanation from, so the two can never
+disagree about *why*, only about which columns they are allowed to mention.
+
+Getting the note from `Gathered::requests` to the pane meant carrying it the
+same way `usage_note` already travels: computed once in
+`commands::nodes::spawn_gather`, carried on `NodesFetch`, and stored on
+`NodesState::Loaded` beside `usage_note` and `refresh_error` — surviving a
+failed background refresh over good rows for the same reason those two do,
+since a transient poll failure must not erase news about an *earlier*
+successful fetch's own gap. `ui::nodes::draw` prints it above `usage_note`,
+matching the order the CLI's own two footnotes already print in
+(`requests_unavailable` then `usage_unavailable`), and `Missing::requests` —
+which had been hardcoded `false` in the pane since the note had nowhere to
+live — now reads `requests_note.is_some()`, which is the one line the whole
+task was building toward: `cpu-requested`/`memory-requested`/`pods` ranking
+nothing now reads "for the reason above" in the pane exactly as it already
+does in the CLI table.

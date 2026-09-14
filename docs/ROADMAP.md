@@ -1446,7 +1446,7 @@ cluster.
 
 ### Follow-ups from the panes' "nothing ranked" note
 
-- [ ] **Explain a failed pod listing in the node pane, so the booked
+- [x] **Explain a failed pod listing in the node pane, so the booked
   orderings can point at it.**
   `cpu-requested`, `memory-requested`, and `pods` always compute
   `Cause::Unexplained` in the node pane tonight, because the pane has no
@@ -1463,6 +1463,20 @@ cluster.
   `Missing::requests` in `ui::nodes::draw` reads it instead of the `false`
   this PR left there; a node pane that has never failed a pod listing is
   unchanged.
+  Landed as `k8s_nodes::requests_note`, beside `requests_unavailable` but not
+  sharing its exact wording: the CLI footnote names `CPU REQ`/`MEM REQ`,
+  columns this pane has never drawn — `node_line` only ever showed the usage
+  bars and the pod count — so naming them would send the reader looking for
+  text that does not exist here. The pane's own note instead names what the
+  pane actually loses: `PODS` reading `- pods`, and the three orderings that
+  went unexplained. `NodesFetch` carries it alongside `usage_note`, computed
+  once in `spawn_gather` from the same `Gathered::requests` the CLI already
+  had; `NodesState::Loaded` gained the field beside `usage_note` and
+  `refresh_error`, surviving a failed background refresh the same way those
+  two already do. `ui::nodes::draw` prints it above `usage_note`, matching
+  the CLI footnotes' own order, and `Missing::requests` now reads
+  `requests_note.is_some()` instead of the hardcoded `false` this task
+  existed to remove. See decision 97.
 
 - [ ] **Wire `metrics.k8s.io` into the pod-drilldown pane.**
   `commands::pods::spawn_gather_for_node` builds every row with `PodRow::
