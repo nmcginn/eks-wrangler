@@ -26,9 +26,11 @@ use std::collections::BTreeMap;
 
 use k8s_openapi::api::core::v1::{Container, Pod, PodSpec};
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity as ApiQuantity;
+use k8s_openapi::jiff::Timestamp;
 use kube::Client;
 use kube::api::{Api, ListParams};
 
+use crate::k8s::metrics::{self, Sample};
 use crate::k8s::page;
 use crate::k8s::quantity::Quantity;
 use crate::k8s::resource;
@@ -47,7 +49,10 @@ pub use order::{
     Missing, Order, cause, device_note, distinguishes, ranks_any, sort, sort_by_device,
 };
 pub use row::{PodRow, render, selector_note, shows_usage, usage_unavailable, usage_unsampled};
-pub(crate) use row::{device_hidden, nominated_node, order_hidden, pod_ip, readiness_gates};
+pub(crate) use row::{
+    device_hidden, nominated_node, order_hidden, pod_ip, readiness_gates, usage_cell,
+    usage_severity,
+};
 
 /// Pods that have finished linger in the API server until something collects
 /// them, and they hold nothing on the node. Excluding them server-side keeps a
@@ -493,6 +498,52 @@ fn occupied_node(pod: &Pod) -> Option<&str> {
         .node_name
         .as_deref()
         .filter(|name| !name.is_empty())
+}
+
+/// The usage-freshness note for a renderer that keeps its own copy of the
+/// rows rather than printing a footnote list — the dashboard's
+/// pod-drilldown pane, [`crate::k8s::nodes::usage_note`]'s counterpart here.
+///
+/// `list` foots the CLI table with a wrapped version of this: `Unsampled`
+/// gets [`usage_unsampled`], which names `CPU`/`MEMORY` because those are the
+/// table's own headings. The pane's rows have no such headings, so this uses
+/// [`metrics::unsampled`] bare rather than inventing a second wrapping for
+/// columns that do not exist. `Unreadable` says nothing here — the pane has
+/// no footnote list to add [`usage_unavailable`] to yet, and a row already
+/// reading `-` says the figure did not arrive.
+///
+/// The classification is [`metrics::Outcome::of`], asked of the rows rather
+/// than of the read result, for the reason its own doc comment gives: a read
+/// that answered for pods a selector kept out of the table must not be
+/// called `Shown` here either.
+#[must_use]
+pub fn usage_note(
+    rows: &[PodRow],
+    usage: &Result<(), String>,
+    samples: &[Option<Sample>],
+    now: Timestamp,
+    label: &str,
+) -> Option<String> {
+    match metrics::Outcome::of(usage.as_ref().ok(), shows_usage(rows)) {
+        metrics::Outcome::Shown => {
+            metrics::freshness(samples.iter().flatten(), now).map(metrics::freshness_note)
+        }
+        metrics::Outcome::Unsampled => Some(metrics::unsampled(label)),
+        metrics::Outcome::Unreadable => None,
+    }
+}
+
+/// Whether the pane's own [`usage_note`] already accounts for `Cpu`/
+/// `Memory`/`CpuShare`/`MemoryShare` ranking nothing —
+/// [`crate::k8s::nodes::usage_missing_explained`]'s counterpart here.
+///
+/// Recovered from what the pane already has, for the same reason the node
+/// pane's version is: [`shows_usage`] is false in both the unsampled and the
+/// unreadable case, and among those two `usage_note` is `Some` in exactly the
+/// unsampled one.
+#[must_use]
+pub fn usage_missing_explained(rows: &[PodRow], usage_note: Option<&str>) -> bool {
+    !shows_usage(rows) && usage_note.is_some()
 }
 
 #[cfg(test)]
@@ -1156,5 +1207,144 @@ mod tests {
     fn only_a_cluster_wide_scope_needs_a_namespace_column() {
         assert!(Scope::All.needs_namespace_column());
         assert!(!Scope::Namespace("payments".to_owned()).needs_namespace_column());
+    }
+
+    // --- `usage_note`/`usage_missing_explained`, the pod-drilldown pane's own
+    // reading of the same three cases `k8s::nodes::usage_note` answers ---
+
+    use k8s_openapi::jiff::SignedDuration;
+
+    use crate::k8s::metrics::Usage;
+    use crate::theme::Severity;
+
+    fn now() -> Timestamp {
+        "2026-08-19T12:00:00Z".parse().unwrap()
+    }
+
+    /// A minimal, unmeasured pod row — the same fixture shape
+    /// `commands::pods`'s and `ui::pods`'s own tests build.
+    fn pod_row(name: &str, cpu_used: Option<Quantity>) -> PodRow {
+        PodRow {
+            namespace: "payments".to_owned(),
+            name: name.to_owned(),
+            ready: "1/1".to_owned(),
+            status: "Running".to_owned(),
+            severity: Severity::Ok,
+            restarts: 0,
+            restart_age: None,
+            last_restart: None,
+            age: "3h".to_owned(),
+            created_at: None,
+            cpu_used,
+            memory_used: None,
+            usage_stale: false,
+            cpu_requested: Quantity::default(),
+            memory_requested: Quantity::default(),
+            extended_requested: BTreeMap::new(),
+            cpu_limit: None,
+            memory_limit: None,
+            node: "worker-1".to_owned(),
+            ip: "-".to_owned(),
+            nominated_node: "-".to_owned(),
+            readiness_gates: None,
+        }
+    }
+
+    fn sampled(cpu: &str, seconds_ago: i64) -> Sample {
+        Sample {
+            usage: Usage {
+                cpu: Some(quantity(cpu)),
+                memory: None,
+            },
+            taken_at: Some(now() - SignedDuration::from_secs(seconds_ago)),
+            window: Some(SignedDuration::from_secs(20)),
+        }
+    }
+
+    #[test]
+    fn usage_note_dates_the_pane_when_the_columns_reached_the_rows() {
+        let rows = [pod_row("api-1", Some(quantity("250m")))];
+        let samples = [Some(sampled("250m", 8))];
+
+        let note = usage_note(&rows, &Ok(()), &samples, now(), "prod (us-east-1)");
+
+        assert_eq!(
+            note.as_deref(),
+            Some("Usage is up to 8s old, averaged over 20s.")
+        );
+    }
+
+    #[test]
+    fn usage_note_for_an_unsampled_pane_is_the_bare_metrics_wording() {
+        // The pane has no `CPU`/`MEMORY` headings to name, unlike the CLI
+        // table's `usage_unsampled`, so this must not wrap the sentence in
+        // language about columns the pane does not have.
+        let rows = [pod_row("api-1", None)];
+
+        let note = usage_note(&rows, &Ok(()), &[None], now(), "prod (us-east-1)");
+
+        assert_eq!(
+            note.as_deref(),
+            Some(metrics::unsampled("prod (us-east-1)").as_str())
+        );
+        assert!(!note.unwrap().contains("CPU"));
+    }
+
+    #[test]
+    fn usage_note_is_silent_when_the_metrics_read_failed() {
+        // Out of scope for this task: the pane has no footnote list yet to add
+        // `usage_unavailable`'s explanation to, and an unsampled row already
+        // reads `-`.
+        let rows = [pod_row("api-1", None)];
+
+        let note = usage_note(
+            &rows,
+            &Err("no metrics.k8s.io API".to_owned()),
+            &[None],
+            now(),
+            "prod (us-east-1)",
+        );
+
+        assert_eq!(note, None);
+    }
+
+    #[test]
+    fn a_shown_usage_column_is_not_missing() {
+        let rows = [pod_row("api-1", Some(quantity("250m")))];
+        let note = usage_note(
+            &rows,
+            &Ok(()),
+            &[Some(sampled("250m", 8))],
+            now(),
+            "prod (us-east-1)",
+        );
+
+        assert!(!usage_missing_explained(&rows, note.as_deref()));
+    }
+
+    #[test]
+    fn an_unsampled_usage_column_is_missing_and_the_note_explains_it() {
+        let rows = [pod_row("api-1", None)];
+        let note = usage_note(&rows, &Ok(()), &[None], now(), "prod (us-east-1)");
+
+        assert!(usage_missing_explained(&rows, note.as_deref()));
+    }
+
+    #[test]
+    fn a_failed_usage_read_is_missing_but_the_pane_says_nothing_about_it() {
+        // The case the doc comment calls out: the pane has no footnote for a
+        // failed read, so this must stay honestly unexplained rather than
+        // claiming a note that was never printed.
+        let rows = [pod_row("api-1", None)];
+        let note = usage_note(
+            &rows,
+            &Err("no metrics.k8s.io API".to_owned()),
+            &[None],
+            now(),
+            "prod (us-east-1)",
+        );
+
+        assert_eq!(note, None);
+        assert!(!usage_missing_explained(&rows, note.as_deref()));
     }
 }

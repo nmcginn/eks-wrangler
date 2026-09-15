@@ -9,9 +9,14 @@ use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Wrap};
 
+use crate::k8s::metrics::mark_stale;
 use crate::k8s::nodes::{self as k8s_nodes, NodeRow};
 use crate::k8s::order::{self, Direction};
-use crate::k8s::pods::{Missing, Order, PodRow, cause, device_note, distinguishes, ranks_any};
+use crate::k8s::pods::{
+    Missing, Order, PodRow, cause, device_note, distinguishes, ranks_any, usage_cell,
+    usage_missing_explained, usage_severity,
+};
+use crate::k8s::quantity::{self, Quantity};
 use crate::theme::{Severity, Theme};
 
 /// What the pod-drilldown pane is showing, independent of how it is drawn.
@@ -28,6 +33,13 @@ pub enum PodsState {
         /// `--field-selector` the user typed is why the list is empty. See
         /// [`crate::commands::pods::PodsFetch::selector_note`].
         selector_note: Option<String>,
+        /// How stale the pane's own `cpu`/`mem` figures are, worded through
+        /// [`crate::k8s::pods::usage_note`] — the node pane's `usage_note`
+        /// field, for the same reason. `None` when there is nothing to date,
+        /// including when the metrics read failed outright: a row reading
+        /// `-` already says so. See
+        /// [`crate::commands::pods::PodsFetch::usage_note`].
+        usage_note: Option<String>,
     },
     /// The fetch failed; the message is already a full sentence, via
     /// `k8s::explain`.
@@ -101,6 +113,7 @@ pub(super) fn draw(
         PodsState::Loaded {
             rows,
             selector_note,
+            ..
         } if rows.is_empty() => {
             // A selector that matched nothing must not read like an empty
             // node, or the user goes looking for pods that are there but
@@ -112,10 +125,22 @@ pub(super) fn draw(
             );
             vec![Line::styled(message, theme.dim())]
         }
-        PodsState::Loaded { rows, .. } => {
+        PodsState::Loaded {
+            rows, usage_note, ..
+        } => {
             let mut lines = vec![Line::styled("PODS", theme.heading())];
             if !filter.is_empty() {
                 lines.push(Line::styled(format!("Filter: \"{filter}\""), theme.dim()));
+            }
+            // Split rather than handed straight to one `Line`, mirroring
+            // `nodes::draw`: a stale sample earns a second sentence of
+            // advice, and `ratatui` does not treat an embedded `\n` as a line
+            // break the way a terminal does.
+            if let Some(note) = usage_note {
+                lines.extend(
+                    note.lines()
+                        .map(|line| Line::styled(line.to_owned(), theme.dim())),
+                );
             }
             // The prompt's own line, shown only while `R` is capturing
             // keystrokes for it — before anything below has something to say
@@ -131,15 +156,17 @@ pub(super) fn draw(
                     if let Some(note) = order::note(order, direction) {
                         lines.push(Line::styled(note, theme.dim()));
                     }
-                    // This pane never samples usage for its own rows yet (see
-                    // `spawn_gather_for_node`), so `Missing::default()` —
-                    // `usage: false` — is always the honest reading: nothing
-                    // above these rows explains why `cpu`/`memory` ranked
-                    // nothing, because nothing is printed about metrics here
-                    // at all.
+                    // Now that this pane samples usage for its own rows (see
+                    // `commands::pods::gather_for_node`), the same split the
+                    // node pane's `usage_missing_explained` draws applies
+                    // here: a failed read stays honestly unexplained, and an
+                    // empty one points back at `usage_note` above.
+                    let missing = Missing {
+                        usage: usage_missing_explained(rows, usage_note.as_deref()),
+                    };
                     if let Some(note) = order::unranked_note(
                         order,
-                        cause(order, Missing::default()),
+                        cause(order, missing),
                         |candidate| ranks_any(rows, candidate),
                         |candidate| distinguishes(rows, candidate),
                     ) {
@@ -209,6 +236,28 @@ fn node_facts_lines(node: Option<&NodeRow>, theme: Theme) -> Vec<Line<'static>> 
     wide.chain(pressure).collect()
 }
 
+/// One row's `cpu`/`mem` figure — the pane's counterpart to
+/// [`crate::k8s::pods::row::Column::Cpu`]'s cell, built from the same
+/// [`usage_cell`] and [`usage_severity`] rather than a second reading of what
+/// the pod asked for. A pod with no sample yet, or that asked for nothing to
+/// be a share of, carries no judgement — the same "no colour is not a
+/// missing colour" rule the CLI table's cells follow — so this dims rather
+/// than borrowing a false `Ok`.
+fn usage_span(
+    label: &'static str,
+    used: Option<Quantity>,
+    requested: Quantity,
+    limit: Option<Quantity>,
+    show: fn(Quantity) -> String,
+    is_stale: bool,
+    theme: Theme,
+) -> Span<'static> {
+    let text = mark_stale(usage_cell(used, requested, show), is_stale);
+    let ink = usage_severity(used, requested, limit)
+        .map_or_else(|| theme.dim(), |severity| theme.severity(severity));
+    Span::styled(format!("{label} {text}"), ink)
+}
+
 fn pod_line(row: &PodRow, selected: bool, theme: Theme) -> Line<'static> {
     let restarts = match &row.restart_age {
         Some(age) => format!("{} ({age} ago)", row.restarts),
@@ -223,6 +272,26 @@ fn pod_line(row: &PodRow, selected: bool, theme: Theme) -> Line<'static> {
         Span::styled(row.ready.clone(), theme.dim()),
         Span::raw("  "),
         Span::styled(restarts, theme.dim()),
+        Span::raw("  "),
+        usage_span(
+            "cpu",
+            row.cpu_used,
+            row.cpu_requested,
+            row.cpu_limit,
+            quantity::cpu,
+            row.usage_stale,
+            theme,
+        ),
+        Span::raw("  "),
+        usage_span(
+            "mem",
+            row.memory_used,
+            row.memory_requested,
+            row.memory_limit,
+            quantity::memory,
+            row.usage_stale,
+            theme,
+        ),
         Span::raw("  "),
         Span::styled(row.age.clone(), theme.dim()),
     ];
@@ -408,6 +477,7 @@ mod tests {
         let state = PodsState::Loaded {
             rows: vec![pod("api-1"), pod("api-2")],
             selector_note: None,
+            usage_note: None,
         };
         let rendered = render(&state, None);
 
@@ -421,6 +491,7 @@ mod tests {
         let state = PodsState::Loaded {
             rows: Vec::new(),
             selector_note: None,
+            usage_note: None,
         };
         let rendered = render(&state, None);
         assert!(rendered.contains("no pods"), "{rendered}");
@@ -431,6 +502,7 @@ mod tests {
         let state = PodsState::Loaded {
             rows: vec![pod("api-1")],
             selector_note: None,
+            usage_note: None,
         };
         let rendered = render(&state, None);
         assert!(!rendered.contains("Sorted by"), "{rendered}");
@@ -441,6 +513,7 @@ mod tests {
         let state = PodsState::Loaded {
             rows: vec![pod("api-1")],
             selector_note: None,
+            usage_note: None,
         };
         let rendered = render_ordered(&state, None, Order::Restarts, Direction::Reversed);
         assert!(
@@ -454,6 +527,7 @@ mod tests {
         let state = PodsState::Loaded {
             rows: Vec::new(),
             selector_note: None,
+            usage_note: None,
         };
         let rendered = render_ordered(&state, None, Order::Restarts, Direction::Natural);
         assert!(!rendered.contains("Sorted by"), "{rendered}");
@@ -466,6 +540,7 @@ mod tests {
         let state = PodsState::Loaded {
             rows: vec![pod("api-1")],
             selector_note: None,
+            usage_note: None,
         };
 
         let rendered = render_ordered(&state, None, Order::Cpu, Direction::Natural);
@@ -493,6 +568,7 @@ mod tests {
                 },
             ],
             selector_note: None,
+            usage_note: None,
         };
 
         let rendered = render_ordered(&state, None, Order::Cpu, Direction::Natural);
@@ -513,6 +589,7 @@ mod tests {
         let state = PodsState::Loaded {
             rows: vec![sampled],
             selector_note: None,
+            usage_note: None,
         };
 
         let rendered = render_ordered(&state, None, Order::Cpu, Direction::Natural);
@@ -542,6 +619,7 @@ mod tests {
                 },
             ],
             selector_note: None,
+            usage_note: None,
         };
 
         let rendered = render_ordered(&state, None, Order::Cpu, Direction::Natural);
@@ -555,18 +633,38 @@ mod tests {
     }
 
     #[test]
-    fn this_pane_never_points_an_unranked_ordering_at_a_usage_note() {
-        // Unlike the node pane, this one has no usage note above its rows at
-        // all yet (see `spawn_gather_for_node`), so the diagnosis must never
-        // claim one explains the empty column.
+    fn a_failed_metrics_read_is_never_explained_by_a_reason_above() {
+        // `usage_note` is `None` for a failed read exactly as
+        // `k8s::pods::usage_note` leaves it (see its own doc comment): the
+        // pane has no footnote list to add `usage_unavailable`'s explanation
+        // to yet, so the diagnosis must not claim a reason above that was
+        // never printed.
         let state = PodsState::Loaded {
             rows: vec![pod("api-1")],
             selector_note: None,
+            usage_note: None,
         };
 
         let rendered = render_ordered(&state, None, Order::Memory, Direction::Natural);
 
         assert!(!rendered.contains("for the reason above"), "{rendered}");
+    }
+
+    #[test]
+    fn an_unsampled_usage_note_explains_an_unranked_ordering() {
+        // Unlike the failed-read case above, an unsampled read still earns a
+        // note — `k8s::pods::usage_note`'s `Unsampled` arm — and once it is
+        // printed, the ordering that ranked nothing on `cpu`/`memory` should
+        // point back at it, the same way the node pane's own diagnosis does.
+        let state = PodsState::Loaded {
+            rows: vec![pod("api-1")],
+            selector_note: None,
+            usage_note: Some("nothing here has been sampled yet".to_owned()),
+        };
+
+        let rendered = render_ordered(&state, None, Order::Memory, Direction::Natural);
+
+        assert!(rendered.contains("for the reason above"), "{rendered}");
     }
 
     #[test]
@@ -578,6 +676,7 @@ mod tests {
         let state = PodsState::Loaded {
             rows: Vec::new(),
             selector_note: Some("label selector `app=api`".to_owned()),
+            usage_note: None,
         };
         let rendered = render(&state, None);
 
@@ -605,6 +704,7 @@ mod tests {
         let state = PodsState::Loaded {
             rows: vec![pod("api-1")],
             selector_note: None,
+            usage_note: None,
         };
         assert_eq!(state.rows().len(), 1);
     }
@@ -614,6 +714,7 @@ mod tests {
         let state = PodsState::Loaded {
             rows: vec![pod("api-1")],
             selector_note: None,
+            usage_note: None,
         };
         let node = node_row("worker-1");
         for (width, height) in [(1, 1), (8, 3), (20, 2), (200, 60)] {
@@ -643,6 +744,7 @@ mod tests {
         let state = PodsState::Loaded {
             rows: vec![pod("api-1"), pod("api-2")],
             selector_note: None,
+            usage_note: None,
         };
         assert_eq!(
             render_filtered(&state, None, Order::default(), Direction::default(), ""),
@@ -655,6 +757,7 @@ mod tests {
         let state = PodsState::Loaded {
             rows: vec![pod("api-1"), pod("api-2")],
             selector_note: None,
+            usage_note: None,
         };
         let rendered = render_filtered(&state, None, Order::default(), Direction::default(), "2");
 
@@ -667,6 +770,7 @@ mod tests {
         let state = PodsState::Loaded {
             rows: vec![pod("api-1")],
             selector_note: None,
+            usage_note: None,
         };
         let rendered =
             render_filtered(&state, None, Order::default(), Direction::default(), "nope");
@@ -686,6 +790,7 @@ mod tests {
         let state = PodsState::Loaded {
             rows: vec![pod("api-1")],
             selector_note: Some("label selector `app=api`".to_owned()),
+            usage_note: None,
         };
         let rendered =
             render_filtered(&state, None, Order::default(), Direction::default(), "nope");
@@ -702,6 +807,7 @@ mod tests {
         let state = PodsState::Loaded {
             rows: vec![pod("api-1")],
             selector_note: None,
+            usage_note: None,
         };
         let node = node_row("worker-1");
 
@@ -726,6 +832,7 @@ mod tests {
         let state = PodsState::Loaded {
             rows: vec![pod("api-1")],
             selector_note: None,
+            usage_note: None,
         };
         let node = node_row("worker-1");
 
@@ -773,6 +880,7 @@ mod tests {
         let state = PodsState::Loaded {
             rows: vec![pod("api-1")],
             selector_note: None,
+            usage_note: None,
         };
 
         let rendered = render_with_node(&state, None);
@@ -817,6 +925,7 @@ mod tests {
         let state = PodsState::Loaded {
             rows: vec![pod_with_device("api-1", "nvidia.com/gpu", "2")],
             selector_note: None,
+            usage_note: None,
         };
 
         let rendered = render_resource_sorted(&state, "nvidia.com/gpu", Direction::Natural);
@@ -829,6 +938,7 @@ mod tests {
         let state = PodsState::Loaded {
             rows: vec![pod_with_device("api-1", "nvidia.com/gpu", "2")],
             selector_note: None,
+            usage_note: None,
         };
 
         let rendered = render_resource_sorted(&state, "nvidia.com/gpu", Direction::Reversed);
@@ -844,6 +954,7 @@ mod tests {
         let state = PodsState::Loaded {
             rows: Vec::new(),
             selector_note: None,
+            usage_note: None,
         };
 
         let rendered = render_resource_sorted(&state, "nvidia.com/gpu", Direction::Natural);
@@ -860,6 +971,7 @@ mod tests {
         let state = PodsState::Loaded {
             rows: vec![pod("api-1")],
             selector_note: None,
+            usage_note: None,
         };
 
         let rendered = render_resource_sorted(&state, "nvidia.com/gpu", Direction::Natural);
@@ -873,6 +985,7 @@ mod tests {
         let state = PodsState::Loaded {
             rows: vec![pod("api-1")],
             selector_note: None,
+            usage_note: None,
         };
 
         let rendered = render_resource_prompt(&state, "nvidia.com/g");
@@ -888,10 +1001,85 @@ mod tests {
         let state = PodsState::Loaded {
             rows: vec![pod_with_device("api-1", "nvidia.com/gpu", "2")],
             selector_note: None,
+            usage_note: None,
         };
 
         let rendered = render_resource_sorted(&state, "nvidia.com/gpu", Direction::Natural);
 
         assert!(!rendered.contains("Sort by resource:"), "{rendered}");
+    }
+
+    // --- `usage_note` and each row's own `cpu`/`mem` figure ---
+
+    #[test]
+    fn an_unsampled_pods_cpu_and_memory_read_as_a_dash() {
+        // The fixture's own default: no sample, no request — the honest
+        // reading for a pod nobody has measured yet, matching the CLI
+        // table's own fallback.
+        let state = PodsState::Loaded {
+            rows: vec![pod("api-1")],
+            selector_note: None,
+            usage_note: None,
+        };
+
+        let rendered = render(&state, None);
+
+        assert!(rendered.contains("cpu -"), "{rendered}");
+        assert!(rendered.contains("mem -"), "{rendered}");
+    }
+
+    #[test]
+    fn a_sampled_pods_cpu_and_memory_are_shown_against_its_request() {
+        let sampled = PodRow {
+            cpu_used: Some(Quantity::parse("250m").unwrap()),
+            cpu_requested: Quantity::parse("500m").unwrap(),
+            memory_used: Some(Quantity::parse("512Mi").unwrap()),
+            memory_requested: Quantity::parse("1Gi").unwrap(),
+            ..pod("api-1")
+        };
+        let state = PodsState::Loaded {
+            rows: vec![sampled],
+            selector_note: None,
+            usage_note: None,
+        };
+
+        let rendered = render(&state, None);
+
+        assert!(rendered.contains("cpu 250m (50%)"), "{rendered}");
+        assert!(rendered.contains("mem 512Mi (50%)"), "{rendered}");
+    }
+
+    #[test]
+    fn a_stale_samples_figure_is_marked_in_the_row() {
+        let stale_pod = PodRow {
+            cpu_used: Some(Quantity::parse("250m").unwrap()),
+            usage_stale: true,
+            ..pod("api-1")
+        };
+        let state = PodsState::Loaded {
+            rows: vec![stale_pod],
+            selector_note: None,
+            usage_note: None,
+        };
+
+        let rendered = render(&state, None);
+
+        assert!(rendered.contains("cpu 250m (stale)"), "{rendered}");
+    }
+
+    #[test]
+    fn a_usage_note_is_drawn_above_the_pod_list() {
+        let state = PodsState::Loaded {
+            rows: vec![pod("api-1")],
+            selector_note: None,
+            usage_note: Some("Usage is up to 8s old, averaged over 20s.".to_owned()),
+        };
+
+        let rendered = render(&state, None);
+
+        assert!(
+            rendered.contains("Usage is up to 8s old, averaged over 20s."),
+            "{rendered}"
+        );
     }
 }

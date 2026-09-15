@@ -705,6 +705,7 @@ impl App {
             Ok(fetch) => PodsState::Loaded {
                 rows: fetch.rows,
                 selector_note: fetch.selector_note,
+                usage_note: fetch.usage_note,
             },
             Err(error) => PodsState::Error(error.message),
         };
@@ -2315,6 +2316,7 @@ mod tests {
         app.apply_pods(Ok(PodsFetch {
             rows: vec![pod_row("api-1")],
             selector_note: None,
+            usage_note: None,
         }));
         app
     }
@@ -2844,6 +2846,7 @@ mod tests {
         app.apply_pods(Ok(PodsFetch {
             rows: vec![pod_row("api-1")],
             selector_note: None,
+            usage_note: None,
         }));
         app.on_key(press(KeyCode::Enter));
         assert!(matches!(app.view(), View::PodContainers { .. }));
@@ -2919,6 +2922,7 @@ mod tests {
         app.apply_pods(Ok(PodsFetch {
             rows: vec![pod_row("api-1")],
             selector_note: None,
+            usage_note: None,
         }));
 
         let mut terminal = Terminal::new(TestBackend::new(90, 20)).unwrap();
@@ -3353,6 +3357,7 @@ mod tests {
             &PodsState::Loaded {
                 rows: vec![pod_row("api-1")],
                 selector_note: None,
+                usage_note: None,
             }
         );
     }
@@ -3687,6 +3692,7 @@ mod tests {
         app.apply_pods(Ok(PodsFetch {
             rows: vec![pod_row("api-1")],
             selector_note: None,
+            usage_note: None,
         }));
         app.on_key(press(KeyCode::Enter));
         assert_eq!(app.containers(), &ContainersState::Loading);
@@ -3709,6 +3715,7 @@ mod tests {
             &PodsState::Loaded {
                 rows: Vec::new(),
                 selector_note: None,
+                usage_note: None,
             }
         );
     }
@@ -3720,6 +3727,7 @@ mod tests {
         app.apply_pods(Ok(PodsFetch {
             rows: Vec::new(),
             selector_note: Some("label selector `app=api`".to_owned()),
+            usage_note: None,
         }));
 
         assert_eq!(
@@ -3727,6 +3735,7 @@ mod tests {
             &PodsState::Loaded {
                 rows: Vec::new(),
                 selector_note: Some("label selector `app=api`".to_owned()),
+                usage_note: None,
             }
         );
     }
@@ -4144,6 +4153,7 @@ mod tests {
         app.apply_pods(Ok(PodsFetch {
             rows: vec![pod_row("api-1")],
             selector_note: None,
+            usage_note: None,
         }));
 
         app.on_key(press(KeyCode::Char('R')));
@@ -4167,6 +4177,7 @@ mod tests {
                 pod_row_with_device("bravo", "nvidia.com/gpu", "2"),
             ],
             selector_note: None,
+            usage_note: None,
         }));
 
         app.on_key(press(KeyCode::Char('R')));
@@ -4200,6 +4211,7 @@ mod tests {
                 pod_row_with_device("bravo", "nvidia.com/gpu", "2"),
             ],
             selector_note: None,
+            usage_note: None,
         }));
         app.on_key(press(KeyCode::Char('R')));
         for c in "nvidia.com/gpu".chars() {
@@ -4233,6 +4245,7 @@ mod tests {
         app.apply_pods(Ok(PodsFetch {
             rows: vec![pod_row_with_device("alpha", "nvidia.com/gpu", "1")],
             selector_note: None,
+            usage_note: None,
         }));
         app.on_key(press(KeyCode::Char('R')));
         for c in "nvidia.com/gpu".chars() {
@@ -4256,6 +4269,7 @@ mod tests {
                 pod_row_with_device("bravo", "nvidia.com/gpu", "2"),
             ],
             selector_note: None,
+            usage_note: None,
         }));
         app.on_key(press(KeyCode::Char('R')));
         for c in "nvidia.com/gpu".chars() {
