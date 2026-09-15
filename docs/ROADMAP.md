@@ -1492,7 +1492,7 @@ cluster.
   `requests_note.is_some()` instead of the hardcoded `false` this task
   existed to remove. See decision 98.
 
-- [ ] **Wire `metrics.k8s.io` into the pod-drilldown pane.**
+- [x] **Wire `metrics.k8s.io` into the pod-drilldown pane.**
   `commands::pods::spawn_gather_for_node` builds every row with `PodRow::
   from_pod(pod, None, now)` — no usage sample, ever — so `--sort cpu`/`--sort
   memory` in that pane can only ever rank nothing, and the diagnosis this PR
@@ -1509,6 +1509,47 @@ cluster.
   answered with nothing — rather than the `Missing::default()` this PR left
   there; a pane that has not sampled a container's usage keeps reading `-`
   wherever it does today.
+  Landed as the same `tokio::join!` pair `commands::pods::list` already runs,
+  scoped to `Scope::All` with the user's own `-l`/`--field-selector` (not the
+  node-scoped field selector): metrics-server does not implement field
+  filtering, so the listing is narrowed by the namespace/name join exactly as
+  `list`'s own doc comment already explains — the node filter would have
+  been sent for nothing. The refresh-cadence question the task left open is
+  answered "no change, yet": this fetch still runs once per drill-in, the same
+  as the pod listing beside it, rather than growing its own interval —
+  reopening that is its own decision now that the pane has something to
+  refresh, and it is the follow-up below. `k8s::pods::usage_note`/
+  `usage_missing_explained` mirror `k8s::nodes`'s own pair field-for-field,
+  reading `PodRow` instead of `NodeRow`. `PodsFetch`/`PodsState::Loaded` both
+  gained a `usage_note` field carried the same way `NodesFetch`/
+  `NodesState::Loaded` already carry theirs. The rows had the figures all
+  along — `PodRow::cpu_used`/`memory_used`/`cpu_requested`/`cpu_limit` exist
+  for `--sort cpu`/`--sort-resource` to read — but `ui::pods::pod_line` had
+  never drawn them, so `--sort cpu` sorted a column nobody could see even once
+  it started ranking something; `usage_cell`/`usage_severity` moved from
+  `k8s::pods::row`-private to `pub(crate)` so the pane could build the same
+  `262m (52%)` cell the CLI table does, rather than a second reading of what a
+  pod asked for, each row now printing `cpu 262m (52%)`/`mem 512Mi (80%)`
+  through a new `ui::pods::usage_span` that wraps them in `metrics::mark_stale`
+  and the CLI table's own severity judgement. See decision 99.
+
+### Follow-ups from wiring `metrics.k8s.io` into the pod-drilldown pane
+
+- [ ] **Refresh the pod-drilldown pane's usage on an interval, not only on
+  drill-in.**
+  The node pane refreshes its usage bars on `RefreshInterval`/`r`; the
+  pod-drilldown pane fetches once per node and never again, which the task
+  above left unchanged rather than guessed at. A pod's CPU/memory moves faster
+  than its status does, so a pane a reader leaves open now shows figures that
+  age silently — the same problem "Say that a listing is still arriving"
+  answered for a slow first fetch, but for a *stale* one instead. Separate
+  because it is a real decision the task above deliberately declined to make:
+  whether this pane gets its own `RefreshInterval`, shares the node pane's,
+  or only refreshes while it is the focused view, and reopening it needs the
+  usage figures to exist first.
+  *Acceptance:* whichever cadence it takes, the fetch goes through
+  `commands::pods::gather_for_node` rather than a second reading of the join;
+  a pane nobody leaves open long enough to matter is unchanged.
 
 ### Follow-ups from the dashboard's selectors
 

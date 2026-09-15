@@ -353,6 +353,11 @@ pub struct PodsFetch {
     /// which answers the same question for the CLI table. `None` when no
     /// selector is active, so the pane keeps its plainer wording.
     pub selector_note: Option<String>,
+    /// How stale the pane's own `CPU`/`MEMORY` figures are, worded through
+    /// [`k8s_pods::usage_note`] — the node pane's `usage_note` field, for the
+    /// same reason. `None` when there is nothing to date, including when the
+    /// metrics read failed outright: a row reading `-` already says so.
+    pub usage_note: Option<String>,
 }
 
 /// Fetch the pods placed on one node, on a background thread.
@@ -360,15 +365,21 @@ pub struct PodsFetch {
 /// The dashboard's pod-browsing pane calls this once each time it is asked to
 /// show a different node — unlike the node pane, it does not refresh itself
 /// on an interval yet, which the dashboard follow-ups leave as its own task.
-/// No usage figures are fetched either: a node's pods are already a full
-/// round trip of their own, and wiring `metrics.k8s.io` into a third pane
-/// reads better as a considered addition than as a rider on this one.
+///
+/// Usage figures come along for the ride, from the same `metrics.k8s.io`
+/// endpoint [`list`] reads: the two requests run concurrently, the same
+/// "independent fetches, partial degradation" rule every other multi-request
+/// fetch in this module follows, so a metrics-server outage costs this pane
+/// two columns rather than the whole listing.
 ///
 /// `selectors` is whatever the user typed with `-l`/`--field-selector`,
 /// already validated by [`selectors_for`] — the same function and the same
 /// rejection path `eks pods` uses, so a selector means one thing across the
 /// tool. It is combined with the pane's own `spec.nodeName` filter rather
-/// than replacing it.
+/// than replacing it. The metrics endpoint is asked with the user's own
+/// selectors rather than the node-scoped ones, matching [`list`]: it does not
+/// implement field filtering, and the listing is narrowed by the join below
+/// instead — see [`k8s_metrics::pod_params`](crate::k8s::metrics::pod_params).
 #[must_use]
 pub fn spawn_gather_for_node(
     config: KubeConfig,
@@ -407,15 +418,47 @@ async fn gather_for_node(
     let client = k8s::connect(paths, &target, budget, &Progress::none()).await?;
 
     let scoped = scoped_to_node(node, selectors);
-    let pods = k8s_pods::fetch_scope(client, &Scope::All, &scoped, budget, &Progress::none())
-        .await
-        .map_err(|error| k8s::client::Error::explained(&error, &label))?;
+    let progress = Progress::none();
+    // Concurrently, not in sequence, the same trade [`list`] makes for its own
+    // pair: the two requests are independent, and the pane should cost one
+    // round trip's worth of waiting rather than two.
+    let (pods, usage) = tokio::join!(
+        k8s_pods::fetch_scope(client.clone(), &Scope::All, &scoped, budget, &progress),
+        k8s_metrics::usage_by_pod(&client, &Scope::All, selectors, budget, &progress),
+    );
+    let pods = pods.map_err(|error| k8s::client::Error::explained(&error, &label))?;
 
+    // Only the pod listing is fatal — metrics-server is an add-on EKS does not
+    // install for you, and a pane with names and statuses but no usage
+    // figures still beats one that errored outright.
+    let usage: Result<_, String> = usage.map_err(|error| {
+        tracing::debug!(%error, "reading pod metrics failed");
+        k8s_metrics::explain(&error, &label)
+    });
+
+    // One instant for every row, matching `list`'s own reasoning: the samples
+    // are wanted twice, once for the figures and once to date the pane.
     let now = Timestamp::now();
-    let rows = pods
+    let samples: Vec<Option<k8s_metrics::Sample>> = pods
         .iter()
-        .map(|pod| PodRow::from_pod(pod, None, now))
+        .map(|pod| {
+            usage.as_ref().ok().and_then(|samples| {
+                let namespace = pod.metadata.namespace.as_deref()?;
+                let name = pod.metadata.name.as_deref()?;
+                samples
+                    .get(&(namespace.to_owned(), name.to_owned()))
+                    .copied()
+            })
+        })
         .collect();
+
+    let rows: Vec<PodRow> = pods
+        .iter()
+        .zip(&samples)
+        .map(|(pod, sample)| PodRow::from_pod(pod, *sample, now))
+        .collect();
+
+    let usage_note = k8s_pods::usage_note(&rows, &usage.map(|_| ()), &samples, now, &label);
 
     Ok(PodsFetch {
         rows,
@@ -423,6 +466,7 @@ async fn gather_for_node(
         // implicit in "this is the node's pane", never something to explain
         // back to the user as a reason the list came back empty.
         selector_note: k8s_pods::selector_note(selectors),
+        usage_note,
     })
 }
 

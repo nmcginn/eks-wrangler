@@ -732,7 +732,11 @@ fn restarts_cell(row: &PodRow) -> String {
 /// figure: `ratio_of` declines a zero denominator, which is exactly the pod
 /// that asked for nothing, so the two cases are one branch rather than a
 /// second check for zero that could come to disagree with it.
-fn usage_cell(used: Option<Quantity>, requested: Quantity, show: fn(Quantity) -> String) -> String {
+pub(crate) fn usage_cell(
+    used: Option<Quantity>,
+    requested: Quantity,
+    show: fn(Quantity) -> String,
+) -> String {
     let Some(used) = used else {
         return UNKNOWN.to_owned();
     };
@@ -761,7 +765,7 @@ fn usage_cell(used: Option<Quantity>, requested: Quantity, show: fn(Quantity) ->
 /// whose containers left the limit unbounded stays on
 /// [`Severity::from_request_share`] alone, reading exactly as it did before
 /// this existed.
-fn usage_severity(
+pub(crate) fn usage_severity(
     used: Option<Quantity>,
     requested: Quantity,
     limit: Option<Quantity>,

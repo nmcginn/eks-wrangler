@@ -3576,3 +3576,41 @@ live — now reads `requests_note.is_some()`, which is the one line the whole
 task was building toward: `cpu-requested`/`memory-requested`/`pods` ranking
 nothing now reads "for the reason above" in the pane exactly as it already
 does in the CLI table.
+
+### 99. The pod-drilldown pane's usage fetch is scoped like `eks pods`'s, and its refresh cadence is left for its own decision
+
+Wiring `metrics.k8s.io` into `commands::pods::gather_for_node` raised two
+questions the roadmap task left open, and both had an existing answer to
+borrow rather than invent.
+
+The first was what to scope the metrics request to. The pod listing itself is
+scoped with `spec.nodeName=<node>` ANDed onto the user's own field selector
+(`scoped_to_node`), because it needs exactly this node's pods. The metrics
+endpoint cannot take that filter at all — `k8s_metrics::pod_params`'s own doc
+comment says so: metrics-server does not implement field filtering, and
+`spec.nodeName` is not a field `PodMetrics` carries in the first place. Asking
+it with the node-scoped selector would have sent a filter the server cannot
+honour for no benefit; asking it with `Scope::All` and the user's own
+selectors, exactly as `commands::pods::list` already does for the CLI table,
+lets the existing namespace/name join narrow the result to this node's rows,
+the same way it already narrows out everything a `-l`/`--field-selector` kept
+off the table.
+
+The second was refresh cadence: the node pane refreshes on `RefreshInterval`,
+and this pane still fetches once per node, unchanged. The roadmap task's own
+wording flagged this as a real decision rather than a detail this PR could
+guess at, and building a second refresh loop here would have been exactly
+that guess — worse, a guess made *before* the pane had any usage figures
+worth refreshing. Reopening it is the follow-up entry left in
+`docs/ROADMAP.md`, now that there is something on screen to keep current.
+
+One more small call fell out of drawing the figures at all: `k8s::pods::row`'s
+`usage_cell`/`usage_severity` moved from module-private to `pub(crate)` rather
+than the pane growing a second copy of "a bare figure when there is no
+request to be a share of, `metrics::mark_stale`'s marker when the sample is
+old." `k8s::pods::row::Column::Cpu`'s own `text`/`severity` methods stayed
+private — they are `Column`'s business, tied to the CLI table's cell/heading
+shape — but the two pure functions underneath them belong to neither renderer
+in particular, and a second reading of "150% of request is a `Warn`, 300% is a
+`Critical`, and a known limit overrides both past 100%" is exactly the kind of
+drift `CLAUDE.md` asks this codebase to avoid.
