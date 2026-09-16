@@ -363,8 +363,12 @@ pub struct PodsFetch {
 /// Fetch the pods placed on one node, on a background thread.
 ///
 /// The dashboard's pod-browsing pane calls this once each time it is asked to
-/// show a different node — unlike the node pane, it does not refresh itself
-/// on an interval yet, which the dashboard follow-ups leave as its own task.
+/// show a different node, and again on the node pane's own refresh triggers —
+/// `r`, the refresh interval, a successful login — for as long as that node's
+/// pane is the one on screen (`ui::pods_refresh_target`, `ui::refetch_pods`):
+/// a pod's CPU and memory move faster than its status does, so a pane a
+/// reader leaves open must not show figures that age silently the way a
+/// once-per-drill-in fetch would.
 ///
 /// Usage figures come along for the ride, from the same `metrics.k8s.io`
 /// endpoint [`list`] reads: the two requests run concurrently, the same

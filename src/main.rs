@@ -212,10 +212,12 @@ fn dashboard(
     };
 
     // The pod-browsing pane's counterpart: called once each time drilling
-    // into a node changes which one the detail pane is showing. `selectors`
-    // is fixed for the life of the session — set from `-l`/`--field-selector`
-    // at startup, the same flags `eks pods` reads — so every node's pods are
-    // filtered by the one the user typed rather than the pane growing its own.
+    // into a node changes which one the detail pane is showing, and again on
+    // that pane's own refresh triggers for as long as it stays on screen
+    // (`ui::refetch_pods`). `selectors` is fixed for the life of the session —
+    // set from `-l`/`--field-selector` at startup, the same flags `eks pods`
+    // reads — so every node's pods are filtered by the one the user typed
+    // rather than the pane growing its own.
     let spawn_pods: ui::PodsFetcher = {
         let config = config.clone();
         let paths = paths.to_vec();

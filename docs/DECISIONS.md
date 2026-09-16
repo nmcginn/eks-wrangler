@@ -3614,3 +3614,47 @@ shape — but the two pure functions underneath them belong to neither renderer
 in particular, and a second reading of "150% of request is a `Warn`, 300% is a
 `Critical`, and a known limit overrides both past 100%" is exactly the kind of
 drift `CLAUDE.md` asks this codebase to avoid.
+
+### 100. The pod-drilldown pane shares the node pane's refresh triggers, and keeps its rows over a failed one
+
+Decision 99 left the pod-drilldown pane's refresh cadence open, on the
+grounds that reopening it before the pane had usage figures worth refreshing
+would have been a guess made too early. The roadmap task that came back to it
+named three shapes: a `RefreshInterval` of its own, sharing the node pane's,
+or refreshing only while it is the focused view.
+
+The answer taken is the second and third together, not a choice between them:
+`event_loop` already has exactly one refresh clock — the interval tick, `r`,
+and a successful login all already refetch the node listing through
+`refetch` — and the pod-drilldown pane now rides the same three triggers
+through a new `refetch_pods`, rather than a second `RefreshInterval` a config
+file does not exist yet to carry (see the `Config file` entry still open in
+`docs/ROADMAP.md`) or a `--pod-refresh` flag nobody asked for. "Only while
+focused" was not a separate design to weigh against that — it falls out of
+`pods_refresh_target`, the pure function every trigger reads first: it names
+the node behind `View::NodePods` and nothing else, so a reader who has
+drilled further in, into a pod's containers or a container's log, or backed
+out to the node listing, is not charged for a fetch nothing on screen would
+show. `commands::pods::spawn_gather_for_node`'s own doc comment is updated to
+match — it no longer claims to run once per node.
+
+Refreshing in the background raised the question `apply_pods` had
+deliberately answered the other way: its doc comment used to justify
+overwriting on any failure by pointing at the pane's own one-shot fetch, which
+this task removes. `apply_pods` now follows `apply_nodes`'s rule instead — a
+failure after an earlier fetch had already succeeded keeps the last good rows
+on screen as a new `PodsState::Loaded::refresh_error` field, `NodesState`'s
+own field mirrored rather than reinvented, so one bad poll does not read as
+the node having lost every pod. `ui::pods::draw` shows it the same way
+`ui::nodes::draw` shows `refresh_error` — a "Last refresh failed: …" line in
+`Severity::Warn` above the row list — with the same gap left standing rather
+than papered over: an empty listing's own branch is matched before the
+refresh-error branch runs, so a node whose last known pod count was genuinely
+zero and then suffers a failed refresh reads as "This node has no pods."
+with no mention of the failure, exactly as an empty node listing already does
+on the node pane. Threading a login hint into this pane's inline text, the
+way `ui::nodes::draw` does with `hint_lines`, is left alone: the pane had no
+such text on a bare `PodsState::Error` before tonight either, `L` is already
+offered in the footer regardless of which pane is showing, and wiring one in
+is a pre-existing gap this task did not create rather than a thought it left
+unfinished.

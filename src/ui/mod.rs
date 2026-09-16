@@ -695,19 +695,38 @@ impl App {
 
     /// Apply the outcome of a fetch for one node's pods.
     ///
-    /// Unlike [`Self::apply_nodes`], a failure always overwrites: the
-    /// pod-drilldown pane fetches once per node it is asked to show rather
-    /// than refreshing in the background, so there is no earlier good
-    /// listing for this node worth keeping over a failed one.
+    /// The pod-drilldown pane now refreshes in the background too (see
+    /// `pods_refresh_target`), so this follows [`Self::apply_nodes`]'s own
+    /// rule rather than the one-shot behaviour it used to: a failure after an
+    /// earlier fetch had already loaded keeps the last good rows on screen,
+    /// as `refresh_error`, rather than blanking them — a pane a reader left
+    /// open must not read as "this node lost every pod" over one missed
+    /// poll. A failure with nothing loaded yet is still the full-pane error
+    /// it always was.
     pub fn apply_pods(&mut self, result: Result<PodsFetch, FetchError>) {
         self.credentials_lost = result.as_ref().is_err_and(|error| error.credentials);
-        self.pods = match result {
-            Ok(fetch) => PodsState::Loaded {
+        self.pods = match (result, std::mem::take(&mut self.pods)) {
+            (Ok(fetch), _) => PodsState::Loaded {
                 rows: fetch.rows,
                 selector_note: fetch.selector_note,
                 usage_note: fetch.usage_note,
+                refresh_error: None,
             },
-            Err(error) => PodsState::Error(error.message),
+            (
+                Err(error),
+                PodsState::Loaded {
+                    rows,
+                    selector_note,
+                    usage_note,
+                    ..
+                },
+            ) => PodsState::Loaded {
+                rows,
+                selector_note,
+                usage_note,
+                refresh_error: Some(error.message),
+            },
+            (Err(error), _) => PodsState::Error(error.message),
         };
         self.sort_pods();
     }
@@ -1484,7 +1503,10 @@ impl App {
 /// [`commands::nodes::spawn_gather`](crate::commands::nodes::spawn_gather)).
 /// `spawn_pods` is the same idea for a node's pods, called with the selected
 /// cluster's context and the drilled-into node's name whenever the detail
-/// pane's view changes to [`View::NodePods`]. `spawn_containers` is one level
+/// pane's view changes to [`View::NodePods`], and again on the same three
+/// triggers `spawn_nodes` answers to — `r`, the refresh interval, a
+/// successful login — for as long as that view is the one on screen (see
+/// `pods_refresh_target`, `refetch_pods`). `spawn_containers` is one level
 /// further in: the selected cluster's context, and the namespace and name of
 /// the drilled-into pod, whenever the view changes to [`View::PodContainers`].
 /// `spawn_logs` is the last level: the selected cluster's context, the
@@ -1669,6 +1691,12 @@ where
 
         if next_refresh.is_some_and(|at| Instant::now() >= at) {
             refetch(spawn_nodes, &mut nodes_rx, selected_context.as_deref());
+            refetch_pods(
+                drill,
+                app.view(),
+                selected_context.as_deref(),
+                &mut inflight,
+            );
             next_refresh = schedule(refresh);
         }
 
@@ -1696,6 +1724,12 @@ where
                     // into rows without a second keystroke.
                     Ok(()) => {
                         refetch(spawn_nodes, &mut nodes_rx, selected_context.as_deref());
+                        refetch_pods(
+                            drill,
+                            app.view(),
+                            selected_context.as_deref(),
+                            &mut inflight,
+                        );
                         next_refresh = schedule(refresh);
                     }
                     Err(message) => app.apply_login_failure(message),
@@ -1706,6 +1740,12 @@ where
 
         if is_refresh_key(key) {
             refetch(spawn_nodes, &mut nodes_rx, selected_context.as_deref());
+            refetch_pods(
+                drill,
+                app.view(),
+                selected_context.as_deref(),
+                &mut inflight,
+            );
             next_refresh = schedule(refresh);
         }
 
@@ -1810,6 +1850,40 @@ fn refetch(
 ) {
     if let Some(context) = selected_context {
         *nodes_rx = Some(spawn_nodes(context));
+    }
+}
+
+/// The node whose pods should be refetched right now, or `None` when the
+/// detail pane is not on [`View::NodePods`] — the pane's own answer to
+/// "am I the one currently on screen", read by every trigger that also
+/// refetches the node listing (the interval tick, `r`, and a successful
+/// login) so a reader who has drilled further in, into a pod's containers or
+/// its logs, does not pay for a fetch nothing is showing. Pulled out of
+/// [`refetch_pods`] as a pure function so the "which view counts" rule is a
+/// fixture rather than something only a live event loop exercises.
+fn pods_refresh_target(view: &View) -> Option<&str> {
+    match view {
+        View::NodePods { node } => Some(node),
+        View::Overview | View::PodContainers { .. } | View::ContainerLogs { .. } => None,
+    }
+}
+
+/// Refresh the pod-drilldown pane's rows in place, the same trigger points
+/// [`refetch`] uses for the node listing beside it — this pane fetches once
+/// per node no longer, matching `commands::pods::spawn_gather_for_node`'s own
+/// updated doc comment. Replaces whatever pod fetch was already in flight
+/// rather than adding a second one; a no-op when nothing is selected or the
+/// pane showing right now is not [`View::NodePods`], so a reader who has
+/// drilled deeper, or backed out to the node listing, is not charged for a
+/// fetch nobody would see land.
+fn refetch_pods(
+    drill: &DrillFetchers<'_>,
+    view: &View,
+    selected_context: Option<&str>,
+    inflight: &mut Inflight,
+) {
+    if let (Some(context), Some(node)) = (selected_context, pods_refresh_target(view)) {
+        inflight.pods = Some((drill.spawn_pods)(context, node));
     }
 }
 
@@ -3051,6 +3125,37 @@ mod tests {
     }
 
     #[test]
+    fn pods_refresh_target_names_the_node_under_the_node_pods_view() {
+        let view = View::NodePods {
+            node: "worker-1".to_owned(),
+        };
+        assert_eq!(pods_refresh_target(&view), Some("worker-1"));
+    }
+
+    #[test]
+    fn pods_refresh_target_is_none_off_the_node_pods_view() {
+        assert_eq!(pods_refresh_target(&View::Overview), None);
+        assert_eq!(
+            pods_refresh_target(&View::PodContainers {
+                node: "worker-1".to_owned(),
+                namespace: "default".to_owned(),
+                pod: "api-1".to_owned(),
+            }),
+            None
+        );
+        assert_eq!(
+            pods_refresh_target(&View::ContainerLogs {
+                node: "worker-1".to_owned(),
+                namespace: "default".to_owned(),
+                pod: "api-1".to_owned(),
+                container: "app".to_owned(),
+                previous: false,
+            }),
+            None
+        );
+    }
+
+    #[test]
     fn refresh_interval_parses_and_prints_the_same_grammar_timeout_does() {
         assert_eq!(
             RefreshInterval::from_str("15s").unwrap(),
@@ -3358,6 +3463,7 @@ mod tests {
                 rows: vec![pod_row("api-1")],
                 selector_note: None,
                 usage_note: None,
+                refresh_error: None,
             }
         );
     }
@@ -3716,6 +3822,7 @@ mod tests {
                 rows: Vec::new(),
                 selector_note: None,
                 usage_note: None,
+                refresh_error: None,
             }
         );
     }
@@ -3736,23 +3843,43 @@ mod tests {
                 rows: Vec::new(),
                 selector_note: Some("label selector `app=api`".to_owned()),
                 usage_note: None,
+                refresh_error: None,
             }
         );
     }
 
     #[test]
-    fn apply_pods_moves_a_failure_into_the_error_state_even_after_a_success() {
-        // Unlike the node pane, the pod pane fetches once per node rather
-        // than refreshing in the background, so there is no earlier good
-        // listing for *this* node worth keeping over a failed one.
+    fn apply_pods_moves_a_failure_into_the_error_state() {
         let mut app = app();
-        app.apply_pods(Ok(PodsFetch::default()));
 
         app.apply_pods(Err(failed("could not list pods")));
 
         assert_eq!(
             app.pods(),
             &PodsState::Error("could not list pods".to_owned())
+        );
+    }
+
+    #[test]
+    fn apply_pods_keeps_the_last_good_rows_when_a_background_refresh_fails() {
+        // The pod-drilldown pane now refreshes on the same interval and `r`
+        // press the node pane does (see `pods_refresh_target`), so a failure
+        // is no longer necessarily the *first* answer this pane gets: one
+        // bad poll after a good one must not blank it back to an error
+        // screen, mirroring `a_failed_refresh_after_a_loaded_pane_keeps_its_rows`.
+        let mut app = app();
+        app.apply_pods(Ok(PodsFetch::default()));
+
+        app.apply_pods(Err(failed("could not list pods: nope")));
+
+        assert_eq!(
+            app.pods(),
+            &PodsState::Loaded {
+                rows: Vec::new(),
+                selector_note: None,
+                usage_note: None,
+                refresh_error: Some("could not list pods: nope".to_owned()),
+            }
         );
     }
 
