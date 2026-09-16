@@ -1535,7 +1535,7 @@ cluster.
 
 ### Follow-ups from wiring `metrics.k8s.io` into the pod-drilldown pane
 
-- [ ] **Refresh the pod-drilldown pane's usage on an interval, not only on
+- [x] **Refresh the pod-drilldown pane's usage on an interval, not only on
   drill-in.**
   The node pane refreshes its usage bars on `RefreshInterval`/`r`; the
   pod-drilldown pane fetches once per node and never again, which the task
@@ -1550,6 +1550,23 @@ cluster.
   *Acceptance:* whichever cadence it takes, the fetch goes through
   `commands::pods::gather_for_node` rather than a second reading of the join;
   a pane nobody leaves open long enough to matter is unchanged.
+  Landed as both of the last two answers at once, not a choice between them:
+  the pod-drilldown pane now rides the same three triggers `spawn_nodes`
+  already answers to — the refresh interval, `r`, a successful login —
+  through a new `ui::refetch_pods`, rather than growing a `RefreshInterval`
+  of its own with nowhere yet to be configured from (see `Config file`,
+  still open below). "Only while focused" fell out of that rather than
+  needing its own decision: `ui::pods_refresh_target`, the pure function
+  every trigger reads first, names the node behind `View::NodePods` and
+  nothing else, so a reader drilled further into a pod's containers or a
+  container's log is not charged for a fetch nothing on screen would show.
+  Refreshing in the background meant `App::apply_pods` could no longer
+  overwrite on any failure the way it used to — that was fine for a pane
+  that fetched once, and wrong for one that polls — so it now follows
+  `apply_nodes`'s own rule: a failure after an earlier success keeps the
+  last good rows on screen as a new `PodsState::Loaded::refresh_error`,
+  drawn the same "Last refresh failed: …" line `ui::nodes::draw` already
+  prints for its own field. See decision 100.
 
 ### Follow-ups from the dashboard's selectors
 

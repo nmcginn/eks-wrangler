@@ -40,6 +40,13 @@ pub enum PodsState {
         /// `-` already says so. See
         /// [`crate::commands::pods::PodsFetch::usage_note`].
         usage_note: Option<String>,
+        /// Set when the most recent *background* refresh failed after an
+        /// earlier fetch had already succeeded — `NodesState`'s own
+        /// `refresh_error` field, for the same reason: the rows shown are
+        /// still the last good listing, and wiping them because one poll
+        /// failed would make a transient network blip read as the node
+        /// having lost every pod.
+        refresh_error: Option<String>,
     },
     /// The fetch failed; the message is already a full sentence, via
     /// `k8s::explain`.
@@ -126,9 +133,25 @@ pub(super) fn draw(
             vec![Line::styled(message, theme.dim())]
         }
         PodsState::Loaded {
-            rows, usage_note, ..
+            rows,
+            usage_note,
+            refresh_error,
+            ..
         } => {
             let mut lines = vec![Line::styled("PODS", theme.heading())];
+            if let Some(error) = refresh_error {
+                let mut wrapped = error.lines();
+                if let Some(first) = wrapped.next() {
+                    lines.push(Line::styled(
+                        format!("Last refresh failed: {first}"),
+                        theme.severity(Severity::Warn),
+                    ));
+                }
+                lines.extend(
+                    wrapped
+                        .map(|line| Line::styled(line.to_owned(), theme.severity(Severity::Warn))),
+                );
+            }
             if !filter.is_empty() {
                 lines.push(Line::styled(format!("Filter: \"{filter}\""), theme.dim()));
             }
@@ -478,6 +501,7 @@ mod tests {
             rows: vec![pod("api-1"), pod("api-2")],
             selector_note: None,
             usage_note: None,
+            refresh_error: None,
         };
         let rendered = render(&state, None);
 
@@ -487,11 +511,41 @@ mod tests {
     }
 
     #[test]
+    fn a_failed_refresh_keeps_the_last_good_rows_visible() {
+        let state = PodsState::Loaded {
+            rows: vec![pod("api-1")],
+            selector_note: None,
+            usage_note: None,
+            refresh_error: Some("could not list pods: nope".to_owned()),
+        };
+
+        let rendered = render(&state, None);
+
+        assert!(rendered.contains("Last refresh failed"), "{rendered}");
+        assert!(rendered.contains("api-1"), "{rendered}");
+    }
+
+    #[test]
+    fn no_refresh_error_is_shown_when_the_last_fetch_succeeded() {
+        let rendered = render(
+            &PodsState::Loaded {
+                rows: vec![pod("api-1")],
+                selector_note: None,
+                usage_note: None,
+                refresh_error: None,
+            },
+            None,
+        );
+        assert!(!rendered.contains("Last refresh failed"), "{rendered}");
+    }
+
+    #[test]
     fn an_empty_pod_list_says_so_rather_than_rendering_nothing() {
         let state = PodsState::Loaded {
             rows: Vec::new(),
             selector_note: None,
             usage_note: None,
+            refresh_error: None,
         };
         let rendered = render(&state, None);
         assert!(rendered.contains("no pods"), "{rendered}");
@@ -503,6 +557,7 @@ mod tests {
             rows: vec![pod("api-1")],
             selector_note: None,
             usage_note: None,
+            refresh_error: None,
         };
         let rendered = render(&state, None);
         assert!(!rendered.contains("Sorted by"), "{rendered}");
@@ -514,6 +569,7 @@ mod tests {
             rows: vec![pod("api-1")],
             selector_note: None,
             usage_note: None,
+            refresh_error: None,
         };
         let rendered = render_ordered(&state, None, Order::Restarts, Direction::Reversed);
         assert!(
@@ -528,6 +584,7 @@ mod tests {
             rows: Vec::new(),
             selector_note: None,
             usage_note: None,
+            refresh_error: None,
         };
         let rendered = render_ordered(&state, None, Order::Restarts, Direction::Natural);
         assert!(!rendered.contains("Sorted by"), "{rendered}");
@@ -541,6 +598,7 @@ mod tests {
             rows: vec![pod("api-1")],
             selector_note: None,
             usage_note: None,
+            refresh_error: None,
         };
 
         let rendered = render_ordered(&state, None, Order::Cpu, Direction::Natural);
@@ -569,6 +627,7 @@ mod tests {
             ],
             selector_note: None,
             usage_note: None,
+            refresh_error: None,
         };
 
         let rendered = render_ordered(&state, None, Order::Cpu, Direction::Natural);
@@ -590,6 +649,7 @@ mod tests {
             rows: vec![sampled],
             selector_note: None,
             usage_note: None,
+            refresh_error: None,
         };
 
         let rendered = render_ordered(&state, None, Order::Cpu, Direction::Natural);
@@ -620,6 +680,7 @@ mod tests {
             ],
             selector_note: None,
             usage_note: None,
+            refresh_error: None,
         };
 
         let rendered = render_ordered(&state, None, Order::Cpu, Direction::Natural);
@@ -643,6 +704,7 @@ mod tests {
             rows: vec![pod("api-1")],
             selector_note: None,
             usage_note: None,
+            refresh_error: None,
         };
 
         let rendered = render_ordered(&state, None, Order::Memory, Direction::Natural);
@@ -660,6 +722,7 @@ mod tests {
             rows: vec![pod("api-1")],
             selector_note: None,
             usage_note: Some("nothing here has been sampled yet".to_owned()),
+            refresh_error: None,
         };
 
         let rendered = render_ordered(&state, None, Order::Memory, Direction::Natural);
@@ -677,6 +740,7 @@ mod tests {
             rows: Vec::new(),
             selector_note: Some("label selector `app=api`".to_owned()),
             usage_note: None,
+            refresh_error: None,
         };
         let rendered = render(&state, None);
 
@@ -705,6 +769,7 @@ mod tests {
             rows: vec![pod("api-1")],
             selector_note: None,
             usage_note: None,
+            refresh_error: None,
         };
         assert_eq!(state.rows().len(), 1);
     }
@@ -715,6 +780,7 @@ mod tests {
             rows: vec![pod("api-1")],
             selector_note: None,
             usage_note: None,
+            refresh_error: None,
         };
         let node = node_row("worker-1");
         for (width, height) in [(1, 1), (8, 3), (20, 2), (200, 60)] {
@@ -745,6 +811,7 @@ mod tests {
             rows: vec![pod("api-1"), pod("api-2")],
             selector_note: None,
             usage_note: None,
+            refresh_error: None,
         };
         assert_eq!(
             render_filtered(&state, None, Order::default(), Direction::default(), ""),
@@ -758,6 +825,7 @@ mod tests {
             rows: vec![pod("api-1"), pod("api-2")],
             selector_note: None,
             usage_note: None,
+            refresh_error: None,
         };
         let rendered = render_filtered(&state, None, Order::default(), Direction::default(), "2");
 
@@ -771,6 +839,7 @@ mod tests {
             rows: vec![pod("api-1")],
             selector_note: None,
             usage_note: None,
+            refresh_error: None,
         };
         let rendered =
             render_filtered(&state, None, Order::default(), Direction::default(), "nope");
@@ -791,6 +860,7 @@ mod tests {
             rows: vec![pod("api-1")],
             selector_note: Some("label selector `app=api`".to_owned()),
             usage_note: None,
+            refresh_error: None,
         };
         let rendered =
             render_filtered(&state, None, Order::default(), Direction::default(), "nope");
@@ -808,6 +878,7 @@ mod tests {
             rows: vec![pod("api-1")],
             selector_note: None,
             usage_note: None,
+            refresh_error: None,
         };
         let node = node_row("worker-1");
 
@@ -833,6 +904,7 @@ mod tests {
             rows: vec![pod("api-1")],
             selector_note: None,
             usage_note: None,
+            refresh_error: None,
         };
         let node = node_row("worker-1");
 
@@ -881,6 +953,7 @@ mod tests {
             rows: vec![pod("api-1")],
             selector_note: None,
             usage_note: None,
+            refresh_error: None,
         };
 
         let rendered = render_with_node(&state, None);
@@ -926,6 +999,7 @@ mod tests {
             rows: vec![pod_with_device("api-1", "nvidia.com/gpu", "2")],
             selector_note: None,
             usage_note: None,
+            refresh_error: None,
         };
 
         let rendered = render_resource_sorted(&state, "nvidia.com/gpu", Direction::Natural);
@@ -939,6 +1013,7 @@ mod tests {
             rows: vec![pod_with_device("api-1", "nvidia.com/gpu", "2")],
             selector_note: None,
             usage_note: None,
+            refresh_error: None,
         };
 
         let rendered = render_resource_sorted(&state, "nvidia.com/gpu", Direction::Reversed);
@@ -955,6 +1030,7 @@ mod tests {
             rows: Vec::new(),
             selector_note: None,
             usage_note: None,
+            refresh_error: None,
         };
 
         let rendered = render_resource_sorted(&state, "nvidia.com/gpu", Direction::Natural);
@@ -972,6 +1048,7 @@ mod tests {
             rows: vec![pod("api-1")],
             selector_note: None,
             usage_note: None,
+            refresh_error: None,
         };
 
         let rendered = render_resource_sorted(&state, "nvidia.com/gpu", Direction::Natural);
@@ -986,6 +1063,7 @@ mod tests {
             rows: vec![pod("api-1")],
             selector_note: None,
             usage_note: None,
+            refresh_error: None,
         };
 
         let rendered = render_resource_prompt(&state, "nvidia.com/g");
@@ -1002,6 +1080,7 @@ mod tests {
             rows: vec![pod_with_device("api-1", "nvidia.com/gpu", "2")],
             selector_note: None,
             usage_note: None,
+            refresh_error: None,
         };
 
         let rendered = render_resource_sorted(&state, "nvidia.com/gpu", Direction::Natural);
@@ -1020,6 +1099,7 @@ mod tests {
             rows: vec![pod("api-1")],
             selector_note: None,
             usage_note: None,
+            refresh_error: None,
         };
 
         let rendered = render(&state, None);
@@ -1041,6 +1121,7 @@ mod tests {
             rows: vec![sampled],
             selector_note: None,
             usage_note: None,
+            refresh_error: None,
         };
 
         let rendered = render(&state, None);
@@ -1060,6 +1141,7 @@ mod tests {
             rows: vec![stale_pod],
             selector_note: None,
             usage_note: None,
+            refresh_error: None,
         };
 
         let rendered = render(&state, None);
@@ -1073,6 +1155,7 @@ mod tests {
             rows: vec![pod("api-1")],
             selector_note: None,
             usage_note: Some("Usage is up to 8s old, averaged over 20s.".to_owned()),
+            refresh_error: None,
         };
 
         let rendered = render(&state, None);
