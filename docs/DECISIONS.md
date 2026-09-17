@@ -3658,3 +3658,61 @@ such text on a bare `PodsState::Error` before tonight either, `L` is already
 offered in the footer regardless of which pane is showing, and wiring one in
 is a pre-existing gap this task did not create rather than a thought it left
 unfinished.
+
+### 101. `l`/`F` retype the dashboard's selectors as two independent prompts, and a commit refetches immediately
+
+"Edit the dashboard's selector without restarting it" left two questions open:
+whether a selector reuses `/`'s keystroke-capture machinery or gets its own,
+and whether committing one refetches immediately or waits for the pane's own
+refresh. Both had a precedent already sitting in the codebase to follow rather
+than a call to make from nothing.
+
+The first is decision 84's own question, asked and answered for
+`--sort-resource`: reusing `/` for a second, unrelated purpose would make one
+key mean two things depending on context, and a selector is validated grammar
+sent to the API server, not a client-side ranking over rows already in hand —
+a real difference in kind from a fuzzy filter, not just a second use of the
+same shape. `l` and `F` each open their own prompt, `SelectorEdit`, mirroring
+`ResourceSort`'s `Inactive`/`Editing` life cycle (there is no third,
+`Applied`, state to mirror: unlike a resource name, a selector can be
+*rejected*, and `Editing`'s own `error` field is what a resource prompt never
+needed). One `SelectorEdit` covers both keys rather than two, since only one
+of the pane's two selectors can be mid-retype at a time — the same reason
+`Filter` and `ResourceSort` are each a single field rather than one per key.
+
+The second follows the precedent already sitting in `event_loop`: a cluster
+selection or a view change already refetches immediately rather than waiting
+for `RefreshInterval`, on the reasoning that showing stale rows under a
+newly-typed answer for however long the interval takes would read as broken,
+not merely slow. A committed selector is exactly that kind of change — it
+changes what is being asked for, not how the pane displays what it already
+has — so it gets the same immediate trigger, noticed the same way the
+existing ones are: `pod_selectors_before` is captured beside `view_before` at
+the top of each iteration, and a mismatch after `on_key` fires `refetch_pods`
+on its own, independent `if` rather than another arm of the cluster/view
+chain, since committing a selector never changes either of those.
+
+Validation goes through `commands::pods::selectors_for`, unconditionally, on
+every `Enter` — including the selector that is *not* being retyped, read back
+out of the already-canonical `App::pod_selectors` rather than skipped. This
+costs nothing (a canonical selector parses back to itself) and avoids a
+second, narrower validation path that would have had to prove, separately,
+that it agreed with the CLI's own. A rejection keeps the prompt's text and
+attaches the rejection's own sentence as `SelectorEdit::Editing`'s `error`
+field, cleared on the next keystroke, rather than losing the typed text or
+reverting silently to whatever was last applied — the same "don't discard
+what the user typed" bar `edit_filter` and `edit_resource_sort` never had to
+clear, since neither of theirs can fail to parse.
+
+The applied selector's own display reuses `PodsState::Loaded::selector_note`
+— already built for the pane's "no pods here match …" empty-state wording —
+as a persistent `Selector: …` header line whenever it is `Some` and nothing
+is mid-edit, rather than `App` keeping a second, redundant copy of the same
+sentence to hand `ui::pods::draw`. This shifted one existing test's
+assumption: `a_filter_with_no_match_is_distinguishable_from_an_empty_selector_result`
+asserted that a `/`-filter miss never mentions "label selector" at all, which
+was only ever true because nothing else printed that phrase yet. The test now
+asserts the narrower, still-true claim — the filter-miss sentence itself never
+says "No pods here match label selector `…`" — since the persistent header
+line legitimately says "label selector" whenever one is active, filter or no
+filter.
