@@ -169,6 +169,9 @@ fn dashboard(
 ) -> Result<()> {
     let views = contexts::views(config);
     let mut app = App::new(views);
+    // Retypeable at runtime through `l`/`F` from here on — see
+    // `App::set_pod_selectors` and `ui::PodsFetcher`'s own doc comment.
+    app.set_pod_selectors(selectors.clone());
 
     if let Some(name) = requested_context {
         // Resolve through the same selector logic as `eks use`, so `--context`
@@ -214,15 +217,16 @@ fn dashboard(
     // The pod-browsing pane's counterpart: called once each time drilling
     // into a node changes which one the detail pane is showing, and again on
     // that pane's own refresh triggers for as long as it stays on screen
-    // (`ui::refetch_pods`). `selectors` is fixed for the life of the session —
-    // set from `-l`/`--field-selector` at startup, the same flags `eks pods`
-    // reads — so every node's pods are filtered by the one the user typed
-    // rather than the pane growing its own.
+    // (`ui::refetch_pods`), or the moment `l`/`F` commits a new selector.
+    // `selectors` is only the *initial* value now, set from `-l`/
+    // `--field-selector` at startup, the same flags `eks pods` reads —
+    // `App::pod_selectors` carries whatever is currently applied from there,
+    // and this closure is handed it fresh on every call rather than closing
+    // over one fixed for the life of the session.
     let spawn_pods: ui::PodsFetcher = {
         let config = config.clone();
         let paths = paths.to_vec();
-        let selectors = selectors.clone();
-        Box::new(move |context: &str, node: &str| {
+        Box::new(move |context: &str, node: &str, selectors: &Selectors| {
             pods::spawn_gather_for_node(
                 config.clone(),
                 paths.clone(),

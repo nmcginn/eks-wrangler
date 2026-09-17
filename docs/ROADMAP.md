@@ -1570,7 +1570,7 @@ cluster.
 
 ### Follow-ups from the dashboard's selectors
 
-- [ ] **Edit the dashboard's selector without restarting it.**
+- [x] **Edit the dashboard's selector without restarting it.**
   `-l`/`--field-selector` now filter every node's pods in the dashboard, but
   only as flags read once at startup — changing what you are looking for
   means quitting and retyping the command. Separate because it is a surface
@@ -1586,6 +1586,24 @@ cluster.
   `commands::pods::selectors_for` — the same validation and rejection
   wording `eks pods` and dashboard startup already share — rather than a
   second parser for text typed live.
+  Landed as two independent prompts, `l` for the label selector and `F` for
+  the field one, rather than folded into `/` — the same call
+  `--sort-resource` made above, for the same reason: a selector is validated
+  grammar sent to the server, not a client-side ranking over rows already in
+  hand. `SelectorEdit` mirrors `ResourceSort`'s `Inactive`/`Editing` life
+  cycle, minus `Applied` (nothing to mirror it with) plus an `error` field
+  `ResourceSort` never needed, since a resource name cannot fail to parse and
+  a selector can. Every commit revalidates through `selectors_for` — both
+  selectors, not just the one retyped, since the other's already-canonical
+  text costs nothing to re-parse — and a rejection keeps the offending text
+  on screen with its own sentence attached rather than discarding it or
+  reverting silently. Committing refetches immediately, the same trigger a
+  cluster or view change already gets, rather than waiting for
+  `RefreshInterval`: `App::pod_selectors` is read fresh by every pod fetch
+  now, in place of the value `main::dashboard`'s closure used to close over
+  once. The applied selector's own line reuses the pane's existing
+  `selector_note` rather than a second copy of the same sentence. See
+  decision 101.
 
 ### Follow-ups from fuzzy search
 

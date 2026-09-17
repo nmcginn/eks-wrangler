@@ -19,13 +19,13 @@ use ratatui::{Frame, Terminal};
 
 use crate::cluster::ClusterView;
 use crate::commands::nodes::NodesFetch;
-use crate::commands::pods::{ContainersFetch, PodsFetch};
+use crate::commands::pods::{ContainersFetch, PodsFetch, selectors_for};
 use crate::commands::{FetchError, StreamHandle};
 use crate::k8s::nodes as k8s_nodes;
 use crate::k8s::order::Direction as SortDirection;
 use crate::k8s::page::{Budget, ParseError};
 use crate::k8s::pods as k8s_pods;
-use crate::k8s::pods::LogEvent;
+use crate::k8s::pods::{LogEvent, Selectors};
 use crate::theme::Theme;
 
 mod containers;
@@ -73,8 +73,13 @@ pub type LoginRunner = Box<dyn Fn(&str) -> Result<(), String>>;
 /// one that does nothing.
 type Suspended<'a> = &'a dyn Fn(&str) -> Result<(), String>;
 
-/// Starts a fetch of the pods on one node of one cluster.
-pub type PodsFetcher = Box<dyn Fn(&str, &str) -> mpsc::Receiver<Result<PodsFetch, FetchError>>>;
+/// Starts a fetch of the pods on one node of one cluster, filtered by
+/// whichever `-l`/`--field-selector` `App::pod_selectors` currently holds —
+/// the flags the process started with until `l`/`F` retypes one of them, so a
+/// fetch started after a commit asks the cluster the new question rather than
+/// the one the session began with.
+pub type PodsFetcher =
+    Box<dyn Fn(&str, &str, &Selectors) -> mpsc::Receiver<Result<PodsFetch, FetchError>>>;
 
 /// Starts a fetch of one pod's containers, given its namespace and name.
 pub type ContainersFetcher =
@@ -310,6 +315,39 @@ impl ResourceSort {
     }
 }
 
+/// The `l`/`F` prompt that retypes one of the pod-drilldown pane's two
+/// selectors — the dashboard's own `-l`/`--field-selector` — without
+/// restarting it. [`ResourceSort`]'s counterpart for a value that can be
+/// rejected: `Editing` captures every keystroke as selector text; `Enter`
+/// revalidates it through [`selectors_for`], the same function and rejection
+/// wording `eks pods` and dashboard startup already share, and either commits
+/// the canonical result to [`App::pod_selectors`] and returns to `Inactive`,
+/// or stays `Editing` with `error` set to the rejection's own sentence, so
+/// the offending text is not lost. `Esc` cancels outright, leaving
+/// `pod_selectors` exactly as it was. Only one of the two selectors can be
+/// mid-edit at a time — `l`/`F` each open their own text seeded from what is
+/// currently applied, the same seeding `ResourceSort::query` gives its own
+/// prompt.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+enum SelectorEdit {
+    #[default]
+    Inactive,
+    Editing {
+        field: pods::SelectorField,
+        text: String,
+        /// The last rejection [`selectors_for`] gave this text, if any —
+        /// cleared on the next keystroke so a fixed selector does not still
+        /// show the old complaint.
+        error: Option<String>,
+    },
+}
+
+impl SelectorEdit {
+    fn is_editing(&self) -> bool {
+        matches!(self, Self::Editing { .. })
+    }
+}
+
 /// Dashboard state.
 #[derive(Debug, Clone)]
 pub struct App {
@@ -356,6 +394,16 @@ pub struct App {
     /// against one node's pods has nothing to say about the next one drilled
     /// into.
     pod_resource_sort: ResourceSort,
+    /// The dashboard's own `-l`/`--field-selector`, seeded from the flags the
+    /// process started with (`Self::set_pod_selectors`) and retypeable at
+    /// runtime through `l`/`F` (`Self::pod_selector_edit`). Read by every
+    /// pod-drilldown fetch — [`PodsFetcher`]'s third argument — so a fetch
+    /// started after a commit asks the new question rather than the one the
+    /// session began with.
+    pod_selectors: Selectors,
+    /// The `l`/`F` prompt retyping one of the selectors above, if either is
+    /// being retyped right now.
+    pod_selector_edit: SelectorEdit,
     /// When the last unconfirmed `Esc`/`q` at the top level was pressed —
     /// `None` when no quit is pending. A second press of either key within
     /// [`QUIT_CONFIRM_WINDOW`] confirms it; any other key clears it.
@@ -396,6 +444,8 @@ impl App {
             pod_order: k8s_pods::Order::default(),
             pod_direction: SortDirection::default(),
             pod_resource_sort: ResourceSort::default(),
+            pod_selectors: Selectors::default(),
+            pod_selector_edit: SelectorEdit::default(),
             quit_armed_at: None,
             credentials_lost: false,
         }
@@ -560,6 +610,35 @@ impl App {
     #[must_use]
     pub fn pod_direction(&self) -> SortDirection {
         self.pod_direction
+    }
+
+    /// The dashboard's own `-l`/`--field-selector`, as every pod-drilldown
+    /// fetch reads it right now.
+    #[must_use]
+    fn pod_selectors(&self) -> &Selectors {
+        &self.pod_selectors
+    }
+
+    /// The pod-drilldown pane's `l`/`F` prompt, mid-edit — `None` once
+    /// nothing is being retyped right now, whether or not a selector is
+    /// applied.
+    #[must_use]
+    fn pod_selector_prompt(&self) -> Option<pods::SelectorPrompt<'_>> {
+        match &self.pod_selector_edit {
+            SelectorEdit::Editing { field, text, error } => Some(pods::SelectorPrompt {
+                field: *field,
+                text: text.as_str(),
+                error: error.as_deref(),
+            }),
+            SelectorEdit::Inactive => None,
+        }
+    }
+
+    /// Whether the `l`/`F` prompt is currently capturing keystrokes, for the
+    /// footer's hints — the selector counterpart to [`Self::is_filtering`].
+    #[must_use]
+    pub fn is_typing_selector(&self) -> bool {
+        self.pod_selector_edit.is_editing()
     }
 
     /// Whether a quit is armed and awaiting its confirming `Esc`/`q` within
@@ -962,6 +1041,91 @@ impl App {
         Flow::Continue
     }
 
+    /// `l`/`F`: begin retyping the pod-drilldown pane's label or field
+    /// selector, seeded with whatever is already applied so a second press
+    /// refines it — the same seeding [`Self::start_resource_sort`] gives its
+    /// own prompt. A no-op off [`View::NodePods`]: no other pane's fetch
+    /// reads `pod_selectors` at all, so there is nothing here for either key
+    /// to retype.
+    fn start_selector_edit(&mut self, field: pods::SelectorField) {
+        if !matches!(self.view, View::NodePods { .. }) {
+            return;
+        }
+        self.focus = Focus::Detail;
+        let text = match field {
+            pods::SelectorField::Label => self.pod_selectors.label.clone(),
+            pods::SelectorField::Field => self.pod_selectors.field.clone(),
+        }
+        .unwrap_or_default();
+        self.pod_selector_edit = SelectorEdit::Editing {
+            field,
+            text,
+            error: None,
+        };
+    }
+
+    /// Handle a key press while [`SelectorEdit::Editing`] is capturing text —
+    /// the selector counterpart to [`Self::edit_filter`]. `Enter` revalidates
+    /// the retyped selector through [`selectors_for`], alongside whichever of
+    /// the two is *not* being retyped right now taken from its own already-
+    /// canonical `pod_selectors`, so a rejected label does not also
+    /// re-reject an already-applied field selector. A good pair commits to
+    /// `pod_selectors` and returns to `Inactive`; a bad one stays `Editing`
+    /// with the rejection's own sentence attached, so the offending text is
+    /// not lost. `Esc` cancels outright, leaving `pod_selectors` exactly as
+    /// it was.
+    fn edit_selector(&mut self, key: KeyEvent) -> Flow {
+        let SelectorEdit::Editing { field, text, .. } = &self.pod_selector_edit else {
+            return Flow::Continue;
+        };
+        let field = *field;
+        let mut text = text.clone();
+        match key.code {
+            KeyCode::Enter => {
+                let (label, field_selector): (&str, &str) = match field {
+                    pods::SelectorField::Label => {
+                        (&text, self.pod_selectors.field.as_deref().unwrap_or(""))
+                    }
+                    pods::SelectorField::Field => {
+                        (self.pod_selectors.label.as_deref().unwrap_or(""), &text)
+                    }
+                };
+                match selectors_for(Some(label), Some(field_selector)) {
+                    Ok(selectors) => {
+                        self.pod_selectors = selectors;
+                        self.pod_selector_edit = SelectorEdit::Inactive;
+                    }
+                    Err(error) => {
+                        self.pod_selector_edit = SelectorEdit::Editing {
+                            field,
+                            text,
+                            error: Some(error.to_string()),
+                        };
+                    }
+                }
+            }
+            KeyCode::Esc => self.pod_selector_edit = SelectorEdit::Inactive,
+            KeyCode::Backspace => {
+                text.pop();
+                self.pod_selector_edit = SelectorEdit::Editing {
+                    field,
+                    text,
+                    error: None,
+                };
+            }
+            KeyCode::Char(c) => {
+                text.push(c);
+                self.pod_selector_edit = SelectorEdit::Editing {
+                    field,
+                    text,
+                    error: None,
+                };
+            }
+            _ => {}
+        }
+        Flow::Continue
+    }
+
     /// Toggle which pane `j`/`k`/`Home`/`End` move the highlight in.
     pub fn toggle_focus(&mut self) {
         self.focus = match self.focus {
@@ -1252,6 +1416,15 @@ impl App {
         }
     }
 
+    /// Seed the dashboard's `-l`/`--field-selector` from the flags the
+    /// process started with, before the terminal takes over. Only
+    /// `main::dashboard` calls this — every test after `App::new` wants the
+    /// empty default, the same reason `select_context` is a separate call
+    /// rather than a second `App::new` parameter.
+    pub fn set_pod_selectors(&mut self, selectors: Selectors) {
+        self.pod_selectors = selectors;
+    }
+
     /// Move the highlight down, wrapping at the end.
     pub fn select_next(&mut self) {
         if self.clusters.is_empty() {
@@ -1393,6 +1566,10 @@ impl App {
             return self.edit_resource_sort(key);
         }
 
+        if self.pod_selector_edit.is_editing() {
+            return self.edit_selector(key);
+        }
+
         // Any key other than the quit-family ones clears a pending quit arm,
         // so a stray press elsewhere doesn't leave a dangling "press again"
         // state for a much later, unrelated Esc/q to confirm.
@@ -1419,6 +1596,8 @@ impl App {
             KeyCode::Char('s') => self.cycle_sort(),
             KeyCode::Char('S') => self.reverse_sort(),
             KeyCode::Char('R') => self.start_resource_sort(),
+            KeyCode::Char('l') => self.start_selector_edit(pods::SelectorField::Label),
+            KeyCode::Char('F') => self.start_selector_edit(pods::SelectorField::Field),
             // Only when there is something for it to fix. A key that silently
             // does nothing is worse than one that is not offered, so the
             // footer hint appears under exactly this condition too.
@@ -1502,11 +1681,13 @@ impl App {
 /// and request budget the CLI itself uses (see
 /// [`commands::nodes::spawn_gather`](crate::commands::nodes::spawn_gather)).
 /// `spawn_pods` is the same idea for a node's pods, called with the selected
-/// cluster's context and the drilled-into node's name whenever the detail
+/// cluster's context, the drilled-into node's name, and the dashboard's
+/// current `-l`/`--field-selector` (`App::pod_selectors`) whenever the detail
 /// pane's view changes to [`View::NodePods`], and again on the same three
 /// triggers `spawn_nodes` answers to — `r`, the refresh interval, a
-/// successful login — for as long as that view is the one on screen (see
-/// `pods_refresh_target`, `refetch_pods`). `spawn_containers` is one level
+/// successful login, or `l`/`F` committing a new selector — for as long as
+/// that view is the one on screen (see `pods_refresh_target`,
+/// `refetch_pods`). `spawn_containers` is one level
 /// further in: the selected cluster's context, and the namespace and name of
 /// the drilled-into pod, whenever the view changes to [`View::PodContainers`].
 /// `spawn_logs` is the last level: the selected cluster's context, the
@@ -1694,6 +1875,7 @@ where
             refetch_pods(
                 drill,
                 app.view(),
+                app.pod_selectors(),
                 selected_context.as_deref(),
                 &mut inflight,
             );
@@ -1709,6 +1891,11 @@ where
         };
 
         let view_before = app.view().clone();
+        // Captured the same way as `view_before`, and read the same way
+        // below: a commit through `l`/`F` is a fetch trigger in its own
+        // right, and the only way to notice one is to compare before and
+        // after, the same as a cluster or view change already does.
+        let pod_selectors_before = app.pod_selectors().clone();
 
         match app.on_key(key) {
             Flow::Quit => return Ok(()),
@@ -1727,6 +1914,7 @@ where
                         refetch_pods(
                             drill,
                             app.view(),
+                            app.pod_selectors(),
                             selected_context.as_deref(),
                             &mut inflight,
                         );
@@ -1743,6 +1931,7 @@ where
             refetch_pods(
                 drill,
                 app.view(),
+                app.pod_selectors(),
                 selected_context.as_deref(),
                 &mut inflight,
             );
@@ -1768,6 +1957,22 @@ where
             // through `leave_detail_view`, so re-deriving the same outcome
             // here would just repeat it.
             start_drill_fetch(&app, drill, selected_context.as_deref(), &mut inflight);
+        }
+
+        // Its own `if`, not another arm of the chain above: committing a new
+        // `l`/`F` selector never changes the cluster or the view, so it would
+        // never be reached as an `else`. Immediate for the same reason a
+        // selection change is above — waiting for the interval would leave
+        // the pane showing the *previous* selector's rows under the newly
+        // typed one for however long that takes.
+        if *app.pod_selectors() != pod_selectors_before {
+            refetch_pods(
+                drill,
+                app.view(),
+                app.pod_selectors(),
+                selected_context.as_deref(),
+                &mut inflight,
+            );
         }
     }
 }
@@ -1800,7 +2005,7 @@ fn start_drill_fetch(
             if matches!(app.pods(), PodsState::Loading)
                 && let Some(context) = context
             {
-                inflight.pods = Some((drill.spawn_pods)(context, node));
+                inflight.pods = Some((drill.spawn_pods)(context, node, app.pod_selectors()));
             }
         }
         View::PodContainers { namespace, pod, .. } => {
@@ -1879,11 +2084,12 @@ fn pods_refresh_target(view: &View) -> Option<&str> {
 fn refetch_pods(
     drill: &DrillFetchers<'_>,
     view: &View,
+    selectors: &Selectors,
     selected_context: Option<&str>,
     inflight: &mut Inflight,
 ) {
     if let (Some(context), Some(node)) = (selected_context, pods_refresh_target(view)) {
-        inflight.pods = Some((drill.spawn_pods)(context, node));
+        inflight.pods = Some((drill.spawn_pods)(context, node, selectors));
     }
 }
 
@@ -2107,6 +2313,7 @@ fn draw_detail(frame: &mut Frame, area: Rect, app: &App) {
             app.pod_sort(),
             app.pod_direction(),
             app.pod_resource_prompt(),
+            app.pod_selector_prompt(),
             app.filter_query(),
             theme,
         ),
@@ -2157,6 +2364,10 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
         // The `R` counterpart to the branch above: every key is resource-name
         // text while this is showing, through `App::edit_resource_sort`.
         vec![("type", "resource"), ("enter", "apply"), ("esc", "cancel")]
+    } else if app.is_typing_selector() {
+        // The `l`/`F` counterpart to the two branches above: every key is
+        // selector text while this is showing, through `App::edit_selector`.
+        vec![("type", "selector"), ("enter", "apply"), ("esc", "cancel")]
     } else if app.credentials_lost() {
         // Its own list rather than one more hint on the end of the others,
         // for the reason the two branches around it are: this is a state that
@@ -2207,6 +2418,14 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
         // newest and the narrowest-scoped of the hints here.
         if matches!(app.view(), View::Overview | View::NodePods { .. }) {
             hints.push(("R", "sort resource"));
+        }
+        // `l`/`F` only do anything against the pod-drilldown pane's own
+        // fetch (`App::start_selector_edit`) — the node pane has no
+        // selector of its own to retype. Pushed last of all: the newest and
+        // narrowest-scoped hint here, so a narrow terminal drops it before
+        // `R` above.
+        if matches!(app.view(), View::NodePods { .. }) {
+            hints.push(("l/F", "selector"));
         }
         hints
     };
@@ -4654,6 +4873,222 @@ mod tests {
     fn ctrl_c_still_quits_immediately_while_editing_the_filter() {
         let mut app = app_with_two_nodes();
         app.on_key(press(KeyCode::Char('/')));
+
+        assert_eq!(
+            app.on_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+            Flow::Quit
+        );
+    }
+
+    // --- `l`/`F`: retyping the pod-drilldown pane's selectors ---
+
+    #[test]
+    fn l_opens_a_label_selector_prompt() {
+        let mut app = app_with_pod();
+
+        app.on_key(press(KeyCode::Char('l')));
+
+        assert!(app.is_typing_selector());
+        let prompt = app.pod_selector_prompt().unwrap();
+        assert_eq!(prompt.field, pods::SelectorField::Label);
+        assert_eq!(prompt.text, "");
+        assert_eq!(prompt.error, None);
+    }
+
+    #[test]
+    fn shift_f_opens_a_field_selector_prompt_distinct_from_l() {
+        let mut app = app_with_pod();
+
+        app.on_key(press(KeyCode::Char('F')));
+
+        assert!(app.is_typing_selector());
+        let prompt = app.pod_selector_prompt().unwrap();
+        assert_eq!(prompt.field, pods::SelectorField::Field);
+    }
+
+    #[test]
+    fn l_and_shift_f_do_nothing_off_the_node_pods_view() {
+        let mut app = app_with_node();
+        assert_eq!(*app.view(), View::Overview);
+
+        app.on_key(press(KeyCode::Char('l')));
+        assert!(!app.is_typing_selector());
+
+        app.on_key(press(KeyCode::Char('F')));
+        assert!(!app.is_typing_selector());
+    }
+
+    #[test]
+    fn typing_after_l_builds_up_the_selector_prompts_text() {
+        let mut app = app_with_pod();
+        app.on_key(press(KeyCode::Char('l')));
+
+        for c in "app=api".chars() {
+            app.on_key(press(KeyCode::Char(c)));
+        }
+
+        assert_eq!(app.pod_selector_prompt().unwrap().text, "app=api");
+    }
+
+    #[test]
+    fn backspace_erases_the_selector_prompts_last_character() {
+        let mut app = app_with_pod();
+        app.on_key(press(KeyCode::Char('l')));
+        for c in "app=api".chars() {
+            app.on_key(press(KeyCode::Char(c)));
+        }
+
+        app.on_key(press(KeyCode::Backspace));
+
+        assert_eq!(app.pod_selector_prompt().unwrap().text, "app=ap");
+    }
+
+    #[test]
+    fn enter_commits_a_valid_label_selector() {
+        let mut app = app_with_pod();
+        app.on_key(press(KeyCode::Char('l')));
+        for c in "app=api".chars() {
+            app.on_key(press(KeyCode::Char(c)));
+        }
+
+        app.on_key(press(KeyCode::Enter));
+
+        assert!(!app.is_typing_selector());
+        assert_eq!(app.pod_selector_prompt(), None);
+        assert_eq!(app.pod_selectors().label.as_deref(), Some("app=api"));
+    }
+
+    #[test]
+    fn enter_on_a_bad_selector_keeps_editing_with_its_own_rejection_shown() {
+        let mut app = app_with_pod();
+        app.on_key(press(KeyCode::Char('l')));
+        for c in "app in".chars() {
+            app.on_key(press(KeyCode::Char(c)));
+        }
+
+        app.on_key(press(KeyCode::Enter));
+
+        assert!(
+            app.is_typing_selector(),
+            "a rejected selector must not be lost"
+        );
+        let prompt = app.pod_selector_prompt().unwrap();
+        assert_eq!(prompt.text, "app in", "the offending text stays as typed");
+        assert!(prompt.error.is_some());
+        assert_eq!(
+            app.pod_selectors().label,
+            None,
+            "nothing was ever committed"
+        );
+    }
+
+    #[test]
+    fn a_keystroke_after_a_rejection_clears_the_old_error() {
+        let mut app = app_with_pod();
+        app.on_key(press(KeyCode::Char('l')));
+        for c in "app in".chars() {
+            app.on_key(press(KeyCode::Char(c)));
+        }
+        app.on_key(press(KeyCode::Enter));
+        assert!(app.pod_selector_prompt().unwrap().error.is_some());
+
+        app.on_key(press(KeyCode::Backspace));
+
+        assert_eq!(app.pod_selector_prompt().unwrap().error, None);
+    }
+
+    #[test]
+    fn esc_while_editing_a_selector_cancels_it_without_changing_the_applied_one() {
+        let mut app = app_with_pod();
+        app.on_key(press(KeyCode::Char('l')));
+        for c in "app=api".chars() {
+            app.on_key(press(KeyCode::Char(c)));
+        }
+        app.on_key(press(KeyCode::Enter));
+
+        // Re-open the prompt, seeded with the applied text, retype it, and
+        // cancel — the applied selector must survive untouched.
+        app.on_key(press(KeyCode::Char('l')));
+        assert_eq!(app.pod_selector_prompt().unwrap().text, "app=api");
+        app.on_key(press(KeyCode::Char('x')));
+        app.on_key(press(KeyCode::Esc));
+
+        assert!(!app.is_typing_selector());
+        assert_eq!(app.pod_selectors().label.as_deref(), Some("app=api"));
+    }
+
+    #[test]
+    fn committing_a_field_selector_does_not_disturb_an_already_applied_label_selector() {
+        let mut app = app_with_pod();
+        app.on_key(press(KeyCode::Char('l')));
+        for c in "app=api".chars() {
+            app.on_key(press(KeyCode::Char(c)));
+        }
+        app.on_key(press(KeyCode::Enter));
+
+        app.on_key(press(KeyCode::Char('F')));
+        for c in "status.phase=Running".chars() {
+            app.on_key(press(KeyCode::Char(c)));
+        }
+        app.on_key(press(KeyCode::Enter));
+
+        assert_eq!(app.pod_selectors().label.as_deref(), Some("app=api"));
+        assert_eq!(
+            app.pod_selectors().field.as_deref(),
+            Some("status.phase=Running")
+        );
+    }
+
+    #[test]
+    fn committing_an_empty_selector_prompt_clears_it_rather_than_rejecting_it() {
+        let mut app = app_with_pod();
+        app.on_key(press(KeyCode::Char('l')));
+        for c in "app=api".chars() {
+            app.on_key(press(KeyCode::Char(c)));
+        }
+        app.on_key(press(KeyCode::Enter));
+
+        // Retype it away to nothing and commit — a blank selector filters
+        // nothing, the same rule `selectors_for` gives `-l ''` on the CLI.
+        app.on_key(press(KeyCode::Char('l')));
+        for _ in 0.."app=api".len() {
+            app.on_key(press(KeyCode::Backspace));
+        }
+        app.on_key(press(KeyCode::Enter));
+
+        assert!(!app.is_typing_selector());
+        assert_eq!(app.pod_selectors().label, None);
+    }
+
+    #[test]
+    fn the_footer_switches_to_selector_hints_while_the_prompt_is_editing() {
+        let mut app = app_with_pod();
+        app.on_key(press(KeyCode::Char('l')));
+
+        let mut terminal = Terminal::new(TestBackend::new(90, 20)).unwrap();
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+        let rendered = terminal.backend().to_string();
+
+        assert!(rendered.contains("type"), "{rendered}");
+        assert!(rendered.contains("selector"), "{rendered}");
+        assert!(!rendered.contains("sort"), "{rendered}");
+    }
+
+    #[test]
+    fn a_quit_key_while_editing_a_selector_is_added_to_it_instead_of_arming_a_quit() {
+        let mut app = app_with_pod();
+        app.on_key(press(KeyCode::Char('l')));
+
+        assert_eq!(app.on_key(press(KeyCode::Char('q'))), Flow::Continue);
+
+        assert_eq!(app.pod_selector_prompt().unwrap().text, "q");
+        assert!(!app.quit_pending());
+    }
+
+    #[test]
+    fn ctrl_c_still_quits_immediately_while_editing_a_selector() {
+        let mut app = app_with_pod();
+        app.on_key(press(KeyCode::Char('l')));
 
         assert_eq!(
             app.on_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),

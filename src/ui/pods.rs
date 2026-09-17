@@ -78,6 +78,27 @@ pub(super) enum Sort<'a> {
     Resource(&'a str),
 }
 
+/// Which of the pane's two selectors — the dashboard's own `-l`/
+/// `--field-selector`, retypeable through `l`/`F` without restarting it — a
+/// [`SelectorPrompt`] is currently retyping.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum SelectorField {
+    Label,
+    Field,
+}
+
+/// The `l`/`F` prompt's own text and, once a bad selector was rejected, the
+/// sentence to show under it — the selector counterpart to `resource_prompt`
+/// below, for a value that can fail to parse. `App::edit_selector` is the
+/// only place that decides any of this; this only draws whichever it is
+/// handed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct SelectorPrompt<'a> {
+    pub field: SelectorField,
+    pub text: &'a str,
+    pub error: Option<&'a str>,
+}
+
 /// Draw whatever the pod pane currently knows.
 ///
 /// `node` is the [`NodeRow`] behind the node drilled into, from the node
@@ -93,10 +114,13 @@ pub(super) enum Sort<'a> {
 /// [`super::App`] rather than a request — see [`super::nodes::draw`], whose
 /// node-pane counterpart this mirrors. `resource_prompt` is the
 /// `--sort-resource` prompt's own text while `R` is capturing keystrokes for
-/// it, the same as it is there. `filter` is the `/` query, empty when no
-/// filter is active — see that same doc comment for why every footnote above
-/// still reads off the full `rows` and only the drawn rows themselves
-/// narrow.
+/// it, the same as it is there. `selector_prompt` is `l`/`F`'s own prompt,
+/// the same way, while one of them is capturing keystrokes — `None` once
+/// nothing is being retyped, whether or not a selector is applied, since the
+/// applied one already reaches this pane through `PodsState::Loaded`'s own
+/// `selector_note`. `filter` is the `/` query, empty when no filter is
+/// active — see that same doc comment for why every footnote above still
+/// reads off the full `rows` and only the drawn rows themselves narrow.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn draw(
     frame: &mut Frame,
@@ -107,6 +131,7 @@ pub(super) fn draw(
     sort: Sort<'_>,
     direction: Direction,
     resource_prompt: Option<&str>,
+    selector_prompt: Option<SelectorPrompt<'_>>,
     filter: &str,
     theme: Theme,
 ) {
@@ -134,6 +159,7 @@ pub(super) fn draw(
         }
         PodsState::Loaded {
             rows,
+            selector_note,
             usage_note,
             refresh_error,
             ..
@@ -152,6 +178,11 @@ pub(super) fn draw(
                         .map(|line| Line::styled(line.to_owned(), theme.severity(Severity::Warn))),
                 );
             }
+            lines.extend(selector_lines(
+                selector_prompt,
+                selector_note.as_deref(),
+                theme,
+            ));
             if !filter.is_empty() {
                 lines.push(Line::styled(format!("Filter: \"{filter}\""), theme.dim()));
             }
@@ -174,43 +205,13 @@ pub(super) fn draw(
                     theme.dim(),
                 ));
             }
-            match sort {
-                Sort::Order(order) => {
-                    if let Some(note) = order::note(order, direction) {
-                        lines.push(Line::styled(note, theme.dim()));
-                    }
-                    // Now that this pane samples usage for its own rows (see
-                    // `commands::pods::gather_for_node`), the same split the
-                    // node pane's `usage_missing_explained` draws applies
-                    // here: a failed read stays honestly unexplained, and an
-                    // empty one points back at `usage_note` above.
-                    let missing = Missing {
-                        usage: usage_missing_explained(rows, usage_note.as_deref()),
-                    };
-                    if let Some(note) = order::unranked_note(
-                        order,
-                        cause(order, missing),
-                        |candidate| ranks_any(rows, candidate),
-                        |candidate| distinguishes(rows, candidate),
-                    ) {
-                        lines.extend(
-                            note.lines()
-                                .map(|line| Line::styled(line.to_owned(), theme.dim())),
-                        );
-                    }
-                }
-                // The free-form counterpart: always named, unlike
-                // `order::note` — there is no default resource to compare
-                // against and stay silent about. No unranked half beside it:
-                // unlike a node, a pod that never asked for the resource
-                // sorts as a real `0` rather than falling out of the
-                // ordering, so `commands::pods::list` never pairs
-                // `device_note` with an unranked note either, and this pane
-                // does not either.
-                Sort::Resource(resource) => {
-                    lines.push(Line::styled(device_note(resource, direction), theme.dim()));
-                }
-            }
+            lines.extend(sort_lines(
+                sort,
+                direction,
+                rows,
+                usage_note.as_deref(),
+                theme,
+            ));
             let visible = crate::fuzzy::rank(filter, rows, |row| row.name.as_str());
             if !filter.is_empty() && visible.is_empty() {
                 lines.push(Line::styled(
@@ -230,6 +231,87 @@ pub(super) fn draw(
     });
 
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), area);
+}
+
+/// The `l`/`F` prompt's own line, shown only while one of them is capturing
+/// keystrokes — before anything below has something to say about a selector
+/// nobody has committed yet, mirroring `resource_prompt` in [`draw`]. Takes
+/// the place of the applied-selector line rather than sitting beside it: the
+/// two never have anything different to say about the same selector at once,
+/// and showing both would repeat the text back mid-edit.
+fn selector_lines(
+    prompt: Option<SelectorPrompt<'_>>,
+    applied: Option<&str>,
+    theme: Theme,
+) -> Vec<Line<'static>> {
+    let Some(prompt) = prompt else {
+        return applied
+            .map(|note| Line::styled(format!("Selector: {note}."), theme.dim()))
+            .into_iter()
+            .collect();
+    };
+    let label = match prompt.field {
+        SelectorField::Label => "Label selector",
+        SelectorField::Field => "Field selector",
+    };
+    let mut lines = vec![Line::styled(
+        format!("{label}: \"{}\"", prompt.text),
+        theme.dim(),
+    )];
+    if let Some(error) = prompt.error {
+        lines.push(Line::styled(
+            error.to_owned(),
+            theme.severity(Severity::Warn),
+        ));
+    }
+    lines
+}
+
+/// The pane's own ordering note: `order::note`'s silence on the default
+/// order and `order::unranked_note`'s diagnosis when nothing could be ranked
+/// under [`Sort::Order`], or [`device_note`]'s always-named counterpart under
+/// a `--sort-resource` prompt — no unranked half there, unlike a node, since
+/// a pod that never asked for the resource sorts as a real `0` rather than
+/// falling out of the ordering. Split out of [`draw`] so this `match` does
+/// not count against its own line budget too.
+fn sort_lines(
+    sort: Sort<'_>,
+    direction: Direction,
+    rows: &[PodRow],
+    usage_note: Option<&str>,
+    theme: Theme,
+) -> Vec<Line<'static>> {
+    match sort {
+        Sort::Order(order) => {
+            let mut lines = Vec::new();
+            if let Some(note) = order::note(order, direction) {
+                lines.push(Line::styled(note, theme.dim()));
+            }
+            // Now that this pane samples usage for its own rows (see
+            // `commands::pods::gather_for_node`), the same split the node
+            // pane's `usage_missing_explained` draws applies here: a failed
+            // read stays honestly unexplained, and an empty one points back
+            // at `usage_note` above.
+            let missing = Missing {
+                usage: usage_missing_explained(rows, usage_note),
+            };
+            if let Some(note) = order::unranked_note(
+                order,
+                cause(order, missing),
+                |candidate| ranks_any(rows, candidate),
+                |candidate| distinguishes(rows, candidate),
+            ) {
+                lines.extend(
+                    note.lines()
+                        .map(|line| Line::styled(line.to_owned(), theme.dim())),
+                );
+            }
+            lines
+        }
+        Sort::Resource(resource) => {
+            vec![Line::styled(device_note(resource, direction), theme.dim())]
+        }
+    }
 }
 
 /// The node's `--wide` facts, then its four pressure conditions, above the
@@ -451,6 +533,38 @@ mod tests {
                     Sort::Order(Order::default()),
                     Direction::default(),
                     Some(prompt),
+                    None,
+                    "",
+                    Theme::dark(),
+                );
+            })
+            .unwrap();
+        terminal.backend().to_string()
+    }
+
+    /// The `l`/`F` counterpart to [`render_resource_prompt`]: one of the two
+    /// selectors is capturing keystrokes, with `error` set once a bad one was
+    /// rejected.
+    fn render_selector_prompt(
+        state: &PodsState,
+        field: SelectorField,
+        text: &str,
+        error: Option<&str>,
+    ) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(90, 20)).unwrap();
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                draw(
+                    frame,
+                    area,
+                    state,
+                    None,
+                    None,
+                    Sort::Order(Order::default()),
+                    Direction::default(),
+                    None,
+                    Some(SelectorPrompt { field, text, error }),
                     "",
                     Theme::dark(),
                 );
@@ -480,6 +594,7 @@ mod tests {
                     selected,
                     sort,
                     direction,
+                    None,
                     None,
                     filter,
                     Theme::dark(),
@@ -797,6 +912,7 @@ mod tests {
                         Sort::Order(Order::default()),
                         Direction::default(),
                         None,
+                        None,
                         "",
                         Theme::dark(),
                     );
@@ -856,6 +972,10 @@ mod tests {
         // The selector-driven empty message names the selector, not the
         // literal word "filter" — a `/` filter with no match must not be
         // confused with it even though both read "no pods here match …".
+        // The applied selector's own persistent header line (see
+        // `an_applied_selector_names_itself_once_nothing_is_being_typed`)
+        // legitimately names it too, so this only asserts the filter-miss
+        // sentence itself does not conflate the two.
         let state = PodsState::Loaded {
             rows: vec![pod("api-1")],
             selector_note: Some("label selector `app=api`".to_owned()),
@@ -869,7 +989,10 @@ mod tests {
             rendered.contains("No pods here match \"nope\"."),
             "{rendered}"
         );
-        assert!(!rendered.contains("label selector"), "{rendered}");
+        assert!(
+            !rendered.contains("No pods here match label selector"),
+            "{rendered}"
+        );
     }
 
     #[test]
@@ -1086,6 +1209,114 @@ mod tests {
         let rendered = render_resource_sorted(&state, "nvidia.com/gpu", Direction::Natural);
 
         assert!(!rendered.contains("Sort by resource:"), "{rendered}");
+    }
+
+    // --- the `l`/`F` selector prompt ---
+
+    #[test]
+    fn a_label_selector_prompt_being_typed_names_itself_above_the_rows() {
+        let state = PodsState::Loaded {
+            rows: vec![pod("api-1")],
+            selector_note: None,
+            usage_note: None,
+            refresh_error: None,
+        };
+
+        let rendered = render_selector_prompt(&state, SelectorField::Label, "app=ap", None);
+
+        assert!(
+            rendered.contains("Label selector: \"app=ap\""),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn a_field_selector_prompt_names_itself_distinctly_from_a_label_one() {
+        let state = PodsState::Loaded {
+            rows: vec![pod("api-1")],
+            selector_note: None,
+            usage_note: None,
+            refresh_error: None,
+        };
+
+        let rendered = render_selector_prompt(&state, SelectorField::Field, "status.phase", None);
+
+        assert!(
+            rendered.contains("Field selector: \"status.phase\""),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("Label selector"), "{rendered}");
+    }
+
+    #[test]
+    fn a_rejected_selector_shows_its_own_sentence_under_the_prompt() {
+        let state = PodsState::Loaded {
+            rows: vec![pod("api-1")],
+            selector_note: None,
+            usage_note: None,
+            refresh_error: None,
+        };
+
+        let rendered = render_selector_prompt(
+            &state,
+            SelectorField::Label,
+            "app in",
+            Some("`app in`: `in` needs a parenthesised list, like `in (a, b)`"),
+        );
+
+        assert!(
+            rendered.contains("`app in`: `in` needs a parenthesised list, like `in (a, b)`"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn an_applied_selector_names_itself_once_nothing_is_being_typed() {
+        let state = PodsState::Loaded {
+            rows: vec![pod("api-1")],
+            selector_note: Some("label selector `app=api`".to_owned()),
+            usage_note: None,
+            refresh_error: None,
+        };
+
+        let rendered = render(&state, None);
+
+        assert!(
+            rendered.contains("Selector: label selector `app=api`."),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn no_selector_line_is_shown_when_nothing_is_applied_or_being_typed() {
+        let state = PodsState::Loaded {
+            rows: vec![pod("api-1")],
+            selector_note: None,
+            usage_note: None,
+            refresh_error: None,
+        };
+
+        let rendered = render(&state, None);
+
+        assert!(!rendered.contains("Selector:"), "{rendered}");
+    }
+
+    #[test]
+    fn the_edit_prompt_takes_the_place_of_the_applied_selector_line_rather_than_joining_it() {
+        let state = PodsState::Loaded {
+            rows: vec![pod("api-1")],
+            selector_note: Some("label selector `app=api`".to_owned()),
+            usage_note: None,
+            refresh_error: None,
+        };
+
+        let rendered = render_selector_prompt(&state, SelectorField::Label, "app=ap", None);
+
+        assert!(
+            rendered.contains("Label selector: \"app=ap\""),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("Selector: label selector"), "{rendered}");
     }
 
     // --- `usage_note` and each row's own `cpu`/`mem` figure ---
