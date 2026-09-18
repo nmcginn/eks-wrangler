@@ -1607,7 +1607,7 @@ cluster.
 
 ### Follow-ups from fuzzy search
 
-- [ ] **Search the container-logs pane.**
+- [x] **Search the container-logs pane.**
   `/` now filters every pane that shows a list of rows, and the one detail
   view left out is the one made of text rather than rows: `View::
   ContainerLogs` has no highlight to narrow, only `ui::logs::Log`'s bounded
@@ -1624,6 +1624,21 @@ cluster.
   *Acceptance:* whichever shape it takes, a match highlights without
   removing the lines around it — a log's context is often the point — and
   a search with no match says so rather than silently going nowhere.
+  Landed as `logs::LogSearch`, plain case-insensitive substring matching
+  rather than a second `fuzzy::rank` — see decision 102 for why the two
+  open questions above answer each other. `/` opens the same seeded
+  `Editing`/`Applied` life cycle `Filter` uses, but committing it jumps
+  rather than narrows: `Log::jump_to_match` (`n`/`N` step it further,
+  wrapping past either end) and the pure `step` function it is built on are
+  the "current match position" the roadmap asked for, computed fresh from
+  the live buffer each time rather than cached against it. A match
+  highlights the whole line it was found on via the new
+  `Theme::match_highlight`; a query with nothing to match shows
+  `No matches for "…".` beside the log rather than replacing it, since
+  unlike a filtered row list this pane never removes a line. `Esc`/`Left`
+  clears an applied search before backing out of the drill-down, the same
+  order `Filter`'s own clear already follows, and the footer's `n/N` hint
+  is offered only once a search is committed.
 
 ## Milestone 3 — Polish
 
