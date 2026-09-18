@@ -75,6 +75,21 @@ impl Theme {
             .add_modifier(Modifier::BOLD)
     }
 
+    /// A substring a search has matched, in the container-logs pane.
+    ///
+    /// Deliberately not [`Self::selected`]: that marks the row under the
+    /// cursor, and a matched log line is neither selected nor removed from
+    /// its neighbours, so it needs ink of its own rather than borrowing the
+    /// row-highlight's background. Bold and underlined in the accent colour
+    /// — [`Self::heading`]'s own colour, with the underline as the one thing
+    /// that tells the two apart at a glance.
+    #[must_use]
+    pub fn match_highlight(self) -> Style {
+        Style::default()
+            .fg(self.accent)
+            .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+    }
+
     /// Border style for a pane, varying with focus.
     #[must_use]
     pub fn pane_border(self, focused: bool) -> Style {

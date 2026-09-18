@@ -557,6 +557,8 @@ change, and the next command prints normally underneath it.
 | `f` | Toggle following a container's log |
 | `w` | Toggle line wrap in a container's log |
 | `p` | Switch a container's log between its current instance and its previous one |
+| `/` | Search a container's log — jumps to the nearest match, `Esc` clears it |
+| `n` / `N` | Jump to the next / previous match, wrapping past either end |
 | `q`, `Ctrl-C` | Quit |
 
 Focus starts on the cluster list; the focused pane's border is highlighted.

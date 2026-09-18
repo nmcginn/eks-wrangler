@@ -533,6 +533,21 @@ impl App {
         self.filter.is_editing()
     }
 
+    /// [`Self::is_filtering`]'s counterpart for the container-logs pane's
+    /// own `/` search.
+    #[must_use]
+    pub fn is_searching_log(&self) -> bool {
+        self.logs.is_search_editing()
+    }
+
+    /// Whether the container-logs pane has a committed search for `n`/`N` to
+    /// step through — offered in the footer only then, the same "only offer
+    /// a key where it does something" rule `R`'s hint already follows.
+    #[must_use]
+    pub fn log_search_active(&self) -> bool {
+        self.logs.is_search_applied()
+    }
+
     /// The node pane's current ordering.
     #[must_use]
     pub fn node_order(&self) -> k8s_nodes::Order {
@@ -920,13 +935,19 @@ impl App {
     /// showing a row list, seeded with whatever query was already applied so
     /// a second press refines it rather than starting over.
     ///
-    /// A no-op on [`View::ContainerLogs`], which has no rows to filter — the
-    /// same exception `cycle_sort`/`reverse_sort` make. Switches focus to the
+    /// [`View::ContainerLogs`] has no rows to filter, so its own `/` means
+    /// something else — "jump to the next matching line," through
+    /// [`logs::Log::start_search`] — rather than being a no-op the way
+    /// `cycle_sort`/`reverse_sort` still are there. Switches focus to the
     /// detail pane regardless of which pane held it: once this returns, every
-    /// following keystroke is filter text belonging to that pane, so it
+    /// following keystroke is query text belonging to that pane, so it
     /// should be the one drawing the focus border.
     fn start_filter(&mut self) {
         if matches!(self.view, View::ContainerLogs { .. }) {
+            self.focus = Focus::Detail;
+            if let LogsState::Streaming(log) = &mut self.logs {
+                log.start_search();
+            }
             return;
         }
         self.focus = Focus::Detail;
@@ -943,6 +964,56 @@ impl App {
         self.detail_selected = 0;
     }
 
+    /// [`Self::clear_filter`]'s own counterpart for the container-logs
+    /// pane's `/` search.
+    fn clear_log_search(&mut self) {
+        if let LogsState::Streaming(log) = &mut self.logs {
+            log.clear_search();
+        }
+    }
+
+    /// Handle a key press while the container-logs pane's own `/` search is
+    /// capturing text — [`Self::edit_filter`]'s counterpart for
+    /// [`logs::Log::handle_search_key`], which holds the actual state
+    /// transitions; this only routes the key to whichever log is currently
+    /// streaming, the same indirection [`Self::search_log_next`] and
+    /// [`Self::search_log_previous`] need for `n`/`N`.
+    fn edit_log_search(&mut self, key: KeyEvent) -> Flow {
+        if let LogsState::Streaming(log) = &mut self.logs {
+            log.handle_search_key(key);
+        }
+        Flow::Continue
+    }
+
+    /// `n`/`N`: jump the container-logs pane to the next (`forward`) or
+    /// previous match of its committed search, wrapping past either end of
+    /// the buffer. A no-op outside [`View::ContainerLogs`] or before `Enter`
+    /// has committed a query — the same shape [`Self::toggle_log_follow`]
+    /// and its siblings share.
+    fn search_log(&mut self, forward: bool) {
+        if let LogsState::Streaming(log) = &mut self.logs {
+            let direction = if forward {
+                logs::SearchDirection::Forward
+            } else {
+                logs::SearchDirection::Backward
+            };
+            log.jump_to_match(direction, false);
+        }
+    }
+
+    /// Route a key press to whichever `/` is currently capturing text — the
+    /// row-list [`Filter`] or the container-logs pane's own
+    /// [`logs::LogSearch`], through [`Self::edit_filter`]/[`Self::edit_log_search`].
+    /// Only called from [`Self::on_key`], which has already checked that one
+    /// of the two is editing.
+    fn edit_search(&mut self, key: KeyEvent) -> Flow {
+        if self.filter.is_editing() {
+            self.edit_filter(key)
+        } else {
+            self.edit_log_search(key)
+        }
+    }
+
     /// Handle a key press while [`Filter::Editing`] is capturing text —
     /// split out of [`Self::on_key`] so every other key's handling does not
     /// have to share a function with this one. `Enter` commits the query
@@ -951,6 +1022,9 @@ impl App {
     /// outright; `Backspace` and any other character edit the text. Every
     /// other key — including the ones that would otherwise navigate or
     /// quit — is simply not one of those and does nothing.
+    ///
+    /// Routed to from [`Self::edit_search`] whenever it is `Filter` doing the
+    /// editing rather than the logs pane's own search.
     fn edit_filter(&mut self, key: KeyEvent) -> Flow {
         let Filter::Editing(query) = &self.filter else {
             return Flow::Continue;
@@ -1555,11 +1629,13 @@ impl App {
             return Flow::Quit;
         }
 
-        // While the `/` filter is capturing text, every key below — `j`,
-        // `k`, `s`, `q`, the lot — is a character in the query rather than a
-        // navigation key, so this returns before any of it is reached.
-        if self.filter.is_editing() {
-            return self.edit_filter(key);
+        // While a `/` is capturing text — the row-list `Filter` or the
+        // container-logs pane's own `logs::LogSearch` — every key below is a
+        // character in that query rather than its usual meaning, so this
+        // returns before any of it is reached. At most one of the two is
+        // ever editing at once: `/` only ever opens one for a given `View`.
+        if self.filter.is_editing() || self.logs.is_search_editing() {
+            return self.edit_search(key);
         }
 
         if self.node_resource_sort.is_editing() || self.pod_resource_sort.is_editing() {
@@ -1588,8 +1664,9 @@ impl App {
             // A filter clears before a drill-down backs out, the same
             // "unwind the newest thing first" order the quit arm already
             // follows — so leaving a search behind takes one extra press,
-            // not zero.
+            // not zero. The line below follows suit for the logs pane.
             KeyCode::Esc | KeyCode::Left if self.filter.is_applied() => self.clear_filter(),
+            KeyCode::Esc | KeyCode::Left if self.log_search_active() => self.clear_log_search(),
             KeyCode::Esc | KeyCode::Left => return self.retreat(),
             KeyCode::Tab | KeyCode::Right => self.advance(),
             KeyCode::Enter => self.drill_in(),
@@ -1632,6 +1709,7 @@ impl App {
             KeyCode::Char('f') => self.toggle_log_follow(),
             KeyCode::Char('w') => self.toggle_log_wrap(),
             KeyCode::Char('p') => self.toggle_log_previous(),
+            KeyCode::Char(c @ ('n' | 'N')) => self.search_log(c == 'n'),
             KeyCode::Char('j') | KeyCode::Down => match self.focus {
                 Focus::Sidebar => self.select_next(),
                 Focus::Detail => self.select_next_detail_row(),
@@ -2368,6 +2446,11 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
         // The `l`/`F` counterpart to the two branches above: every key is
         // selector text while this is showing, through `App::edit_selector`.
         vec![("type", "selector"), ("enter", "apply"), ("esc", "cancel")]
+    } else if app.is_searching_log() {
+        // The container-logs pane's own `/`, which jumps rather than
+        // narrows — "apply" would read like the row-list filter above, so
+        // this says what `Enter` actually does here.
+        vec![("type", "search"), ("enter", "jump"), ("esc", "cancel")]
     } else if app.credentials_lost() {
         // Its own list rather than one more hint on the end of the others,
         // for the reason the two branches around it are: this is a state that
@@ -2386,8 +2469,11 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
     } else if matches!(app.view(), View::ContainerLogs { .. }) {
         // A log has nothing to `enter` further into and no ordering `s`/`S`
         // could apply to — `f`/`w`/`p` take their place, the three things
-        // this pane's own keys change.
-        vec![
+        // this pane's own keys change. `/` and the conditional `n`/`N` below
+        // it are placed after `q`, the same "narrow terminal clips the
+        // newest hint first" ordering the default list below already
+        // follows, so a narrow pane drops them before it drops `q quit`.
+        let mut hints = vec![
             ("tab/→", "switch"),
             ("j/k", "scroll"),
             ("f", "follow"),
@@ -2395,7 +2481,12 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
             ("p", "previous"),
             ("←/esc", "back"),
             ("q", "quit"),
-        ]
+            ("/", "search"),
+        ];
+        if app.log_search_active() {
+            hints.push(("n/N", "next/prev match"));
+        }
+        hints
     } else {
         let mut hints = vec![
             ("tab/→", "switch/drill"),
@@ -3921,6 +4012,149 @@ mod tests {
         assert_eq!(app.view(), &View::Overview);
     }
 
+    /// Drives `/`, then a query, then `Enter` through `App::on_key` — the
+    /// end-to-end path [`logs::tests`] covers piece by piece on `Log` itself.
+    fn commit_log_search(app: &mut App, query: &str) {
+        app.on_key(press(KeyCode::Char('/')));
+        for c in query.chars() {
+            app.on_key(press(KeyCode::Char(c)));
+        }
+        app.on_key(press(KeyCode::Enter));
+    }
+
+    #[test]
+    fn slash_then_a_query_and_enter_commits_a_search_and_jumps_to_the_match() {
+        let mut app = app_with_container();
+        app.on_key(press(KeyCode::Enter));
+        for line in ["alpha", "beta error", "gamma"] {
+            app.apply_log_event(LogEvent::Line(line.to_owned()));
+        }
+
+        commit_log_search(&mut app, "error");
+
+        assert!(!app.is_searching_log());
+        assert!(app.log_search_active());
+        assert_eq!(
+            streaming(app.logs()).visible(1).collect::<Vec<_>>(),
+            vec!["beta error"]
+        );
+    }
+
+    #[test]
+    fn n_and_shift_n_step_through_a_committed_search() {
+        let mut app = app_with_container();
+        app.on_key(press(KeyCode::Enter));
+        // The newest line deliberately does not match: committing a search
+        // while following lands on the newest *matching* line, which needs
+        // wrapping past the oldest match to reach here, the same case
+        // `logs::tests::committing_a_query_jumps_to_the_nearest_match_and_stops_following`
+        // covers directly on `Log`.
+        for line in ["alpha", "beta error", "gamma", "delta error", "epsilon"] {
+            app.apply_log_event(LogEvent::Line(line.to_owned()));
+        }
+        commit_log_search(&mut app, "error");
+        assert_eq!(
+            streaming(app.logs()).visible(1).collect::<Vec<_>>(),
+            vec!["beta error"]
+        );
+
+        app.on_key(press(KeyCode::Char('n')));
+        assert_eq!(
+            streaming(app.logs()).visible(1).collect::<Vec<_>>(),
+            vec!["delta error"]
+        );
+
+        app.on_key(press(KeyCode::Char('N')));
+        assert_eq!(
+            streaming(app.logs()).visible(1).collect::<Vec<_>>(),
+            vec!["beta error"],
+            "shift-n steps back to where n started"
+        );
+    }
+
+    #[test]
+    fn n_and_shift_n_are_harmless_outside_the_logs_view() {
+        let mut app = app_with_node();
+
+        assert_eq!(app.on_key(press(KeyCode::Char('n'))), Flow::Continue);
+        assert_eq!(app.on_key(press(KeyCode::Char('N'))), Flow::Continue);
+        assert_eq!(app.view(), &View::Overview);
+    }
+
+    #[test]
+    fn esc_clears_an_applied_log_search_before_backing_out_of_the_drill_down() {
+        let mut app = app_with_container();
+        app.on_key(press(KeyCode::Enter));
+        app.apply_log_event(LogEvent::Line("beta error".to_owned()));
+        commit_log_search(&mut app, "error");
+        assert!(app.log_search_active());
+
+        app.on_key(press(KeyCode::Esc));
+        assert!(!app.log_search_active(), "the first esc clears the search");
+        assert!(
+            matches!(app.view(), View::ContainerLogs { .. }),
+            "not backed out yet"
+        );
+
+        app.on_key(press(KeyCode::Esc));
+        assert!(
+            matches!(app.view(), View::PodContainers { .. }),
+            "the second esc backs out"
+        );
+    }
+
+    #[test]
+    fn esc_while_editing_a_log_search_cancels_it_outright() {
+        let mut app = app_with_container();
+        app.on_key(press(KeyCode::Enter));
+        app.apply_log_event(LogEvent::Line("hello".to_owned()));
+        app.on_key(press(KeyCode::Char('/')));
+        app.on_key(press(KeyCode::Char('x')));
+
+        app.on_key(press(KeyCode::Esc));
+
+        assert!(!app.is_searching_log());
+        assert!(!app.log_search_active());
+    }
+
+    #[test]
+    fn the_footer_switches_to_search_hints_while_the_logs_prompt_is_editing() {
+        let mut app = app_with_container();
+        app.on_key(press(KeyCode::Enter));
+        app.apply_log_event(LogEvent::Line("hello".to_owned()));
+        app.on_key(press(KeyCode::Char('/')));
+
+        let mut terminal = Terminal::new(TestBackend::new(90, 20)).unwrap();
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+
+        let rendered = terminal.backend().to_string();
+        assert!(rendered.contains("search"), "{rendered}");
+        assert!(rendered.contains("jump"), "{rendered}");
+        assert!(rendered.contains("cancel"), "{rendered}");
+    }
+
+    #[test]
+    fn the_footer_offers_n_and_shift_n_only_once_a_log_search_is_committed() {
+        // `n/N` is the newest, narrowest-scoped hint in this pane's list — see
+        // `draw_footer` — so a wide terminal keeps it from being clipped
+        // before this test gets to look for it.
+        let mut terminal = Terminal::new(TestBackend::new(200, 20)).unwrap();
+        let mut app = app_with_container();
+        app.on_key(press(KeyCode::Enter));
+        app.apply_log_event(LogEvent::Line("beta error".to_owned()));
+
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+        assert!(
+            !terminal.backend().to_string().contains("n/N"),
+            "no search committed yet"
+        );
+
+        commit_log_search(&mut app, "error");
+
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+        assert!(terminal.backend().to_string().contains("n/N"));
+    }
+
     #[test]
     fn a_frame_drilled_into_a_containers_logs_carries_the_full_breadcrumb() {
         let mut app = app_with_container();
@@ -4819,15 +5053,33 @@ mod tests {
     }
 
     #[test]
-    fn slash_is_a_no_op_on_the_container_logs_pane() {
+    fn slash_opens_the_logs_panes_own_search_rather_than_the_row_filter() {
         let mut app = app_with_container();
         app.on_key(press(KeyCode::Enter)); // drills into the container's log
+        assert!(matches!(app.view(), View::ContainerLogs { .. }));
+        app.apply_log_event(LogEvent::Line("hello".to_owned()));
+
+        app.on_key(press(KeyCode::Char('/')));
+
+        // The row-list `Filter` is untouched — this pane has no rows — but
+        // the logs pane's own search is now capturing keystrokes.
+        assert!(!app.is_filtering());
+        assert_eq!(app.filter_query(), "");
+        assert!(app.is_searching_log());
+    }
+
+    #[test]
+    fn slash_before_the_log_has_streamed_anything_does_not_open_a_search() {
+        // There is no `Log` to hold the query yet — `LogsState` is still
+        // `Loading` — so this is the one point in the drill-down where `/`
+        // really is a no-op, same as the roadmap's original exception.
+        let mut app = app_with_container();
+        app.on_key(press(KeyCode::Enter));
         assert!(matches!(app.view(), View::ContainerLogs { .. }));
 
         app.on_key(press(KeyCode::Char('/')));
 
-        assert!(!app.is_filtering());
-        assert_eq!(app.filter_query(), "");
+        assert!(!app.is_searching_log());
     }
 
     #[test]

@@ -3716,3 +3716,54 @@ asserts the narrower, still-true claim — the filter-miss sentence itself never
 says "No pods here match label selector `…`" — since the persistent header
 line legitimately says "label selector" whenever one is active, filter or no
 filter.
+
+### 102. The container-logs pane's `/` is a plain substring jump-to-match, not a second `fuzzy::rank`
+
+The roadmap left two questions open for "Search the container-logs pane":
+whether `/` here reuses the row-list `Filter`'s fuzzy ranking or reads as
+plain text, and whether a match highlights or a scored subsequence would be
+the more familiar answer for "find this text" in a scrolling log. Both read
+the same way once the actual difference between a log and a row list is
+named: a log's order is the one thing about it nobody wants re-ranked or
+thinned — restarting a pod does not re-sort its own log — so `/` here can
+only ever mean "jump to the next matching line," never "show only the
+matching ones." Scored, order-preserving subsequence matching solves a
+problem (which of many candidates is *closest*) that does not exist when
+there is exactly one candidate list and it is never reordered; plain,
+case-insensitive substring matching is what is left, and it happens to be
+the reading `less`'s own `/` already trained every likely user on.
+
+This produced its own state machine, `logs::LogSearch`, rather than a second
+caller of `crate::fuzzy::rank` or reuse of `super::Filter`: `Filter`'s
+`Editing`/`Applied` life cycle carries over unchanged (seeded from the last
+query on a second `/`, `Esc` cancelling outright rather than reverting to
+what was applied before, `Esc`/`Left` clearing an applied one before a
+drill-down backs out), but what committing it *does* differs enough that
+sharing the type would have meant branching on which pane was open inside
+methods that should not need to know. `Log::jump_to_match` is the pure
+stepping rule, `step`, parameterised over `SearchDirection` and an
+`inclusive` flag so the one commit-time jump (which should count the line
+already in view as a hit, or it would surprise a reader already looking at a
+match) and the two `n`/`N` steps (which must move to a *different* line even
+when the one on screen still matches) share one function rather than three
+near-copies. Matches are recomputed fresh from `Log`'s own `VecDeque` on
+every commit and every `n`/`N` — not cached alongside the query — because the
+buffer evicts from the front as new lines arrive, which would renumber a
+cached index list on every push; a full scan of at most `MAX_LINES` short
+strings costs nothing next to redrawing the frame that already needs one,
+the same trade-off `fuzzy::rank` already makes for the row-list filter every
+frame it is active.
+
+Highlighting is the whole line a match was found on, not the matched
+substring within it, via a new `Theme::match_highlight` (bold, underlined,
+the same accent colour `Theme::heading` uses) — the acceptance criterion
+asks only that a match "highlights without removing the lines around it,"
+and per-character span-splitting would have meant reworking how
+`log_lines` builds each row for a distinction a reader scanning a log is
+unlikely to need over the coarser one. One implementation note worth
+recording since it cost a debugging pass: `Line::styled` in this `ratatui`
+version carries its style on the `Line` itself, not on its one `Span` the
+way `Span::styled` (used by, e.g., `containers::event_lines`) does — a test
+asserting on `spans[0].style` for a `Line::styled` line silently compares
+against the default and always fails the "matches" branch, so
+`logs::tests`'s own style assertions compare `line.style` instead.
