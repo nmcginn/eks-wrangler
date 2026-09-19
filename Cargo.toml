@@ -38,6 +38,10 @@ ratatui = "0.30.2"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_yaml_ng = "0.10.0"
 thiserror = "2.0.20"
+# `~/.config/eks/config.toml` — see `config`. The one file format among the
+# three this tool reads (kubeconfig, the SSO token cache, this) with no other
+# dependency already pulling in a parser for it.
+toml = "1.1.6"
 # `sync` adds `tokio::sync::oneshot`, which is what lets a dropped
 # `commands::StreamHandle` interrupt a live log stream's read rather than
 # merely abandoning it — see that module's doc comment. `signal` adds

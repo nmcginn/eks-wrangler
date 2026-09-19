@@ -3767,3 +3767,67 @@ way `Span::styled` (used by, e.g., `containers::event_lines`) does — a test
 asserting on `spans[0].style` for a `Line::styled` line silently compares
 against the default and always fails the "matches" branch, so
 `logs::tests`'s own style assertions compare `line.style` instead.
+
+### 103. The config file's path is `~/.config/eks/config.toml` on every platform, not a platform-varying one
+
+`config::path` builds the config file's location from `directories::
+UserDirs::home_dir()` and a literal `.config/eks/config.toml`, the same
+choice `kubeconfig::search_paths` already made for `~/.kube/config` over
+`directories::BaseDirs::config_dir()` — which would put the file under
+`~/Library/Application Support` on macOS and `%APPDATA%` on Windows. Both
+crate functions were one call away; the reason to match `kubeconfig`'s
+answer rather than reach for the more "correct" platform-native one is the
+same reason `kubeconfig` gave it originally, just inherited rather than
+re-litigated: this tool's other config file already lives at a literal
+path every `kubectl` user's muscle memory already points at, and a second
+config file one `find ~/.config` away from the first is a smaller surprise
+than a technically-more-correct one a user would have to look up per
+platform. `directories` stays a dependency either way, so this cost nothing
+extra to choose.
+
+"Theme" in the roadmap task's own wording became the `color` key, aliased to
+`colour`, rather than a new name: the only thing in this codebase that
+answers to "theme" today is `ColourChoice` (`auto`/`always`/`never`), since
+no light or dark variant exists yet — "Light theme and auto-detection" is
+still its own, unstarted roadmap entry. Naming the key `theme` would have
+promised a selector this tool cannot honour yet; naming it `color` says
+exactly what it does, and leaves the eventual theme-variant task free to
+either extend this same key's grammar or add its own, rather than guessing
+which one it wanted from inside a task that was never about theming.
+
+A malformed file — unparsable TOML, an unknown key, or one of the three
+values failing its own flag's grammar — discards the whole file's settings
+rather than keeping whichever fields did parse. The acceptance criterion
+only asked for "falls back to defaults," not for partial recovery, and a
+file that is half-honoured is a harder thing to reason about from the
+warning alone: "namespace was ignored, the other two were not" needs a
+sentence per field, where "the file could not be used, so nothing in it
+took effect" is one. If a genuinely malformed-but-mostly-fine file turns out
+to be a real complaint, per-field recovery is a small, separable follow-up
+— the shape of `RawConfig::resolve` does not fight it, since each field is
+already parsed independently before any of them are combined.
+
+The warning goes out through the existing `tracing::warn!` machinery
+(`k8s::page::collect`'s stalled-page notice is the precedent) rather than a
+bespoke `eprintln!`: the default log filter already shows `warn`-level
+events on stderr, so this costs no new plumbing and stays off when
+`-v`/`RUST_LOG` redirect logging elsewhere the same way every other warning
+already does. The parsing itself — `config::parse`, `RawConfig::resolve` —
+stays a pure function returning `(Config, Option<Warning>)` regardless, so
+"a bad file falls back and says why" is asserted on the return value in a
+test, not on captured log output; only the one line in `main::user_config`
+that calls `tracing::warn!` is impure, and it is three lines that do nothing
+but relay a value already computed.
+
+Each config value is parsed through the exact `FromStr`/`ValueEnum` grammar
+its CLI flag already uses — `ColourChoice::from_str`, `RefreshInterval::
+from_str` — rather than a second table of accepted spellings for the file.
+That is also why `--color`, `--refresh`, and `--namespace` needed to stop
+carrying their own `default_value`/`default_value_t` in `cli.rs`: a value
+`clap` fills in before anybody asked is indistinguishable from one the user
+typed, which would have made the file's own setting permanently
+unreachable. All three are `Option<T>` on `GlobalArgs` now — `namespace`
+already was — and `GlobalArgs::effective_color`/`effective_refresh`/
+`effective_namespace` are the one place per setting that chains flag, then
+file, then built-in default; every call site in `main.rs` reads through
+those rather than the raw fields.

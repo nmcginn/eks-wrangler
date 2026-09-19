@@ -7,6 +7,7 @@
 pub mod aws;
 pub mod cluster;
 pub mod commands;
+pub mod config;
 pub mod format;
 pub mod fuzzy;
 pub mod k8s;
