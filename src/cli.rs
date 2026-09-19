@@ -8,6 +8,7 @@ use std::path::PathBuf;
 use clap::{Parser, Subcommand};
 
 use crate::aws::LoginMode;
+use crate::config::Config;
 use crate::k8s::nodes::Order as NodeOrder;
 use crate::k8s::page::Budget;
 use crate::k8s::pods::Order as PodOrder;
@@ -39,7 +40,8 @@ pub struct GlobalArgs {
     #[arg(long, short = 'c', global = true, value_name = "NAME")]
     pub context: Option<String>,
 
-    /// Namespace to scope resources to.
+    /// Namespace to scope resources to. Falls back to the config file's own
+    /// `namespace` when not given — [`GlobalArgs::effective_namespace`].
     #[arg(long, short = 'n', global = true, value_name = "NAMESPACE")]
     pub namespace: Option<String>,
 
@@ -66,15 +68,16 @@ pub struct GlobalArgs {
     pub timeout: Budget,
 
     /// When to colour the listing: `auto` (a terminal that wants it), `always`,
-    /// or `never`. `auto` also honours `NO_COLOR`.
+    /// or `never`. `auto` also honours `NO_COLOR`. Falls back to the config
+    /// file's own `color`, then to `auto`, when not given —
+    /// [`GlobalArgs::effective_color`].
     #[arg(
         long = "color",
         visible_alias = "colour",
         global = true,
-        value_name = "WHEN",
-        default_value = "auto"
+        value_name = "WHEN"
     )]
-    pub color: ColourChoice,
+    pub color: Option<ColourChoice>,
 
     /// When to log in to AWS IAM Identity Center for you: `auto` (offer, when
     /// there is a terminal to ask at), `always` (log in without asking), or
@@ -86,9 +89,10 @@ pub struct GlobalArgs {
     /// How often the dashboard's panes refresh themselves in the background,
     /// on top of pressing `r` to refresh on demand. `0` turns automatic
     /// refresh off. The CLI listings ignore this flag: they print once and
-    /// exit.
-    #[arg(long, global = true, value_name = "DURATION", default_value_t = RefreshInterval::default())]
-    pub refresh: RefreshInterval,
+    /// exit. Falls back to the config file's own `refresh`, then to fifteen
+    /// seconds, when not given — [`GlobalArgs::effective_refresh`].
+    #[arg(long, global = true, value_name = "DURATION")]
+    pub refresh: Option<RefreshInterval>,
 
     /// Increase log verbosity. Repeat for more detail.
     #[arg(long, short = 'v', global = true, action = clap::ArgAction::Count)]
@@ -122,6 +126,27 @@ impl GlobalArgs {
                 .collect()),
             None => crate::kubeconfig::search_paths(),
         }
+    }
+
+    /// `--color`/`--colour`, then the config file's own `color`, then `auto`.
+    #[must_use]
+    pub fn effective_color(&self, config: &Config) -> ColourChoice {
+        self.color.or(config.color).unwrap_or_default()
+    }
+
+    /// `--refresh`, then the config file's own `refresh`, then fifteen
+    /// seconds.
+    #[must_use]
+    pub fn effective_refresh(&self, config: &Config) -> RefreshInterval {
+        self.refresh.or(config.refresh).unwrap_or_default()
+    }
+
+    /// `--namespace`/`-n`, then the config file's own `namespace`. Still
+    /// `None` when neither gave one — a command reads that as "the context's
+    /// own namespace," which this has no default of its own to override.
+    #[must_use]
+    pub fn effective_namespace<'a>(&'a self, config: &'a Config) -> Option<&'a str> {
+        self.namespace.as_deref().or(config.namespace.as_deref())
     }
 }
 
@@ -683,7 +708,10 @@ mod tests {
 
     #[test]
     fn the_dashboard_refreshes_every_fifteen_seconds_unless_told_otherwise() {
-        assert_eq!(parse(&["eks"]).global.refresh, RefreshInterval::default());
+        // Nobody typed `--refresh` and there is no config file, so it resolves
+        // to the built-in default rather than clap's own — see
+        // `effective_refresh_falls_back_through_flag_then_file_then_default`.
+        assert!(parse(&["eks"]).global.refresh.is_none());
         assert_eq!(RefreshInterval::default().to_string(), "15s");
     }
 
@@ -695,7 +723,7 @@ mod tests {
         assert_eq!(before.global.refresh, after.global.refresh);
         assert_eq!(
             before.global.refresh,
-            RefreshInterval::every(std::time::Duration::from_secs(5))
+            Some(RefreshInterval::every(std::time::Duration::from_secs(5)))
         );
     }
 
@@ -703,7 +731,7 @@ mod tests {
     fn refresh_zero_turns_automatic_refresh_off() {
         assert_eq!(
             parse(&["eks", "--refresh", "0"]).global.refresh,
-            RefreshInterval::never()
+            Some(RefreshInterval::never())
         );
     }
 
@@ -845,7 +873,10 @@ mod tests {
         // The listing people already have must not gain escape sequences
         // because a flag was added; `auto` is the same rule they had before it
         // existed, which is "a terminal gets colour and a pipe does not".
-        assert_eq!(parse(&["eks", "nodes"]).global.color, ColourChoice::Auto);
+        // Nobody typed `--color`, so it resolves through the config file
+        // (absent here) to the built-in default — see
+        // `effective_color_falls_back_through_flag_then_file_then_default`.
+        assert!(parse(&["eks", "nodes"]).global.color.is_none());
         assert_eq!(ColourChoice::default(), ColourChoice::Auto);
     }
 
@@ -857,7 +888,7 @@ mod tests {
             ("never", ColourChoice::Never),
         ] {
             let cli = parse(&["eks", "nodes", "--color", flag]);
-            assert_eq!(cli.global.color, expected, "--color {flag}");
+            assert_eq!(cli.global.color, Some(expected), "--color {flag}");
         }
     }
 
@@ -868,7 +899,7 @@ mod tests {
         // uses should not be told it does not exist.
         assert_eq!(
             parse(&["eks", "nodes", "--colour", "never"]).global.color,
-            ColourChoice::Never
+            Some(ColourChoice::Never)
         );
     }
 
@@ -893,15 +924,78 @@ mod tests {
         // on either side of the subcommand and on the bare dashboard form.
         assert_eq!(
             parse(&["eks", "--color", "never", "pods"]).global.color,
-            ColourChoice::Never
+            Some(ColourChoice::Never)
         );
         assert_eq!(
             parse(&["eks", "pods", "--color", "never"]).global.color,
-            ColourChoice::Never
+            Some(ColourChoice::Never)
         );
         assert_eq!(
             parse(&["eks", "--color", "always"]).global.color,
-            ColourChoice::Always
+            Some(ColourChoice::Always)
         );
+    }
+
+    #[test]
+    fn effective_color_falls_back_through_flag_then_file_then_default() {
+        let flag = GlobalArgs {
+            color: Some(ColourChoice::Never),
+            ..GlobalArgs::default()
+        };
+        let file = Config {
+            color: Some(ColourChoice::Always),
+            ..Config::default()
+        };
+        let neither = GlobalArgs::default();
+
+        // The flag wins even when the file disagrees.
+        assert_eq!(flag.effective_color(&file), ColourChoice::Never);
+        // With no flag, the file's own value is used.
+        assert_eq!(neither.effective_color(&file), ColourChoice::Always);
+        // With neither, the built-in default.
+        assert_eq!(
+            neither.effective_color(&Config::default()),
+            ColourChoice::Auto
+        );
+    }
+
+    #[test]
+    fn effective_refresh_falls_back_through_flag_then_file_then_default() {
+        let flag = GlobalArgs {
+            refresh: Some(RefreshInterval::never()),
+            ..GlobalArgs::default()
+        };
+        let file = Config {
+            refresh: Some(RefreshInterval::every(std::time::Duration::from_secs(5))),
+            ..Config::default()
+        };
+        let neither = GlobalArgs::default();
+
+        assert_eq!(flag.effective_refresh(&file), RefreshInterval::never());
+        assert_eq!(
+            neither.effective_refresh(&file),
+            RefreshInterval::every(std::time::Duration::from_secs(5))
+        );
+        assert_eq!(
+            neither.effective_refresh(&Config::default()),
+            RefreshInterval::default()
+        );
+    }
+
+    #[test]
+    fn effective_namespace_falls_back_through_flag_then_file_then_absent() {
+        let flag = GlobalArgs {
+            namespace: Some("flag-namespace".to_owned()),
+            ..GlobalArgs::default()
+        };
+        let file = Config {
+            namespace: Some("file-namespace".to_owned()),
+            ..Config::default()
+        };
+        let neither = GlobalArgs::default();
+
+        assert_eq!(flag.effective_namespace(&file), Some("flag-namespace"));
+        assert_eq!(neither.effective_namespace(&file), Some("file-namespace"));
+        assert_eq!(neither.effective_namespace(&Config::default()), None);
     }
 }

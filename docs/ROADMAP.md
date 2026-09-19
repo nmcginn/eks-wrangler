@@ -1642,11 +1642,33 @@ cluster.
 
 ## Milestone 3 — Polish
 
-- [ ] **Config file.**
+- [x] **Config file.**
   `~/.config/eks/config.toml` for theme, refresh interval, default namespace.
   CLI flags override the file; the file overrides defaults.
   *Acceptance:* precedence is tested; a malformed file warns and falls back to
   defaults rather than exiting.
+  Landed as `src/config.rs`, covering the three settings that already have a
+  CLI-flag counterpart: `color` (`colour` accepted too, mirroring `--color`/
+  `--colour`), `refresh`, and `namespace` — "theme" reads as `color` because
+  that is the only theme-shaped knob that exists yet; "Light theme and
+  auto-detection," below, is where a real theme variant would extend this
+  same key. Each value is a string parsed through the exact grammar its flag
+  already accepts — `ColourChoice::from_str`, `RefreshInterval::from_str` —
+  rather than a second reading of "auto" or "30s". `GlobalArgs::effective_color`/
+  `effective_refresh`/`effective_namespace` are the one place the three-way
+  precedence (flag, then file, then built-in default) is resolved, so
+  `--color`, `--refresh`, and `--namespace` became `Option<T>` in `GlobalArgs`
+  with no `default_value` of their own — a flag nobody typed now reads as
+  `None` rather than as clap's default standing in for "unset," which is what
+  lets the file's own value show through. A malformed file — bad TOML, an
+  unknown key, a `color` that is not one of the three, a `refresh` that is
+  not a duration — loses the whole file's settings rather than salvaging the
+  fields that did parse, and warns once through `tracing::warn!`, named and
+  worded by `config::Warning`, at the same `warn` level every other run
+  already shows by default. The path is `~/.config/eks/config.toml` via
+  `directories::UserDirs::home_dir()`, the same literal-path choice
+  `kubeconfig::search_paths` already made over a platform-varying
+  `directories::BaseDirs::config_dir()` — see decision 103.
 
 - [ ] **Light theme and auto-detection.**
   Detect terminal background where possible, with a config override.
