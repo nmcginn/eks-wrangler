@@ -432,7 +432,7 @@ more columns, not for a table that gets out of the way.
 | Flag | Description |
 | --- | --- |
 | `-c, --context <NAME>` | Use a specific context for this invocation |
-| `-n, --namespace <NS>` | Scope resources to a namespace |
+| `-n, --namespace <NS>` | Scope resources to a namespace. Falls back to the config file's `namespace`, then to the context's own |
 | `-A, --all-namespaces` | List pods across every namespace (`eks pods`) |
 | `-l, --selector <SEL>` | Filter pods by label selector (`eks pods`, and the dashboard's pod-drilldown pane) |
 | `--field-selector <SEL>` | Filter pods by field selector (`eks pods`, and the dashboard's pod-drilldown pane) |
@@ -441,8 +441,8 @@ more columns, not for a table that gets out of the way.
 | `--wide` | Add the extra columns `kubectl -o wide` shows. Pods: `IP`, `NOMINATED NODE`, `READINESS GATES`. Nodes: `INTERNAL-IP`, `EXTERNAL-IP`, `OS-IMAGE`, `KERNEL-VERSION`, `CONTAINER-RUNTIME` |
 | `--kubeconfig <PATH>` | Override the kubeconfig search path |
 | `--timeout <DURATION>` | How long to wait for any one request to the cluster. Default `30s`; `0` waits for as long as it takes |
-| `--refresh <DURATION>` | How often the dashboard refreshes its panes in the background. Default `15s`; `0` turns automatic refresh off (`r` still refreshes on demand) |
-| `--color <WHEN>` | `auto` (default), `always`, or `never`. Spelled `--colour` too |
+| `--refresh <DURATION>` | How often the dashboard refreshes its panes in the background. Falls back to the config file's `refresh`, then to `15s`; `0` turns automatic refresh off (`r` still refreshes on demand) |
+| `--color <WHEN>` | `auto`, `always`, or `never`. Spelled `--colour` too. Falls back to the config file's `color`, then to `auto` |
 | `--login <WHEN>` | Whether to log in to AWS IAM Identity Center for you when the session has run out. `auto` (default) offers, `always` does it without asking, `never` just tells you what to run |
 | `-v, --verbose` | Increase log verbosity (repeatable) |
 
@@ -451,6 +451,25 @@ more columns, not for a table that gets out of the way.
 
 All of these are global, and they parse on either side of the subcommand:
 `eks --context prod nodes` and `eks nodes --context prod` are the same command.
+
+### Config file
+
+`~/.config/eks/config.toml` sets defaults for three of the flags above, for
+whoever is tired of typing `--color always` or `--refresh 5s` every time:
+
+```toml
+color = "always"      # or "colour" — same as --color/--colour
+refresh = "5s"         # same grammar as --refresh and --timeout
+namespace = "payments" # same as --namespace/-n
+```
+
+Every key is optional, and so is the file itself — nothing changes if it does
+not exist. Precedence is the flag, then the file, then the built-in default:
+`eks --color never` wins over the file's `color = "always"`, which wins over
+`auto`. A file that fails to parse — bad TOML, an unknown key, a `color` that
+is not `auto`/`always`/`never` — is not fatal: `eks` warns and runs with the
+built-in defaults for whatever the flags did not set, exactly as if the file
+were not there.
 
 ### Colour
 

@@ -15,10 +15,12 @@ use tracing_subscriber::EnvFilter;
 use eks::aws::LoginMode;
 use eks::cli::{Cli, Command, GlobalArgs};
 use eks::commands::{self, contexts, credentials, nodes, pods};
+use eks::config::{self, Config};
 use eks::format::Width;
+use eks::k8s::nodes::Order as NodeOrder;
 use eks::k8s::order::Direction;
 use eks::k8s::page::Budget;
-use eks::k8s::pods::Selectors;
+use eks::k8s::pods::{Order as PodOrder, Selectors};
 use eks::kubeconfig::KubeConfig;
 use eks::progress::{self, Progress};
 use eks::theme::{ColourChoice, Palette};
@@ -51,6 +53,7 @@ fn main() -> ExitCode {
 fn run(cli: Cli) -> Result<ExitCode> {
     let paths = cli.global.kubeconfig_paths()?;
     let config = KubeConfig::load_from(&paths)?;
+    let user_config = user_config();
 
     match cli.command.unwrap_or(Command::Dashboard) {
         Command::Dashboard => {
@@ -67,7 +70,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
                 &paths,
                 cli.global.context.as_deref(),
                 cli.global.timeout,
-                cli.global.refresh,
+                cli.global.effective_refresh(&user_config),
                 &selectors,
                 cli.global.login,
             )?;
@@ -77,7 +80,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
             print_line(&contexts::list(
                 &config,
                 quiet,
-                stdout_palette(cli.global.color),
+                stdout_palette(cli.global.effective_color(&user_config)),
             ));
             Ok(ExitCode::SUCCESS)
         }
@@ -86,67 +89,33 @@ fn run(cli: Cli) -> Result<ExitCode> {
             sort_reverse,
             sort_resource,
             wide,
-        } => {
-            // The only commands that need a runtime; each builds one for
-            // itself so the filesystem-only commands stay as cheap as they
-            // are. `_interruptible`, unlike the dashboard's own `block_on`
-            // calls, because this is one of the two commands that draw
-            // `progress`'s line — see that function's doc comment.
-            match commands::block_on_interruptible(nodes::list(
-                &config,
-                &paths,
-                cli.global.context.as_deref(),
-                nodes::Request {
-                    order: sort,
-                    direction: Direction::reversed(sort_reverse),
-                    resource: sort_resource,
-                    width: Width::for_terminal(wide, stdout_terminal_cols()),
-                    palette: stdout_palette(cli.global.color),
-                    budget: cli.global.timeout,
-                    login: cli.global.login,
-                    progress: stderr_progress(&cli.global),
-                },
-            ))? {
-                commands::Interruptible::Finished(output) => {
-                    print_line(&output);
-                    Ok(ExitCode::SUCCESS)
-                }
-                commands::Interruptible::Interrupted => Ok(interrupted()),
-            }
-        }
+        } => run_nodes(
+            &config,
+            &paths,
+            &cli.global,
+            &user_config,
+            sort,
+            sort_reverse,
+            sort_resource,
+            wide,
+        ),
         Command::Pods {
             all_namespaces,
             sort,
             sort_reverse,
             sort_resource,
             wide,
-        } => {
-            match commands::block_on_interruptible(pods::list(
-                &config,
-                &paths,
-                cli.global.context.as_deref(),
-                pods::Request {
-                    namespace: cli.global.namespace.as_deref(),
-                    all_namespaces,
-                    label_selector: cli.global.selector.as_deref(),
-                    field_selector: cli.global.field_selector.as_deref(),
-                    order: sort,
-                    direction: Direction::reversed(sort_reverse),
-                    resource: sort_resource.as_deref(),
-                    width: Width::for_terminal(wide, stdout_terminal_cols()),
-                    palette: stdout_palette(cli.global.color),
-                    budget: cli.global.timeout,
-                    login: cli.global.login,
-                    progress: stderr_progress(&cli.global),
-                },
-            ))? {
-                commands::Interruptible::Finished(output) => {
-                    print_line(&output);
-                    Ok(ExitCode::SUCCESS)
-                }
-                commands::Interruptible::Interrupted => Ok(interrupted()),
-            }
-        }
+        } => run_pods(
+            &config,
+            &paths,
+            &cli.global,
+            &user_config,
+            all_namespaces,
+            sort,
+            sort_reverse,
+            sort_resource.as_deref(),
+            wide,
+        ),
         Command::Use { name } => {
             print_line(&contexts::switch(&config, &name)?);
             Ok(ExitCode::SUCCESS)
@@ -156,6 +125,104 @@ fn run(cli: Cli) -> Result<ExitCode> {
             Ok(ExitCode::SUCCESS)
         }
     }
+}
+
+/// `eks nodes`. Split out of [`run`] to keep that function's match arms
+/// short — this one still builds and drives the whole request on its own.
+#[allow(clippy::too_many_arguments)]
+fn run_nodes(
+    config: &KubeConfig,
+    paths: &[PathBuf],
+    global: &GlobalArgs,
+    user_config: &Config,
+    sort: NodeOrder,
+    sort_reverse: bool,
+    sort_resource: Option<String>,
+    wide: bool,
+) -> Result<ExitCode> {
+    let color = global.effective_color(user_config);
+    // `_interruptible`, unlike the dashboard's own `block_on` calls, because
+    // this is one of the two commands that draw `progress`'s line — see that
+    // function's doc comment.
+    match commands::block_on_interruptible(nodes::list(
+        config,
+        paths,
+        global.context.as_deref(),
+        nodes::Request {
+            order: sort,
+            direction: Direction::reversed(sort_reverse),
+            resource: sort_resource,
+            width: Width::for_terminal(wide, stdout_terminal_cols()),
+            palette: stdout_palette(color),
+            budget: global.timeout,
+            login: global.login,
+            progress: stderr_progress(global, color),
+        },
+    ))? {
+        commands::Interruptible::Finished(output) => {
+            print_line(&output);
+            Ok(ExitCode::SUCCESS)
+        }
+        commands::Interruptible::Interrupted => Ok(interrupted()),
+    }
+}
+
+/// `eks pods`. [`run_nodes`]'s doc comment explains the split.
+#[allow(clippy::too_many_arguments)]
+fn run_pods(
+    config: &KubeConfig,
+    paths: &[PathBuf],
+    global: &GlobalArgs,
+    user_config: &Config,
+    all_namespaces: bool,
+    sort: PodOrder,
+    sort_reverse: bool,
+    sort_resource: Option<&str>,
+    wide: bool,
+) -> Result<ExitCode> {
+    let color = global.effective_color(user_config);
+    match commands::block_on_interruptible(pods::list(
+        config,
+        paths,
+        global.context.as_deref(),
+        pods::Request {
+            namespace: global.effective_namespace(user_config),
+            all_namespaces,
+            label_selector: global.selector.as_deref(),
+            field_selector: global.field_selector.as_deref(),
+            order: sort,
+            direction: Direction::reversed(sort_reverse),
+            resource: sort_resource,
+            width: Width::for_terminal(wide, stdout_terminal_cols()),
+            palette: stdout_palette(color),
+            budget: global.timeout,
+            login: global.login,
+            progress: stderr_progress(global, color),
+        },
+    ))? {
+        commands::Interruptible::Finished(output) => {
+            print_line(&output);
+            Ok(ExitCode::SUCCESS)
+        }
+        commands::Interruptible::Interrupted => Ok(interrupted()),
+    }
+}
+
+/// Read `~/.config/eks/config.toml`, warning (rather than failing) if it
+/// exists and could not be used as written.
+///
+/// No resolvable config path — no home directory — is silently the same as
+/// no file: there is nowhere this file could be, which is not itself
+/// something to warn about.
+fn user_config() -> Config {
+    let Some(path) = config::path() else {
+        return Config::default();
+    };
+    let (user_config, warning) = config::load(&path);
+    if let Some(warning) = warning {
+        tracing::warn!("{warning}");
+    }
+    user_config
 }
 
 fn dashboard(
@@ -370,9 +437,9 @@ fn stdout_palette(choice: ColourChoice) -> Palette {
 /// piped listing, every `--color never`, every `-v`, and every fetch the
 /// dashboard runs gets it, and nothing about those paths costs a lock, a
 /// timer, or a byte.
-fn stderr_progress(global: &GlobalArgs) -> Progress {
+fn stderr_progress(global: &GlobalArgs, color: ColourChoice) -> Progress {
     let allowed = progress::wanted(
-        global.color,
+        color,
         std::io::stdout().is_terminal(),
         std::io::stderr().is_terminal(),
         progress::logging_to_stderr(global.verbose, std::env::var_os("RUST_LOG").as_deref()),
