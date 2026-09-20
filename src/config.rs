@@ -14,7 +14,7 @@ use clap::ValueEnum;
 use serde::Deserialize;
 
 use crate::k8s::page::ParseError as DurationParseError;
-use crate::theme::ColourChoice;
+use crate::theme::{ColourChoice, ThemeChoice};
 use crate::ui::RefreshInterval;
 
 /// Settings read from the config file. Every field is optional: an absent
@@ -23,6 +23,7 @@ use crate::ui::RefreshInterval;
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Config {
     pub color: Option<ColourChoice>,
+    pub theme: Option<ThemeChoice>,
     pub refresh: Option<RefreshInterval>,
     pub namespace: Option<String>,
 }
@@ -119,6 +120,7 @@ fn parse(text: &str, path: &Path) -> (Config, Option<Warning>) {
 struct RawConfig {
     #[serde(alias = "colour")]
     color: Option<String>,
+    theme: Option<String>,
     refresh: Option<String>,
     namespace: Option<String>,
 }
@@ -132,6 +134,13 @@ impl RawConfig {
                     .map_err(|_| format!("color {value:?} is not one of auto, always, never"))
             })
             .transpose()?;
+        let theme = self
+            .theme
+            .map(|value| {
+                ThemeChoice::from_str(&value, true)
+                    .map_err(|_| format!("theme {value:?} is not one of auto, dark, light"))
+            })
+            .transpose()?;
         let refresh = self
             .refresh
             .map(|value| {
@@ -143,6 +152,7 @@ impl RawConfig {
 
         Ok(Config {
             color,
+            theme,
             refresh,
             namespace: self.namespace,
         })
@@ -179,17 +189,27 @@ mod tests {
     #[test]
     fn every_key_parses_through_the_same_grammar_the_flags_use() {
         let (config, warning) = parse(
-            "color = \"always\"\nrefresh = \"5s\"\nnamespace = \"payments\"\n",
+            "color = \"always\"\ntheme = \"light\"\nrefresh = \"5s\"\nnamespace = \"payments\"\n",
             Path::new("config.toml"),
         );
 
         assert!(warning.is_none());
         assert_eq!(config.color, Some(ColourChoice::Always));
+        assert_eq!(config.theme, Some(ThemeChoice::Light));
         assert_eq!(
             config.refresh,
             Some(RefreshInterval::every(Duration::from_secs(5)))
         );
         assert_eq!(config.namespace.as_deref(), Some("payments"));
+    }
+
+    #[test]
+    fn a_bad_theme_value_falls_back_to_defaults_with_a_warning_naming_it() {
+        let (config, warning) = parse("theme = \"sepia\"\n", Path::new("config.toml"));
+
+        assert_eq!(config, Config::default());
+        let warning = warning.expect("an unrecognised theme should warn");
+        assert!(warning.to_string().contains("sepia"));
     }
 
     #[test]
@@ -206,6 +226,7 @@ mod tests {
 
         assert!(warning.is_none());
         assert_eq!(config.color, None);
+        assert_eq!(config.theme, None);
         assert_eq!(
             config.refresh,
             Some(RefreshInterval::every(Duration::from_secs(60)))

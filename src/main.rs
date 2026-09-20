@@ -23,7 +23,7 @@ use eks::k8s::page::Budget;
 use eks::k8s::pods::{Order as PodOrder, Selectors};
 use eks::kubeconfig::KubeConfig;
 use eks::progress::{self, Progress};
-use eks::theme::{ColourChoice, Palette};
+use eks::theme::{self, ColourChoice, Palette, Theme};
 use eks::ui::{self, App, RefreshInterval};
 
 /// What a listing exits with when the user's own Ctrl-C ended it, rather than
@@ -73,6 +73,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
                 cli.global.effective_refresh(&user_config),
                 &selectors,
                 cli.global.login,
+                resolved_theme(&cli.global, &user_config),
             )?;
             Ok(ExitCode::SUCCESS)
         }
@@ -80,7 +81,10 @@ fn run(cli: Cli) -> Result<ExitCode> {
             print_line(&contexts::list(
                 &config,
                 quiet,
-                stdout_palette(cli.global.effective_color(&user_config)),
+                stdout_palette(
+                    cli.global.effective_color(&user_config),
+                    resolved_theme(&cli.global, &user_config),
+                ),
             ));
             Ok(ExitCode::SUCCESS)
         }
@@ -141,6 +145,7 @@ fn run_nodes(
     wide: bool,
 ) -> Result<ExitCode> {
     let color = global.effective_color(user_config);
+    let theme = resolved_theme(global, user_config);
     // `_interruptible`, unlike the dashboard's own `block_on` calls, because
     // this is one of the two commands that draw `progress`'s line — see that
     // function's doc comment.
@@ -153,7 +158,7 @@ fn run_nodes(
             direction: Direction::reversed(sort_reverse),
             resource: sort_resource,
             width: Width::for_terminal(wide, stdout_terminal_cols()),
-            palette: stdout_palette(color),
+            palette: stdout_palette(color, theme),
             budget: global.timeout,
             login: global.login,
             progress: stderr_progress(global, color),
@@ -181,6 +186,7 @@ fn run_pods(
     wide: bool,
 ) -> Result<ExitCode> {
     let color = global.effective_color(user_config);
+    let theme = resolved_theme(global, user_config);
     match commands::block_on_interruptible(pods::list(
         config,
         paths,
@@ -194,7 +200,7 @@ fn run_pods(
             direction: Direction::reversed(sort_reverse),
             resource: sort_resource,
             width: Width::for_terminal(wide, stdout_terminal_cols()),
-            palette: stdout_palette(color),
+            palette: stdout_palette(color, theme),
             budget: global.timeout,
             login: global.login,
             progress: stderr_progress(global, color),
@@ -225,6 +231,7 @@ fn user_config() -> Config {
     user_config
 }
 
+#[allow(clippy::too_many_arguments)]
 fn dashboard(
     config: &KubeConfig,
     paths: &[PathBuf],
@@ -233,9 +240,11 @@ fn dashboard(
     refresh: RefreshInterval,
     selectors: &Selectors,
     login: LoginMode,
+    theme: Theme,
 ) -> Result<()> {
     let views = contexts::views(config);
     let mut app = App::new(views);
+    app.set_theme(theme);
     // Retypeable at runtime through `l`/`F` from here on — see
     // `App::set_pod_selectors` and `ui::PodsFetcher`'s own doc comment.
     app.set_pod_selectors(selectors.clone());
@@ -411,12 +420,27 @@ fn print_line(output: &str) {
 /// `OsStr` rather than `String`: an environment variable that is not valid
 /// UTF-8 is still set, and `NO_COLOR=<invalid>` must turn colour off rather
 /// than be dropped as unreadable.
-fn stdout_palette(choice: ColourChoice) -> Palette {
+fn stdout_palette(choice: ColourChoice, theme: Theme) -> Palette {
     Palette::choose(
         choice,
+        theme,
         std::io::stdout().is_terminal(),
         std::env::var_os("NO_COLOR").as_deref(),
         std::env::var_os("TERM").as_deref(),
+    )
+}
+
+/// Which theme this run draws in — the dashboard's panes and, through
+/// [`stdout_palette`], a listing's own severity ink.
+///
+/// The one impure answer `theme::resolve` needs beyond `--theme`/the config
+/// file, gathered here for the same reason `stdout_palette` gathers its own:
+/// the environment read happens once, in `main`, and the rule itself is
+/// `theme::resolve`'s, tested without a `COLORFGBG` to set.
+fn resolved_theme(global: &GlobalArgs, user_config: &Config) -> Theme {
+    theme::resolve(
+        global.effective_theme(user_config),
+        std::env::var_os("COLORFGBG").as_deref(),
     )
 }
 

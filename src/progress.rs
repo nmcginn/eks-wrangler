@@ -33,7 +33,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use crate::format;
-use crate::theme::{ColourChoice, Palette};
+use crate::theme::{ColourChoice, Palette, Theme};
 
 /// How often a step redraws while nothing about it changes.
 ///
@@ -220,10 +220,12 @@ pub fn wanted(
     no_color: Option<&OsStr>,
     term: Option<&OsStr>,
 ) -> bool {
+    // The theme itself never matters here — only whether *something* would be
+    // painted — so `Theme::dark()` is a filler value, not a choice.
     stdout_is_terminal
         && stderr_is_terminal
         && !logging
-        && Palette::choose(choice, true, no_color, term).is_colour()
+        && Palette::choose(choice, Theme::dark(), true, no_color, term).is_colour()
 }
 
 /// Whether this run writes log lines to stderr, from the two things that turn

@@ -1670,10 +1670,25 @@ cluster.
   `kubeconfig::search_paths` already made over a platform-varying
   `directories::BaseDirs::config_dir()` — see decision 103.
 
-- [ ] **Light theme and auto-detection.**
+- [x] **Light theme and auto-detection.**
   Detect terminal background where possible, with a config override.
   *Acceptance:* both themes meet WCAG AA contrast for body text; a test asserts
   the contrast ratios.
+  Landed as `Theme::light()` beside `Theme::dark()`, `--theme`/config `theme`
+  (`auto`/`dark`/`light`, `auto` the default) resolved through the new
+  `theme::resolve`, and detection through `COLORFGBG` — the one hint that
+  costs no I/O on the first-paint path an OSC 11 terminal query would have
+  meant blocking on. `theme::resolve` reads `--theme`'s own choice outright
+  and only asks `detect_background` under `Auto`, falling back to `dark` when
+  the terminal cannot be told (unset `COLORFGBG`, which most terminal
+  emulators never set) rather than guessing light. Threaded to both surfaces
+  a theme can reach: `App::set_theme` seeds the dashboard right after
+  `App::new`, the same shape `set_pod_selectors` already uses, and
+  `Palette::choose` now takes the resolved `Theme` outright rather than
+  hardcoding `Theme::default()`, so `eks nodes --theme light`'s `STATUS`
+  column reads in the same ink a light-mode dashboard pane would — a `--color`
+  honoured by one surface and not its twin was the gap CLAUDE.md's "one pull
+  request" section warns about. See decision 104.
 
 - [ ] **Startup budget and benchmarks.**
   Add `criterion` benchmarks for kubeconfig parsing and first paint. Document

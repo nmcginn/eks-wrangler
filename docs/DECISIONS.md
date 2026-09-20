@@ -3831,3 +3831,68 @@ already was — and `GlobalArgs::effective_color`/`effective_refresh`/
 `effective_namespace` are the one place per setting that chains flag, then
 file, then built-in default; every call site in `main.rs` reads through
 those rather than the raw fields.
+
+### 104. Terminal-background detection reads `COLORFGBG`, not an OSC 11 query, and falls back to dark
+
+"Light theme and auto-detection" wanted the terminal's own background asked
+for "where possible" — the honest reading of that phrase, once the two ways
+of asking were weighed, is `COLORFGBG` and nothing more. The reliable
+answer, an OSC 11 query, means writing an escape sequence to the terminal
+and blocking on its reply: real I/O, on the one path CLAUDE.md is strictest
+about — "never block first paint on a network call" is written about a
+network call specifically because that was the I/O this tool had at the
+time, but the budget it protects (first paint under 50ms) does not care
+whether the wait is a socket or a terminal that never answers a query it
+does not understand. A `--timeout`-style budget around the query would have
+made it safe but not free, and worse, not testable the way everything else
+in this tool is: CLAUDE.md's testing standard is "no live AWS credentials,"
+not "no terminal, either," but a query-response protocol has no fixture to
+stand in for a terminal's raw-mode reply the way `page::collect`'s tests
+stand in for a cluster's paged one. `COLORFGBG` costs neither: it is an
+environment variable some terminals and multiplexers already export
+unasked, read the same way `NO_COLOR`/`TERM` already are in `main.rs`, and
+`theme::detect_background` is a pure function over it exactly like
+`Palette::choose` is over its own three.
+
+The honest cost: most terminal emulators people actually use day to day
+(iTerm2, Terminal.app, GNOME Terminal, Windows Terminal, Alacritty, kitty)
+do not set `COLORFGBG` at all, so `auto` will read as "cannot be told" for
+most users most of the time and fall back to dark — the same fallback a
+`false` "is this a light background" bit would have given, and the safer
+wrong guess: a dark theme's ink is unreadable on a light terminal, but not
+catastrophically so the way a light theme's ink would be on a genuinely
+dark one, painted in colours picked to clear WCAG AA against white. Where
+detection is silent, `--theme light`/the config file's own `theme` is the
+answer, the same "the flag is the override, not the fallback" shape
+`--color` already has. An OSC 11 query is not ruled out for good — it is a
+real follow-up, and a bigger one than this task's own wording suggested,
+since it needs the timeout-and-fixture machinery above before it can ship
+at all — but it was never this task's to build, only to leave room for:
+`theme::resolve` takes `Option<Background>` from whatever answers
+`detect_background`'s question, so a second, richer detector slots in
+beside it without `Palette::choose` or `App::set_theme` changing at all.
+
+`Theme::light()` is not `Theme::dark()`'s palette lightened — a pastel
+tuned to read on black goes nearly invisible on white, so each colour was
+picked against its own theme's assumed background rather than derived from
+the other's. Neither theme paints a background of its own: `Theme::
+background` stays `Color::Reset` in both, trusting whatever the terminal
+already shows, the same choice `dark()` already made before this task and
+the reason `--theme light` on a terminal that is not actually light will
+still look wrong — the override fixes a wrong *guess*, not a mismatched
+terminal, and painting an explicit background to cover that case was ruled
+out as its own, larger decision (real risk to first paint's "render from
+empty state" rule, and untested territory `TestBackend` covers today only
+because nothing paints one) rather than folded in here.
+
+Wiring stopped at neither surface alone. `Palette::choose` gained a `Theme`
+parameter rather than keeping its internal `Theme::default()`, so `eks
+nodes --theme light` and a light-mode dashboard pane draw `STATUS`/severity
+ink in the same colours — `--color` already reaches both the CLI table and
+the dashboard through one `Theme`, and a `--theme` that only reached one of
+them would have been the exact gap CLAUDE.md's "what one pull request
+means" warns against: a flag honoured by one listing and not its twin.
+`App::set_theme` mirrors `App::set_pod_selectors`'s own shape — seeded once
+in `main::dashboard` right after `App::new`, so every existing test still
+gets the dark default without a second constructor parameter to thread
+through five call sites.

@@ -46,6 +46,29 @@ impl Theme {
         }
     }
 
+    /// The light theme, tuned for readability on a light terminal. Every
+    /// colour here is darker/more saturated than its `dark()` counterpart —
+    /// a pastel that reads fine on black turns nearly invisible on white, so
+    /// this is not `dark()`'s palette lightened, but a second one chosen
+    /// against the opposite background. See `tests::
+    /// both_themes_meet_wcag_aa_contrast_for_body_text` for the numbers this
+    /// was picked to clear.
+    #[must_use]
+    pub const fn light() -> Self {
+        Self {
+            background: Color::Reset,
+            text: Color::Rgb(0x1F, 0x23, 0x28),
+            muted: Color::Rgb(0x65, 0x6D, 0x76),
+            accent: Color::Rgb(0x0B, 0x72, 0x85),
+            border: Color::Rgb(0xD1, 0xD5, 0xDA),
+            border_focused: Color::Rgb(0x0B, 0x72, 0x85),
+            success: Color::Rgb(0x1A, 0x7F, 0x37),
+            warning: Color::Rgb(0x9A, 0x67, 0x00),
+            danger: Color::Rgb(0xCF, 0x22, 0x2E),
+            selection_bg: Color::Rgb(0xE9, 0xEC, 0xEF),
+        }
+    }
+
     /// Body text.
     #[must_use]
     pub fn body(self) -> Style {
@@ -213,6 +236,79 @@ impl Severity {
     }
 }
 
+/// What the user asked for with `--theme`.
+///
+/// A `clap::ValueEnum` on the domain type, the same reason `ColourChoice`
+/// is one: a value this does not take is rejected with the ones it does
+/// listed, before anything connects, rather than parsed into a silent
+/// default.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, clap::ValueEnum)]
+pub enum ThemeChoice {
+    /// Detect the terminal's own background where possible, falling back to
+    /// dark when it cannot be told. The default.
+    #[default]
+    Auto,
+    Dark,
+    Light,
+}
+
+/// Whether a terminal's background reads as dark or light, the one fact
+/// [`resolve`] needs beyond what the user typed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Background {
+    Dark,
+    Light,
+}
+
+/// Read `COLORFGBG` for a hint about the terminal's own background.
+///
+/// There is no portable way to ask a terminal what colour it is: the
+/// reliable answer is an OSC 11 query, which means writing to the terminal
+/// and blocking on its reply — exactly the kind of I/O CLAUDE.md's startup
+/// budget rules out of first paint, and not something a fixture can stand in
+/// for in a test. `COLORFGBG` is the one hint that costs neither: several
+/// terminals and multiplexers (rxvt, and `tmux`/`screen` forwarding it from
+/// whatever set it) export it unasked, in `foreground;background` form —
+/// sometimes `foreground;default;background`, which is why the *last*
+/// `;`-separated field is read rather than the second — as an index into the
+/// 16-colour ANSI palette. `7` (light grey, conventionally "white") and
+/// `9`–`15` (the bright colours, `15` being bright white) read as a light
+/// background; everything else, including `8`'s "bright black", stays dark.
+/// Absent, unset, or unparseable is `None` — "cannot be told," not "is
+/// dark" — so [`resolve`] is the one place that turns "cannot be told" into
+/// a fallback.
+#[must_use]
+pub fn detect_background(colorfgbg: Option<&OsStr>) -> Option<Background> {
+    let value = colorfgbg?.to_str()?;
+    let field = value.rsplit(';').next()?;
+    let index: u8 = field.trim().parse().ok()?;
+    Some(if matches!(index, 7 | 9..=15) {
+        Background::Light
+    } else {
+        Background::Dark
+    })
+}
+
+/// Resolve `--theme`/the config file's own `theme` and `COLORFGBG` into the
+/// [`Theme`] to draw with.
+///
+/// Pure over its two answers, the same shape [`Palette::choose`] already is:
+/// `choice` wins outright when it names a theme outright, and `Auto` asks
+/// [`detect_background`] — falling back to [`Theme::dark`] when that comes
+/// back `None`, since a terminal already dark is the safer wrong guess than
+/// one this tool just painted unreadable.
+#[must_use]
+pub fn resolve(choice: ThemeChoice, colorfgbg: Option<&OsStr>) -> Theme {
+    match choice {
+        ThemeChoice::Dark => Theme::dark(),
+        ThemeChoice::Light => Theme::light(),
+        ThemeChoice::Auto => match detect_background(colorfgbg) {
+            Some(Background::Light) => Theme::light(),
+            Some(Background::Dark) | None => Theme::dark(),
+        },
+    }
+}
+
 /// What the user asked for with `--color`.
 ///
 /// A `clap::ValueEnum` on the domain type for the reason `--sort` is one
@@ -262,12 +358,17 @@ pub enum Palette {
 const FOREGROUND_DEFAULT: &str = "\x1b[39m";
 
 impl Palette {
-    /// Decide whether this run prints colour.
+    /// Decide whether this run prints colour, and in which theme's severity
+    /// ink.
     ///
-    /// Pure over the four things that decide it, so every combination below is
+    /// Pure over the five things that decide it, so every combination below is
     /// a test rather than an environment variable somebody has to set:
     ///
     /// - `choice` is `--color`, and it wins outright. The user typed it.
+    /// - `theme` is `--theme`/the config file's own `theme`, already resolved
+    ///   by [`resolve`] — a listing's colour and a dashboard's are the same
+    ///   `Theme`, so `eks nodes` on a light terminal reads its `STATUS`
+    ///   column in the same ink the pane beside it would.
     /// - `stdout_is_terminal` is the `auto` default: a pipe or a file gets the
     ///   plain table, so `eks nodes | grep NotReady` is unchanged and nothing
     ///   downstream has to strip escapes it did not ask for.
@@ -283,6 +384,7 @@ impl Palette {
     #[must_use]
     pub fn choose(
         choice: ColourChoice,
+        theme: Theme,
         stdout_is_terminal: bool,
         no_color: Option<&OsStr>,
         term: Option<&OsStr>,
@@ -300,7 +402,7 @@ impl Palette {
         };
 
         if wanted {
-            Self::Colour(Theme::default())
+            Self::Colour(theme)
         } else {
             Self::Plain
         }
@@ -438,7 +540,7 @@ mod tests {
     /// The palette a CLI listing gets when `--color=always` was typed, without
     /// asking a terminal anything.
     fn colour() -> Palette {
-        Palette::choose(ColourChoice::Always, false, None, None)
+        Palette::choose(ColourChoice::Always, Theme::dark(), false, None, None)
     }
 
     #[test]
@@ -539,7 +641,8 @@ mod tests {
 
     #[test]
     fn auto_colours_a_terminal_and_leaves_a_pipe_alone() {
-        let auto = |terminal| Palette::choose(ColourChoice::Auto, terminal, None, None);
+        let auto =
+            |terminal| Palette::choose(ColourChoice::Auto, Theme::dark(), terminal, None, None);
 
         assert!(auto(true).is_colour());
         // `eks nodes | grep NotReady` must be the bytes it was before colour
@@ -552,6 +655,7 @@ mod tests {
         let auto = |no_color: Option<&str>| {
             Palette::choose(
                 ColourChoice::Auto,
+                Theme::dark(),
                 true,
                 no_color.map(OsStr::new),
                 Some(OsStr::new("xterm-256color")),
@@ -569,8 +673,15 @@ mod tests {
 
     #[test]
     fn a_terminal_that_says_it_is_dumb_is_believed() {
-        let auto =
-            |term: &str| Palette::choose(ColourChoice::Auto, true, None, Some(OsStr::new(term)));
+        let auto = |term: &str| {
+            Palette::choose(
+                ColourChoice::Auto,
+                Theme::dark(),
+                true,
+                None,
+                Some(OsStr::new(term)),
+            )
+        };
 
         assert!(!auto("dumb").is_colour());
         assert!(auto("xterm-256color").is_colour());
@@ -588,6 +699,7 @@ mod tests {
         assert!(
             Palette::choose(
                 ColourChoice::Always,
+                Theme::dark(),
                 false,
                 Some(OsStr::new("1")),
                 Some(OsStr::new("dumb")),
@@ -595,7 +707,7 @@ mod tests {
             .is_colour()
         );
         // And the other way: a terminal that would have been coloured.
-        assert!(!Palette::choose(ColourChoice::Never, true, None, None).is_colour());
+        assert!(!Palette::choose(ColourChoice::Never, Theme::dark(), true, None, None).is_colour());
     }
 
     #[test]
@@ -636,5 +748,136 @@ mod tests {
         // "Whatever the terminal was already using" is the absence of a
         // sequence, not a sequence that sets it.
         assert_eq!(foreground(Color::Reset), None);
+    }
+
+    /// Relative luminance, [WCAG 2.1]'s own formula: each channel
+    /// linearised, then weighted by how much the eye actually notices it.
+    ///
+    /// [WCAG 2.1]: https://www.w3.org/TR/WCAG21/#dfn-relative-luminance
+    fn relative_luminance((r, g, b): (u8, u8, u8)) -> f64 {
+        fn channel(c: u8) -> f64 {
+            let c = f64::from(c) / 255.0;
+            if c <= 0.039_28 {
+                c / 12.92
+            } else {
+                ((c + 0.055) / 1.055).powf(2.4)
+            }
+        }
+        0.2126 * channel(r) + 0.7152 * channel(g) + 0.0722 * channel(b)
+    }
+
+    /// [WCAG 2.1]'s contrast ratio between two colours, from 1:1 (identical)
+    /// to 21:1 (black on white). `4.5:1` is the AA bar for body text.
+    ///
+    /// [WCAG 2.1]: https://www.w3.org/TR/WCAG21/#dfn-contrast-ratio
+    fn contrast_ratio(a: (u8, u8, u8), b: (u8, u8, u8)) -> f64 {
+        let (la, lb) = (relative_luminance(a), relative_luminance(b));
+        let (lighter, darker) = if la > lb { (la, lb) } else { (lb, la) };
+        (lighter + 0.05) / (darker + 0.05)
+    }
+
+    fn rgb(colour: Color) -> (u8, u8, u8) {
+        let Color::Rgb(r, g, b) = colour else {
+            panic!("expected a 24-bit colour, got {colour:?}");
+        };
+        (r, g, b)
+    }
+
+    /// Neither theme paints a background of its own — [`Theme::background`]
+    /// stays [`Color::Reset`] in both, trusting whatever the terminal already
+    /// shows — so there is no literal swatch to measure `text` against.
+    /// These are the backgrounds each theme was tuned to read well on: a
+    /// common dark terminal default for [`Theme::dark`], and plain white for
+    /// [`Theme::light`], which a user forcing `--theme light` on an
+    /// already-light terminal is assumed to be close to.
+    const ASSUMED_DARK_BACKGROUND: (u8, u8, u8) = (0x1E, 0x1E, 0x1E);
+    const ASSUMED_LIGHT_BACKGROUND: (u8, u8, u8) = (0xFF, 0xFF, 0xFF);
+
+    #[test]
+    fn both_themes_meet_wcag_aa_contrast_for_body_text() {
+        const AA_NORMAL_TEXT: f64 = 4.5;
+
+        let dark = contrast_ratio(rgb(Theme::dark().text), ASSUMED_DARK_BACKGROUND);
+        let light = contrast_ratio(rgb(Theme::light().text), ASSUMED_LIGHT_BACKGROUND);
+
+        assert!(dark >= AA_NORMAL_TEXT, "dark theme body text: {dark:.2}:1");
+        assert!(
+            light >= AA_NORMAL_TEXT,
+            "light theme body text: {light:.2}:1"
+        );
+    }
+
+    #[test]
+    fn detect_background_reads_the_last_colorfgbg_field_as_the_background_index() {
+        let read = |value: &str| detect_background(Some(OsStr::new(value)));
+
+        // `foreground;background` — the common two-field form.
+        assert_eq!(read("15;0"), Some(Background::Dark));
+        assert_eq!(read("0;15"), Some(Background::Light));
+        // `7` (light grey) reads as light too; `8` (bright black) stays dark.
+        assert_eq!(read("0;7"), Some(Background::Light));
+        assert_eq!(read("15;8"), Some(Background::Dark));
+        // Konsole's three-field form — the middle "default" is skipped
+        // because only the *last* field is read.
+        assert_eq!(read("0;default;15"), Some(Background::Light));
+    }
+
+    #[test]
+    fn detect_background_is_none_when_it_cannot_be_told() {
+        assert_eq!(detect_background(None), None);
+        assert_eq!(detect_background(Some(OsStr::new(""))), None);
+        assert_eq!(detect_background(Some(OsStr::new("not-a-number"))), None);
+        assert_eq!(detect_background(Some(OsStr::new("0;256"))), None);
+    }
+
+    #[test]
+    fn resolve_honours_an_explicit_choice_over_the_terminal() {
+        // A light-reading terminal, overridden both ways.
+        let light_env = Some(OsStr::new("0;15"));
+        assert_eq!(resolve(ThemeChoice::Dark, light_env), Theme::dark());
+        let dark_env = Some(OsStr::new("15;0"));
+        assert_eq!(resolve(ThemeChoice::Light, dark_env), Theme::light());
+    }
+
+    #[test]
+    fn resolve_auto_reads_the_terminal_and_falls_back_to_dark() {
+        assert_eq!(
+            resolve(ThemeChoice::Auto, Some(OsStr::new("0;15"))),
+            Theme::light()
+        );
+        assert_eq!(
+            resolve(ThemeChoice::Auto, Some(OsStr::new("15;0"))),
+            Theme::dark()
+        );
+        // Cannot be told at all: the safer wrong guess, not a light theme
+        // painted onto a terminal that never said it was one.
+        assert_eq!(resolve(ThemeChoice::Auto, None), Theme::dark());
+    }
+
+    #[test]
+    fn the_default_theme_choice_is_the_one_that_looks_at_the_terminal() {
+        assert_eq!(ThemeChoice::default(), ThemeChoice::Auto);
+    }
+
+    #[test]
+    fn a_resolved_theme_reaches_the_cli_palette() {
+        // `--theme light` on a listing colours its severity ink from
+        // `Theme::light`, not a hardcoded dark default — the same table a
+        // light-mode dashboard would draw beside it.
+        let palette = Palette::choose(ColourChoice::Always, Theme::light(), false, None, None);
+        assert_eq!(
+            palette.paint("NotReady", Severity::Critical),
+            colour_with(Theme::light(), Severity::Critical, "NotReady")
+        );
+        assert_ne!(
+            palette.paint("NotReady", Severity::Critical),
+            colour_with(Theme::dark(), Severity::Critical, "NotReady")
+        );
+    }
+
+    fn colour_with(theme: Theme, severity: Severity, text: &str) -> String {
+        Palette::choose(ColourChoice::Always, theme, false, None, None)
+            .paint(text, severity)
+            .into_owned()
     }
 }

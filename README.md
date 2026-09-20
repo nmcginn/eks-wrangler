@@ -443,6 +443,7 @@ more columns, not for a table that gets out of the way.
 | `--timeout <DURATION>` | How long to wait for any one request to the cluster. Default `30s`; `0` waits for as long as it takes |
 | `--refresh <DURATION>` | How often the dashboard refreshes its panes in the background. Falls back to the config file's `refresh`, then to `15s`; `0` turns automatic refresh off (`r` still refreshes on demand) |
 | `--color <WHEN>` | `auto`, `always`, or `never`. Spelled `--colour` too. Falls back to the config file's `color`, then to `auto` |
+| `--theme <THEME>` | `auto`, `dark`, or `light`. Falls back to the config file's `theme`, then to `auto` |
 | `--login <WHEN>` | Whether to log in to AWS IAM Identity Center for you when the session has run out. `auto` (default) offers, `always` does it without asking, `never` just tells you what to run |
 | `-v, --verbose` | Increase log verbosity (repeatable) |
 
@@ -454,11 +455,12 @@ All of these are global, and they parse on either side of the subcommand:
 
 ### Config file
 
-`~/.config/eks/config.toml` sets defaults for three of the flags above, for
+`~/.config/eks/config.toml` sets defaults for four of the flags above, for
 whoever is tired of typing `--color always` or `--refresh 5s` every time:
 
 ```toml
 color = "always"      # or "colour" — same as --color/--colour
+theme = "light"        # same as --theme
 refresh = "5s"         # same grammar as --refresh and --timeout
 namespace = "payments" # same as --namespace/-n
 ```
@@ -466,10 +468,10 @@ namespace = "payments" # same as --namespace/-n
 Every key is optional, and so is the file itself — nothing changes if it does
 not exist. Precedence is the flag, then the file, then the built-in default:
 `eks --color never` wins over the file's `color = "always"`, which wins over
-`auto`. A file that fails to parse — bad TOML, an unknown key, a `color` that
-is not `auto`/`always`/`never` — is not fatal: `eks` warns and runs with the
-built-in defaults for whatever the flags did not set, exactly as if the file
-were not there.
+`auto`. A file that fails to parse — bad TOML, an unknown key, a `color`/
+`theme` that is not one of its own accepted values — is not fatal: `eks`
+warns and runs with the built-in defaults for whatever the flags did not set,
+exactly as if the file were not there.
 
 ### Colour
 
@@ -499,13 +501,35 @@ $ eks nodes --color always | less -R
 on either listing and on either side of the subcommand.
 
 `eks contexts` is unaffected: none of its cells is a reading off a cluster, so
-there is nothing there to colour. The dashboard has its own palette and is not
-governed by these flags.
+there is nothing there to colour.
 
 These switches also govern the progress line described below, on the principle
 that movement is ink: a `--color never`, a `NO_COLOR`, or a `TERM=dumb` that
 asks for plain output gets plain output, not a plain table with a spinner over
 it.
+
+### Theme
+
+`--color` decides *whether* a listing paints; `--theme` decides *which*
+colours it — and the dashboard, which always paints — use. `auto`, the
+default, tries to detect whether your terminal's background is dark or
+light from the `COLORFGBG` environment variable, which some terminals and
+multiplexers set and most do not; where it cannot be told, `eks` assumes
+dark. `--theme light`/`--theme dark`, or the config file's own `theme`,
+override the guess outright — reach for one of these if `auto` picked the
+wrong theme, or if your terminal never set `COLORFGBG` in the first place:
+
+```
+$ eks --theme light
+$ eks nodes --theme light --color always | less -R
+```
+
+Both themes are tuned to meet WCAG AA contrast for body text against the
+background they assume: near-black on white for `light`, light grey on a
+dark terminal default for `dark`. `eks` never paints a background of its
+own — it trusts whatever your terminal already shows — so `--theme light`
+on a terminal that is not actually light in colour will still look wrong;
+the flag fixes a wrong guess, not a mismatched terminal.
 
 ### Big clusters, and slow ones
 
