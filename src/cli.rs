@@ -12,7 +12,7 @@ use crate::config::Config;
 use crate::k8s::nodes::Order as NodeOrder;
 use crate::k8s::page::Budget;
 use crate::k8s::pods::Order as PodOrder;
-use crate::theme::ColourChoice;
+use crate::theme::{ColourChoice, ThemeChoice};
 use crate::ui::RefreshInterval;
 
 /// Explore and interact with AWS EKS clusters.
@@ -79,6 +79,13 @@ pub struct GlobalArgs {
     )]
     pub color: Option<ColourChoice>,
 
+    /// Which theme to paint in: `auto` (detect the terminal's own background
+    /// where possible), `dark`, or `light`. Falls back to the config file's
+    /// own `theme`, then to `auto`, when not given —
+    /// [`GlobalArgs::effective_theme`].
+    #[arg(long, global = true, value_name = "THEME")]
+    pub theme: Option<ThemeChoice>,
+
     /// When to log in to AWS IAM Identity Center for you: `auto` (offer, when
     /// there is a terminal to ask at), `always` (log in without asking), or
     /// `never` (be told what to run instead). Only ever offered for a context
@@ -132,6 +139,12 @@ impl GlobalArgs {
     #[must_use]
     pub fn effective_color(&self, config: &Config) -> ColourChoice {
         self.color.or(config.color).unwrap_or_default()
+    }
+
+    /// `--theme`, then the config file's own `theme`, then `auto`.
+    #[must_use]
+    pub fn effective_theme(&self, config: &Config) -> ThemeChoice {
+        self.theme.or(config.theme).unwrap_or_default()
     }
 
     /// `--refresh`, then the config file's own `refresh`, then fifteen
@@ -916,6 +929,65 @@ mod tests {
         assert!(error.contains("auto"), "{error}");
         assert!(error.contains("always"), "{error}");
         assert!(error.contains("never"), "{error}");
+    }
+
+    #[test]
+    fn theme_takes_each_of_its_three_answers() {
+        for (flag, expected) in [
+            ("auto", ThemeChoice::Auto),
+            ("dark", ThemeChoice::Dark),
+            ("light", ThemeChoice::Light),
+        ] {
+            let cli = parse(&["eks", "nodes", "--theme", flag]);
+            assert_eq!(cli.global.theme, Some(expected), "--theme {flag}");
+        }
+    }
+
+    #[test]
+    fn an_unknown_theme_setting_is_rejected_with_the_ones_that_exist() {
+        let error = Cli::try_parse_from(["eks", "nodes", "--theme", "sepia"])
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("sepia"), "{error}");
+        assert!(error.contains("auto"), "{error}");
+        assert!(error.contains("dark"), "{error}");
+        assert!(error.contains("light"), "{error}");
+    }
+
+    #[test]
+    fn theme_is_global_like_every_other_flag() {
+        assert_eq!(
+            parse(&["eks", "--theme", "light", "pods"]).global.theme,
+            Some(ThemeChoice::Light)
+        );
+        assert_eq!(
+            parse(&["eks", "pods", "--theme", "light"]).global.theme,
+            Some(ThemeChoice::Light)
+        );
+    }
+
+    #[test]
+    fn effective_theme_falls_back_through_flag_then_file_then_default() {
+        let flag = GlobalArgs {
+            theme: Some(ThemeChoice::Dark),
+            ..GlobalArgs::default()
+        };
+        let file = Config {
+            theme: Some(ThemeChoice::Light),
+            ..Config::default()
+        };
+        let neither = GlobalArgs::default();
+
+        // The flag wins even when the file disagrees.
+        assert_eq!(flag.effective_theme(&file), ThemeChoice::Dark);
+        // With no flag, the file's own value is used.
+        assert_eq!(neither.effective_theme(&file), ThemeChoice::Light);
+        // With neither, the built-in default.
+        assert_eq!(
+            neither.effective_theme(&Config::default()),
+            ThemeChoice::Auto
+        );
     }
 
     #[test]

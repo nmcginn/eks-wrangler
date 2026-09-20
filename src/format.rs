@@ -432,7 +432,7 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
-    use crate::theme::ColourChoice;
+    use crate::theme::{ColourChoice, Theme};
 
     /// A cell with no judgement attached — most of a table, and all of the
     /// alignment tests below, which are about widths rather than about ink.
@@ -442,7 +442,7 @@ mod tests {
 
     /// A palette that paints, without asking a terminal anything.
     fn colour() -> Palette {
-        Palette::choose(ColourChoice::Always, false, None, None)
+        Palette::choose(ColourChoice::Always, Theme::dark(), false, None, None)
     }
 
     /// The visible text of a rendered table: every escape sequence removed.

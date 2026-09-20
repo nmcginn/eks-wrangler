@@ -4317,7 +4317,13 @@ mod tests {
 
     /// A palette that paints, without asking a terminal anything.
     fn colour() -> Palette {
-        Palette::choose(crate::theme::ColourChoice::Always, false, None, None)
+        Palette::choose(
+            crate::theme::ColourChoice::Always,
+            crate::theme::Theme::dark(),
+            false,
+            None,
+            None,
+        )
     }
 
     #[test]

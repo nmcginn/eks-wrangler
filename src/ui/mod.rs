@@ -1499,6 +1499,16 @@ impl App {
         self.pod_selectors = selectors;
     }
 
+    /// Set the theme every pane draws in, resolved from `--theme`/the config
+    /// file's own `theme` and the terminal's own background before the
+    /// terminal takes over — the same seed-after-`new` shape
+    /// [`Self::set_pod_selectors`] already uses, and for the same reason:
+    /// every test after `App::new` wants the dark default rather than a
+    /// second constructor parameter every call site would have to pass.
+    pub fn set_theme(&mut self, theme: Theme) {
+        self.theme = theme;
+    }
+
     /// Move the highlight down, wrapping at the end.
     pub fn select_next(&mut self) {
         if self.clusters.is_empty() {
@@ -2573,6 +2583,21 @@ mod tests {
             cluster("beta", true),
             cluster("gamma", false),
         ])
+    }
+
+    #[test]
+    fn a_fresh_app_draws_in_the_dark_theme_until_told_otherwise() {
+        // `main::dashboard` sets the resolved theme right after `App::new`,
+        // but every test after it — this whole module — wants the same
+        // default `set_pod_selectors` already gives `pod_selectors`.
+        assert_eq!(app().theme, Theme::dark());
+    }
+
+    #[test]
+    fn set_theme_replaces_the_theme_every_pane_draws_in() {
+        let mut app = app();
+        app.set_theme(Theme::light());
+        assert_eq!(app.theme, Theme::light());
     }
 
     fn press(code: KeyCode) -> KeyEvent {

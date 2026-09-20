@@ -1670,10 +1670,46 @@ cluster.
   `kubeconfig::search_paths` already made over a platform-varying
   `directories::BaseDirs::config_dir()` — see decision 103.
 
-- [ ] **Light theme and auto-detection.**
+- [x] **Light theme and auto-detection.**
   Detect terminal background where possible, with a config override.
   *Acceptance:* both themes meet WCAG AA contrast for body text; a test asserts
   the contrast ratios.
+  Landed as `Theme::light()` beside `Theme::dark()`, `--theme`/config `theme`
+  (`auto`/`dark`/`light`, `auto` the default) resolved through the new
+  `theme::resolve`, and detection through `COLORFGBG` — the one hint that
+  costs no I/O on the first-paint path an OSC 11 terminal query would have
+  meant blocking on. `theme::resolve` reads `--theme`'s own choice outright
+  and only asks `detect_background` under `Auto`, falling back to `dark` when
+  the terminal cannot be told (unset `COLORFGBG`, which most terminal
+  emulators never set) rather than guessing light. Threaded to both surfaces
+  a theme can reach: `App::set_theme` seeds the dashboard right after
+  `App::new`, the same shape `set_pod_selectors` already uses, and
+  `Palette::choose` now takes the resolved `Theme` outright rather than
+  hardcoding `Theme::default()`, so `eks nodes --theme light`'s `STATUS`
+  column reads in the same ink a light-mode dashboard pane would — a `--color`
+  honoured by one surface and not its twin was the gap CLAUDE.md's "one pull
+  request" section warns about. See decision 104.
+
+- [ ] **Detect a terminal's background by querying it, not just `COLORFGBG`.**
+  `theme::detect_background` reads `COLORFGBG`, the one hint that costs no
+  I/O — but most terminal emulators people actually use (iTerm2, Terminal.app,
+  GNOME Terminal, Windows Terminal, Alacritty, kitty) never set it, so `auto`
+  reads as "cannot be told" and falls back to dark for most users most of the
+  time. The exact answer is an OSC 11 query, and it was left out rather than
+  folded into the light-theme task because it is a real design question of
+  its own: the query means writing an escape sequence to the terminal and
+  blocking on its reply, which needs a timeout budget before it can be safe
+  on the first-paint path CLAUDE.md is strictest about, and there is no
+  fixture today that can stand in for a terminal's raw-mode response the way
+  `page::collect`'s tests stand in for a paged cluster listing. Both of those
+  are the reviewer's to settle — how much of the startup budget a query may
+  spend, and what a test for it even looks like — not something this task's
+  acceptance criteria could answer by itself. See decision 104.
+  *Acceptance:* `theme::resolve` still reads `Option<Background>` from
+  whatever answers the detection question, so `Palette::choose`/
+  `App::set_theme` need no change; a terminal that would have answered
+  `COLORFGBG` correctly is not asked twice; the query never delays first
+  paint past CLAUDE.md's budget, with a test proving it.
 
 - [ ] **Startup budget and benchmarks.**
   Add `criterion` benchmarks for kubeconfig parsing and first paint. Document

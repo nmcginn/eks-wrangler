@@ -240,6 +240,18 @@ terminal-size lookup, for the same reason. The renderer then pads by the cell's
 plain one have their columns in the same places — which is what lets the drop
 rules above keep measuring rows without knowing colour exists.
 
+*Which* colours is a question underneath that one: `Theme::dark`/`Theme::light`
+are two complete palettes, and `theme::resolve` is the pure function that
+picks between them from `--theme`/the config file's own `theme` and
+`theme::detect_background`'s reading of `COLORFGBG` — the one hint about a
+terminal's own background that costs no I/O, unlike the blocking OSC 11 query
+an exact answer would need (see decision 104). `main::resolved_theme` reads
+that one environment variable, next to `NO_COLOR`/`TERM`, and the `Theme` it
+returns reaches both surfaces through the same seam: `Palette::choose` takes
+it directly rather than a hardcoded default, and `App::set_theme` seeds the
+dashboard with it right after `App::new`, the same shape
+`App::set_pod_selectors` already uses for `-l`/`--field-selector`.
+
 Selectors take the same shape in reverse: `k8s::selector` parses the label and
 field selectors a user types (`app=api`, `status.phase!=Running`) into a
 canonical string, rejecting a malformed one — with the offending text quoted —
