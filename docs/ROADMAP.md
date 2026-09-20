@@ -1690,6 +1690,27 @@ cluster.
   honoured by one surface and not its twin was the gap CLAUDE.md's "one pull
   request" section warns about. See decision 104.
 
+- [ ] **Detect a terminal's background by querying it, not just `COLORFGBG`.**
+  `theme::detect_background` reads `COLORFGBG`, the one hint that costs no
+  I/O — but most terminal emulators people actually use (iTerm2, Terminal.app,
+  GNOME Terminal, Windows Terminal, Alacritty, kitty) never set it, so `auto`
+  reads as "cannot be told" and falls back to dark for most users most of the
+  time. The exact answer is an OSC 11 query, and it was left out rather than
+  folded into the light-theme task because it is a real design question of
+  its own: the query means writing an escape sequence to the terminal and
+  blocking on its reply, which needs a timeout budget before it can be safe
+  on the first-paint path CLAUDE.md is strictest about, and there is no
+  fixture today that can stand in for a terminal's raw-mode response the way
+  `page::collect`'s tests stand in for a paged cluster listing. Both of those
+  are the reviewer's to settle — how much of the startup budget a query may
+  spend, and what a test for it even looks like — not something this task's
+  acceptance criteria could answer by itself. See decision 104.
+  *Acceptance:* `theme::resolve` still reads `Option<Background>` from
+  whatever answers the detection question, so `Palette::choose`/
+  `App::set_theme` need no change; a terminal that would have answered
+  `COLORFGBG` correctly is not asked twice; the query never delays first
+  paint past CLAUDE.md's budget, with a test proving it.
+
 - [ ] **Startup budget and benchmarks.**
   Add `criterion` benchmarks for kubeconfig parsing and first paint. Document
   the budget from CLAUDE.md and measure against it.
