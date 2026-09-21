@@ -3896,3 +3896,59 @@ means" warns against: a flag honoured by one listing and not its twin.
 in `main::dashboard` right after `App::new`, so every existing test still
 gets the dark default without a second constructor parameter to thread
 through five call sites.
+
+### 105. Startup benchmarks measure the pure computation, not the process; CI reports through a branch-keyed cache, never fails
+
+"Startup budget and benchmarks" asked for `criterion` benchmarks over
+kubeconfig parsing and first paint, with CI reporting regressions rather
+than failing on them. Two decisions the task's own wording left open:
+
+**What "first paint" means to a benchmark that cannot open a terminal.**
+`ui::run`'s real first paint is `ratatui::init()` — raw mode, an alternate
+screen — followed by one `terminal.draw`. `criterion` runs in an ordinary
+process with no controlling terminal at all in CI, so benchmarking the real
+sequence was never on the table; the honest alternative was the one the
+UI's own rendering tests already established: `TestBackend`, exactly as
+every `ui::mod` test already uses it, drawing the same `ui::draw(frame,
+&app)` a real frame would call. `benches/startup.rs`'s `first_paint`
+benchmark is therefore `KubeConfig::parse` → `contexts::views` → `App::new`
+→ `set_theme` → one `terminal.draw` — the full computed path `main::
+dashboard` walks before handing control to `ui::run`, minus the raw-mode
+and alternate-screen syscalls neither this tool's architecture nor a CI
+runner's environment can put a number on honestly. `kubeconfig_parse`
+benchmarks the same parse alone, so a regression in one cannot hide behind
+the other's noise. Both come out around 0.6–0.9ms against a synthetic
+50-cluster kubeconfig — comfortably inside CLAUDE.md's 50ms budget, but
+that number is not the budget's own: real process startup (the dynamic
+linker, `exec`, the kernel handing back a terminal) is the majority of what
+a user actually waits on and is exactly the part no benchmark run inside
+`cargo bench` can see. This is a computation-only instrument, consistent
+with "separate computation from I/O and rendering" — it catches an
+accidental O(n²) in `KubeConfig::parse` or a widget that got expensive, not
+a regression in exec overhead.
+
+Both benchmarks build their own synthetic kubeconfig — 50 ARN-style EKS
+contexts — rather than reusing `kubeconfig.rs`'s two-cluster `SAMPLE`: a
+benchmark's fixture should be shaped like the input that makes the cost
+worth measuring, which for kubeconfig parsing is a multi-account operator's
+config, not a unit test's minimal one.
+
+**How CI reports a regression without a persistent benchmark server.**
+`criterion` already refuses to fail a build over a regression — it only
+ever prints one — so meeting "reports rather than failing" needed no flag
+at all. The open question was making that report say anything: `criterion`
+compares each run against whatever it finds under `target/criterion`, and
+that directory does not survive between CI runs on its own. Rather than
+stand up an external benchmark-tracking service (a new secret, a new
+account, a dependency this tool's contributors cannot inspect), the new
+`bench` job in `ci.yml` caches `target/criterion` itself through `actions/
+cache`, keyed by OS and branch and falling back to `master`'s latest — so a
+pull request's numbers compare against master's own history rather than
+starting from nothing, and master's own runs build up a real trend over
+time. The comparison output is written into the job's `$GITHUB_STEP_
+SUMMARY` rather than a PR comment, which would have needed a token with
+write access this job has no other reason to hold. `criterion`'s default
+feature set was trimmed to `cargo_bench_support` alone — `plotters`,
+`rayon`, and HTML report generation buy nothing when the only reader is a
+CI log, and CLAUDE.md's "earn its place" is about weight as much as
+necessity.

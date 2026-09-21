@@ -4,7 +4,7 @@ CARGO ?= cargo
 BIN   := eks
 
 .DEFAULT_GOAL := help
-.PHONY: help build release run test lint fmt fmt-check doc check install clean
+.PHONY: help build release run test bench lint fmt fmt-check doc check install clean
 
 help: ## Show this help
 	@grep -hE '^[a-z-]+:.*?## ' $(MAKEFILE_LIST) \
@@ -21,6 +21,9 @@ run: ## Run the dashboard (make run ARGS="contexts")
 
 test: ## Run the test suite
 	$(CARGO) test --locked --all-features
+
+bench: ## Run the startup benchmarks (see benches/startup.rs)
+	$(CARGO) bench --locked --bench startup
 
 lint: ## Clippy, warnings are errors
 	$(CARGO) clippy --locked --all-targets --all-features -- -D warnings
