@@ -18,6 +18,10 @@ path = "src/lib.rs"
 name = "eks"
 path = "src/main.rs"
 
+[[bench]]
+name = "startup"
+harness = false
+
 [dependencies]
 anyhow = "1.0.104"
 clap = { version = "4.6.6", features = ["derive", "env", "wrap_help"] }
@@ -53,6 +57,7 @@ tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 
 [dev-dependencies]
+criterion = { version = "0.8.2", default-features = false, features = ["cargo_bench_support"] }
 insta = "1.44.2"
 tempfile = "3.24.0"
 

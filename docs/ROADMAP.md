@@ -1711,10 +1711,45 @@ cluster.
   `COLORFGBG` correctly is not asked twice; the query never delays first
   paint past CLAUDE.md's budget, with a test proving it.
 
-- [ ] **Startup budget and benchmarks.**
+- [x] **Startup budget and benchmarks.**
   Add `criterion` benchmarks for kubeconfig parsing and first paint. Document
   the budget from CLAUDE.md and measure against it.
   *Acceptance:* `make bench` runs; CI reports regressions rather than failing.
+  Landed as `benches/startup.rs`, two benchmarks against a synthetic
+  50-cluster kubeconfig: `kubeconfig_parse` over `KubeConfig::parse` alone,
+  and `first_paint` over the same computed path `main::dashboard` walks
+  before `ui::run` takes the terminal — parse, `contexts::views`, `App::new`,
+  `set_theme`, one `terminal.draw` against `TestBackend`, the same backend
+  every `ui::mod` rendering test already uses. Both land around 0.6–0.9ms,
+  comfortably inside the 50ms budget, with the honest caveat that this
+  measures the computation this tool controls, not the process-startup
+  overhead (`exec`, the dynamic linker, opening a real terminal) that makes
+  up most of what a user actually waits on. `make bench` runs
+  `cargo bench --bench startup`; CI gained a `bench` job that caches
+  `target/criterion` by branch (falling back to `master`'s) so a pull
+  request's numbers compare against master's history, and writes the
+  comparison to the job summary rather than failing on it — `criterion`
+  itself never fails a build over a regression, so the job's only work was
+  giving it something to compare against and somewhere to say so. See
+  decision 105.
+
+- [ ] **Wall-clock process-startup benchmarks, alongside the in-process ones.**
+  `benches/startup.rs`'s `first_paint` measures the computation this tool
+  controls — parsing, building the sidebar, one render — inside a `criterion`
+  process that never `exec`s the real binary or opens a real terminal. For
+  most users, the bigger share of "time to first paint" is exactly the part
+  that skips: the dynamic linker, `exec`, `ratatui::init()`'s raw-mode and
+  alternate-screen setup. Separate because it is a different mechanism
+  entirely, not a wider version of this one — a `criterion` `Bencher::iter`
+  closure cannot spawn a process and time it the way a tool like `hyperfine`
+  does, so this means either shelling out to a wall-clock benchmarking tool
+  from CI or hand-rolling a process-timing harness, and which is the
+  reviewer's call: a new tool in the CI image is a cost `criterion` alone
+  never asked to pay, and a hand-rolled harness has no fixture standing in
+  for "a terminal" the way `TestBackend` does for the render half.
+  *Acceptance:* whichever shape it takes, it measures the actual `eks`
+  binary rather than a library call standing in for it; it reports the same
+  way `bench` does today — CI shows the number, never fails a build over it.
 
 - [ ] **Shell completions and a man page.**
   Generate from the clap definition via `clap_complete` and `clap_mangen`.
@@ -1750,6 +1785,19 @@ cluster.
 ---
 
 ## Done
+
+- **Startup budget and benchmarks** (2026-09-21) — `benches/startup.rs` adds
+  two `criterion` benchmarks: `kubeconfig_parse` over `KubeConfig::parse`
+  alone, and `first_paint` over the full computed path before `ui::run` takes
+  the terminal (parse, `contexts::views`, `App::new`, `set_theme`, one
+  `terminal.draw` against `TestBackend`). Both land around 0.6–0.9ms against a
+  synthetic 50-cluster kubeconfig, well inside CLAUDE.md's 50ms budget — with
+  the caveat that this measures computation, not real process startup.
+  `make bench` runs them; CI's new `bench` job caches `target/criterion` by
+  branch, falling back to `master`, so a pull request's numbers compare
+  against master's own history, and reports the comparison in the job summary
+  rather than failing the build — `criterion` never fails a build over a
+  regression on its own. See decision 105.
 
 - **What "hot" means for a pod against its own request** (2026-09-08) — `eks
   pods`' `CPU`/`MEMORY` cells now carry a colour: `Ok` up to and a little past

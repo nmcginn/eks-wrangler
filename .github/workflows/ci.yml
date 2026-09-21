@@ -73,3 +73,51 @@ jobs:
             echo "expected a failure exit code with no kubeconfig" >&2
             exit 1
           fi
+
+  bench:
+    name: Startup benchmarks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      # Criterion compares each run against whatever it finds under
+      # target/criterion and prints a regression or improvement — but never
+      # fails the build over it, which is the whole point: this job reports,
+      # it does not gate. That history means nothing unless it survives
+      # between runs, which Swatinem/rust-cache above does not promise for a
+      # directory that is not a compiler artifact. A cache keyed by branch,
+      # falling back to master's, is what makes a pull request's numbers read
+      # as "versus master" instead of "versus nothing."
+      - name: Restore benchmark history
+        uses: actions/cache/restore@v4
+        with:
+          path: target/criterion
+          key: criterion-${{ runner.os }}-${{ github.ref_name }}-${{ github.sha }}
+          restore-keys: |
+            criterion-${{ runner.os }}-${{ github.ref_name }}-
+            criterion-${{ runner.os }}-master-
+
+      - name: Run benchmarks
+        run: |
+          {
+            echo '### Startup benchmarks'
+            echo
+            echo '```'
+            cargo bench --locked --bench startup
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
+      # Best-effort: a re-run on the same commit hits an already-occupied key,
+      # which is not a reason to fail a job whose whole purpose is reporting.
+      - name: Save benchmark history
+        if: always()
+        uses: actions/cache/save@v4
+        continue-on-error: true
+        with:
+          path: target/criterion
+          key: criterion-${{ runner.os }}-${{ github.ref_name }}-${{ github.sha }}
