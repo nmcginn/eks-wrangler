@@ -4,7 +4,7 @@ CARGO ?= cargo
 BIN   := eks
 
 .DEFAULT_GOAL := help
-.PHONY: help build release run test bench lint fmt fmt-check doc check install clean
+.PHONY: help build release run test bench lint fmt fmt-check doc check install dist clean
 
 help: ## Show this help
 	@grep -hE '^[a-z-]+:.*?## ' $(MAKEFILE_LIST) \
@@ -43,5 +43,16 @@ check: fmt-check lint test doc ## Everything CI runs — run before pushing
 install: ## Install eks into ~/.cargo/bin
 	$(CARGO) install --locked --path .
 
+dist: release ## Package the release binary with its completions and man page into dist/
+	rm -rf dist
+	mkdir -p dist/completions
+	cp target/release/$(BIN) README.md LICENSE dist/
+	./target/release/$(BIN) completions bash > dist/completions/$(BIN).bash
+	./target/release/$(BIN) completions zsh > dist/completions/_$(BIN)
+	./target/release/$(BIN) completions fish > dist/completions/$(BIN).fish
+	./target/release/$(BIN) man > dist/$(BIN).1
+	@echo "Packaged into dist/"
+
 clean: ## Remove build artifacts
 	$(CARGO) clean
+	rm -rf dist

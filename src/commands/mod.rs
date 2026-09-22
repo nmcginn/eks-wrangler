@@ -9,6 +9,7 @@ use std::sync::mpsc;
 
 use anyhow::{Context as _, Result};
 
+pub mod completions;
 pub mod contexts;
 pub mod credentials;
 pub mod nodes;

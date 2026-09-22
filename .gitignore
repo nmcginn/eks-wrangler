@@ -24,3 +24,6 @@ target
 # Added by cargo
 
 /target
+
+# `make dist`'s packaged binary, completions, and man page.
+/dist

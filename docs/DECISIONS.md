@@ -3952,3 +3952,51 @@ feature set was trimmed to `cargo_bench_support` alone — `plotters`,
 `rayon`, and HTML report generation buy nothing when the only reader is a
 CI log, and CLAUDE.md's "earn its place" is about weight as much as
 necessity.
+
+### 106. Completions and the man page skip kubeconfig entirely; the man page is a hidden command; CI generates both only for native targets
+
+"Shell completions and a man page" asked for `eks completions bash|zsh|fish`
+and a man page generated from the `clap` definition, with `make dist`
+including both. Three things the task's own wording left to fill in:
+
+**Where the man page lives as a command.** `clap_mangen::Man` needs the same
+`clap::Command` tree `clap_complete::generate` walks for completions, and the
+simplest way to get one inside this binary at packaging time — no build
+script, no `OUT_DIR` path to locate across a hashed build directory the way
+`ripgrep`'s does — is to ask the binary itself, the same way `eks completions`
+already does. `eks man`, printing roff to stdout, is that ask: a real
+subcommand, but `#[command(hide = true)]`, because it exists for `make dist`
+to pipe into a `.1` file, not for a user to find in `--help`. `commands::
+completions` holds both functions beside each other (`shell`/`man`) since they
+are the same kind of thing — a pure render of `Cli::command()` into a
+different text format — and both are `String`-returning like every other
+command in `commands::`, with no `Result` to thread: `clap_mangen::Man::
+render`'s only failure mode is a write error, which a `Vec<u8>` cannot
+produce.
+
+**Neither reads a kubeconfig, so neither is allowed to fail because of one.**
+`main::run` loaded `paths`/`config` unconditionally before dispatching on the
+parsed command, which would have made `eks completions bash` fail on a
+malformed `KUBECONFIG` it has no reason to care about — exactly the kind of
+machine a shell's own setup script installs completions from, possibly with
+no kubeconfig in sight at all. `Completions`/`Man` are now matched and
+returned on before that load, the same "costs nothing at all" bargain
+`--login never` already makes elsewhere in that function; the exhaustive
+match further down still has to name both variants, so it does with
+`unreachable!` rather than a wildcard, since NLL proves the two `return`
+arms above are the only way that code could have been reached.
+
+**CI generates them only where the binary can run.** `release.yml`'s build
+matrix already draws exactly this line for its smoke test:
+`x86_64-apple-darwin` is cross-compiled on an arm64 runner and cannot be
+executed without Rosetta, so `if: matrix.native` skips running it at all.
+Completions and the man page are pure renders of the same `Cli` regardless of
+target, so there is nothing target-specific to lose by generating them once on
+a runner that can actually run what it just built — reusing `matrix.native`
+rather than adding a fourth job to share one text file across a matrix that
+already runs its three legs in parallel. The one cross-compiled leg ships its
+tarball without them, a real, pre-existing gap in that matrix (the smoke test
+has the same one) rather than one this task introduced trying to paper over
+with Rosetta or a second build. `make dist` mirrors the same three files
+locally, from a plain `cargo build --release` with no cross-compilation
+question to answer.

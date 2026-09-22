@@ -621,6 +621,19 @@ eks --field-selector status.phase!=Running   # only the ones that are not Runnin
 A node whose pods are all filtered out reads as "no pods match", not as "this
 node has none" — the selector is why the list is empty, and the pane says so.
 
+## Shell completions
+
+```sh
+eks completions bash > /etc/bash_completion.d/eks
+eks completions zsh > "${fpath[1]}/_eks"
+eks completions fish > ~/.config/fish/completions/eks.fish
+```
+
+Also takes `elvish` and `powershell`. Generated straight from the same
+definition `clap` parses your arguments with, so a flag it does not know about
+here cannot appear in a completion either. `make dist` writes all three
+alongside a man page into `dist/`.
+
 ## Development
 
 ```sh

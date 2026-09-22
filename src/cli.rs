@@ -249,6 +249,18 @@ pub enum Command {
 
     /// Print the active cluster.
     Current,
+
+    /// Print a shell completion script to stdout, e.g.
+    /// `eks completions zsh > "${fpath[1]}/_eks"`.
+    Completions {
+        /// Which shell to generate completions for.
+        shell: clap_complete::Shell,
+    },
+
+    /// Print the man page as roff to stdout. Not meant to be read directly —
+    /// `make dist` pipes it into a `.1` file for packaging.
+    #[command(hide = true)]
+    Man,
 }
 
 #[cfg(test)]
@@ -580,6 +592,57 @@ mod tests {
         let cli = parse(&["eks", "-l", "app=api"]);
         assert_eq!(cli.global.selector.as_deref(), Some("app=api"));
         assert!(cli.command.is_none());
+    }
+
+    #[test]
+    fn completions_takes_each_shell_by_name() {
+        for (flag, expected) in [
+            ("bash", clap_complete::Shell::Bash),
+            ("zsh", clap_complete::Shell::Zsh),
+            ("fish", clap_complete::Shell::Fish),
+            ("elvish", clap_complete::Shell::Elvish),
+            ("powershell", clap_complete::Shell::PowerShell),
+        ] {
+            let Some(Command::Completions { shell }) = parse(&["eks", "completions", flag]).command
+            else {
+                panic!("expected a Completions command for {flag}");
+            };
+            assert_eq!(shell, expected, "completions {flag}");
+        }
+    }
+
+    #[test]
+    fn completions_rejects_an_unknown_shell_with_the_ones_that_exist() {
+        let error = Cli::try_parse_from(["eks", "completions", "cmd"])
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("cmd"), "{error}");
+        assert!(error.contains("bash"), "{error}");
+        assert!(error.contains("zsh"), "{error}");
+    }
+
+    #[test]
+    fn man_takes_no_arguments() {
+        assert!(matches!(parse(&["eks", "man"]).command, Some(Command::Man)));
+    }
+
+    #[test]
+    fn man_is_hidden_from_help() {
+        // It exists for `make dist` to pipe into a `.1` file, not for a user
+        // to stumble onto — CLAUDE.md's "discoverable without a manual" is
+        // about the dashboard's own keys, not an internal packaging command.
+        // `render_help` is not checked directly: "man" is a substring of
+        // "command", so a text search would pass even if this regressed.
+        let command = Cli::command();
+        let visible_names: Vec<&str> = command
+            .get_subcommands()
+            .filter(|sub| !sub.is_hide_set())
+            .map(clap::Command::get_name)
+            .collect();
+
+        assert!(!visible_names.contains(&"man"), "{visible_names:?}");
+        assert!(visible_names.contains(&"completions"), "{visible_names:?}");
     }
 
     #[test]

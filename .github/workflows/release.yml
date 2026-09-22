@@ -60,6 +60,25 @@ jobs:
           ./target/${{ matrix.target }}/release/eks --version
           ./target/${{ matrix.target }}/release/eks --help
 
+      # Completions and the man page are rendered straight from the `Cli`
+      # definition, so they read the same regardless of which target they are
+      # packaged for — but only a native binary can be run to render them.
+      # `matrix.native` is exactly the flag the smoke test above already
+      # answers that question with; the one cross-compiled leg
+      # (x86_64-apple-darwin, built on an arm64 runner) ships without them
+      # rather than needing Rosetta just to generate two text files.
+      - name: Generate completions and man page
+        if: matrix.native
+        shell: bash
+        run: |
+          set -euo pipefail
+          bin="target/${{ matrix.target }}/release/eks"
+          mkdir -p assets/completions
+          "$bin" completions bash > assets/completions/eks.bash
+          "$bin" completions zsh > assets/completions/_eks
+          "$bin" completions fish > assets/completions/eks.fish
+          "$bin" man > assets/eks.1
+
       - name: Package
         shell: bash
         run: |
@@ -68,6 +87,9 @@ jobs:
           mkdir -p "dist/${staging}"
           cp "target/${{ matrix.target }}/release/eks" "dist/${staging}/"
           cp README.md LICENSE "dist/${staging}/"
+          if [ -d assets ]; then
+            cp -r assets/. "dist/${staging}/"
+          fi
           tar -czf "dist/${staging}.tar.gz" -C dist "${staging}"
           # Checksums travel with the artifact so the install story can verify them.
           shasum -a 256 "dist/${staging}.tar.gz" > "dist/${staging}.tar.gz.sha256"
