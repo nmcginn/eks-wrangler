@@ -25,6 +25,11 @@ harness = false
 [dependencies]
 anyhow = "1.0.104"
 clap = { version = "4.6.6", features = ["derive", "env", "wrap_help"] }
+# `eks completions`/`eks man` render straight from the same `Cli` definition
+# `clap` already parses with, so a flag added there can never drift out of
+# sync with the shell completions or the man page describing it.
+clap_complete = "4.6.11"
+clap_mangen = "0.3.3"
 directories = "6.0.0"
 # `kube::Api::log_stream` hands back a bare `futures::AsyncBufRead`, and
 # reading it line by line needs the extension traits — `kube-client` already

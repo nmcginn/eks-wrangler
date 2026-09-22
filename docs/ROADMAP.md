@@ -1751,10 +1751,24 @@ cluster.
   binary rather than a library call standing in for it; it reports the same
   way `bench` does today — CI shows the number, never fails a build over it.
 
-- [ ] **Shell completions and a man page.**
+- [x] **Shell completions and a man page.**
   Generate from the clap definition via `clap_complete` and `clap_mangen`.
   *Acceptance:* `eks completions bash|zsh|fish` emits valid output; generation
   is covered by a test; `make dist` includes them.
+  Landed as `eks completions <shell>` — bash/zsh/fish plus elvish/powershell,
+  which `clap_complete::Shell` gives for free — and a hidden `eks man`,
+  printing roff for `make dist` to pipe into a `.1` file; both live in
+  `commands::completions` as plain `String`-returning renders of
+  `Cli::command()`, mirroring every other command module. Neither touches a
+  kubeconfig: `main::run` was loading one unconditionally before dispatch,
+  which would have failed `eks completions bash` on a malformed
+  `KUBECONFIG` it has no reason to read, so both are matched and returned on
+  before that load. `make dist` packages the binary, both, and README/LICENSE
+  into `dist/`; `release.yml`'s existing `matrix.native` guard — already
+  there because the cross-compiled `x86_64-apple-darwin` leg cannot run what
+  it just built — decides whether a target's tarball gets them too, so that
+  one leg ships without them rather than needing Rosetta for two text files.
+  See decision 106.
 
 - [ ] **Golden-file rendering tests.**
   Use `insta` snapshots over `TestBackend` for the main views.

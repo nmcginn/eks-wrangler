@@ -14,7 +14,7 @@ use tracing_subscriber::EnvFilter;
 
 use eks::aws::LoginMode;
 use eks::cli::{Cli, Command, GlobalArgs};
-use eks::commands::{self, contexts, credentials, nodes, pods};
+use eks::commands::{self, completions, contexts, credentials, nodes, pods};
 use eks::config::{self, Config};
 use eks::format::Width;
 use eks::k8s::nodes::Order as NodeOrder;
@@ -51,6 +51,24 @@ fn main() -> ExitCode {
 }
 
 fn run(cli: Cli) -> Result<ExitCode> {
+    // Neither reads a cluster or a kubeconfig, so both are handled before
+    // either is touched — the same "costs nothing at all" bargain
+    // `--login never` makes elsewhere in this function. Generating
+    // completions in an image with no kubeconfig at all, which is exactly
+    // where a shell's own setup script tends to run this, must not fail on
+    // account of a file this command never reads.
+    match cli.command {
+        Some(Command::Completions { shell }) => {
+            print_line(&completions::shell(shell));
+            return Ok(ExitCode::SUCCESS);
+        }
+        Some(Command::Man) => {
+            print_line(&completions::man());
+            return Ok(ExitCode::SUCCESS);
+        }
+        _ => {}
+    }
+
     let paths = cli.global.kubeconfig_paths()?;
     let config = KubeConfig::load_from(&paths)?;
     let user_config = user_config();
@@ -128,6 +146,8 @@ fn run(cli: Cli) -> Result<ExitCode> {
             print_line(&contexts::current(&config)?);
             Ok(ExitCode::SUCCESS)
         }
+        // Handled above, before a kubeconfig was ever read.
+        Command::Completions { .. } | Command::Man => unreachable!("handled above"),
     }
 }
 
