@@ -39,8 +39,39 @@ jobs:
             # Cross-compiled from an arm64 runner; running it needs Rosetta,
             # which may not be present, so skip the smoke test here.
             native: false
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            # The one binary that runs on any Linux, whatever its glibc or
+            # however bare its container image — so it is checked to be
+            # static rather than trusted to be. An x86_64 runner executes it
+            # directly, so it is smoke-tested like any native build.
+            native: true
+            static: true
+            # `ring`'s C code is compiled for musl by `musl-gcc`, which `cc`
+            # finds on its own once this package puts it on the PATH.
+            apt: musl-tools
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            # Cross-compiled on x86_64 (the linker is set in the job's env
+            # below; `cc` finds `aarch64-linux-gnu-gcc` for `ring` by the
+            # target's own prefix), and run under user-mode QEMU so it gets
+            # the same smoke test and completions as every native leg rather
+            # than shipping untested and without them.
+            native: false
+            emulator: qemu-aarch64 -L /usr/aarch64-linux-gnu
+            apt: gcc-aarch64-linux-gnu libc6-dev-arm64-cross qemu-user
+    env:
+      # Read by cargo only when building for aarch64-unknown-linux-gnu, so it
+      # is inert on every other leg of the matrix.
+      CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
     steps:
       - uses: actions/checkout@v7
+
+      - name: Install the target's C toolchain
+        if: matrix.apt
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends ${{ matrix.apt }}
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -54,30 +85,37 @@ jobs:
       - name: Build
         run: cargo build --locked --release --target ${{ matrix.target }}
 
+      - name: Verify the binary is static
+        if: matrix.static
+        run: scripts/verify-static.sh target/${{ matrix.target }}/release/eks
+
+      # `matrix.emulator` is empty on every leg that has none, so on a native
+      # build this runs the binary directly.
       - name: Smoke-test the binary
-        if: matrix.native
+        if: matrix.native || matrix.emulator
         run: |
-          ./target/${{ matrix.target }}/release/eks --version
-          ./target/${{ matrix.target }}/release/eks --help
+          ${{ matrix.emulator }} ./target/${{ matrix.target }}/release/eks --version
+          ${{ matrix.emulator }} ./target/${{ matrix.target }}/release/eks --help
 
       # Completions and the man page are rendered straight from the `Cli`
       # definition, so they read the same regardless of which target they are
-      # packaged for — but only a native binary can be run to render them.
-      # `matrix.native` is exactly the flag the smoke test above already
-      # answers that question with; the one cross-compiled leg
-      # (x86_64-apple-darwin, built on an arm64 runner) ships without them
-      # rather than needing Rosetta just to generate two text files.
+      # packaged for — but only a binary the runner can execute can render
+      # them, natively or under `matrix.emulator`. That is exactly the
+      # condition the smoke test above already answers; the one leg that can
+      # do neither (x86_64-apple-darwin, built on an arm64 runner) ships
+      # without them rather than needing Rosetta just to generate two text
+      # files.
       - name: Generate completions and man page
-        if: matrix.native
+        if: matrix.native || matrix.emulator
         shell: bash
         run: |
           set -euo pipefail
-          bin="target/${{ matrix.target }}/release/eks"
+          run="${{ matrix.emulator }} target/${{ matrix.target }}/release/eks"
           mkdir -p assets/completions
-          "$bin" completions bash > assets/completions/eks.bash
-          "$bin" completions zsh > assets/completions/_eks
-          "$bin" completions fish > assets/completions/eks.fish
-          "$bin" man > assets/eks.1
+          $run completions bash > assets/completions/eks.bash
+          $run completions zsh > assets/completions/_eks
+          $run completions fish > assets/completions/eks.fish
+          $run man > assets/eks.1
 
       - name: Package
         shell: bash

@@ -1793,10 +1793,35 @@ cluster.
 
 ## Milestone 4 — Distribution and hardening
 
-- [ ] **More release targets.**
+- [x] **More release targets.**
   Add `aarch64-unknown-linux-gnu` and `x86_64-unknown-linux-musl` to the release
   workflow.
   *Acceptance:* both cross-compile in CI; musl binary is verified static.
+  Landed as two more legs of `release.yml`'s existing build matrix, both on
+  `ubuntu-latest` with Ubuntu's own cross toolchains (`gcc-aarch64-linux-gnu`,
+  `musl-tools`) rather than `cross` or `cargo-zigbuild`, installed by a step
+  keyed on a new `matrix.apt`. The musl binary runs on the x86_64 runner, so
+  it gets the smoke test and completions like any native leg, and
+  `scripts/verify-static.sh` fails the job unless it has no `PT_INTERP`
+  header and no `DT_NEEDED` entry — read from the ELF headers because a Rust
+  musl build is a static-pie, which `file` words differently across versions.
+  The aarch64 binary runs under user-mode QEMU, named by a new
+  `matrix.emulator`, so it too is smoke-tested and ships completions and a
+  man page rather than taking the `x86_64-apple-darwin` leg's exemption.
+  See decision 108.
+
+- [ ] **Lower the glibc floor of the `-gnu` release binaries.**
+  Both `-gnu` tarballs link against whatever glibc `ubuntu-latest` carries —
+  2.39 today — and refuse to start on anything older, Amazon Linux 2023's
+  2.34 included, which is exactly where an EKS tool on Graviton gets run. The
+  x86_64 musl tarball has no floor, so x86_64 users have a way out; aarch64
+  users do not. Separate because the fix is a choice of build tool
+  (`cargo-zigbuild` targeting `aarch64-unknown-linux-gnu.2.17`, `cross`'s
+  older-glibc images, or an aarch64 musl leg instead), which the release
+  targets task deliberately left alone, and because it changes the existing
+  `x86_64-unknown-linux-gnu` leg as much as the new one. See decision 108.
+  *Acceptance:* both `-gnu` binaries start on glibc 2.34; CI fails a build
+  whose binary needs a newer glibc than the floor it declares.
 
 - [ ] **Supply-chain checks in CI.**
   `cargo-deny` for advisories, licences, and duplicate versions.
