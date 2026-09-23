@@ -4045,3 +4045,60 @@ the nicer path, not the only one, because installing another tool should not
 stand between a contributor and a one-line layout fix. CI needs nothing new —
 GitHub Actions sets `CI=true`, under which `insta` writes nothing and fails on
 any mismatch or missing snapshot, and `cargo test` already runs these.
+
+### 108. The new Linux targets cross-compile with the distribution's own toolchains, aarch64 runs under QEMU, and "static" is read from the ELF headers
+
+"More release targets" asked for `aarch64-unknown-linux-gnu` and
+`x86_64-unknown-linux-musl` in the release workflow, cross-compiled in CI, with
+the musl binary verified static. Four things the wording left open:
+
+**No new build tool.** Both legs build on `ubuntu-latest` with plain `cargo
+build --target`, plus the Ubuntu packages that target needs:
+`gcc-aarch64-linux-gnu` (and its `libc6-dev-arm64-cross` sysroot) for aarch64,
+`musl-tools` for musl. The only C this tree compiles is `ring`'s, and `cc`
+already looks for `aarch64-linux-gnu-gcc` and `musl-gcc` by the target's own
+name, so the one setting the workflow has to spell out is aarch64's linker
+(`CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER`, inert on every other leg).
+`cross` (Docker images per target) and `cargo-zigbuild` (zig as the linker)
+were the alternatives; each is a tool the release job would have to install
+and trust, and neither was needed to get either target to build. A native
+arm64 runner (`ubuntu-24.04-arm`) was the other: it would build without
+cross-compiling at all, but the task asked for cross-compilation, and the
+arm runners' availability depends on the repository's plan in a way an
+`ubuntu-latest` runner's does not.
+
+**The aarch64 binary is run, under QEMU, not skipped.** The existing
+`x86_64-apple-darwin` leg ships without a smoke test or completions because
+it cannot run what it built (decision 106). The aarch64 leg could have taken
+the same `native: false` exemption; instead it names an `emulator` —
+`qemu-aarch64 -L /usr/aarch64-linux-gnu`, the user-mode emulator pointed at
+the cross sysroot the build already installed — and the smoke test and the
+completions step run under `matrix.native || matrix.emulator`, prefixing the
+binary with `matrix.emulator` (empty on every other leg). Emulation costs a
+second or two for `--version`, `--help`, and four renders; the alternative
+was a tarball nobody had ever executed, missing files every other Linux
+tarball has.
+
+**"Static" is checked from the ELF headers, by a script.**
+`scripts/verify-static.sh` fails if the binary has a `PT_INTERP` program
+header (it asks for a dynamic loader) or any `DT_NEEDED` entry (it names a
+shared library). `file`'s "statically linked" would have been shorter, but
+Rust's musl target builds a *static-pie*, which `file` describes differently
+across versions, and which still has a dynamic section of its own — for its
+own relocations — so "has no dynamic section" would have been the wrong
+test. It is a script in the tree rather than inline YAML so it can be run
+against a local build and against a binary that should fail it; the PR that
+added it did both.
+
+**The glibc build is only as portable as the runner.** A `-gnu` binary needs
+at least the glibc its build host had, and on `ubuntu-latest` (24.04) that is
+2.39: `std` binds `pidfd_spawnp`/`pidfd_getpid` weakly, but the version
+requirement it records is not weak, so the loader refuses the binary on an
+older glibc — including Amazon Linux 2023's 2.34, the obvious host for an EKS
+tool on Graviton. The existing `x86_64-unknown-linux-gnu` leg has the same
+floor for the same reason. The musl build has no floor at all, which is what
+it is for; lowering the `-gnu` floor means choosing a toolchain that can link
+against an older glibc (`cargo-zigbuild`'s `target.2.17` suffix, `cross`'s
+older images, or an older runner that only moves the floor a little), which
+is the build-tool question this change deliberately did not reopen, and it
+is a roadmap entry of its own.
