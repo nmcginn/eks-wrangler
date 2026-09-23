@@ -1,0 +1,28 @@
+---
+source: src/ui/tests/golden.rs
+expression: "text(&frame(&node_pods(), WIDTH, HEIGHT))"
+---
+ eks │ beta (us-east-1)
+┌ Clusters ────────────────────┐┌ Overview › ip-10-0-1-17.ec2.internal ────────────────────────────┐
+│  alpha us-east-1             ││Context   arn:aws:eks:us-east-1:1234:cluster/beta                 │
+│● beta us-east-1              ││Namespace default                                                 │
+│  gamma us-east-1             ││Region    us-east-1                                               │
+│                              ││Account   1234                                                    │
+│                              ││                                                                  │
+│                              ││INTERNAL-IP: 10.0.1.17                                            │
+│                              ││EXTERNAL-IP: -                                                    │
+│                              ││OS-IMAGE: Amazon Linux 2023                                       │
+│                              ││KERNEL-VERSION: 6.1.109                                           │
+│                              ││CONTAINER-RUNTIME: containerd://1.7.22                            │
+│                              ││MemoryPressure: False                                             │
+│                              ││DiskPressure: False                                               │
+│                              ││PIDPressure: False                                                │
+│                              ││NetworkUnavailable: False                                         │
+│                              ││PODS                                                              │
+│                              ││api-7d9f8b6c4-x2kqp  Running  1/1  0  cpu 120m (48%)  mem 300Mi   │
+│                              ││(59%)  3d                                                         │
+│                              ││ledger-0  Running  1/1  0  cpu 400m (160%)  mem 900Mi (176%)  3d  │
+│                              ││worker-5b8c7d9f6-hj4lm  CrashLoopBackOff  0/1  14 (2m ago)  cpu 5m│
+│                              ││(2%)  mem 40Mi (8%)  3d                                           │
+└──────────────────────────────┘└──────────────────────────────────────────────────────────────────┘
+ tab/→ switch/drill   j/k move   enter open   ←/esc back   r refresh   s/S sort   q quit   / filter

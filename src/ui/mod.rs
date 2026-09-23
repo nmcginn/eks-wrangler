@@ -5372,4 +5372,6 @@ mod tests {
             Flow::Quit
         );
     }
+
+    mod golden;
 }

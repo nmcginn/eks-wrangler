@@ -1,0 +1,28 @@
+---
+source: src/ui/tests/golden.rs
+expression: "text(&frame(&container_logs(), WIDTH, HEIGHT))"
+---
+ eks │ beta (us-east-1)
+┌ Clusters ────────────────────┐┌ Overview › ip-10-0-1-17.ec2.internal › worker-5b8c7d9f6-hj4lm › w┐
+│  alpha us-east-1             ││Context   arn:aws:eks:us-east-1:1234:cluster/beta                 │
+│● beta us-east-1              ││Namespace default                                                 │
+│  gamma us-east-1             ││Region    us-east-1                                               │
+│                              ││Account   1234                                                    │
+│                              ││                                                                  │
+│                              ││LOGS  following · wrap off  · stream ended                        │
+│                              ││2026-09-23T02:14:07Z INFO  starting worker v2.4.1                 │
+│                              ││2026-09-23T02:14:07Z INFO  connecting to queue at amqp://queue.pay│
+│                              ││2026-09-23T02:14:12Z ERROR connection refused (os error 111)      │
+│                              ││2026-09-23T02:14:12Z ERROR giving up after 5 attempts             │
+│                              ││                                                                  │
+│                              ││                                                                  │
+│                              ││                                                                  │
+│                              ││                                                                  │
+│                              ││                                                                  │
+│                              ││                                                                  │
+│                              ││                                                                  │
+│                              ││                                                                  │
+│                              ││                                                                  │
+│                              ││                                                                  │
+└──────────────────────────────┘└──────────────────────────────────────────────────────────────────┘
+ tab/→ switch   j/k scroll   f follow   w wrap   p previous   ←/esc back   q quit   / search

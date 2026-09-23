@@ -1,0 +1,28 @@
+---
+source: src/ui/tests/golden.rs
+expression: "text(&frame(&pod_containers(), WIDTH, HEIGHT))"
+---
+ eks │ beta (us-east-1)
+┌ Clusters ────────────────────┐┌ Overview › ip-10-0-1-17.ec2.internal › worker-5b8c7d9f6-hj4lm ───┐
+│  alpha us-east-1             ││Context   arn:aws:eks:us-east-1:1234:cluster/beta                 │
+│● beta us-east-1              ││Namespace default                                                 │
+│  gamma us-east-1             ││Region    us-east-1                                               │
+│                              ││Account   1234                                                    │
+│                              ││                                                                  │
+│                              ││IP: 10.0.1.203                                                    │
+│                              ││CONTAINERS                                                        │
+│                              ││migrate (init)  Completed  ready  0  app:1.0                      │
+│                              ││requests: cpu 0, memory 0  limits: cpu unlimited, memory unlimited│
+│                              ││worker  CrashLoopBackOff  not ready  14  app:1.0                  │
+│                              ││requests: cpu 250m, memory 512Mi  limits: cpu unlimited, memory   │
+│                              ││unlimited                                                         │
+│                              ││                                                                  │
+│                              ││EVENTS                                                            │
+│                              ││BackOff  40s ago (×61)                                            │
+│                              ││Back-off restarting failed container worker                       │
+│                              ││Pulled  2m ago (×15)                                              │
+│                              ││Container image "app:1.0" already present on machine              │
+│                              ││                                                                  │
+│                              ││                                                                  │
+└──────────────────────────────┘└──────────────────────────────────────────────────────────────────┘
+ tab/→ switch/drill   j/k move   enter open   ←/esc back   r refresh   s/S sort   q quit   / filter

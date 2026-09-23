@@ -1,0 +1,10 @@
+---
+source: src/ui/tests/golden.rs
+expression: "text(&frame(&overview(), 30, 6))"
+---
+ eks │ beta (us-east-1)
+┌ Cluster┐┌ Overview ────────┐
+│  alpha ││Context   arn:aws:│
+│● beta u││Namespace default │
+└────────┘└──────────────────┘
+ tab/→ switch/drill   j/k move

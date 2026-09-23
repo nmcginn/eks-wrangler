@@ -27,3 +27,9 @@ target
 
 # `make dist`'s packaged binary, completions, and man page.
 /dist
+
+# `insta`'s pending snapshots, written beside a `.snap` when a golden-file test
+# fails outside CI. Accept them with `cargo insta review` or `make snapshots`;
+# never commit them.
+*.snap.new
+*.pending-snap

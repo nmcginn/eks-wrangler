@@ -1,0 +1,28 @@
+---
+source: src/ui/tests/golden.rs
+expression: "text(&frame(&app, WIDTH, HEIGHT))"
+---
+ eks │ beta (us-east-1)
+┌ Clusters ────────────────────┐┌ Overview ────────────────────────────────────────────────────────┐
+│  alpha us-east-1             ││Context   arn:aws:eks:us-east-1:1234:cluster/beta                 │
+│● beta us-east-1              ││Namespace default                                                 │
+│  gamma us-east-1             ││Region    us-east-1                                               │
+│                              ││Account   1234                                                    │
+│                              ││                                                                  │
+│                              ││NODES                                                             │
+│                              ││ip-10-0-1-17.ec2.internal  Ready  CPU ██░░░░░░░░ 900m  MEM        │
+│                              ││████░░░░░░ 6Gi  23/58 pods                                        │
+│                              ││ip-10-0-2-40.ec2.internal  Ready  CPU █████████░ 3500m  MEM       │
+│                              ││████████░░ 13Gi  23/58 pods                                       │
+│                              ││ip-10-0-3-8.ec2.internal  NotReady  CPU ░░░░░░░░░░ -  MEM         │
+│                              ││░░░░░░░░░░ -  23/58 pods                                          │
+│                              ││                                                                  │
+│                              ││                                                                  │
+│                              ││                                                                  │
+│                              ││                                                                  │
+│                              ││                                                                  │
+│                              ││                                                                  │
+│                              ││                                                                  │
+│                              ││                                                                  │
+└──────────────────────────────┘└──────────────────────────────────────────────────────────────────┘
+ press esc/q again to quit
