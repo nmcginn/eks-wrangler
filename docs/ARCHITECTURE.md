@@ -451,6 +451,9 @@ that is a property to defend rather than a coincidence.
 - **Terminal rendering** — `ratatui`'s `TestBackend` renders into an in-memory
   buffer; assert on the text that lands on screen. Always include a
   tiny-terminal case; a panic mid-render leaves a real user in raw mode.
+- **Whole frames** — `ui::tests::golden` draws every main view of the
+  dashboard into a `TestBackend` and compares it with a snapshot committed under
+  `src/ui/tests/snapshots/`. See *Golden-file snapshots* below.
 - **Input** — construct `KeyEvent`s and feed them to `App::on_key`.
 
 Tests that need a fake cluster get fixtures, never live AWS. Where the claim
@@ -463,6 +466,74 @@ no credential, name lookup, or cluster anywhere in it.
   back, so "the line named the credential helper" and "the line was gone before
   the table was printed" are assertions rather than things somebody has to
   watch happen.
+
+### Golden-file snapshots
+
+The `contains` assertions above each pin one guarantee. A snapshot pins the
+whole frame, so it is what notices a change that keeps every one of those
+strings and still moves everything else — a column that lost its padding, a
+note that pushed the table off the bottom. It is also how a reviewer sees a
+layout change without running a cluster: the `.snap` file's diff *is* the
+screen, before and after.
+
+The tests live in `src/ui/tests/golden.rs` (a child of `ui`'s own test module,
+so they reuse its fixtures) and use [`insta`](https://insta.rs). Two kinds:
+
+- **Text** — `text(&frame(..))`, the characters on screen, one terminal row
+  per line. Every main view has one, plus the awkward cases: no clusters, no
+  nodes, each kind of failure, 80x24, a terminal too small to hold anything,
+  and 1x1.
+- **Colour** — `styled(&frame(..), theme)`, the same text followed by one line
+  per run of styled cells, with each colour printed as the `Theme` field it
+  came from (`fg=muted bg=selection_bg mod=BOLD`) rather than as RGB. One per
+  drill-down level, in the dark theme. Two ordinary tests sweep every view in
+  *both* themes: one fails if any cell is inked in a colour that is not a
+  `Theme` field, the other if the light theme gives any cell a different role
+  than the dark one does.
+
+#### When a snapshot test fails
+
+A failure means the frame changed. Decide whether you meant it:
+
+1. **Not intended** — the diff in the test output shows what moved. Fix the
+   code, not the snapshot.
+2. **Intended** — accept the new frame, then read the `.snap` diff in
+   `git diff` as carefully as you would the code. It is what the reviewer will
+   read.
+
+Two ways to accept, depending on whether `cargo-insta` is installed:
+
+```sh
+# With cargo-insta (`cargo install cargo-insta --locked`): an interactive
+# accept/reject per snapshot.
+cargo insta test --review
+# ...and to find snapshots no test refers to any more, after renaming a test:
+cargo insta test --unreferenced=reject
+
+# Without it: rewrite every golden snapshot in place, then review with git.
+make snapshots
+git diff src/ui/tests/snapshots/
+```
+
+Outside CI a failing run leaves a `<name>.snap.new` beside the snapshot for
+`cargo insta review` to pick up; those are git-ignored and never committed.
+In CI (where `CI=true`) nothing is written and the test simply fails, so a PR
+that changes a frame without committing the new snapshot cannot go green.
+
+#### Adding a snapshot
+
+Write a `#[test]` in `golden.rs` whose body is one `insta::assert_snapshot!`
+over `text(..)` or `styled(..)`, named as a sentence like every other test —
+the snapshot file takes its name from it. Run `make snapshots` (or
+`cargo insta test --review`) to create the file, read it, and commit it with
+the test. A new snapshot with no `.snap` committed fails `make check`, so it
+cannot be forgotten.
+
+Keep fixtures deterministic: ages are fixed strings rather than computed from
+a clock, and nothing the dashboard draws reads the time, so a snapshot never
+drifts on its own. If a pane ever starts drawing something time-dependent,
+give it a fixed value in the fixture rather than filtering it out of the
+snapshot.
 
 ## Error handling
 

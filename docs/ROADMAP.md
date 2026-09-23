@@ -1770,10 +1770,26 @@ cluster.
   one leg ships without them rather than needing Rosetta for two text files.
   See decision 106.
 
-- [ ] **Golden-file rendering tests.**
+- [x] **Golden-file rendering tests.**
   Use `insta` snapshots over `TestBackend` for the main views.
   *Acceptance:* snapshots committed; `cargo insta` workflow documented in
   CONTRIBUTING-level detail in `docs/ARCHITECTURE.md`.
+  Landed as `src/ui/tests/golden.rs`, a child of `ui`'s own test module so it
+  draws with the same fixtures the `contains` tests already build, and 19
+  snapshots under `src/ui/tests/snapshots/`: every drill-down level (overview,
+  a node's pods, a pod's containers and events, a container's log), the
+  overview's loading, empty, credential-refused, unreachable, and
+  metrics-server-missing states, a typed filter and an armed quit, no clusters
+  at all, and 80x24, 30x6, and 1x1 terminals. Text snapshots are the
+  characters on screen with nothing else; four colour snapshots add one line
+  per styled run with each colour named by its `Theme` field — `fg=muted`,
+  not `Rgb(138, 143, 152)` — so a reviewer can read them and a hardcoded
+  `Color` is the one thing in the file without a name. Two plain tests turn
+  that into a guarantee over every view in both themes: no colour outside the
+  theme, and the light theme inks each cell in the same role as the dark one.
+  `make snapshots` rewrites them without `cargo-insta` installed; the
+  `cargo insta` workflow, and what CI does with a stale snapshot, is under
+  *Golden-file snapshots* in `docs/ARCHITECTURE.md`. See decision 107.
 
 ## Milestone 4 — Distribution and hardening
 

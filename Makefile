@@ -4,7 +4,7 @@ CARGO ?= cargo
 BIN   := eks
 
 .DEFAULT_GOAL := help
-.PHONY: help build release run test bench lint fmt fmt-check doc check install dist clean
+.PHONY: help build release run test snapshots bench lint fmt fmt-check doc check install dist clean
 
 help: ## Show this help
 	@grep -hE '^[a-z-]+:.*?## ' $(MAKEFILE_LIST) \
@@ -21,6 +21,9 @@ run: ## Run the dashboard (make run ARGS="contexts")
 
 test: ## Run the test suite
 	$(CARGO) test --locked --all-features
+
+snapshots: ## Rewrite the dashboard's golden-file snapshots in place; review with git diff
+	INSTA_UPDATE=always $(CARGO) test --locked --all-features --lib ui::tests::golden
 
 bench: ## Run the startup benchmarks (see benches/startup.rs)
 	$(CARGO) bench --locked --bench startup

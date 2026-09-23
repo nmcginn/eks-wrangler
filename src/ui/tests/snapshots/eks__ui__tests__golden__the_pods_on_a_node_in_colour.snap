@@ -1,0 +1,190 @@
+---
+source: src/ui/tests/golden.rs
+expression: "styled(&frame(&node_pods(), WIDTH, HEIGHT), Theme::dark())"
+---
+ eks │ beta (us-east-1)
+┌ Clusters ────────────────────┐┌ Overview › ip-10-0-1-17.ec2.internal ────────────────────────────┐
+│  alpha us-east-1             ││Context   arn:aws:eks:us-east-1:1234:cluster/beta                 │
+│● beta us-east-1              ││Namespace default                                                 │
+│  gamma us-east-1             ││Region    us-east-1                                               │
+│                              ││Account   1234                                                    │
+│                              ││                                                                  │
+│                              ││INTERNAL-IP: 10.0.1.17                                            │
+│                              ││EXTERNAL-IP: -                                                    │
+│                              ││OS-IMAGE: Amazon Linux 2023                                       │
+│                              ││KERNEL-VERSION: 6.1.109                                           │
+│                              ││CONTAINER-RUNTIME: containerd://1.7.22                            │
+│                              ││MemoryPressure: False                                             │
+│                              ││DiskPressure: False                                               │
+│                              ││PIDPressure: False                                                │
+│                              ││NetworkUnavailable: False                                         │
+│                              ││PODS                                                              │
+│                              ││api-7d9f8b6c4-x2kqp  Running  1/1  0  cpu 120m (48%)  mem 300Mi   │
+│                              ││(59%)  3d                                                         │
+│                              ││ledger-0  Running  1/1  0  cpu 400m (160%)  mem 900Mi (176%)  3d  │
+│                              ││worker-5b8c7d9f6-hj4lm  CrashLoopBackOff  0/1  14 (2m ago)  cpu 5m│
+│                              ││(2%)  mem 40Mi (8%)  3d                                           │
+└──────────────────────────────┘└──────────────────────────────────────────────────────────────────┘
+ tab/→ switch/drill   j/k move   enter open   ←/esc back   r refresh   s/S sort   q quit   / filter
+
+--- styles ---
+0:0-4 fg=accent bg=default mod=BOLD
+0:5-6 fg=muted bg=default mod=NONE
+0:7-22 fg=text bg=default mod=BOLD
+1:0-0 fg=border bg=default mod=NONE
+1:1-10 fg=accent bg=default mod=BOLD
+1:11-31 fg=border bg=default mod=NONE
+1:32-32 fg=accent bg=default mod=NONE
+1:33-70 fg=accent bg=default mod=BOLD
+1:71-99 fg=accent bg=default mod=NONE
+2:0-0 fg=border bg=default mod=NONE
+2:1-2 fg=success bg=default mod=NONE
+2:3-7 fg=text bg=default mod=NONE
+2:9-17 fg=muted bg=default mod=NONE
+2:31-31 fg=border bg=default mod=NONE
+2:32-32 fg=accent bg=default mod=NONE
+2:33-42 fg=muted bg=default mod=NONE
+2:43-81 fg=text bg=default mod=NONE
+2:99-99 fg=accent bg=default mod=NONE
+3:0-0 fg=border bg=default mod=NONE
+3:1-30 fg=text bg=selection_bg mod=BOLD
+3:31-31 fg=border bg=default mod=NONE
+3:32-32 fg=accent bg=default mod=NONE
+3:33-42 fg=muted bg=default mod=NONE
+3:43-49 fg=text bg=default mod=NONE
+3:99-99 fg=accent bg=default mod=NONE
+4:0-0 fg=border bg=default mod=NONE
+4:1-2 fg=success bg=default mod=NONE
+4:3-7 fg=text bg=default mod=NONE
+4:9-17 fg=muted bg=default mod=NONE
+4:31-31 fg=border bg=default mod=NONE
+4:32-32 fg=accent bg=default mod=NONE
+4:33-42 fg=muted bg=default mod=NONE
+4:43-51 fg=text bg=default mod=NONE
+4:99-99 fg=accent bg=default mod=NONE
+5:0-0 fg=border bg=default mod=NONE
+5:31-31 fg=border bg=default mod=NONE
+5:32-32 fg=accent bg=default mod=NONE
+5:33-42 fg=muted bg=default mod=NONE
+5:43-46 fg=text bg=default mod=NONE
+5:99-99 fg=accent bg=default mod=NONE
+6:0-0 fg=border bg=default mod=NONE
+6:31-31 fg=border bg=default mod=NONE
+6:32-32 fg=accent bg=default mod=NONE
+6:99-99 fg=accent bg=default mod=NONE
+7:0-0 fg=border bg=default mod=NONE
+7:31-31 fg=border bg=default mod=NONE
+7:32-32 fg=accent bg=default mod=NONE
+7:33-54 fg=muted bg=default mod=NONE
+7:99-99 fg=accent bg=default mod=NONE
+8:0-0 fg=border bg=default mod=NONE
+8:31-31 fg=border bg=default mod=NONE
+8:32-32 fg=accent bg=default mod=NONE
+8:33-46 fg=muted bg=default mod=NONE
+8:99-99 fg=accent bg=default mod=NONE
+9:0-0 fg=border bg=default mod=NONE
+9:31-31 fg=border bg=default mod=NONE
+9:32-32 fg=accent bg=default mod=NONE
+9:33-59 fg=muted bg=default mod=NONE
+9:99-99 fg=accent bg=default mod=NONE
+10:0-0 fg=border bg=default mod=NONE
+10:31-31 fg=border bg=default mod=NONE
+10:32-32 fg=accent bg=default mod=NONE
+10:33-55 fg=muted bg=default mod=NONE
+10:99-99 fg=accent bg=default mod=NONE
+11:0-0 fg=border bg=default mod=NONE
+11:31-31 fg=border bg=default mod=NONE
+11:32-32 fg=accent bg=default mod=NONE
+11:33-70 fg=muted bg=default mod=NONE
+11:99-99 fg=accent bg=default mod=NONE
+12:0-0 fg=border bg=default mod=NONE
+12:31-31 fg=border bg=default mod=NONE
+12:32-32 fg=accent bg=default mod=NONE
+12:33-53 fg=success bg=default mod=NONE
+12:99-99 fg=accent bg=default mod=NONE
+13:0-0 fg=border bg=default mod=NONE
+13:31-31 fg=border bg=default mod=NONE
+13:32-32 fg=accent bg=default mod=NONE
+13:33-51 fg=success bg=default mod=NONE
+13:99-99 fg=accent bg=default mod=NONE
+14:0-0 fg=border bg=default mod=NONE
+14:31-31 fg=border bg=default mod=NONE
+14:32-32 fg=accent bg=default mod=NONE
+14:33-50 fg=success bg=default mod=NONE
+14:99-99 fg=accent bg=default mod=NONE
+15:0-0 fg=border bg=default mod=NONE
+15:31-31 fg=border bg=default mod=NONE
+15:32-32 fg=accent bg=default mod=NONE
+15:33-57 fg=success bg=default mod=NONE
+15:99-99 fg=accent bg=default mod=NONE
+16:0-0 fg=border bg=default mod=NONE
+16:31-31 fg=border bg=default mod=NONE
+16:32-32 fg=accent bg=default mod=NONE
+16:33-36 fg=accent bg=default mod=BOLD
+16:99-99 fg=accent bg=default mod=NONE
+17:0-0 fg=border bg=default mod=NONE
+17:31-31 fg=border bg=default mod=NONE
+17:32-32 fg=accent bg=default mod=NONE
+17:33-53 fg=text bg=selection_bg mod=BOLD
+17:54-60 fg=success bg=selection_bg mod=BOLD
+17:61-62 fg=text bg=selection_bg mod=BOLD
+17:63-65 fg=muted bg=selection_bg mod=BOLD
+17:66-67 fg=text bg=selection_bg mod=BOLD
+17:68-68 fg=muted bg=selection_bg mod=BOLD
+17:69-70 fg=text bg=selection_bg mod=BOLD
+17:71-84 fg=success bg=selection_bg mod=BOLD
+17:85-86 fg=text bg=selection_bg mod=BOLD
+17:87-95 fg=success bg=selection_bg mod=BOLD
+17:99-99 fg=accent bg=default mod=NONE
+18:0-0 fg=border bg=default mod=NONE
+18:31-31 fg=border bg=default mod=NONE
+18:32-32 fg=accent bg=default mod=NONE
+18:33-37 fg=success bg=selection_bg mod=BOLD
+18:38-39 fg=text bg=selection_bg mod=BOLD
+18:40-41 fg=muted bg=selection_bg mod=BOLD
+18:99-99 fg=accent bg=default mod=NONE
+19:0-0 fg=border bg=default mod=NONE
+19:31-31 fg=border bg=default mod=NONE
+19:32-32 fg=accent bg=default mod=NONE
+19:33-40 fg=text bg=default mod=NONE
+19:43-49 fg=success bg=default mod=NONE
+19:52-54 fg=muted bg=default mod=NONE
+19:57-57 fg=muted bg=default mod=NONE
+19:60-74 fg=success bg=default mod=NONE
+19:77-92 fg=warning bg=default mod=NONE
+19:95-96 fg=muted bg=default mod=NONE
+19:99-99 fg=accent bg=default mod=NONE
+20:0-0 fg=border bg=default mod=NONE
+20:31-31 fg=border bg=default mod=NONE
+20:32-32 fg=accent bg=default mod=NONE
+20:33-54 fg=text bg=default mod=NONE
+20:57-72 fg=danger bg=default mod=NONE
+20:75-77 fg=muted bg=default mod=NONE
+20:80-90 fg=muted bg=default mod=NONE
+20:93-98 fg=success bg=default mod=NONE
+20:99-99 fg=accent bg=default mod=NONE
+21:0-0 fg=border bg=default mod=NONE
+21:31-31 fg=border bg=default mod=NONE
+21:32-32 fg=accent bg=default mod=NONE
+21:33-36 fg=success bg=default mod=NONE
+21:39-51 fg=success bg=default mod=NONE
+21:54-55 fg=muted bg=default mod=NONE
+21:99-99 fg=accent bg=default mod=NONE
+22:0-31 fg=border bg=default mod=NONE
+22:32-99 fg=accent bg=default mod=NONE
+23:1-5 fg=accent bg=default mod=BOLD
+23:6-21 fg=muted bg=default mod=NONE
+23:22-24 fg=accent bg=default mod=BOLD
+23:25-32 fg=muted bg=default mod=NONE
+23:33-37 fg=accent bg=default mod=BOLD
+23:38-45 fg=muted bg=default mod=NONE
+23:46-50 fg=accent bg=default mod=BOLD
+23:51-58 fg=muted bg=default mod=NONE
+23:59-59 fg=accent bg=default mod=BOLD
+23:60-70 fg=muted bg=default mod=NONE
+23:71-73 fg=accent bg=default mod=BOLD
+23:74-81 fg=muted bg=default mod=NONE
+23:82-82 fg=accent bg=default mod=BOLD
+23:83-90 fg=muted bg=default mod=NONE
+23:91-91 fg=accent bg=default mod=BOLD
+23:92-99 fg=muted bg=default mod=NONE

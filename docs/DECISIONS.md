@@ -4000,3 +4000,48 @@ has the same one) rather than one this task introduced trying to paper over
 with Rosetta or a second build. `make dist` mirrors the same three files
 locally, from a plain `cargo build --release` with no cross-compilation
 question to answer.
+
+### 107. Golden snapshots are text first, colour by role name, and live beside `ui`'s own tests
+
+"Golden-file rendering tests" asked for `insta` snapshots over `TestBackend`
+for the main views. Three choices the wording left open:
+
+**What a snapshot holds.** `Buffer`'s `Debug` output — what `insta` would
+snapshot for free — interleaves every cell's colour with the text in
+`ratatui`'s own format, which makes every snapshot churn whenever a palette
+entry is tuned and every snapshot churn at once if a `ratatui` release rewords
+that output. Most snapshots here are therefore the characters on screen and
+nothing else, which is the part a reviewer can actually read in a diff. Colour
+gets four snapshots of its own, one per drill-down level, in a format this
+module writes itself: the same text, then one line per run of styled cells.
+
+**Colours are printed by role, not by value.** Each colour in a styled
+snapshot is written as the `Theme` field it equals — `fg=muted
+bg=selection_bg` — and only falls back to its `Debug` spelling when it is none
+of them. That makes the snapshot readable, and it turns `CLAUDE.md`'s "never
+hardcode a `Color` in a widget" into something mechanical: two ordinary tests
+sweep every view in both themes, one failing on any colour without a role
+name, the other if the light theme gives a cell a different role than the
+dark one. The second is the reason there is no separate light-theme snapshot:
+once colours are named by role, it would be byte-identical to the dark one,
+and the test says so more directly than a duplicate file would. One wrinkle:
+both themes give `accent` and `border_focused` the same value today, so a
+focused border reads as `accent`. The name is taken from the first field that
+matches, and the order is fixed, so this is stable; if the two ever diverge,
+the snapshots will show `border_focused` where they now show `accent`, and
+that diff will be correct.
+
+**Where the tests live.** `src/ui/tests/golden.rs`, declared as `mod golden;`
+inside `ui`'s existing `#[cfg(test)] mod tests`, rather than an integration
+test under `tests/` or a sibling of `ui::tests`. As a child it can use the
+fixtures that module already builds — `node_row`, `pod_row`, `container_row`,
+`app`, `press` — without moving them or making them `pub`, and it reaches
+`App` through the same methods a user's key presses do. `insta` puts the
+snapshots in `snapshots/` beside that file.
+
+`cargo-insta` is not a requirement: `make snapshots` runs the golden tests
+with `INSTA_UPDATE=always`, and `git diff` is the review. It is documented as
+the nicer path, not the only one, because installing another tool should not
+stand between a contributor and a one-line layout fix. CI needs nothing new —
+GitHub Actions sets `CI=true`, under which `insta` writes nothing and fails on
+any mismatch or missing snapshot, and `cargo test` already runs these.
