@@ -2352,6 +2352,9 @@ form is one thing to print in the message offering it.
 What `eks` does own is the *question*. That half needs no SDK at all, because
 the answer is on disk.
 
+Narrowed by decision 110: `eks` now runs the kubeconfig `exec` helper itself,
+and still does not own logging in.
+
 ### 75. The session check reads two files, and matches on `startUrl` rather than a hash
 
 `aws::config` reads `~/.aws/config` for four keys, and `aws::sso` reads the AWS
@@ -3897,6 +3900,9 @@ in `main::dashboard` right after `App::new`, so every existing test still
 gets the dark default without a second constructor parameter to thread
 through five call sites.
 
+Amended by decision 111: the OSC 11 query now runs in the dashboard, off the
+paint path, and re-themes after first paint.
+
 ### 105. Startup benchmarks measure the pure computation, not the process; CI reports through a branch-keyed cache, never fails
 
 "Startup budget and benchmarks" asked for `criterion` benchmarks over
@@ -3952,6 +3958,9 @@ feature set was trimmed to `cargo_bench_support` alone — `plotters`,
 `rayon`, and HTML report generation buy nothing when the only reader is a
 CI log, and CLAUDE.md's "earn its place" is about weight as much as
 necessity.
+
+Extended by decision 112: CI's `bench` job also measures wall-clock process
+startup with `hyperfine`.
 
 ### 106. Completions and the man page skip kubeconfig entirely; the man page is a hidden command; CI generates both only for native targets
 
@@ -4150,3 +4159,94 @@ Hub, the aarch64 one under QEMU via `docker/setup-qemu-action` — the host the
 roadmap named, rather than a proxy for it. Nothing in CI runs the binaries on
 glibc 2.17 itself; the ELF check is the evidence for the declared floor, the
 container run is the evidence for the named host.
+
+### 110. `eks` runs the kubeconfig `exec` helper itself; it still does not own logging in
+
+Decided by the reviewer on 2026-09-24. This narrows decision 74 without reversing it.
+
+Decision 74 said no to owning credential resolution and gave two objections. The
+first was the AWS SDK's weight: a second hyper/rustls tree on a binary whose
+startup time comes first. The second was `botocore`'s private token-cache format,
+which a native device flow would have to write. Both objections are about
+*logging in*. Neither applies to *running the `exec` block*. The
+`client.authentication.k8s.io` protocol is small: spawn the command the
+kubeconfig names, with the environment and arguments it names, and read one
+`ExecCredential` JSON document from its stdout. `serde_json` is already a
+dependency (decision 75), so this adds no crate and writes no cache.
+
+Owning the child answers the two roadmap entries that decision 74 left waiting
+on this question:
+
+- **Stopping the helper.** A child we spawned is a child we can kill. On
+  `--timeout` the helper is killed, not abandoned, so it no longer holds the
+  terminal's stdin after the shell gets its prompt back.
+- **Refreshing mid-listing.** We hold the `ExecCredential`'s
+  `expirationTimestamp`, so a listing can re-run the helper between pages when
+  the token is close to expiry. It no longer needs one token for the whole
+  client's life.
+
+What stays as decision 74 had it: `aws sso login --profile X` is still a
+shell-out, the pre-flight still reads the token cache without writing it, and
+failures are still worded through `k8s::client::explain`,
+`k8s::client::stalled_helper` and `helper_command`. There is no second
+spelling. Both token and client-certificate credentials must be handled,
+because the protocol allows either. A helper we cannot parse is an error that
+names the command, not a fallback to letting `kube` run it.
+
+### 111. The OSC 11 background query runs off the paint path, and a light answer re-themes after first paint
+
+Decided by the reviewer on 2026-09-24. This lifts decision 104's deferral.
+
+When `theme` is `auto` and `COLORFGBG` says nothing, the dashboard paints first
+in dark (decision 104's fallback). It then sends the OSC 11 query on the input
+side, never on the render path. If a reply arrives that reads as a light
+background, the dashboard switches through `App::set_theme` and redraws. The
+query spends **none** of the 50 ms first-paint budget. The accepted cost is
+that on a light terminal that answers, a user may see a single frame drawn in
+dark before it flips. No reply, a reply we cannot parse, or a terminal that
+never answers all leave the dark theme in place, and none of them is an error.
+
+This also answers decision 104's testing objection. Parsing the reply is a pure
+function over bytes, tested against fixture replies (`rgb:ffff/ffff/ffff`,
+4-digit and 2-digit forms, BEL and ST terminators, garbage). The re-theme is
+an `App` state change fed an event, tested like any other key. What "never
+delays first paint" means is asserted by the order of events, not by a timer.
+A terminal that `COLORFGBG` already answered is not queried. The CLI's
+one-shot tables keep `COLORFGBG` only: they have no event loop to receive a
+late answer, and a blocking query there would be the trade this decision
+declined for the dashboard.
+
+### 112. Wall-clock startup is measured with `hyperfine` in CI's `bench` job, reported and never gated
+
+Decided by the reviewer on 2026-09-24. This extends decision 105.
+
+`benches/startup.rs` measures the computation. `hyperfine` measures the
+process: `exec`, dynamic linking, and the real binary's own startup, which
+together are most of what a user waits on. The `bench` job installs a pinned
+`hyperfine`, like `cargo-zigbuild` in decision 109, so a new release never
+turns up in an unrelated merge. It times the release `eks` against the same
+synthetic 50-cluster kubeconfig the criterion benches use, on commands that
+need no terminal and no cluster (`eks contexts`, `eks --version`). The result
+goes to the job summary beside criterion's, and CI never fails a build over
+it. A hand-rolled spawn-and-time harness was the alternative. It lost because
+it would be our own statistics code with nothing to show for it that
+`hyperfine` does not already do. Opening a real terminal
+(`ratatui::init()`'s raw-mode setup) is still unmeasured, because CI has no
+TTY. The number is labelled as excluding it rather than implying it covers
+it.
+
+### 113. The Homebrew formula lives in this repository, not a separate tap
+
+Decided by the reviewer on 2026-09-24.
+
+`Formula/eks.rb` is committed here, and users tap it by URL:
+`brew tap nmcginn/eks-wrangler https://github.com/nmcginn/eks-wrangler`, then
+`brew install nmcginn/eks-wrangler/eks`. A separate `homebrew-tap` repository
+is the more conventional setup and would allow the shorter `brew tap`. It would
+also mean a second repository to keep in step and a release-workflow token
+with push rights outside this one. For one formula that trade is not worth it
+yet. If more formulae ever appear, moving to a dedicated tap is a rename, not a
+redesign. The formula installs the release tarballs from decisions 108 and
+109, with their published checksums, and ships the completions and man page
+that are already inside them. The install script verifies the same checksums
+before it installs anything.

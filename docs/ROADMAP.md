@@ -1050,6 +1050,9 @@ cluster.
   *Acceptance:* a token that dies mid-listing costs the user the pages already
   read rather than the command; whatever refreshes it words its failures
   through `k8s::client::explain` rather than a second wording.
+  *Decided (2026-09-24):* `eks` runs the `exec` helper itself and watches the
+  `ExecCredential`'s `expirationTimestamp` between pages. It still does not own
+  logging in. No longer waiting on the reviewer. See decision 110.
 
 - [ ] **Stop the credential helper, rather than only stopping waiting for it.**
   `--timeout` now ends the hang, and it ends it by abandonment: a blocking task
@@ -1068,6 +1071,9 @@ cluster.
   *Acceptance:* the helper is gone by the time the process is; whatever runs it,
   the failure still words itself through `k8s::client::stalled_helper` and names
   the command through `helper_command` rather than a second spelling.
+  *Decided (2026-09-24):* yes to the `exec` protocol, still no to the AWS
+  SDK or writing the token cache. This entry and the one above share the new
+  runner, so whichever lands first builds it. See decision 110.
 
 - [x] **Leave the terminal tidy when a command is interrupted.**
   `eks nodes` now draws a progress line, and Ctrl-C during one kills the process
@@ -1710,6 +1716,10 @@ cluster.
   `App::set_theme` need no change; a terminal that would have answered
   `COLORFGBG` correctly is not asked twice; the query never delays first
   paint past CLAUDE.md's budget, with a test proving it.
+  *Decided (2026-09-24):* the dashboard queries off the paint path and
+  re-themes if a light answer arrives, accepting a possible one-frame flip. The
+  CLI tables keep `COLORFGBG` only. The reply parser is tested against fixture
+  bytes. See decision 111.
 
 - [x] **Startup budget and benchmarks.**
   Add `criterion` benchmarks for kubeconfig parsing and first paint. Document
@@ -1750,6 +1760,9 @@ cluster.
   *Acceptance:* whichever shape it takes, it measures the actual `eks`
   binary rather than a library call standing in for it; it reports the same
   way `bench` does today — CI shows the number, never fails a build over it.
+  *Decided (2026-09-24):* a pinned `hyperfine` in the `bench` job times
+  `eks contexts` and `eks --version` against the synthetic kubeconfig. See
+  decision 112.
 
 - [x] **Shell completions and a man page.**
   Generate from the clap definition via `clap_complete` and `clap_mangen`.
@@ -1848,6 +1861,8 @@ cluster.
   An install script and a Homebrew tap formula.
   *Acceptance:* `README.md` documents install for macOS and Linux; the script
   verifies checksums.
+  *Decided (2026-09-24):* the formula lives here as `Formula/eks.rb` and is
+  tapped by URL, not from a separate `homebrew-tap` repo. See decision 113.
 
 ---
 
