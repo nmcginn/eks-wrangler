@@ -1810,7 +1810,7 @@ cluster.
   man page rather than taking the `x86_64-apple-darwin` leg's exemption.
   See decision 108.
 
-- [ ] **Lower the glibc floor of the `-gnu` release binaries.**
+- [x] **Lower the glibc floor of the `-gnu` release binaries.**
   Both `-gnu` tarballs link against whatever glibc `ubuntu-latest` carries —
   2.39 today — and refuse to start on anything older, Amazon Linux 2023's
   2.34 included, which is exactly where an EKS tool on Graviton gets run. The
@@ -1822,6 +1822,18 @@ cluster.
   `x86_64-unknown-linux-gnu` leg as much as the new one. See decision 108.
   *Acceptance:* both `-gnu` binaries start on glibc 2.34; CI fails a build
   whose binary needs a newer glibc than the floor it declares.
+  Landed with `cargo zigbuild`, linking both `-gnu` legs against glibc 2.17
+  — Rust's own minimum for these targets, below Amazon Linux 2023's 2.34 and
+  Amazon Linux 2's 2.26 alike — declared per leg as `matrix.glibc` and passed
+  as the target's `.2.17` suffix. `scripts/verify-glibc-floor.sh` reads the
+  newest `GLIBC_x.y` the built binary needs from its ELF version-needs
+  section and fails the build when it is above that declared floor, naming
+  each symbol that raised it; its own tests run from `make check` and CI's
+  lint job over fixture readelf output, so they need no binary and no
+  readelf. Each `-gnu` binary is then started on `amazonlinux:2023` in
+  Docker, aarch64 under QEMU. zig is also `ring`'s C compiler now, so the
+  aarch64 leg lost its gcc cross toolchain and linker setting. See decision
+  109.
 
 - [ ] **Supply-chain checks in CI.**
   `cargo-deny` for advisories, licences, and duplicate versions.

@@ -31,6 +31,13 @@ jobs:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             native: true
+            # The oldest glibc this binary starts on. Linked against it by
+            # `cargo zigbuild`, checked back out of the binary afterwards, and
+            # proven by starting the binary on Amazon Linux 2023. 2.17 is
+            # Rust's own minimum for this target, so nothing is gained by
+            # declaring anything newer (decision 109).
+            glibc: "2.17"
+            platform: linux/amd64
           - os: macos-latest
             target: aarch64-apple-darwin
             native: true
@@ -52,18 +59,17 @@ jobs:
             apt: musl-tools
           - os: ubuntu-latest
             target: aarch64-unknown-linux-gnu
-            # Cross-compiled on x86_64 (the linker is set in the job's env
-            # below; `cc` finds `aarch64-linux-gnu-gcc` for `ring` by the
-            # target's own prefix), and run under user-mode QEMU so it gets
-            # the same smoke test and completions as every native leg rather
-            # than shipping untested and without them.
+            # Cross-compiled on x86_64 by `cargo zigbuild`, whose zig is both
+            # the linker and, for `ring`, the C compiler — so no aarch64 gcc
+            # is installed. Run under user-mode QEMU so it gets the same smoke
+            # test and completions as every native leg rather than shipping
+            # untested and without them; `libc6-arm64-cross` is the sysroot
+            # `-L` points the emulator's dynamic loader at.
             native: false
             emulator: qemu-aarch64 -L /usr/aarch64-linux-gnu
-            apt: gcc-aarch64-linux-gnu libc6-dev-arm64-cross qemu-user
-    env:
-      # Read by cargo only when building for aarch64-unknown-linux-gnu, so it
-      # is inert on every other leg of the matrix.
-      CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+            apt: libc6-arm64-cross qemu-user
+            glibc: "2.17"
+            platform: linux/arm64
     steps:
       - uses: actions/checkout@v7
 
@@ -82,8 +88,57 @@ jobs:
         with:
           key: ${{ matrix.target }}
 
+      # A `-gnu` binary needs at least the glibc it was linked against, and
+      # the runner's is whatever `ubuntu-latest` ships (2.39 on 24.04). zig
+      # carries stub libraries for every glibc version, so `cargo zigbuild`
+      # with a `.2.17` suffix on the target links against 2.17's symbol
+      # versions instead. Both are pinned: a zig release can change what its
+      # stubs export, and the floor check below is what would catch it, but
+      # it should not be a surprise on an unrelated merge.
+      - name: Install zig
+        if: matrix.glibc
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      - name: Install cargo-zigbuild
+        if: matrix.glibc
+        run: cargo install --locked cargo-zigbuild@0.23.4
+
+      # `cargo zigbuild` writes to target/<triple>/release/ without the
+      # suffix, so every step after this one reads the same path either way.
       - name: Build
-        run: cargo build --locked --release --target ${{ matrix.target }}
+        shell: bash
+        run: |
+          if [ -n "${{ matrix.glibc }}" ]; then
+            cargo zigbuild --locked --release --target ${{ matrix.target }}.${{ matrix.glibc }}
+          else
+            cargo build --locked --release --target ${{ matrix.target }}
+          fi
+
+      - name: Verify the binary's glibc floor
+        if: matrix.glibc
+        run: scripts/verify-glibc-floor.sh target/${{ matrix.target }}/release/eks ${{ matrix.glibc }}
+
+      # The floor check reads what the binary *asks* for; this starts it
+      # where it matters. Amazon Linux 2023 (glibc 2.34) is where an EKS tool
+      # on Graviton gets run, and the one older-glibc host the roadmap names.
+      # The aarch64 image runs under QEMU through binfmt, registered below.
+      # The image comes from Amazon's own registry rather than Docker Hub,
+      # whose anonymous pull limit is shared across a runner's tenants.
+      - name: Register QEMU for foreign-architecture containers
+        if: matrix.glibc && matrix.platform != 'linux/amd64'
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: ${{ matrix.platform }}
+
+      - name: Start the binary on Amazon Linux 2023
+        if: matrix.glibc
+        run: |
+          docker run --rm --platform ${{ matrix.platform }} \
+            --volume "$PWD/target/${{ matrix.target }}/release:/opt/eks:ro" \
+            public.ecr.aws/amazonlinux/amazonlinux:2023 \
+            sh -c 'rpm -q glibc && /opt/eks/eks --version && /opt/eks/eks --help > /dev/null'
 
       - name: Verify the binary is static
         if: matrix.static

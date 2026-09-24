@@ -4102,3 +4102,51 @@ against an older glibc (`cargo-zigbuild`'s `target.2.17` suffix, `cross`'s
 older images, or an older runner that only moves the floor a little), which
 is the build-tool question this change deliberately did not reopen, and it
 is a roadmap entry of its own.
+
+### 109. The `-gnu` release binaries link against glibc 2.17 through `cargo zigbuild`, and the floor is read back out of the binary
+
+Both `-gnu` tarballs used to need the glibc of the `ubuntu-latest` runner that
+built them — 2.39 — so neither started on Amazon Linux 2023 (2.34), and the
+aarch64 one had no musl sibling to fall back on (decision 108). Three choices:
+
+**`cargo zigbuild`, not `cross` or an older runner.** zig ships stub
+libraries for every glibc release and links against whichever one the target
+names, so `cargo zigbuild --target x86_64-unknown-linux-gnu.2.17` binds each
+symbol to the oldest version that has it, on the same `ubuntu-latest` runner,
+with no container. zig is also the C compiler `ring` gets, so the aarch64 leg
+dropped `gcc-aarch64-linux-gnu` and the `CARGO_TARGET_…_LINKER` setting it
+needed; it keeps `libc6-arm64-cross` only as the sysroot QEMU runs the result
+against. `cross`'s images would pin the floor to whatever glibc each image
+happens to carry, and put a Docker pull in front of every build; an older
+runner (`ubuntu-22.04`, 2.35) does not reach 2.34 at all and is retired on
+GitHub's schedule, not ours. The cost is two tools installed per build — zig
+through `mlugg/setup-zig`, `cargo-zigbuild` through `cargo install --locked` —
+both pinned (zig 0.16.0, cargo-zigbuild 0.23.4, the pair this was built and
+checked with) so a new release of either never arrives on an unrelated merge.
+
+**2.17, not 2.34.** The roadmap entry asked for 2.34 because that is Amazon
+Linux 2023's. But 2.17 is Rust's own documented minimum for both targets, zig
+links it with no extra work, and it reaches Amazon Linux 2 (2.26) and older
+bastion images too, which the same person running `eks` on Graviton is as
+likely to be sitting on. Declaring anything newer than the toolchain's own
+floor would buy nothing but a smaller audience.
+
+**The floor is checked, then exercised.** `scripts/verify-glibc-floor.sh`
+reads the binary's version-needs section (`readelf --version-info`), takes the
+newest `GLIBC_x.y` it asks for, and fails when that is newer than the floor
+the matrix declares — naming each symbol above it, from the dynamic symbol
+table, so the failure says which call raised it. Versions compare component
+by component as numbers: text order would put `2.9` after `2.17`. This is
+what turns "the build asked for 2.17" into a guarantee: a zig release whose
+stubs change, a dependency that starts calling `getrandom`, or a leg that
+quietly loses the suffix fails the release build instead of shipping. Like
+`verify-static.sh` it is a script so it runs against a local build; unlike
+it, it has tests (`scripts/tests/verify-glibc-floor.sh`, run by `make check`
+and by CI's lint job), which feed it fixture readelf output through a
+`READELF` override so they run on a macOS laptop with no readelf at all.
+After the check, each `-gnu` binary is started with `--version` and `--help`
+inside `amazonlinux:2023`, pulled from `public.ecr.aws` rather than Docker
+Hub, the aarch64 one under QEMU via `docker/setup-qemu-action` — the host the
+roadmap named, rather than a proxy for it. Nothing in CI runs the binaries on
+glibc 2.17 itself; the ELF check is the evidence for the declared floor, the
+container run is the evidence for the named host.

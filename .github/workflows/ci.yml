@@ -39,6 +39,11 @@ jobs:
       - name: Check docs build
         run: cargo doc --locked --no-deps --all-features
 
+      # The release workflow only runs on master, so a broken check in
+      # scripts/ would otherwise first show up after the merge that broke it.
+      - name: Test the release scripts
+        run: make script-test
+
   test:
     name: Test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}

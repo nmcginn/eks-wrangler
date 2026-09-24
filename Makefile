@@ -4,7 +4,7 @@ CARGO ?= cargo
 BIN   := eks
 
 .DEFAULT_GOAL := help
-.PHONY: help build release run test snapshots bench lint fmt fmt-check doc check install dist clean
+.PHONY: help build release run test script-test snapshots bench lint fmt fmt-check doc check install dist clean
 
 help: ## Show this help
 	@grep -hE '^[a-z-]+:.*?## ' $(MAKEFILE_LIST) \
@@ -21,6 +21,9 @@ run: ## Run the dashboard (make run ARGS="contexts")
 
 test: ## Run the test suite
 	$(CARGO) test --locked --all-features
+
+script-test: ## Test the release scripts in scripts/ against fixture readelf output
+	scripts/tests/verify-glibc-floor.sh
 
 snapshots: ## Rewrite the dashboard's golden-file snapshots in place; review with git diff
 	INSTA_UPDATE=always $(CARGO) test --locked --all-features --lib ui::tests::golden
@@ -40,7 +43,7 @@ fmt-check: ## Verify formatting without changing files
 doc: ## Build the API docs
 	RUSTDOCFLAGS="-D warnings" $(CARGO) doc --locked --no-deps --all-features
 
-check: fmt-check lint test doc ## Everything CI runs — run before pushing
+check: fmt-check lint test script-test doc ## Everything CI runs — run before pushing
 	@echo "All checks passed."
 
 install: ## Install eks into ~/.cargo/bin
