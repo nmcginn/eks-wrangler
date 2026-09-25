@@ -351,6 +351,15 @@ Credentials come from the kubeconfig context itself, so whatever works for
 refresh them instead of printing an HTTP status code — and, if the session it
 needs is an IAM Identity Center one, offers to refresh it for you.
 
+### Long listings and long sessions
+
+The token `aws eks get-token` prints is good for fifteen minutes. `eks` runs the
+helper once when it connects, then runs it again when that token has a minute
+left, so a slow listing on a large cluster, or a dashboard left open all
+afternoon, keeps working without you seeing it happen. If the cluster refuses a
+token partway through a listing, `eks` fetches a fresh one and asks for that
+page again, so you keep the pages already read.
+
 ### Logging in
 
 An EKS context authenticates by running `aws eks get-token`, and that command
@@ -552,7 +561,8 @@ That is the failure the flag exists for: a private endpoint reached from outside
 its VPC does not refuse the connection, it simply never answers. `--timeout 0`
 restores the old behaviour of waiting indefinitely. It covers the kubeconfig's
 credential helper as well as the requests after it, spent per step rather than
-per command. What it deliberately does *not* cover is `aws sso login`: that one
+per command. A helper that outlives it is stopped, not left running in the
+background. What it deliberately does *not* cover is `aws sso login`: that one
 is waiting for a human at a browser, and cutting it off after thirty seconds
 would be cutting off the thing you asked for.
 

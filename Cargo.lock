@@ -655,12 +655,14 @@ name = "eks"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64",
  "clap",
  "clap_complete",
  "clap_mangen",
  "criterion",
  "directories",
  "futures-util",
+ "http",
  "insta",
  "k8s-openapi",
  "kube",
@@ -672,6 +674,7 @@ dependencies = [
  "thiserror 2.0.20",
  "tokio",
  "toml",
+ "tower",
  "tracing",
  "tracing-subscriber",
 ]
@@ -2665,6 +2668,7 @@ version = "1.53.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "202caea871b69668250d242070849eb495be178ed697a3e98aebce5bc81a0bed"
 dependencies = [
+ "bytes",
  "libc",
  "mio",
  "pin-project-lite",

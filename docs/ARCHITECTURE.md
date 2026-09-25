@@ -17,7 +17,8 @@ src/
   aws/                 Which AWS profile a context uses, whether its IAM
                        Identity Center session is still alive, and running
                        `aws sso login` when it is not.
-  k8s/                 The Kubernetes client, paging and request budgets,
+  k8s/                 The Kubernetes client, the credential helper and the
+                       token it keeps fresh, paging and request budgets,
                        quantities, selectors, nodes, pods, and metrics.
   commands/            One module per user-facing command.
   ui/                  The interactive dashboard.
@@ -343,14 +344,29 @@ request: a cluster large enough to need four pages should not be cut off for its
 size, only for going quiet. Cluster failures are therefore `page::Error` rather
 than `kube::Error` — the API failures and the one `kube` has no opinion about,
 since waiting for ever is a reasonable thing for a library to do and not for a
-command-line tool. The budget covers `k8s::connect` too, and getting it there
-took a detour: `kube` runs a kubeconfig's credential helper with a blocking
-`std::process::Command` inside `Client::try_from`, so a hung `aws eks get-token`
-blocks the thread and a timeout on the same thread has nothing to interrupt. The
-build therefore runs on `spawn_blocking` and the budget races the `JoinHandle`.
-A blocking task cannot be cancelled, so giving up on one only stops waiting for
-it — which is why `commands::block_on` shuts its runtime down instead of
-dropping it (dropping one waits for exactly the task that was abandoned).
+command-line tool. The budget covers `k8s::connect` too, which means it covers
+the credential helper.
+
+The helper is ours to run (decision 110). `k8s::exec` speaks the
+`client.authentication.k8s.io` protocol: it spawns the `exec` block's command as
+a `tokio` child with `kill_on_drop`, and reads one `ExecCredential` off its
+stdout. `k8s::client::build` races that against the budget, and losing the race
+drops the child, which kills it — so a hung `aws eks get-token` is stopped
+rather than left holding the terminal's stdin. The credential goes into the
+client in place of the `exec` block, so `kube` never runs the helper itself
+(it used to, three times per client).
+
+A token is then held by `k8s::auth::Keeper`, which `k8s::auth::Authorise` — a
+`tower` layer on the client — asks for on every request. The keeper runs the
+helper again when the token is inside the last minute of its
+`expirationTimestamp`, and when a `401` retires it; `page::collect` asks once
+more for a page refused partway through a listing, so a token that lapses on
+page four costs one page rather than three. A refresh spends the deadline of the
+request it happens inside, shared through `page::deadline`, so a helper that
+stalls there is stopped at the same instant and reported as the helper rather
+than as a silent cluster. Its failures reach `explain` as `page::Error::Helper`,
+taken back out of the `kube::Error::Service` that `kube` wraps any layer's error
+in.
 
 Resource quantities get their own hop: the API server reports capacity as
 strings in a small grammar (`3920m`, `7134420Ki`, `1e3`), and `k8s::quantity`
@@ -360,9 +376,8 @@ which is why the whole suffix table is covered by tests rather than by whatever
 instance types happen to be in the cluster you tried it on.
 
 Only the async commands build a Tokio runtime, and they build it themselves —
-see `commands::block_on`, which is also where an abandoned credential helper is
-left behind rather than waited for. `eks contexts` still starts with nothing but
-a file read.
+see `commands::block_on`. `eks contexts` still starts with nothing but a file
+read.
 
 The dashboard's node pane refreshes itself in the background rather than
 fetching once at startup: `main` builds one closure over the config,
@@ -551,10 +566,11 @@ and wants "run it again"; and a `Slow` names the budget it overran and the
 larger one to type, spelled through `Budget` itself so the advice cannot suggest
 a value the flag would reject.
 
-`k8s::client::stalled_helper` sits beside `explain` rather than among its
-branches, for the reason `k8s::metrics::unsampled` does: no request failed, so
-there is no `kube::Error` to classify. It is the sentence for a credential
-helper that outlived the budget, and it names the command that context runs —
+`k8s::client::stalled_helper` is the sentence for a credential helper that
+outlived the budget. `build` uses it directly when the helper stalls before any
+request, and `explain` uses it for `Failure::HelperStalled` when a refresh stalls
+partway through a listing, so the two paths share one wording. It names the
+command that context runs —
 built by `helper_command` out of the kubeconfig's own `exec` block and quoted so
 the user can paste it — because running it by hand is the only way to see what
 it is waiting for.

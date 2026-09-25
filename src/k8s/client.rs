@@ -3,29 +3,22 @@
 //! Two jobs live here, and the second one is the interesting one.
 //!
 //! Building a client is *nearly* mechanical: read the same kubeconfig files the
-//! rest of the tool reads, pick a context, hand it to `kube`. No network
-//! traffic happens here, so nothing on this path can stall a first paint. It is
+//! rest of the tool reads, pick a context, hand it to `kube`. No request to the
+//! cluster happens here, so nothing on this path can stall a first paint. It is
 //! not free of side effects, though, and the side effect is the reason this
-//! module is more than twenty lines: `kube` resolves the auth layer eagerly, so
-//! a context with an `exec` block runs `aws eks get-token` inside
-//! `Client::try_from` rather than on the first request. That is why building a
-//! client can fail with a credential error, and why [`explain`] is used on both
-//! paths.
+//! module is more than twenty lines: a context with an `exec` block has to run
+//! `aws eks get-token` before there is anything to connect *with*. That is why
+//! building a client can fail with a credential error, and why [`explain`] is
+//! used on both paths.
 //!
-//! It runs it with a *blocking* `std::process::Command`, on whatever thread
-//! asked. A credential helper that never comes back — an expired SSO session
-//! that wants a browser login, a laptop that has lost its route to the SSO
-//! endpoint — therefore blocks the thread rather than the future, and a
-//! `tokio::time::timeout` wrapped around this function would never fire. So the
-//! build goes onto a blocking task, where the timeout has something to interrupt:
-//! [`connect`] takes the same [`Budget`] the requests after it take, and spends
-//! it on the helper too.
-//!
-//! Abandoning a blocking task does not stop it — nothing here can kill a
-//! subprocess `kube` owns — so the other half of that timeout is
-//! [`crate::commands::block_on`], which shuts the runtime down instead of
-//! dropping it. Dropping one waits for its blocking tasks, and waiting for this
-//! one is the exact hang the budget was written to end.
+//! The helper is run by [`crate::k8s::exec`], once, as a child this process
+//! owns (decision 110). [`build`] races it against the same [`Budget`] the
+//! requests after it take, and losing that race drops the child, which kills
+//! it: a helper that never comes back — an expired SSO session that wants a
+//! browser login, a laptop that has lost its route to the SSO endpoint — is
+//! stopped, not left holding the terminal's stdin after the shell has its
+//! prompt back. The token it printed goes to [`crate::k8s::auth`], which puts
+//! it on every request and runs the helper again when it lapses.
 //!
 //! Translating failures is the job that earns its keep. An EKS cluster whose
 //! SSO session expired answers with `401 Unauthorized`, and `kube` reports that
@@ -40,11 +33,15 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
+use base64::Engine as _;
+use kube::client::ClientBuilder;
 use kube::config::{AuthInfo, KubeConfigOptions, Kubeconfig};
 use kube::{Client, Config};
 
 use crate::cluster::ClusterView;
 use crate::format;
+use crate::k8s::auth::{Authorise, Keeper};
+use crate::k8s::exec::{self, Credential, Secret};
 use crate::k8s::page::{self, Budget};
 use crate::progress::Progress;
 
@@ -80,16 +77,6 @@ pub enum Error {
     /// classify — nothing was asked of the cluster yet.
     #[error("{0}")]
     HelperStalled(String),
-
-    /// The thread building the client stopped without answering. Only a panic
-    /// inside `kube` can do this, so there is no advice to give beyond what it
-    /// said on its way down.
-    #[error(
-        "building a client for {cluster} stopped unexpectedly: {message}\n\
-         That is a bug in eks or in the kube crate rather than something you did; \
-         please report it with the output of `eks -vv`."
-    )]
-    Interrupted { cluster: String, message: String },
 }
 
 impl Error {
@@ -189,11 +176,6 @@ pub async fn build(
     budget: Budget,
     progress: &Progress,
 ) -> Result<Client, Error> {
-    let label = label.to_owned();
-    // Read before `config` moves onto the blocking task, because the message
-    // for a helper that never answers has to name the command to run by hand.
-    let helper = helper_command(&config.auth_info);
-
     // The step the whole progress line exists for. A user waiting thirty
     // seconds on a laptop that has lost its route to the SSO endpoint is
     // waiting on a subprocess nothing on screen has ever mentioned; naming it
@@ -205,29 +187,31 @@ pub async fn build(
         None => progress.waiting(&format!("connecting to {label}")),
     };
 
-    // The one blocking call in the tool, and the reason it is on a blocking
-    // task: `Client::try_from` resolves the auth layer, which runs the
-    // kubeconfig's exec plugin with `std::process::Command::output`. On this
-    // thread that would block the timer below along with everything else.
-    let task = tokio::task::spawn_blocking(move || Client::try_from(config));
-
-    let finished = match budget.limit() {
-        // `--timeout 0`: the user asked to wait, so wait.
-        None => step.tick(task).await,
-        Some(limit) => {
-            // Dropping the join handle abandons the task; it does not stop it,
-            // and nothing here can kill a subprocess `kube` owns. Declining to
-            // wait for it is `commands::block_on`'s half of this.
-            let Ok(finished) = step.tick(tokio::time::timeout(limit, task)).await else {
-                tracing::debug!(?limit, "the credential helper outlived the budget");
-                return Err(Error::HelperStalled(stalled_helper(
-                    &label,
-                    helper.as_deref(),
-                    limit,
-                )));
-            };
-            finished
-        }
+    let credential = if exec::helper_of(&config.auth_info).is_some() {
+        let run = exec::run(&config.auth_info);
+        let finished = match budget.limit() {
+            // `--timeout 0`: the user asked to wait, so wait.
+            None => step.tick(run).await,
+            Some(limit) => {
+                // Losing the race drops `run`, and the child with it — which
+                // is what kills the helper rather than leaving it.
+                let Ok(finished) = step.tick(tokio::time::timeout(limit, run)).await else {
+                    tracing::debug!(?limit, "the credential helper outlived the budget");
+                    return Err(Error::HelperStalled(stalled_helper(
+                        label,
+                        helper_command(&config.auth_info).as_deref(),
+                        limit,
+                    )));
+                };
+                finished
+            }
+        };
+        Some(finished.map_err(|error| {
+            tracing::debug!(%error, "the credential helper failed");
+            Error::explained(&error.into(), label)
+        })?)
+    } else {
+        None
     };
 
     // Off the screen before anything below can print — the sentence explaining
@@ -235,19 +219,48 @@ pub async fn build(
     // makes after one.
     drop(step);
 
-    finished
-        .map_err(|source| Error::Interrupted {
-            cluster: label.clone(),
-            message: source.to_string(),
-        })?
-        .map_err(|source| {
-            tracing::debug!(%source, "building a client failed");
-            let error = source.into();
-            Error::Cluster {
-                failure: Failure::of(&error),
-                message: explain(&error, &label),
-            }
-        })
+    assemble(config, credential, budget).map_err(|source| {
+        tracing::debug!(%source, "building a client failed");
+        Error::explained(&source.into(), label)
+    })
+}
+
+/// Build the client itself, from a context and the credential its helper
+/// printed, if it has one.
+///
+/// Nothing here starts a process: the `exec` block is taken out of the config
+/// before `kube` sees it, and replaced with what running it produced. Left in,
+/// `kube` would run the helper again — three more times, in fact, once each
+/// for the TLS identity, the auth layer, and the identity's expiry.
+fn assemble(
+    mut config: Config,
+    credential: Option<Credential>,
+    budget: Budget,
+) -> Result<Client, kube::Error> {
+    let Some(credential) = credential else {
+        return Client::try_from(config);
+    };
+
+    // The keeper runs the helper again later, so it keeps the block.
+    let auth = config.auth_info.clone();
+    config.auth_info.exec = None;
+
+    match credential.secret {
+        Secret::Token(token) => {
+            let keeper = Keeper::new(token, credential.expires, auth, budget);
+            Ok(ClientBuilder::try_from(config)?
+                .with_layer(&Authorise(keeper))
+                .build())
+        }
+        // The protocol sends PEM; a kubeconfig — which is what `kube` reads
+        // this from — holds base64 of PEM.
+        Secret::Certificate { certificate, key } => {
+            let base64 = base64::engine::general_purpose::STANDARD;
+            config.auth_info.client_certificate_data = Some(base64.encode(certificate));
+            config.auth_info.client_key_data = Some(base64.encode(key).into());
+            Client::try_from(config)
+        }
+    }
 }
 
 /// The command a context runs to get its credentials, spelled the way a user
@@ -405,6 +418,12 @@ pub enum Failure {
     /// A paged listing outlived the marker the cluster was keeping its place
     /// with.
     PageExpired,
+    /// The credential helper was still running when the budget ran out, and
+    /// was stopped. Nothing was asked of the cluster.
+    HelperStalled(Duration),
+    /// The credential helper ran and printed something that is not a
+    /// credential.
+    HelperUnreadable,
     /// Anything we have no specific advice for.
     Other,
 }
@@ -420,6 +439,21 @@ impl Failure {
         match error {
             page::Error::TimedOut { limit } => Self::Slow(*limit),
             page::Error::Api(error) => Self::of_api(error),
+            page::Error::Helper(error) => Self::of_helper(error),
+        }
+    }
+
+    /// Classify a credential helper's failure, the same way `kube`'s own
+    /// running of it was classified before this tool ran it itself — so the
+    /// advice, and whether a login is offered, did not move.
+    fn of_helper(error: &exec::Error) -> Self {
+        match error {
+            exec::Error::Start { .. } => Self::HelperMissing,
+            // A helper that exits non-zero is, for EKS, nearly always an AWS
+            // session that has gone — the case a login is offered for.
+            exec::Error::Failed { .. } => Self::Credentials,
+            exec::Error::Unreadable { .. } => Self::HelperUnreadable,
+            exec::Error::Stalled { limit, .. } => Self::HelperStalled(*limit),
         }
     }
 
@@ -488,9 +522,36 @@ pub fn explain(error: &page::Error, cluster: &str) -> String {
              A listing too large for one response is read in pages, and the marker between them \
              expires after a few minutes. Run it again; if it keeps happening, ask for less at once."
         ),
+        // The same sentence `build` gives a helper that outlives its budget,
+        // for one that does it partway through a listing instead.
+        Failure::HelperStalled(limit) => {
+            stalled_helper(cluster, helper(error).map(exec::Error::command), limit)
+        }
+        Failure::HelperUnreadable => {
+            let (command, reason) = match helper(error) {
+                Some(exec::Error::Unreadable { command, reason }) => {
+                    (command.as_str(), reason.as_str())
+                }
+                _ => ("", "it was not in a form this tool reads"),
+            };
+            format!(
+                "the credential helper for {cluster} ran, but did not print a credential: {reason}.\n\
+                 Its kubeconfig entry runs `{command}`. Run it yourself: it should print an ExecCredential \
+                 whose `status` holds a token or a client certificate. If it prints a prompt instead, \
+                 set `interactiveMode: IfAvailable` in that `exec` block so it can ask you."
+            )
+        }
         // No advice worth inventing, so show the real thing rather than a
         // reassuring guess.
         Failure::Other => format!("talking to {cluster} failed: {error}"),
+    }
+}
+
+/// The credential helper's failure behind `error`, if that is what it is.
+fn helper(error: &page::Error) -> Option<&exec::Error> {
+    match error {
+        page::Error::Helper(helper) => Some(helper),
+        _ => None,
     }
 }
 
@@ -516,8 +577,11 @@ pub fn stalled_helper(cluster: &str, helper: Option<&str>, limit: Duration) -> S
     // `credential_process` of the user's own that prompts — and naming the
     // wrong one confidently would send them off to fix something that is fine.
     let named = match helper {
-        Some(command) => format!("Its kubeconfig entry runs `{command}`, which has not come back"),
-        None => "The command its kubeconfig entry runs has not come back".to_owned(),
+        Some(command) => format!(
+            "Its kubeconfig entry runs `{command}`, which had not come back and has been stopped"
+        ),
+        None => "The command its kubeconfig entry runs had not come back and has been stopped"
+            .to_owned(),
     };
 
     format!(
@@ -823,12 +887,12 @@ users:
     #[tokio::test]
     async fn a_context_with_no_usable_credential_helper_gets_the_friendly_message() {
         // Not a unit test of `explain` but of the path a user actually walks:
-        // `kube` runs the exec plugin while building the client, so this is
-        // where a laptop without the AWS CLI finds out.
+        // the helper runs while the client is being built, so this is where a
+        // laptop without the AWS CLI finds out.
         //
         // Under `--timeout 0`, which is also the only test of that branch: an
-        // unlimited budget must still await the blocking task rather than skip
-        // it, and a helper that cannot start still has to reach `explain`.
+        // unlimited budget must still await the helper rather than skip it,
+        // and a helper that cannot start still has to reach `explain`.
         let dir = tempfile::tempdir().unwrap();
         let paths = vec![write_kubeconfig(dir.path(), MISSING_HELPER)];
 
@@ -1071,7 +1135,10 @@ users:
         let message = stalled_helper("prod", None, Duration::from_secs(30));
 
         assert!(message.contains("prod"), "{message}");
-        assert!(message.contains("has not come back"), "{message}");
+        assert!(
+            message.contains("had not come back and has been stopped"),
+            "{message}"
+        );
         assert!(
             !message.contains("``"),
             "empty command left a hole: {message}"
@@ -1093,31 +1160,11 @@ users:
     }
 
     #[test]
-    fn an_interrupted_build_says_it_is_a_bug_rather_than_the_users_fault() {
-        // Only a panic inside `kube` reaches this, so it is provoked by
-        // construction rather than by making a dependency fall over.
-        let error = Error::Interrupted {
-            cluster: "prod (us-east-1)".to_owned(),
-            message: "task panicked".to_owned(),
-        };
-
-        let message = error.to_string();
-        assert!(message.contains("prod (us-east-1)"), "{message}");
-        assert!(message.contains("bug"), "{message}");
-        assert!(message.contains("eks -vv"), "{message}");
-    }
-
-    #[test]
-    fn a_credential_helper_that_never_answers_is_given_up_on_and_left_behind() {
-        // The acceptance criterion, end to end and without a cluster: a helper
-        // that will not exit for thirty seconds, a budget of a quarter of a
-        // second, and a command that has to be back long before either.
-        //
-        // Through `commands::block_on` on purpose, because the second half of
-        // the fix lives there: `connect` can only abandon the blocking task,
-        // and dropping the runtime would wait out the full thirty seconds at
-        // the door. A plain `#[tokio::test]` here would pass the timeout and
-        // still hang.
+    fn a_credential_helper_that_never_answers_is_given_up_on_inside_the_budget() {
+        // A helper that will not exit for thirty seconds, a budget of a
+        // quarter of a second, and a command that has to be back long before
+        // either. That the helper is *killed*, not only given up on, is
+        // `k8s::auth`'s end-to-end test, which has a pid to look for.
         let dir = tempfile::tempdir().unwrap();
         let paths = vec![write_kubeconfig(dir.path(), SLOW_HELPER)];
 
@@ -1289,5 +1336,127 @@ users:
     fn a_context_that_runs_nothing_has_no_helper_to_name() {
         assert_eq!(helper_name(&AuthInfo::default()), None);
         assert_eq!(helper_name(&exec_auth(None, &[])), None);
+    }
+
+    // --- A credential helper's own failures, now that this tool runs it -----
+
+    fn helper_error(error: exec::Error) -> page::Error {
+        page::Error::Helper(error)
+    }
+
+    #[test]
+    fn a_helper_that_is_not_installed_still_suggests_installing_it() {
+        let error = helper_error(exec::Error::Start {
+            command: "aws eks get-token --cluster-name prod".to_owned(),
+            source: io::Error::from(io::ErrorKind::NotFound),
+        });
+
+        assert_eq!(Failure::of(&error), Failure::HelperMissing);
+        assert!(explain(&error, "prod (us-east-1)").contains("AWS CLI"));
+    }
+
+    #[test]
+    fn a_helper_that_exits_with_a_failure_is_a_credential_problem_as_it_was_under_kube() {
+        // The classification decides whether a login is offered, so it must
+        // not move just because a different piece of code ran the helper.
+        let status = std::process::Command::new("false").status().unwrap();
+        let error = helper_error(exec::Error::Failed {
+            command: "aws eks get-token".to_owned(),
+            status,
+            stderr: "Error loading SSO Token".to_owned(),
+        });
+
+        assert_eq!(Failure::of(&error), Failure::Credentials);
+        assert!(explain(&error, "prod (us-east-1)").contains("aws sso login"));
+    }
+
+    #[test]
+    fn a_helper_that_prints_something_else_is_named_with_what_was_wrong() {
+        let error = helper_error(exec::Error::Unreadable {
+            command: "my-helper --profile 'team a'".to_owned(),
+            reason: "it printed nothing".to_owned(),
+        });
+
+        let message = explain(&error, "prod (us-east-1)");
+
+        assert_eq!(Failure::of(&error), Failure::HelperUnreadable);
+        assert!(message.contains("prod (us-east-1)"), "{message}");
+        assert!(message.contains("it printed nothing"), "{message}");
+        assert!(
+            message.contains("`my-helper --profile 'team a'`"),
+            "{message}"
+        );
+        assert!(message.contains("ExecCredential"), "{message}");
+        assert!(!message.contains("aws sso login"), "{message}");
+    }
+
+    #[test]
+    fn a_helper_that_stalls_partway_through_reads_exactly_as_one_that_stalls_at_the_start() {
+        // One wording for one failure, whichever path met it.
+        let limit = Duration::from_secs(30);
+        let error = helper_error(exec::Error::Stalled {
+            command: "aws eks get-token".to_owned(),
+            limit,
+        });
+
+        assert_eq!(Failure::of(&error), Failure::HelperStalled(limit));
+        assert_eq!(
+            explain(&error, "prod (us-east-1)"),
+            stalled_helper("prod (us-east-1)", Some("aws eks get-token"), limit)
+        );
+    }
+
+    #[test]
+    fn a_layers_helper_failure_is_taken_back_out_of_kubes_service_error() {
+        // `kube` wraps any layer's error as `Service`, its variant for a
+        // connection that could not be made. Left there, this would read as
+        // "could not reach the API server".
+        let wrapped = kube::Error::Service(Box::new(exec::Error::Unreadable {
+            command: "h".to_owned(),
+            reason: "r".to_owned(),
+        }));
+
+        let error = page::Error::from(wrapped);
+
+        assert!(matches!(error, page::Error::Helper(_)), "{error:?}");
+        assert_eq!(Failure::of(&error), Failure::HelperUnreadable);
+    }
+
+    #[test]
+    fn a_service_error_that_is_not_a_helpers_is_still_unreachable() {
+        let wrapped = kube::Error::Service(Box::new(io::Error::other("connection refused")));
+
+        assert_eq!(
+            Failure::of(&page::Error::from(wrapped)),
+            Failure::Unreachable
+        );
+    }
+
+    #[tokio::test]
+    async fn a_certificate_the_helper_printed_that_is_not_pem_is_an_error_not_a_panic() {
+        let config = Config::new("https://127.0.0.1:6443".parse().unwrap());
+        let credential = Credential {
+            secret: Secret::Certificate {
+                certificate: "not a certificate".to_owned(),
+                key: "not a key".to_owned(),
+            },
+            expires: None,
+        };
+
+        assert!(assemble(config, Some(credential), Budget::default()).is_err());
+    }
+
+    #[tokio::test]
+    async fn a_token_the_helper_printed_builds_a_client_without_running_anything_else() {
+        // An `exec` block that would fail if it ran: `assemble` has to take
+        // it out before `kube` sees it.
+        let mut config = Config::new("https://127.0.0.1:6443".parse().unwrap());
+        config.auth_info = exec_auth(Some("eks-test-no-such-credential-helper"), &[]);
+        let credential = Credential {
+            secret: Secret::Token("t".to_owned()),
+            expires: None,
+        };
+
+        assert!(assemble(config, Some(credential), Budget::default()).is_ok());
     }
 }

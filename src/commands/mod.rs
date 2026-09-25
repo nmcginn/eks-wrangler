@@ -63,13 +63,14 @@ impl std::fmt::Display for FetchError {
 /// waiting on a single request, and spawning worker threads to watch it idle
 /// would only cost startup time.
 ///
-/// The runtime is shut down rather than dropped, and that line is the second
-/// half of `--timeout` covering the credential helper. Dropping a runtime waits
-/// for its blocking tasks to finish, and exactly one blocking task exists in
-/// this tool: the kubeconfig's exec plugin, run inside `Client::try_from` (see
-/// [`crate::k8s::client`]). A helper that never exits cannot be cancelled and
-/// cannot be killed from here, so once the budget has given up on it, waiting
-/// for it at the door would reinstate the hang the budget just ended.
+/// The runtime is shut down rather than dropped. Dropping a runtime waits for
+/// its blocking tasks to finish, and this used to be the second half of
+/// `--timeout`: the credential helper ran as a blocking task inside `kube`,
+/// and waiting for it at the door would have reinstated the hang the budget
+/// had just ended. The helper is now a child process that is killed when it is
+/// given up on (see [`crate::k8s::exec`]), so nothing in the tool relies on
+/// this any more — it stays so that a blocking task added later cannot bring
+/// that hang back unnoticed.
 pub fn block_on<T>(future: impl Future<Output = Result<T>>) -> Result<T> {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -78,8 +79,8 @@ pub fn block_on<T>(future: impl Future<Output = Result<T>>) -> Result<T> {
 
     let outcome = runtime.block_on(future);
 
-    // Abandoned rather than awaited: the thread finishes on its own if the
-    // helper ever exits, and returning from `main` ends the process either way.
+    // Abandoned rather than awaited: a blocking thread finishes on its own,
+    // and returning from `main` ends the process either way.
     runtime.shutdown_background();
 
     outcome
@@ -123,9 +124,9 @@ pub fn block_on_interruptible<T>(
     let outcome = runtime.block_on(race(future, ctrl_c()));
 
     // Abandoned rather than awaited, for the same reason `block_on` does this:
-    // a credential helper `race` gave up waiting on is a blocking task nothing
-    // here can cancel, and dropping the runtime instead of shutting it down
-    // would wait out the very hang Ctrl-C just asked to leave.
+    // dropping the runtime would wait for any blocking task still running,
+    // which is the very hang Ctrl-C just asked to leave. The credential helper
+    // is not one — dropping `future` has already killed it.
     runtime.shutdown_background();
 
     outcome
@@ -277,9 +278,9 @@ mod tests {
 
     #[test]
     fn block_on_does_not_wait_for_a_blocking_task_that_will_not_end() {
-        // The credential-helper case with no credential helper in it: a
-        // blocking task cannot be cancelled, so the only way out of one that
-        // has stopped answering is to stop waiting for it. Dropping the
+        // The guard `block_on` keeps now that the credential helper is a child
+        // it can kill: a blocking task cannot be cancelled, so the only way
+        // out of one that has stopped answering is to stop waiting for it. Dropping the
         // runtime here instead of shutting it down would make this test take
         // thirty seconds — which is exactly the hang `--timeout` ends.
         let started = std::time::Instant::now();
