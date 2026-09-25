@@ -4250,3 +4250,63 @@ redesign. The formula installs the release tarballs from decisions 108 and
 109, with their published checksums, and ships the completions and man page
 that are already inside them. The install script verifies the same checksums
 before it installs anything.
+
+### 114. The token is refreshed by a layer on every request, and a refused page is asked for once more
+
+Decision 110 said `eks` runs the `exec` helper itself and watches the
+`expirationTimestamp` between pages. What landed does that in a slightly
+different place, and a few choices along the way are the reviewer's to check.
+
+**Where the refresh lives.** The keeper sits in a `tower` layer on the client
+(`k8s::auth`), not in `page::collect`. Every request asks it for the token, so
+a listing, a log stream, a metrics call and a dashboard left open all stay
+fresh through one mechanism. Putting it in `collect` would have meant passing a
+refresher alongside every `kube::Client` the tool uses, and it would still have
+left the non-paged requests without one. `collect` keeps one job: when a page
+after the first comes back `401`, it asks once more, because the layer has
+already retired the refused token. A `401` on the first page is not retried,
+since the token was minted for this command a moment earlier and the refusal is
+the answer. The login offer in `commands::credentials` then handles it as
+before.
+
+**One deadline for the request and its refresh.** A refresh runs inside the
+request that needed it. If each of them timed itself, two timers set
+microseconds apart for the same length would fire in either order, and the
+user would randomly read "the cluster did not answer" instead of "the helper
+stalled". `Budget::wrap` publishes its deadline in a task-local
+(`page::deadline`) and the refresh uses the same instant. Both fire on the same
+tick, and the helper is polled first, so its error is the one reported. A
+refresh with no wrapping budget falls back to the keeper's own.
+
+**Killing.** `kill_on_drop` sends `SIGKILL` to the helper's own process. A
+helper that forks a grandchild and exits would leave the grandchild running.
+None of the EKS helpers do this: `aws` and `aws-iam-authenticator` are single
+processes. Putting the child in its own process group would fix it, but an
+interactive helper in a background group gets `SIGTTIN` the moment it reads
+the terminal, so that trade was not taken.
+
+**`interactiveMode` as client-go reads it.** `kube` treated anything but
+`Never` as interactive. The protocol says `IfAvailable` (also the default)
+means "if stdin is a terminal", and that is what `exec::interactive` does. A
+piped `eks nodes` now gives a helper `/dev/null` rather than the pipe, and its
+stderr is captured so the last line can appear in logs. The dashboard's stdin
+is a terminal, so its helpers still inherit it. That was true before, and it
+is now a roadmap entry.
+
+**JSON first, then YAML.** Decision 110 named `serde_json`, and JSON is what the
+protocol specifies. `kube` 4.2 decodes helper output as YAML, because client-go
+does and some helpers print YAML. So `exec::parse` tries JSON, then falls back
+to `serde_yaml_ng` (already a dependency) only if the YAML actually has a
+`status`. YAML reads `Enter MFA code:` as a one-key map, so without that check
+a prompt would be reported as "no status" instead of "not an ExecCredential".
+
+**Certificates are not refreshed.** A client certificate is part of the TLS
+connection, so replacing it needs a new client. It is held for the life of the
+client, as `kube` did (`kube` never refreshed one either). EKS helpers issue
+tokens.
+
+**Dependencies.** `tower` (no features, for the `Layer` and `Service` traits),
+`http`, and `base64` (the protocol sends PEM, and a kubeconfig, which is what
+`kube` reads it from, holds base64 of PEM). All three were already in the tree
+at the same versions through `kube`, so none of them adds compiled code.
+`tokio` gains `process`.

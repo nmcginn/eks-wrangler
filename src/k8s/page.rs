@@ -28,8 +28,10 @@ use std::time::Duration;
 
 use kube::api::{Api, ListParams};
 use serde::de::DeserializeOwned;
+use tokio::time::Instant;
 
 use crate::format;
+use crate::k8s::exec;
 use crate::progress::Task;
 
 /// How many objects one request asks for.
@@ -51,11 +53,42 @@ pub const SIZE: u32 = 500;
 pub enum Error {
     /// The cluster answered, and the answer was a failure.
     #[error("{0}")]
-    Api(#[from] kube::Error),
+    Api(kube::Error),
 
     /// The cluster did not answer at all within the budget.
     #[error("no answer within {}", format::exact_duration(*limit))]
     TimedOut { limit: Duration },
+
+    /// The context's credential helper failed, so nothing was asked of the
+    /// cluster at all — when the client was built, or when
+    /// [`crate::k8s::auth`] ran it again to refresh a token partway through.
+    #[error("{0}")]
+    Helper(exec::Error),
+}
+
+impl From<kube::Error> for Error {
+    /// A `kube` failure, with a credential helper's failure taken back out of
+    /// it.
+    ///
+    /// [`crate::k8s::auth`] is a layer inside `kube`'s client, and `kube`
+    /// hands any layer's error back wrapped in `kube::Error::Service`, the
+    /// variant it uses for a connection that could not be made. Left there, a
+    /// helper that failed would be explained as a network that did.
+    fn from(error: kube::Error) -> Self {
+        match error {
+            kube::Error::Service(boxed) => match boxed.downcast::<exec::Error>() {
+                Ok(helper) => Self::Helper(*helper),
+                Err(other) => Self::Api(kube::Error::Service(other)),
+            },
+            other => Self::Api(other),
+        }
+    }
+}
+
+impl From<exec::Error> for Error {
+    fn from(error: exec::Error) -> Self {
+        Self::Helper(error)
+    }
 }
 
 impl Error {
@@ -122,19 +155,55 @@ impl Budget {
     /// The future is dropped when the budget expires, which is what cancels the
     /// request rather than leaving it running behind a message saying it was
     /// abandoned.
+    ///
+    /// The deadline is also published to the request through [`deadline`], so
+    /// a credential helper [`crate::k8s::auth`] runs partway through it gives
+    /// up at the same instant — and, being polled first, is the failure that
+    /// gets reported.
     pub async fn wrap<T>(
         self,
         request: impl Future<Output = Result<T, kube::Error>>,
     ) -> Result<T, Error> {
-        let Some(limit) = self.0 else {
+        // A limit too long to add to the clock is no limit anybody will reach.
+        let Some((limit, at)) = self
+            .0
+            .and_then(|limit| Some((limit, Instant::now().checked_add(limit)?)))
+        else {
             return Ok(request.await?);
         };
 
-        match tokio::time::timeout(limit, request).await {
+        match DEADLINE
+            .scope(at, tokio::time::timeout_at(at, request))
+            .await
+        {
             Ok(answer) => Ok(answer?),
             Err(_) => Err(Error::TimedOut { limit }),
         }
     }
+}
+
+tokio::task_local! {
+    /// The moment the request being awaited runs out of budget.
+    static DEADLINE: Instant;
+}
+
+/// When the request currently being awaited runs out of budget, if it has a
+/// budget and something is waiting on it through [`Budget::wrap`].
+///
+/// For [`crate::k8s::auth`], which may have to run the credential helper
+/// before it can send the request at all. Timing that run on a clock of its
+/// own would race this one: two timers set a few microseconds apart for the
+/// same length of time fire in either order, and the one that loses decides
+/// whether the user reads "your credential helper stalled" or "the cluster did
+/// not answer". Sharing the instant makes both fire in the same tick, and the
+/// helper — polled inside the request — answers first.
+///
+/// Read while the request is being polled, which is on the task awaiting
+/// `wrap`: `kube` builds each request's future on its own worker but hands it
+/// back to the caller to drive.
+#[must_use]
+pub fn deadline() -> Option<Instant> {
+    DEADLINE.try_with(|at| *at).ok()
 }
 
 impl fmt::Display for Budget {
@@ -285,11 +354,39 @@ impl<K> Listing<K> {
         step
     }
 
+    /// Whether any page has arrived yet.
+    ///
+    /// A `401` before the first page is the cluster refusing the credential a
+    /// command started with, and asking again would only ask the user to wait
+    /// twice for the same answer. After it, the credential was good a moment
+    /// ago and has lapsed — see [`retry`].
+    #[must_use]
+    pub fn started(&self) -> bool {
+        self.sent.is_some() || !self.items.is_empty()
+    }
+
     /// Everything the pages held, in the order they arrived.
     #[must_use]
     pub fn finish(self) -> Vec<K> {
         self.items
     }
+}
+
+/// Whether a failed page is worth asking for once more.
+///
+/// Only a `401` partway through a listing, and only once per page. The
+/// credential that read the pages before it was accepted moments ago, so the
+/// likeliest reason it is not now is that it lapsed in between — and
+/// [`crate::k8s::auth`] has already retired it on seeing the `401`, so the
+/// second request goes out with a fresh one. Without this, a token that
+/// expires on page four costs the three pages already read.
+///
+/// Asked of the first answer only: a second `401` on the same page is the
+/// answer, a credential the cluster will not take, and [`collect`] returns it
+/// to be explained like any other rather than asking this again.
+#[must_use]
+pub fn retry(started: bool, error: &Error) -> bool {
+    started && error.status_code() == Some(401)
 }
 
 /// Read a listing to its end, a page at a time.
@@ -319,9 +416,15 @@ where
         // Ticked rather than plainly awaited: one page is allowed to take the
         // whole budget, and a listing whose first page is slow is exactly the
         // silence this is here to end.
-        let page = task
-            .tick(budget.wrap(api.list(&listing.params(base))))
-            .await?;
+        let params = listing.params(base);
+        let page = match task.tick(budget.wrap(api.list(&params))).await {
+            Ok(page) => page,
+            Err(error) if retry(listing.started(), &error) => {
+                tracing::debug!("a page was refused partway through; asking once more");
+                task.tick(budget.wrap(api.list(&params))).await?
+            }
+            Err(error) => return Err(error),
+        };
         task.advance(page.items.len());
 
         match listing.absorb(page.items, page.metadata.continue_.as_deref()) {

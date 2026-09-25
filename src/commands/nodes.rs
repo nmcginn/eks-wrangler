@@ -49,8 +49,8 @@ pub struct Request {
     /// `--timeout`, spent per step rather than per command: each of the three
     /// listings below is read in pages, and a cluster large enough to need
     /// several of them should not be cut off for being large. The step before
-    /// all of them is the credential helper, which `k8s::connect` runs on a
-    /// blocking task so that this can bound it.
+    /// all of them is the credential helper, which `k8s::connect` runs as a
+    /// child it kills if this runs out.
     pub budget: page::Budget,
     /// `--login`: whether a stale IAM Identity Center session may be refreshed
     /// for the user before the credential helper is run. Carried beside the

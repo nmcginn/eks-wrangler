@@ -430,6 +430,8 @@ mod tests {
             client::Failure::Unreachable,
             client::Failure::HelperMissing,
             client::Failure::PageExpired,
+            client::Failure::HelperStalled(std::time::Duration::from_secs(30)),
+            client::Failure::HelperUnreadable,
             client::Failure::Other,
         ] {
             assert!(

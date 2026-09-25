@@ -68,8 +68,8 @@ pub struct Request<'a> {
     pub palette: Palette,
     /// `--timeout`, spent per step rather than per command — a namespace big
     /// enough to be read in several pages should not be cut off for its size.
-    /// The first step is the credential helper, which `k8s::connect` runs on a
-    /// blocking task so that this can bound it.
+    /// The first step is the credential helper, which `k8s::connect` runs as a
+    /// child it kills if this runs out.
     pub budget: page::Budget,
     /// `--login`, carried beside the budget for the reason `eks nodes` carries
     /// it there: both describe the step before the first request. Only this

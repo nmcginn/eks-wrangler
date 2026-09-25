@@ -1035,7 +1035,7 @@ cluster.
   owns the screen: `preflight` before `ui::run` opens, `L` on the failure
   banner after. See decisions 74–77.
 
-- [ ] **Refresh a token that expires partway through a paged listing.**
+- [x] **Refresh a token that expires partway through a paged listing.**
   A listing is several requests now, and a token good at the first page can be
   dead at the fourth — on a cluster large enough to need four pages, which is
   exactly the cluster where waiting for the whole thing and starting again hurts
@@ -1053,8 +1053,21 @@ cluster.
   *Decided (2026-09-24):* `eks` runs the `exec` helper itself and watches the
   `ExecCredential`'s `expirationTimestamp` between pages. It still does not own
   logging in. No longer waiting on the reviewer. See decision 110.
+  Landed together with the entry below, which shares its runner. `k8s::exec`
+  runs the `exec` block as a `tokio` child and parses its `ExecCredential`;
+  `k8s::auth::Keeper` holds the token, and `k8s::auth::Authorise`, a `tower`
+  layer on the client, puts it on every request. The refresh happens *before
+  each request* rather than only between pages: a token inside its last minute
+  is replaced before it is sent, and a `401` retires the token that was refused.
+  That covers the dashboard's long-lived clients and log streams too, not just
+  listings. `page::collect` asks once more for a page refused after the first,
+  so a token revoked or lapsed without an expiry costs that page, not the pages
+  before it. A refresh that stalls spends the request's own deadline
+  (`page::deadline`) and is reported through `stalled_helper`. Its other
+  failures reach `explain` as `page::Error::Helper`. Found on the way: `kube`
+  ran the helper three times per client, and now it runs once. See decision 114.
 
-- [ ] **Stop the credential helper, rather than only stopping waiting for it.**
+- [x] **Stop the credential helper, rather than only stopping waiting for it.**
   `--timeout` now ends the hang, and it ends it by abandonment: a blocking task
   cannot be cancelled, so `eks` prints its message and exits while the `aws eks
   get-token` it started keeps running. Usually harmless — the orphan exits or
@@ -1074,6 +1087,14 @@ cluster.
   *Decided (2026-09-24):* yes to the `exec` protocol, still no to the AWS
   SDK or writing the token cache. This entry and the one above share the new
   runner, so whichever lands first builds it. See decision 110.
+  Landed with the entry above. The helper is a `kill_on_drop` child, so the
+  budget losing its race with it (at connect, or in a refresh partway through)
+  and a Ctrl-C both kill it. It is tested end to end by recording the helper's
+  pid and checking it is gone. `stalled_helper` now says the helper "has been
+  stopped", and `client::Error::Interrupted` is gone, since no blocking task is
+  left to panic. The kill reaches the helper's own process only: a helper that
+  forks a grandchild and exits leaves that behind, and none of the EKS helpers
+  do (decision 114).
 
 - [x] **Leave the terminal tidy when a command is interrupted.**
   `eks nodes` now draws a progress line, and Ctrl-C during one kills the process
@@ -1695,6 +1716,20 @@ cluster.
   column reads in the same ink a light-mode dashboard pane would — a `--color`
   honoured by one surface and not its twin was the gap CLAUDE.md's "one pull
   request" section warns about. See decision 104.
+
+- [ ] **Keep the dashboard's credential helper off the terminal it has drawn on.**
+  `k8s::exec` follows client-go's `interactiveMode`: a helper may prompt when
+  stdin is a terminal. Inside the dashboard, stdin is a terminal, but it is in
+  raw mode behind the alternate screen, so a helper that prompts there (at the
+  first connect, or a refresh an hour in) writes over the panes and competes
+  with `App::on_key` for keystrokes. `kube` did the same before this change,
+  so nothing got worse. Separate because it is the dashboard's surface, and
+  because the fix is a decision for the reviewer: force such helpers to
+  `Never` and let them fail into the `L` banner, or suspend the screen the way
+  `Flow::Login` does and let them ask.
+  *Acceptance:* a dashboard helper never draws inside the alternate screen or
+  reads a key meant for it; what it does instead is whichever the reviewer
+  picks.
 
 - [ ] **Detect a terminal's background by querying it, not just `COLORFGBG`.**
   `theme::detect_background` reads `COLORFGBG`, the one hint that costs no

@@ -24,6 +24,10 @@ harness = false
 
 [dependencies]
 anyhow = "1.0.104"
+# An `ExecCredential` hands back a client certificate as PEM, and `kube` only
+# takes one in a kubeconfig's base64 spelling. `kube` already builds this
+# exact version, so a certificate credential costs one call, not a new crate.
+base64 = "0.22.1"
 clap = { version = "4.6.6", features = ["derive", "env", "wrap_help"] }
 # `eks completions`/`eks man` render straight from the same `Cli` definition
 # `clap` already parses with, so a flag added there can never drift out of
@@ -36,6 +40,11 @@ directories = "6.0.0"
 # pulls this crate in for its own async I/O, so enabling it here adds no new
 # code to the dependency tree, only the two traits `k8s::pods::logs` calls.
 futures-util = { version = "0.3.34", default-features = false, features = ["io", "std"] }
+# `k8s::auth` is a `tower` layer on the client `kube` builds: it puts the
+# helper's token on each request and hears the `401` that says it has gone
+# stale. `kube` is built on these crates and exposes its client through their
+# traits, so this is the vocabulary it already speaks, not a new dependency tree.
+http = "1.5.0"
 k8s-openapi = { version = "0.28.0", features = ["latest"] }
 # The AWS CLI's IAM Identity Center token cache is JSON, and reading its expiry
 # is what lets `eks` tell a stale session from a live one without a network call
@@ -51,13 +60,16 @@ thiserror = "2.0.20"
 # three this tool reads (kubeconfig, the SSO token cache, this) with no other
 # dependency already pulling in a parser for it.
 toml = "1.1.6"
+tower = { version = "0.5.3", default-features = false }
 # `sync` adds `tokio::sync::oneshot`, which is what lets a dropped
 # `commands::StreamHandle` interrupt a live log stream's read rather than
 # merely abandoning it — see that module's doc comment. `signal` adds
 # `tokio::signal::ctrl_c`, which is what lets `commands::block_on_interruptible`
 # race a listing against the user's own Ctrl-C instead of leaving the default
-# `SIGINT` disposition to kill the process mid-draw.
-tokio = { version = "1.53.1", default-features = false, features = ["rt", "macros", "net", "signal", "sync", "time"] }
+# `SIGINT` disposition to kill the process mid-draw. `process` is the
+# credential helper: `k8s::exec` spawns it as a child it can kill, where
+# `kube` ran it as a blocking `std::process::Command` nothing could stop.
+tokio = { version = "1.53.1", default-features = false, features = ["rt", "macros", "net", "process", "signal", "sync", "time"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 

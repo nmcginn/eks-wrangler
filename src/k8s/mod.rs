@@ -10,7 +10,9 @@
 //! offline; the credential helper and the first request happen when a command
 //! actually asks for data.
 
+pub mod auth;
 pub mod client;
+pub mod exec;
 pub mod metrics;
 pub mod nodes;
 pub mod order;

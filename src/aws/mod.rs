@@ -1,8 +1,8 @@
 //! Everything this tool knows about AWS, which is deliberately not much.
 //!
 //! `eks` has no AWS SDK and holds no AWS credential. Authentication is the
-//! kubeconfig `exec` block's job — it runs `aws eks get-token`, and `kube`
-//! resolves it (see [`crate::k8s::client`]). What this module adds is the one
+//! kubeconfig `exec` block's job — it runs `aws eks get-token`, and
+//! [`crate::k8s::exec`] runs that and reads the token it prints. What this module adds is the one
 //! question that block cannot answer for itself: *will it work?* An IAM
 //! Identity Center session that expired overnight makes that helper fail, and
 //! the only thing standing between the user and a working cluster is an `aws
