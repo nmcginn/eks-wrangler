@@ -379,9 +379,7 @@ mod tests {
     }
 
     fn runs(dir: &Path) -> u32 {
-        std::fs::read_to_string(dir.join("runs"))
-            .map(|text| text.trim().parse().unwrap())
-            .unwrap_or(0)
+        std::fs::read_to_string(dir.join("runs")).map_or(0, |text| text.trim().parse().unwrap())
     }
 
     fn kubeconfig(dir: &Path, server: &str, script: &str) -> Vec<PathBuf> {
