@@ -245,13 +245,29 @@ rules above keep measuring rows without knowing colour exists.
 are two complete palettes, and `theme::resolve` is the pure function that
 picks between them from `--theme`/the config file's own `theme` and
 `theme::detect_background`'s reading of `COLORFGBG` — the one hint about a
-terminal's own background that costs no I/O, unlike the blocking OSC 11 query
-an exact answer would need (see decision 104). `main::resolved_theme` reads
+terminal's own background that costs no I/O (see decision 104). `main::resolved_theme` reads
 that one environment variable, next to `NO_COLOR`/`TERM`, and the `Theme` it
 returns reaches both surfaces through the same seam: `Palette::choose` takes
 it directly rather than a hardcoded default, and `App::set_theme` seeds the
 dashboard with it right after `App::new`, the same shape
 `App::set_pod_selectors` already uses for `-l`/`--field-selector`.
+
+The dashboard alone can do better than that hint, because it has an event
+loop to receive a late answer (decisions 111 and 115). When
+`theme::should_query_background` says so — `auto`, `COLORFGBG` silent, a
+`TERM` the query will not scribble on — `main` marks the `App` with
+`set_asks_terminal_background`, and `event_loop` sends
+`theme::BACKGROUND_QUERY` right *after* its first draw, so the query costs
+first paint nothing. The terminal's answer comes back on stdin, where
+crossterm, which knows nothing of OSC replies, parses it as a burst of keys
+(Alt+`]`, `1`, `1`, `;`, `r`, `g`, `b`, …). `ui::background::ReplyReader`
+sits in front of `App::on_key` and the refresh check and swallows exactly
+those keys, rebuilding the reply's bytes for `theme::parse_background_reply`
+— a pure function over fixture bytes — and giving back anything that turns
+out not to be a reply. `App::apply_terminal_background` is the state change.
+`event_loop` takes its terminal reads and the query through `TerminalIo`, so
+`src/ui/tests/event_loop.rs` drives the whole loop against a recording
+`TestBackend` and asserts on the order of frames, queries, and reads.
 
 Selectors take the same shape in reverse: `k8s::selector` parses the label and
 field selectors a user types (`app=api`, `status.phase!=Running`) into a

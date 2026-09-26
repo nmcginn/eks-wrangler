@@ -69,6 +69,16 @@ impl Theme {
         }
     }
 
+    /// The theme tuned for a terminal whose background reads as
+    /// `background`.
+    #[must_use]
+    pub const fn for_background(background: Background) -> Self {
+        match background {
+            Background::Dark => Self::dark(),
+            Background::Light => Self::light(),
+        }
+    }
+
     /// Body text.
     #[must_use]
     pub fn body(self) -> Style {
@@ -262,11 +272,11 @@ pub enum Background {
 
 /// Read `COLORFGBG` for a hint about the terminal's own background.
 ///
-/// There is no portable way to ask a terminal what colour it is: the
-/// reliable answer is an OSC 11 query, which means writing to the terminal
-/// and blocking on its reply — exactly the kind of I/O CLAUDE.md's startup
-/// budget rules out of first paint, and not something a fixture can stand in
-/// for in a test. `COLORFGBG` is the one hint that costs neither: several
+/// The exact answer is an OSC 11 query ([`BACKGROUND_QUERY`]), but that means
+/// writing to the terminal and waiting on its reply — I/O the CLI's one-shot
+/// tables have no event loop to wait on, and which the dashboard only does
+/// after its first frame (decision 111). `COLORFGBG` is the one hint that
+/// costs nothing, so it is read first everywhere: several
 /// terminals and multiplexers (rxvt, and `tmux`/`screen` forwarding it from
 /// whatever set it) export it unasked, in `foreground;background` form —
 /// sometimes `foreground;default;background`, which is why the *last*
@@ -289,6 +299,134 @@ pub fn detect_background(colorfgbg: Option<&OsStr>) -> Option<Background> {
     })
 }
 
+/// The OSC 11 query: "what colour is your background?" Sent by the dashboard
+/// after its first frame, never by a CLI table — see decision 111.
+///
+/// Terminated with BEL rather than ST (`ESC \`): xterm answers with whichever
+/// terminator the query used, both are accepted by every terminal that
+/// answers at all, and BEL is the one older terminals and multiplexers
+/// (`screen`, and `tmux` passing it through) have understood the longest —
+/// the same choice Vim and Neovim make for the same query.
+pub const BACKGROUND_QUERY: &str = "\x1b]11;?\x07";
+
+/// Whether the dashboard should send [`BACKGROUND_QUERY`] at all.
+///
+/// Only under `auto` — a theme the user named is never second-guessed — and
+/// only when `COLORFGBG` could not tell, so a terminal that already answered
+/// is not asked twice. `TERM` rules out the two kinds of terminal where
+/// asking does harm rather than nothing: unset or `dumb`, which is not a
+/// terminal this tool can expect to speak escape sequences at all, and the
+/// Linux virtual console (`linux`), which does not know OSC 11 and prints
+/// the query's tail (`1;?`) onto the screen instead of ignoring it.
+#[must_use]
+pub fn should_query_background(
+    choice: ThemeChoice,
+    colorfgbg: Option<&OsStr>,
+    term: Option<&OsStr>,
+) -> bool {
+    let Some(term) = term.and_then(OsStr::to_str) else {
+        return false;
+    };
+    choice == ThemeChoice::Auto
+        && detect_background(colorfgbg).is_none()
+        && !term.is_empty()
+        && term != "dumb"
+        && term != "linux"
+        && !term.starts_with("linux-")
+}
+
+/// Read a terminal's reply to [`BACKGROUND_QUERY`].
+///
+/// The reply is `ESC ] 11 ; <colour>` terminated by BEL or ST (`ESC \`),
+/// where `<colour>` is X11's `rgb:<r>/<g>/<b>` — each channel one to four
+/// hex digits, scaled by its own width, so `rgb:f/f/f`, `rgb:ff/ff/ff` and
+/// `rgb:ffff/ffff/ffff` are all white — or `rgba:` with a fourth, ignored,
+/// alpha channel, which rxvt-unicode sends. Anything else — a truncated
+/// reply, another OSC's answer, an `rgb:` with a channel that is not hex —
+/// is `None`: "cannot be told," the same as `COLORFGBG` being unset, never a
+/// guess.
+#[must_use]
+pub fn parse_background_reply(reply: &[u8]) -> Option<Background> {
+    let body = reply.strip_prefix(b"\x1b]11;")?;
+    let colour = body
+        .strip_suffix(b"\x07")
+        .or_else(|| body.strip_suffix(b"\x1b\\"))?;
+    let colour = std::str::from_utf8(colour).ok()?;
+    let channels = if let Some(rgb) = colour.strip_prefix("rgb:") {
+        let channels: Vec<&str> = rgb.split('/').collect();
+        (channels.len() == 3).then_some(channels)?
+    } else {
+        let rgba = colour.strip_prefix("rgba:")?;
+        let mut channels: Vec<&str> = rgba.split('/').collect();
+        (channels.len() == 4).then_some(())?;
+        channels.truncate(3);
+        channels
+    };
+    let mut rgb = [0.0; 3];
+    for (slot, channel) in rgb.iter_mut().zip(channels) {
+        *slot = hex_channel(channel)?;
+    }
+    Some(Background::of_rgb(rgb))
+}
+
+/// One X11 colour channel, one to four hex digits, as a fraction of full
+/// intensity.
+fn hex_channel(digits: &str) -> Option<f64> {
+    if digits.is_empty() || digits.len() > 4 || !digits.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    let value = u16::from_str_radix(digits, 16).ok()?;
+    // `len` is 1..=4, so the shift is 4..=16 and the max is 0xF..=0xFFFF.
+    let max = (1_u32 << (4 * digits.len())) - 1;
+    Some(f64::from(value) / f64::from(max))
+}
+
+impl Background {
+    /// Classify a background colour by which theme reads better on it: light
+    /// when [`Theme::light`]'s body text has more contrast against it than
+    /// [`Theme::dark`]'s, dark otherwise — a tie included, dark being the
+    /// safer wrong guess for the reason [`resolve`] gives. Tied to the themes'
+    /// own ink rather than a bare luminance threshold so the answer is always
+    /// "the theme that is more readable here," whatever either palette
+    /// becomes. Channels are fractions of full intensity.
+    fn of_rgb(rgb: [f64; 3]) -> Self {
+        let background = relative_luminance(rgb);
+        let contrast = |ink: Color| {
+            let Color::Rgb(r, g, b) = ink else {
+                return 0.0;
+            };
+            let ink = relative_luminance([r, g, b].map(|c| f64::from(c) / 255.0));
+            let (lighter, darker) = if ink > background {
+                (ink, background)
+            } else {
+                (background, ink)
+            };
+            (lighter + 0.05) / (darker + 0.05)
+        };
+        if contrast(Theme::light().text) > contrast(Theme::dark().text) {
+            Self::Light
+        } else {
+            Self::Dark
+        }
+    }
+}
+
+/// Relative luminance, [WCAG 2.1]'s own formula: each channel (a fraction of
+/// full intensity) linearised, then weighted by how much the eye actually
+/// notices it.
+///
+/// [WCAG 2.1]: https://www.w3.org/TR/WCAG21/#dfn-relative-luminance
+fn relative_luminance([r, g, b]: [f64; 3]) -> f64 {
+    fn channel(c: f64) -> f64 {
+        if c <= 0.039_28 {
+            c / 12.92
+        } else {
+            ((c + 0.055) / 1.055).powf(2.4)
+        }
+    }
+    0.2126 * channel(r) + 0.7152 * channel(g) + 0.0722 * channel(b)
+}
+
 /// Resolve `--theme`/the config file's own `theme` and `COLORFGBG` into the
 /// [`Theme`] to draw with.
 ///
@@ -303,8 +441,8 @@ pub fn resolve(choice: ThemeChoice, colorfgbg: Option<&OsStr>) -> Theme {
         ThemeChoice::Dark => Theme::dark(),
         ThemeChoice::Light => Theme::light(),
         ThemeChoice::Auto => match detect_background(colorfgbg) {
-            Some(Background::Light) => Theme::light(),
-            Some(Background::Dark) | None => Theme::dark(),
+            Some(background) => Theme::for_background(background),
+            None => Theme::dark(),
         },
     }
 }
@@ -750,20 +888,10 @@ mod tests {
         assert_eq!(foreground(Color::Reset), None);
     }
 
-    /// Relative luminance, [WCAG 2.1]'s own formula: each channel
-    /// linearised, then weighted by how much the eye actually notices it.
-    ///
-    /// [WCAG 2.1]: https://www.w3.org/TR/WCAG21/#dfn-relative-luminance
+    /// [`super::relative_luminance`] over 8-bit channels, the form every
+    /// swatch in these tests is written in.
     fn relative_luminance((r, g, b): (u8, u8, u8)) -> f64 {
-        fn channel(c: u8) -> f64 {
-            let c = f64::from(c) / 255.0;
-            if c <= 0.039_28 {
-                c / 12.92
-            } else {
-                ((c + 0.055) / 1.055).powf(2.4)
-            }
-        }
-        0.2126 * channel(r) + 0.7152 * channel(g) + 0.0722 * channel(b)
+        super::relative_luminance([r, g, b].map(|c| f64::from(c) / 255.0))
     }
 
     /// [WCAG 2.1]'s contrast ratio between two colours, from 1:1 (identical)
@@ -852,6 +980,182 @@ mod tests {
         // Cannot be told at all: the safer wrong guess, not a light theme
         // painted onto a terminal that never said it was one.
         assert_eq!(resolve(ThemeChoice::Auto, None), Theme::dark());
+    }
+
+    #[test]
+    fn background_reply_reads_every_channel_width_x11_allows() {
+        let light = [
+            &b"\x1b]11;rgb:ffff/ffff/ffff\x07"[..],
+            b"\x1b]11;rgb:fff/fff/fff\x07",
+            b"\x1b]11;rgb:ff/ff/ff\x07",
+            b"\x1b]11;rgb:f/f/f\x07",
+            b"\x1b]11;rgb:FFFF/FFFF/FFFF\x07",
+        ];
+        for reply in light {
+            assert_eq!(
+                parse_background_reply(reply),
+                Some(Background::Light),
+                "{reply:?}"
+            );
+        }
+        let dark = [
+            &b"\x1b]11;rgb:0000/0000/0000\x07"[..],
+            b"\x1b]11;rgb:1e1e/1e1e/1e1e\x07",
+            b"\x1b]11;rgb:28/2c/34\x07",
+            b"\x1b]11;rgb:0/0/0\x07",
+        ];
+        for reply in dark {
+            assert_eq!(
+                parse_background_reply(reply),
+                Some(Background::Dark),
+                "{reply:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn background_reply_accepts_both_terminators() {
+        assert_eq!(
+            parse_background_reply(b"\x1b]11;rgb:ffff/ffff/ffff\x07"),
+            Some(Background::Light)
+        );
+        assert_eq!(
+            parse_background_reply(b"\x1b]11;rgb:ffff/ffff/ffff\x1b\\"),
+            Some(Background::Light)
+        );
+    }
+
+    #[test]
+    fn background_reply_reads_rgba_and_ignores_its_alpha() {
+        // rxvt-unicode's form.
+        assert_eq!(
+            parse_background_reply(b"\x1b]11;rgba:ffff/ffff/ffff/0000\x07"),
+            Some(Background::Light)
+        );
+        assert_eq!(
+            parse_background_reply(b"\x1b]11;rgba:0000/0000/0000/ffff\x1b\\"),
+            Some(Background::Dark)
+        );
+    }
+
+    #[test]
+    fn background_reply_is_none_for_anything_it_cannot_read() {
+        let garbage: &[&[u8]] = &[
+            b"",
+            b"garbage",
+            // Truncated: no terminator.
+            b"\x1b]11;rgb:ffff/ffff/ffff",
+            // Truncated: no prefix.
+            b"rgb:ffff/ffff/ffff\x07",
+            // Another OSC's answer — the foreground, not the background.
+            b"\x1b]10;rgb:ffff/ffff/ffff\x07",
+            // The query echoed back rather than answered.
+            b"\x1b]11;?\x07",
+            // Two channels, four channels under `rgb:`, three under `rgba:`.
+            b"\x1b]11;rgb:ffff/ffff\x07",
+            b"\x1b]11;rgb:ffff/ffff/ffff/ffff\x07",
+            b"\x1b]11;rgba:ffff/ffff/ffff\x07",
+            // An empty channel, five digits, not hex, a sign.
+            b"\x1b]11;rgb:ffff//ffff\x07",
+            b"\x1b]11;rgb:fffff/ffff/ffff\x07",
+            b"\x1b]11;rgb:gggg/ffff/ffff\x07",
+            b"\x1b]11;rgb:+fff/ffff/ffff\x07",
+            // A colour form X11 has but this does not read.
+            b"\x1b]11;#ffffff\x07",
+            // Not UTF-8.
+            b"\x1b]11;rgb:\xff\xfe/ffff/ffff\x07",
+        ];
+        for reply in garbage {
+            assert_eq!(parse_background_reply(reply), None, "{reply:?}");
+        }
+    }
+
+    #[test]
+    fn a_background_is_light_exactly_when_the_light_theme_reads_better_on_it() {
+        // Mid-grey sits past the crossover, where dark ink already has more
+        // contrast than light ink; a darker grey sits before it.
+        assert_eq!(
+            parse_background_reply(b"\x1b]11;rgb:80/80/80\x07"),
+            Some(Background::Light)
+        );
+        assert_eq!(
+            parse_background_reply(b"\x1b]11;rgb:60/60/60\x07"),
+            Some(Background::Dark)
+        );
+        // Solarized's two backgrounds land where their names say.
+        assert_eq!(
+            parse_background_reply(b"\x1b]11;rgb:fdfd/f6f6/e3e3\x07"),
+            Some(Background::Light)
+        );
+        assert_eq!(
+            parse_background_reply(b"\x1b]11;rgb:0000/2b2b/3636\x07"),
+            Some(Background::Dark)
+        );
+    }
+
+    #[test]
+    fn the_query_is_osc_11_asking_and_terminated_by_bel() {
+        assert_eq!(BACKGROUND_QUERY.as_bytes(), b"\x1b]11;?\x07");
+    }
+
+    #[test]
+    fn the_terminal_is_asked_only_under_auto_and_only_when_colorfgbg_is_silent() {
+        let xterm = Some(OsStr::new("xterm-256color"));
+        assert!(should_query_background(ThemeChoice::Auto, None, xterm));
+        // A theme the user named is never second-guessed.
+        assert!(!should_query_background(ThemeChoice::Dark, None, xterm));
+        assert!(!should_query_background(ThemeChoice::Light, None, xterm));
+        // `COLORFGBG` already answered, either way: not asked twice.
+        assert!(!should_query_background(
+            ThemeChoice::Auto,
+            Some(OsStr::new("0;15")),
+            xterm
+        ));
+        assert!(!should_query_background(
+            ThemeChoice::Auto,
+            Some(OsStr::new("15;0")),
+            xterm
+        ));
+        // A `COLORFGBG` that says nothing readable is the same as none.
+        assert!(should_query_background(
+            ThemeChoice::Auto,
+            Some(OsStr::new("default;default")),
+            xterm
+        ));
+    }
+
+    #[test]
+    fn the_terminal_is_not_asked_where_the_query_would_scribble_on_it() {
+        for term in [
+            None,
+            Some(""),
+            Some("dumb"),
+            Some("linux"),
+            Some("linux-16color"),
+        ] {
+            assert!(
+                !should_query_background(ThemeChoice::Auto, None, term.map(OsStr::new)),
+                "{term:?}"
+            );
+        }
+        for term in [
+            "xterm-256color",
+            "screen-256color",
+            "tmux-256color",
+            "alacritty",
+            "xterm-kitty",
+        ] {
+            assert!(
+                should_query_background(ThemeChoice::Auto, None, Some(OsStr::new(term))),
+                "{term}"
+            );
+        }
+    }
+
+    #[test]
+    fn for_background_picks_the_theme_tuned_for_it() {
+        assert_eq!(Theme::for_background(Background::Light), Theme::light());
+        assert_eq!(Theme::for_background(Background::Dark), Theme::dark());
     }
 
     #[test]

@@ -92,6 +92,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
                 &selectors,
                 cli.global.login,
                 resolved_theme(&cli.global, &user_config),
+                query_background(&cli.global, &user_config),
             )?;
             Ok(ExitCode::SUCCESS)
         }
@@ -261,10 +262,12 @@ fn dashboard(
     selectors: &Selectors,
     login: LoginMode,
     theme: Theme,
+    query_background: bool,
 ) -> Result<()> {
     let views = contexts::views(config);
     let mut app = App::new(views);
     app.set_theme(theme);
+    app.set_asks_terminal_background(query_background);
     // Retypeable at runtime through `l`/`F` from here on — see
     // `App::set_pod_selectors` and `ui::PodsFetcher`'s own doc comment.
     app.set_pod_selectors(selectors.clone());
@@ -462,6 +465,24 @@ fn resolved_theme(global: &GlobalArgs, user_config: &Config) -> Theme {
         global.effective_theme(user_config),
         std::env::var_os("COLORFGBG").as_deref(),
     )
+}
+
+/// Whether the dashboard asks the terminal for its background once its first
+/// frame is up (decision 111).
+///
+/// The environment read gathered here beside [`resolved_theme`]'s, for the
+/// same reason; the rule — `auto` only, never when `COLORFGBG` already
+/// answered, never on a terminal the query would scribble on — is
+/// `theme::should_query_background`'s. Unix only: on Windows crossterm reads
+/// console input records rather than the byte stream a reply arrives on,
+/// and no release target there would exercise the path anyway.
+fn query_background(global: &GlobalArgs, user_config: &Config) -> bool {
+    cfg!(unix)
+        && theme::should_query_background(
+            global.effective_theme(user_config),
+            std::env::var_os("COLORFGBG").as_deref(),
+            std::env::var_os("TERM").as_deref(),
+        )
 }
 
 /// Where this run says how far it has got, while it is still getting there.

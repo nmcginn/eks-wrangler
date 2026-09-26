@@ -3901,7 +3901,7 @@ gets the dark default without a second constructor parameter to thread
 through five call sites.
 
 Amended by decision 111: the OSC 11 query now runs in the dashboard, off the
-paint path, and re-themes after first paint.
+paint path, and re-themes after first paint. Decision 115 records how.
 
 ### 105. Startup benchmarks measure the pure computation, not the process; CI reports through a branch-keyed cache, never fails
 
@@ -4310,3 +4310,44 @@ tokens.
 `kube` reads it from, holds base64 of PEM). All three were already in the tree
 at the same versions through `kube`, so none of them adds compiled code.
 `tokio` gains `process`.
+
+### 115. The OSC 11 reply is read back out of crossterm's key events, asked once with BEL, and judged by which theme reads better
+
+Decision 111 settled *when* the dashboard asks. Building it turned up four
+choices of its own.
+
+**Reading the reply.** crossterm 0.29 has no notion of an OSC reply. The
+terminal's answer arrives on stdin like typing and is parsed as keys: `ESC ]`
+is Alt+`]`, each body character its own key (uppercase hex with SHIFT), BEL is
+Ctrl+G, and ST (`ESC \`) is Alt+`\`. Reading the reply from `/dev/tty`
+ourselves would race crossterm's own reader for the same bytes, and replacing
+crossterm's input handling is far more than this task. So
+`ui::background::ReplyReader` sits in front of `App::on_key` and the refresh
+check, and swallows exactly the keys that spell a reply. It holds an Alt+`]`
+until the next keys confirm `11;`, and gives everything back if they do not,
+so a user's own Alt+`]` is delayed by one key rather than lost. After `11;`, a
+reply that breaks off is dropped rather than replayed as keystrokes, since
+replaying `rgb:…` is the damage the reader exists to prevent. Once one reply
+has been read, the reader steps aside for the rest of the session. The mapping
+from bytes to keys was checked against crossterm's parser source and by running
+the binary under a pty that answered the query. It is still the one place this
+leans on crossterm internals that a crossterm upgrade could change.
+
+**BEL, not ST.** xterm answers with the terminator the query used. Both work in
+every terminal that answers at all. BEL has the longest history in `screen`
+and in `tmux` passthrough, and it is what Vim and Neovim send. Both
+terminators are accepted in the reply.
+
+**Who is not asked.** Only `auto` with a silent `COLORFGBG`, as decision 111
+says. There are also two `TERM` exclusions: unset or `dumb`, and the Linux
+virtual console (`linux`, `linux-*`). The Linux console does not implement OSC
+11 and prints the query's tail onto the screen instead of ignoring it. The
+query is also Unix-only, because crossterm on Windows reads console input
+records rather than a byte stream, and no release target is Windows.
+
+**Light or dark.** A reply is a colour, not a verdict. `Background::of_rgb`
+calls it light when `Theme::light().text` has more WCAG contrast against it
+than `Theme::dark().text` does. That makes the answer "the theme that reads
+better here," and the crossover (a relative luminance near 0.18, about
+`#777777`) moves by itself if either palette is retuned. A tie is dark, the
+safer wrong guess, as in decision 104.

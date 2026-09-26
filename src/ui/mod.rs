@@ -4,6 +4,8 @@
 //! I/O, so navigation can be tested by feeding it key events. Only [`run`]
 //! touches the real terminal.
 
+use std::collections::VecDeque;
+use std::io::Write;
 use std::str::FromStr;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
@@ -26,13 +28,15 @@ use crate::k8s::order::Direction as SortDirection;
 use crate::k8s::page::{Budget, ParseError};
 use crate::k8s::pods as k8s_pods;
 use crate::k8s::pods::{LogEvent, Selectors};
-use crate::theme::Theme;
+use crate::theme::{Background, Theme};
 
+mod background;
 mod containers;
 mod logs;
 mod nodes;
 mod pods;
 
+use background::ReplyReader;
 use containers::ContainersState;
 use logs::LogsState;
 use nodes::NodesState;
@@ -354,6 +358,8 @@ pub struct App {
     clusters: Vec<ClusterView>,
     selected: usize,
     theme: Theme,
+    /// See [`App::set_asks_terminal_background`].
+    asks_terminal_background: bool,
     nodes: NodesState,
     pods: PodsState,
     containers: ContainersState,
@@ -430,6 +436,7 @@ impl App {
             clusters,
             selected,
             theme: Theme::dark(),
+            asks_terminal_background: false,
             nodes: NodesState::default(),
             pods: PodsState::default(),
             containers: ContainersState::default(),
@@ -1509,6 +1516,33 @@ impl App {
         self.theme = theme;
     }
 
+    /// The terminal answered the OSC 11 background query: draw in whichever
+    /// theme its background calls for from the next frame on.
+    ///
+    /// Only reachable when `--theme`/the config file said `auto` and
+    /// `COLORFGBG` could not tell — `main::dashboard` asks nothing otherwise
+    /// (see `theme::should_query_background`) — so an answer here always
+    /// outranks the dark fallback the first frame was drawn in. A dark
+    /// answer is that same fallback confirmed, and changes nothing on screen.
+    pub fn apply_terminal_background(&mut self, background: Background) {
+        self.theme = Theme::for_background(background);
+    }
+
+    /// Whether the theme set so far is only a fallback the terminal should
+    /// be asked to confirm: `main::dashboard` sets this from
+    /// `theme::should_query_background`, and [`run`] reads it to decide
+    /// whether to send the query at all. Seeded after `new` for the reason
+    /// [`Self::set_theme`] is.
+    pub fn set_asks_terminal_background(&mut self, ask: bool) {
+        self.asks_terminal_background = ask;
+    }
+
+    /// See [`Self::set_asks_terminal_background`].
+    #[must_use]
+    pub fn asks_terminal_background(&self) -> bool {
+        self.asks_terminal_background
+    }
+
     /// Move the highlight down, wrapping at the end.
     pub fn select_next(&mut self) {
         if self.clusters.is_empty() {
@@ -1793,6 +1827,10 @@ impl App {
 /// what they start: a fourth drill-down level should not have to grow every
 /// caller's argument list past `clippy::too_many_arguments`' limit again.
 ///
+/// When [`App::asks_terminal_background`] says so, this also sends
+/// [`crate::theme::BACKGROUND_QUERY`] once, right after the first frame is on
+/// screen, and re-themes if the terminal answers light (decision 111).
+///
 /// This function never awaits a fetch: each iteration only polls for a result
 /// that has already arrived, which is what keeps a hung request from blocking
 /// a keypress.
@@ -1804,6 +1842,7 @@ pub fn run(
     refresh: RefreshInterval,
     login: &LoginRunner,
 ) -> Result<()> {
+    let query_background = app.asks_terminal_background();
     let mut terminal = ratatui::init();
 
     // The suspend-and-resume that `L` needs, built here because this is the
@@ -1823,6 +1862,22 @@ pub fn run(
         outcome.and(left).and(entered)
     };
 
+    let mut next_event = |timeout: Duration| -> std::io::Result<Option<Event>> {
+        if event::poll(timeout)? {
+            event::read().map(Some)
+        } else {
+            Ok(None)
+        }
+    };
+    // Written straight to stdout, the terminal `ratatui::init` drew on, and
+    // flushed so it leaves now rather than with the next frame. The answer
+    // comes back on stdin and is read by `next_event` like any keypress.
+    let mut query = || -> std::io::Result<()> {
+        let mut stdout = std::io::stdout();
+        stdout.write_all(crate::theme::BACKGROUND_QUERY.as_bytes())?;
+        stdout.flush()
+    };
+
     let result = event_loop(
         &mut terminal,
         app,
@@ -1830,10 +1885,32 @@ pub fn run(
         spawn_nodes,
         drill,
         refresh,
-        &suspended,
+        TerminalIo {
+            suspend: &suspended,
+            next_event: &mut next_event,
+            query_background: if query_background {
+                Some(&mut query)
+            } else {
+                None
+            },
+        },
     );
     ratatui::restore();
     result
+}
+
+/// What `event_loop` needs from a real terminal beyond drawing on it, taken
+/// as closures so a test can drive the whole loop — keys in, frames out —
+/// against `TestBackend`, the same reason [`Suspended`] is one.
+struct TerminalIo<'a> {
+    /// Hand the terminal back around a login; see [`Suspended`].
+    suspend: Suspended<'a>,
+    /// Wait up to the given time for the next terminal event; `None` if
+    /// nothing arrived.
+    next_event: &'a mut dyn FnMut(Duration) -> std::io::Result<Option<Event>>,
+    /// Send the OSC 11 background query. Called at most once, after the
+    /// first frame; `None` when this run asks nothing.
+    query_background: Option<&'a mut dyn FnMut() -> std::io::Result<()>>,
 }
 
 /// Hand the terminal back to the shell, keeping the `Terminal` handle valid.
@@ -1904,6 +1981,74 @@ impl Inflight {
     }
 }
 
+/// The keys `event_loop` handles, and the background query whose answer
+/// arrives among them.
+struct Input<'a> {
+    next_event: &'a mut dyn FnMut(Duration) -> std::io::Result<Option<Event>>,
+    /// Taken the first time a frame is drawn, so it is sent at most once.
+    query: Option<&'a mut dyn FnMut() -> std::io::Result<()>>,
+    /// Present only once the query has gone out: until then there is no
+    /// reply to pick out of the keys, and after a failed send there never
+    /// will be.
+    reader: Option<ReplyReader>,
+    /// Keys a [`ReplyReader`] gave back several at once — an Alt+`]` that
+    /// turned out to be the user's, and whatever they typed after it —
+    /// handled one per iteration ahead of anything new from the terminal.
+    replayed: VecDeque<KeyEvent>,
+}
+
+impl<'a> Input<'a> {
+    fn new(io: TerminalIo<'a>) -> Self {
+        Self {
+            next_event: io.next_event,
+            query: io.query_background,
+            reader: None,
+            replayed: VecDeque::new(),
+        }
+    }
+
+    /// Called after every draw. The first time, sends the background query.
+    ///
+    /// After the draw, never before it: the first frame is on screen before
+    /// the question is even asked, so the query spends none of the
+    /// first-paint budget however slow the answer is (decision 111). A failed
+    /// write is not an error the user needs to see — it leaves the theme the
+    /// frame was drawn in, the same as a terminal that never answers.
+    fn frame_drawn(&mut self) {
+        if let Some(query) = self.query.take()
+            && query().is_ok()
+        {
+            self.reader = Some(ReplyReader::default());
+        }
+    }
+
+    /// The next key for the dashboard to handle, waiting up to [`TICK`] for
+    /// one; `None` when nothing arrived, or when what arrived was part of the
+    /// terminal's reply rather than a keypress.
+    ///
+    /// The reply is picked out here, ahead of `App::on_key` *and* the
+    /// refresh check after it: a reply's `rgb` is otherwise an `r`, and a
+    /// refetch nobody asked for. A reply that names a background re-themes
+    /// `app` from the next frame on.
+    fn next_key(&mut self, app: &mut App) -> std::io::Result<Option<KeyEvent>> {
+        if let Some(key) = self.replayed.pop_front() {
+            return Ok(Some(key));
+        }
+        let Some(Event::Key(key)) = (self.next_event)(TICK)? else {
+            return Ok(None);
+        };
+        let Some(reader) = self.reader.as_mut() else {
+            return Ok(Some(key));
+        };
+        let fed = reader.feed(key);
+        if let Some(background) = fed.background {
+            app.apply_terminal_background(background);
+        }
+        self.replayed.extend(fed.keys);
+        Ok(self.replayed.pop_front())
+    }
+}
+
 fn event_loop<B>(
     terminal: &mut Terminal<B>,
     mut app: App,
@@ -1911,7 +2056,7 @@ fn event_loop<B>(
     spawn_nodes: &NodesFetcher,
     drill: &DrillFetchers<'_>,
     refresh: RefreshInterval,
-    login: Suspended<'_>,
+    io: TerminalIo<'_>,
 ) -> Result<()>
 where
     B: ratatui::backend::Backend,
@@ -1923,6 +2068,8 @@ where
     let mut selected_context = app.selected_cluster().map(|c| c.context_name.clone());
     let mut next_refresh = schedule(refresh);
     let mut inflight = Inflight::default();
+    let login = io.suspend;
+    let mut input = Input::new(io);
 
     loop {
         // Non-blocking: a fetch that has not finished yet leaves the pane
@@ -1958,6 +2105,8 @@ where
 
         terminal.draw(|frame| draw(frame, &app))?;
 
+        input.frame_drawn();
+
         if next_refresh.is_some_and(|at| Instant::now() >= at) {
             refetch(spawn_nodes, &mut nodes_rx, selected_context.as_deref());
             refetch_pods(
@@ -1970,11 +2119,7 @@ where
             next_refresh = schedule(refresh);
         }
 
-        if !event::poll(TICK)? {
-            continue;
-        }
-
-        let Event::Key(key) = event::read()? else {
+        let Some(key) = input.next_key(&mut app)? else {
             continue;
         };
 
@@ -2598,6 +2743,23 @@ mod tests {
         let mut app = app();
         app.set_theme(Theme::light());
         assert_eq!(app.theme, Theme::light());
+    }
+
+    #[test]
+    fn a_terminal_background_answer_sets_the_theme_it_calls_for() {
+        let mut app = app();
+        app.apply_terminal_background(Background::Light);
+        assert_eq!(app.theme, Theme::light());
+        app.apply_terminal_background(Background::Dark);
+        assert_eq!(app.theme, Theme::dark());
+    }
+
+    #[test]
+    fn a_fresh_app_asks_the_terminal_nothing_until_told_to() {
+        let mut app = app();
+        assert!(!app.asks_terminal_background());
+        app.set_asks_terminal_background(true);
+        assert!(app.asks_terminal_background());
     }
 
     fn press(code: KeyCode) -> KeyEvent {
@@ -5373,5 +5535,6 @@ mod tests {
         );
     }
 
+    mod event_loop;
     mod golden;
 }
