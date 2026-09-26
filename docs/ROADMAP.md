@@ -1731,7 +1731,7 @@ cluster.
   reads a key meant for it; what it does instead is whichever the reviewer
   picks.
 
-- [ ] **Detect a terminal's background by querying it, not just `COLORFGBG`.**
+- [x] **Detect a terminal's background by querying it, not just `COLORFGBG`.**
   `theme::detect_background` reads `COLORFGBG`, the one hint that costs no
   I/O — but most terminal emulators people actually use (iTerm2, Terminal.app,
   GNOME Terminal, Windows Terminal, Alacritty, kitty) never set it, so `auto`
@@ -1755,6 +1755,21 @@ cluster.
   re-themes if a light answer arrives, accepting a possible one-frame flip. The
   CLI tables keep `COLORFGBG` only. The reply parser is tested against fixture
   bytes. See decision 111.
+  Landed as `theme::BACKGROUND_QUERY`/`parse_background_reply`/
+  `should_query_background`, `ui::background::ReplyReader`, and
+  `App::apply_terminal_background`. `event_loop` sends the query once, right
+  after its first draw, and only when `main` marked the `App` with
+  `set_asks_terminal_background`. That happens only under `auto`, with
+  `COLORFGBG` silent and a `TERM` that is not unset, `dumb`, or the Linux
+  console, on Unix. crossterm parses the reply as keys, so `ReplyReader`
+  swallows them ahead of `on_key` and the refresh check. That keeps `rgb`'s
+  `r` from starting a refetch. It gives back anything that turns out not to
+  be a reply. The parser reads `rgb:`/`rgba:` with one to four hex digits
+  per channel and BEL or ST terminators, and calls a background light when
+  the light theme's text contrasts better against it. `event_loop` now takes
+  its terminal reads and the query through `TerminalIo`, so
+  `src/ui/tests/event_loop.rs` drives the whole loop on a recording
+  `TestBackend`. It proves the frame-then-query order. See decision 115.
 
 - [x] **Startup budget and benchmarks.**
   Add `criterion` benchmarks for kubeconfig parsing and first paint. Document

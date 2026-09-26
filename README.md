@@ -521,12 +521,18 @@ it.
 
 `--color` decides *whether* a listing paints; `--theme` decides *which*
 colours it — and the dashboard, which always paints — use. `auto`, the
-default, tries to detect whether your terminal's background is dark or
-light from the `COLORFGBG` environment variable, which some terminals and
-multiplexers set and most do not; where it cannot be told, `eks` assumes
+default, first reads the `COLORFGBG` environment variable, which some
+terminals and multiplexers set and most do not. When that says nothing, the
+dashboard draws in dark, then asks the terminal itself for its background
+colour (an OSC 11 query) and switches to light if the answer is a light
+colour — so on a light terminal you may see one dark frame before it flips.
+Terminals that do not answer simply stay dark. The one-shot listings
+(`eks nodes`, `eks pods`, …) never ask, since they are done before an
+answer could arrive, so they read `COLORFGBG` alone and otherwise assume
 dark. `--theme light`/`--theme dark`, or the config file's own `theme`,
-override the guess outright — reach for one of these if `auto` picked the
-wrong theme, or if your terminal never set `COLORFGBG` in the first place:
+override all of this outright — reach for one of these if `auto` picked the
+wrong theme, or to colour a listing for a light terminal that does not set
+`COLORFGBG`:
 
 ```
 $ eks --theme light
