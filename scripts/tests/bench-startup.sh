@@ -85,8 +85,16 @@ refute_in() {
 # expect_arg_pair <name> <flag> <value>: passes when hyperfine was given
 # <value> as the argument immediately after <flag>, at least once.
 expect_arg_pair() {
-  local name="$1" flag="$2" value="$3"
-  if awk -v f="$flag" -v v="$value" 'prev == f && $0 == v { found = 1 } { prev = $0 } END { exit !found }' "$work/args"; then
+  local name="$1" flag="$2" value="$3" prev="" line found=0
+  # Compared in bash, not awk: `awk -v` expands backslash escapes in the
+  # values it is given, and how it treats `\ ` differs between mawk and
+  # gawk, so the quoted path this checks for would match on one and not
+  # the other.
+  while IFS= read -r line; do
+    if [ "$prev" = "$flag" ] && [ "$line" = "$value" ]; then found=1; fi
+    prev="$line"
+  done < "$work/args"
+  if [ "$found" -eq 1 ]; then
     pass "$name"
   else
     output="$(cat "$work/args")"
