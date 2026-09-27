@@ -17,10 +17,12 @@
 //! `&str`, exactly as `kubeconfig.rs`'s own unit tests exercise it, so this
 //! file measures the same pure functions the architecture already isolates
 //! rather than a second, I/O-shaped version of them.
+//!
+//! The process around that computation — exec, the dynamic linker, the real
+//! binary's own startup — is timed separately by `scripts/bench-startup.sh`
+//! with `hyperfine` (`make bench-process`), against the same fixture.
 
 #![allow(clippy::unwrap_used)]
-
-use std::fmt::Write as _;
 
 use criterion::{Criterion, criterion_group, criterion_main};
 use eks::commands::contexts;
@@ -30,64 +32,28 @@ use eks::ui::App;
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 
-/// A kubeconfig with `clusters` EKS contexts, shaped like the ones this tool
-/// actually reads: one AWS-generated ARN per cluster and context, an `exec`
-/// block per user, and a `current-context` naming the last one — the same
-/// fields `k8s::client` and `cluster::ClusterView` read out of a real file.
+/// A kubeconfig with 50 EKS contexts, shaped like the ones this tool actually
+/// reads: one AWS-generated ARN per cluster and context, an `exec` block per
+/// user, and a `current-context` naming the last one — the same fields
+/// `k8s::client` and `cluster::ClusterView` read out of a real file.
 /// Multi-account, multi-region operators are exactly the users for whom
 /// kubeconfig parsing time is not academic, so the fixture is sized like
-/// their config rather than the two-cluster sample the unit tests use.
-fn synthetic_kubeconfig(clusters: usize) -> String {
-    let mut out = String::from("apiVersion: v1\nkind: Config\n");
-
-    let arn = |i: usize| format!("arn:aws:eks:us-east-1:111122223333:cluster/cluster-{i:03}");
-
-    let _ = writeln!(out, "current-context: {}", arn(clusters.saturating_sub(1)));
-
-    out.push_str("clusters:\n");
-    for i in 0..clusters {
-        let name = arn(i);
-        let _ = write!(
-            out,
-            "  - name: {name}\n    cluster:\n      server: https://{i:04X}.gr7.us-east-1.eks.amazonaws.com\n      certificate-authority-data: Zm9vYmFyYmF6cXV1eA==\n"
-        );
-    }
-
-    out.push_str("contexts:\n");
-    for i in 0..clusters {
-        let name = arn(i);
-        let _ = write!(
-            out,
-            "  - name: {name}\n    context:\n      cluster: {name}\n      user: {name}\n      namespace: default\n"
-        );
-    }
-
-    out.push_str("users:\n");
-    for i in 0..clusters {
-        let name = arn(i);
-        let _ = write!(
-            out,
-            "  - name: {name}\n    user:\n      exec:\n        apiVersion: client.authentication.k8s.io/v1beta1\n        command: aws\n        args: [\"eks\", \"get-token\", \"--cluster-name\", \"cluster-{i:03}\"]\n"
-        );
-    }
-
-    out
-}
-
-/// The number of contexts the fixture carries — large enough to separate a
-/// linear-in-clusters regression from noise, without making the benchmark
-/// itself slow to iterate.
-const CLUSTERS: usize = 50;
+/// their config rather than the two-cluster sample the unit tests use. Fifty
+/// is large enough to separate a linear-in-clusters regression from noise,
+/// without making the benchmark itself slow to iterate.
+///
+/// It is a committed file rather than generated here because
+/// `scripts/bench-startup.sh` points the real binary's `KUBECONFIG` at the
+/// same bytes, so the in-process and wall-clock numbers describe one input.
+const KUBECONFIG: &str = include_str!("fixtures/kubeconfig-50.yaml");
 
 fn kubeconfig_parse(c: &mut Criterion) {
-    let yaml = synthetic_kubeconfig(CLUSTERS);
     c.bench_function("kubeconfig_parse", |b| {
-        b.iter(|| KubeConfig::parse(std::hint::black_box(&yaml)).unwrap());
+        b.iter(|| KubeConfig::parse(std::hint::black_box(KUBECONFIG)).unwrap());
     });
 }
 
 fn first_paint(c: &mut Criterion) {
-    let yaml = synthetic_kubeconfig(CLUSTERS);
     // 120x40 covers a normal terminal window without leaning on `--wide`'s
     // extra columns, matching the size the dashboard's own rendering tests
     // use elsewhere in `ui::mod`.
@@ -95,7 +61,7 @@ fn first_paint(c: &mut Criterion) {
 
     c.bench_function("first_paint", |b| {
         b.iter(|| {
-            let config = KubeConfig::parse(std::hint::black_box(&yaml)).unwrap();
+            let config = KubeConfig::parse(std::hint::black_box(KUBECONFIG)).unwrap();
             let views = contexts::views(&config);
             let mut app = App::new(views);
             app.set_theme(Theme::dark());
