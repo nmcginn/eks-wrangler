@@ -4235,6 +4235,8 @@ it would be our own statistics code with nothing to show for it that
 TTY. The number is labelled as excluding it rather than implying it covers
 it.
 
+Built as decision 116.
+
 ### 113. The Homebrew formula lives in this repository, not a separate tap
 
 Decided by the reviewer on 2026-09-24.
@@ -4351,3 +4353,42 @@ than `Theme::dark().text` does. That makes the answer "the theme that reads
 better here," and the crossover (a relative luminance near 0.18, about
 `#777777`) moves by itself if either palette is retuned. A tie is dark, the
 safer wrong guess, as in decision 104.
+
+### 116. The wall-clock benchmark is a tested shell script over a committed fixture, and it times the binary without a shell or the user's home
+
+Decision 112 chose `hyperfine` in CI's `bench` job. Building it turned up four
+choices of its own.
+
+**One fixture, as a file.** Decision 112 said the binary is timed against "the
+same synthetic 50-cluster kubeconfig the criterion benches use". That kubeconfig
+was a Rust function inside `benches/startup.rs`, which a process started by
+`hyperfine` cannot call. It is now `benches/fixtures/kubeconfig-50.yaml`, which
+the criterion benches `include_str!` and the script passes as `KUBECONFIG`. Its
+bytes are the old generator's output exactly (checked by asserting the two
+equal before the generator was removed), plus a four-line YAML comment at the
+top saying who reads it. The comment makes `kubeconfig_parse` very slightly
+slower than master's cached history, so the first run after this lands may
+report a small regression that is not one. Generating the file in CI instead
+would have kept the generator, but then the bench and the script could drift
+onto different inputs without anything noticing.
+
+**A script, not inline YAML.** The timing lives in `scripts/bench-startup.sh`,
+beside the release scripts, so `make bench-process` runs on a laptop exactly
+what CI runs. Like `verify-glibc-floor.sh`, it takes its tool from an
+environment variable (`HYPERFINE`) so `scripts/tests/bench-startup.sh` can
+check what it asks hyperfine to do without timing anything, and `make
+script-test` runs those tests in `make check` and CI's lint job.
+
+**No shell, no home.** The commands run with `--shell=none`. A shell in
+between would add its own startup to rows that take 2 to 3 ms, which is the
+noise hyperfine's documentation warns about. `HOME` points at an empty
+directory, so a contributor's own `~/.config/eks/config.toml` cannot make
+their numbers differ from CI's.
+
+**What goes where.** hyperfine's progress output goes to stderr and only the
+Markdown table (under a heading, with the "excludes opening a terminal" label)
+goes to stdout. That lets CI append stdout straight to the job summary next to
+criterion's. The script's exit status is hyperfine's, so a timed command that
+exits non-zero fails the job. A slow run never does. hyperfine is installed
+with `cargo install --locked hyperfine@1.20.0`, the same way release.yml
+installs `cargo-zigbuild`, rather than through a third-party install action.

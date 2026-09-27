@@ -39,9 +39,10 @@ jobs:
       - name: Check docs build
         run: cargo doc --locked --no-deps --all-features
 
-      # The release workflow only runs on master, so a broken check in
-      # scripts/ would otherwise first show up after the merge that broke it.
-      - name: Test the release scripts
+      # The release workflow only runs on master, and the bench job reports
+      # rather than gates, so a broken script in scripts/ would otherwise
+      # first show up after the merge that broke it.
+      - name: Test the scripts
         run: make script-test
 
   test:
@@ -116,6 +117,21 @@ jobs:
             cargo bench --locked --bench startup
             echo '```'
           } | tee -a "$GITHUB_STEP_SUMMARY"
+
+      # The criterion step above never execs the binary, so it cannot see
+      # exec, dynamic linking, or the binary's own startup — most of what a
+      # user waits on. hyperfine times that (decision 112). Pinned, like
+      # cargo-zigbuild in release.yml, so a new hyperfine release never turns
+      # up in an unrelated merge; rust-cache keeps the installed binary.
+      - name: Install hyperfine
+        run: cargo install --locked hyperfine@1.20.0
+
+      # Reported, never gated: the script fails only if a timed command exits
+      # non-zero, which is a broken binary, not a slow one.
+      - name: Time process startup
+        run: |
+          cargo build --locked --release
+          scripts/bench-startup.sh target/release/eks | tee -a "$GITHUB_STEP_SUMMARY"
 
       # Best-effort: a re-run on the same commit hits an already-occupied key,
       # which is not a reason to fail a job whose whole purpose is reporting.

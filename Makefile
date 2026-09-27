@@ -4,7 +4,7 @@ CARGO ?= cargo
 BIN   := eks
 
 .DEFAULT_GOAL := help
-.PHONY: help build release run test script-test snapshots bench lint fmt fmt-check doc check install dist clean
+.PHONY: help build release run test script-test snapshots bench bench-process lint fmt fmt-check doc check install dist clean
 
 help: ## Show this help
 	@grep -hE '^[a-z-]+:.*?## ' $(MAKEFILE_LIST) \
@@ -22,14 +22,18 @@ run: ## Run the dashboard (make run ARGS="contexts")
 test: ## Run the test suite
 	$(CARGO) test --locked --all-features
 
-script-test: ## Test the release scripts in scripts/ against fixture readelf output
+script-test: ## Test the scripts in scripts/ against stand-in readelf and hyperfine
 	scripts/tests/verify-glibc-floor.sh
+	scripts/tests/bench-startup.sh
 
 snapshots: ## Rewrite the dashboard's golden-file snapshots in place; review with git diff
 	INSTA_UPDATE=always $(CARGO) test --locked --all-features --lib ui::tests::golden
 
 bench: ## Run the startup benchmarks (see benches/startup.rs)
 	$(CARGO) bench --locked --bench startup
+
+bench-process: release ## Time the release binary from exec to exit with hyperfine
+	scripts/bench-startup.sh target/release/$(BIN)
 
 lint: ## Clippy, warnings are errors
 	$(CARGO) clippy --locked --all-targets --all-features -- -D warnings

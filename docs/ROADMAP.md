@@ -1793,7 +1793,7 @@ cluster.
   giving it something to compare against and somewhere to say so. See
   decision 105.
 
-- [ ] **Wall-clock process-startup benchmarks, alongside the in-process ones.**
+- [x] **Wall-clock process-startup benchmarks, alongside the in-process ones.**
   `benches/startup.rs`'s `first_paint` measures the computation this tool
   controls — parsing, building the sidebar, one render — inside a `criterion`
   process that never `exec`s the real binary or opens a real terminal. For
@@ -1813,6 +1813,18 @@ cluster.
   *Decided (2026-09-24):* a pinned `hyperfine` in the `bench` job times
   `eks contexts` and `eks --version` against the synthetic kubeconfig. See
   decision 112.
+  Landed as `scripts/bench-startup.sh`, run by the `bench` job after
+  criterion and by `make bench-process` locally. It times the release
+  binary's `eks --version` (clap's floor) and `eks contexts` with
+  `hyperfine --shell=none`, with `HOME` emptied and `KUBECONFIG` pointed at
+  `benches/fixtures/kubeconfig-50.yaml`. That file is the criterion benches'
+  old generated kubeconfig, byte for byte, now committed so both benchmarks
+  read one input. The job summary gets a Markdown table labelled as
+  excluding terminal setup. hyperfine is pinned at 1.20.0 through
+  `cargo install --locked`. `scripts/tests/bench-startup.sh` checks, against
+  a stand-in hyperfine, what the script asks hyperfine to do and where each
+  stream goes; `make script-test` runs it. Locally the two rows come out
+  around 1.8 ms and 2.9 ms. See decision 116.
 
 - [x] **Shell completions and a man page.**
   Generate from the clap definition via `clap_complete` and `clap_mangen`.
