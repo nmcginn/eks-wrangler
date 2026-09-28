@@ -1,0 +1,92 @@
+# Supply-chain policy for `cargo deny check`, run by CI's `supply-chain` job
+# and locally by `make deny`. See decision 117 in docs/DECISIONS.md.
+#
+# Every allowance below says why it is there. A new one needs the same: the
+# point of this file is that nothing gets in by default.
+
+[graph]
+# Only the targets `release.yml` actually ships. A Windows-only crate never
+# reaches a user, so it should not be able to fail a licence or duplicate
+# check — and it is also why `windows-sys`, which `kube` and `crossterm` pull
+# in at two versions on Windows alone, is not in `bans.skip` below.
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+    "x86_64-unknown-linux-musl",
+    "x86_64-apple-darwin",
+    "aarch64-apple-darwin",
+]
+# `make test` and CI build with `--all-features`, so the audit sees the same tree.
+all-features = true
+
+[advisories]
+# Vulnerabilities, unmaintained crates, and unsound crates are all errors by
+# default. There are no ignores; one needs an advisory ID and a reason.
+ignore = []
+# A yanked version in Cargo.lock was pulled by its own author, usually for a
+# reason worth knowing. `cargo update -p <crate>` is the fix, not an ignore.
+yanked = "deny"
+
+[licenses]
+# Permissive licences only. `eks` is MIT and ships as a single binary with
+# every dependency linked in, so each licence here has to allow that without
+# obligations beyond keeping the notice.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    # rustix, linux-raw-sys: Apache-2.0 plus an exception that only relaxes it.
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    # ryu.
+    "BSL-1.0",
+    # ring, rustls-webpki, untrusted — the TLS stack `kube` talks to the API
+    # server over.
+    "ISC",
+    "Unicode-3.0",
+    "Unlicense",
+    # foldhash.
+    "Zlib",
+]
+confidence-threshold = 0.8
+# Allowed for one crate each rather than for the whole tree, so the next crate
+# to arrive under one of these gets looked at too.
+exceptions = [
+    # Pulled in by `directories` through `dirs-sys`. MPL-2.0 is file-level
+    # copyleft: it binds changes to option-ext's own source files, which we
+    # never modify, and places no obligation on the rest of the binary.
+    { crate = "option-ext", allow = ["MPL-2.0"] },
+]
+
+[bans]
+# A second version of a crate is a second copy compiled into the binary and a
+# second thing to keep patched. Deny it, and name each one we accept.
+multiple-versions = "deny"
+# A `*` requirement in Cargo.toml would accept any future release, breaking or
+# malicious alike.
+wildcards = "deny"
+highlight = "all"
+deny = [
+    # `kube` is built with `rustls-tls` so the musl binary stays static
+    # (decision 108) and nothing links the system's libssl. A dependency that
+    # quietly pulls OpenSSL back in would undo both; this makes it loud.
+    { crate = "openssl-sys", reason = "TLS is rustls; OpenSSL would break the static musl build" },
+    { crate = "native-tls", reason = "TLS is rustls; native-tls links the platform's OpenSSL on Linux" },
+]
+# Each of these comes from two dependencies we do not control pinning
+# different major versions. Nothing in `eks`'s own Cargo.toml can merge them;
+# they go when upstream catches up. The newer version is left unskipped, so a
+# third version of the same crate still fails.
+skip = [
+    { crate = "getrandom@0.2", reason = "ring 0.17 (the TLS stack) is on 0.2; ahash, via kube's YAML parser, is on 0.3" },
+    { crate = "hashbrown@0.16", reason = "kasuari, ratatui's layout solver, is on 0.16; indexmap and lru are on 0.17" },
+    { crate = "syn@2", reason = "most proc macros (tracing, strum, derive_more, zerocopy) are on 2; clap_derive and darling are on 3" },
+]
+
+[sources]
+# crates.io only. A git or alternative-registry dependency bypasses both the
+# advisory database's coverage and Cargo.lock's checksums of published crates.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

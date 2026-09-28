@@ -1910,10 +1910,26 @@ cluster.
   aarch64 leg lost its gcc cross toolchain and linker setting. See decision
   109.
 
-- [ ] **Supply-chain checks in CI.**
+- [x] **Supply-chain checks in CI.**
   `cargo-deny` for advisories, licences, and duplicate versions.
   *Acceptance:* runs on PRs; `deny.toml` committed with rationale for any
   allowance.
+  Landed as `deny.toml` and a `supply-chain` job in `ci.yml` running
+  `make deny` with a pinned `cargo-deny` 0.20.2. The policy denies by default
+  and comments every allowance: permissive licences only, with MPL-2.0
+  allowed for `option-ext` alone; duplicate versions denied, with the three
+  `kube`/`ratatui`/`clap` bring in (`getrandom`, `hashbrown`, `syn`) skipped
+  by their older version so a third still fails; `*` requirements denied;
+  `openssl-sys` and `native-tls` banned to keep TLS on rustls and the musl
+  build static; crates.io the only source; yanked crates denied. The graph is
+  limited to the five targets `release.yml` ships. Turning it on found
+  RUSTSEC-2026-0285 in `rustls` 0.23.43, so Cargo.lock now carries 0.23.45.
+  `scripts/tests/deny-policy.sh` points the real policy at fixture crates
+  (path and local-git dependencies, so no network) and checks each rule
+  fires — a GPL crate, `openssl-sys`, a third `syn` — so a loosened
+  `deny.toml` fails the job, not just a new dependency. `make deny` is not in
+  `make check`, because it needs `cargo-deny` installed and the network for
+  the advisory database. See decision 117.
 
 - [ ] **MSRV verification job.**
   Build against the `rust-version` in `Cargo.toml` so it stops being a claim.

@@ -80,6 +80,33 @@ jobs:
             exit 1
           fi
 
+  # Advisories, licences, bans, and sources, per deny.toml (decision 117).
+  # Its own job so a new advisory against an unchanged Cargo.lock — which can
+  # land on any PR, whatever it touches — reads as exactly that, not as the
+  # PR's own lint or test failure.
+  supply-chain:
+    name: Supply chain (cargo-deny)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      # Pinned, like hyperfine below and cargo-zigbuild in release.yml, so a
+      # new cargo-deny release (and whatever it newly checks) never turns up
+      # in an unrelated merge; rust-cache keeps the installed binary. The
+      # version is repeated in scripts/tests/deny-policy.sh's install hint.
+      - name: Install cargo-deny
+        run: cargo install --locked cargo-deny@0.20.2
+
+      # Checks the real tree, then proves the policy rejects what it claims
+      # to against fixture crates.
+      - name: Check dependencies
+        run: make deny
+
   bench:
     name: Startup benchmarks
     runs-on: ubuntu-latest
