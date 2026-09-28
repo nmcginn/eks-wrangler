@@ -4,7 +4,7 @@ CARGO ?= cargo
 BIN   := eks
 
 .DEFAULT_GOAL := help
-.PHONY: help build release run test script-test snapshots bench bench-process lint fmt fmt-check doc check install dist clean
+.PHONY: help build release run test script-test deny snapshots bench bench-process lint fmt fmt-check doc check install dist clean
 
 help: ## Show this help
 	@grep -hE '^[a-z-]+:.*?## ' $(MAKEFILE_LIST) \
@@ -25,6 +25,10 @@ test: ## Run the test suite
 script-test: ## Test the scripts in scripts/ against stand-in readelf and hyperfine
 	scripts/tests/verify-glibc-floor.sh
 	scripts/tests/bench-startup.sh
+
+deny: ## Audit dependencies with cargo-deny (see deny.toml), then test the policy itself
+	$(CARGO) deny --locked check
+	scripts/tests/deny-policy.sh
 
 snapshots: ## Rewrite the dashboard's golden-file snapshots in place; review with git diff
 	INSTA_UPDATE=always $(CARGO) test --locked --all-features --lib ui::tests::golden

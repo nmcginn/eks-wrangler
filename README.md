@@ -655,8 +655,15 @@ alongside a man page into `dist/`.
 ```sh
 make            # list available targets
 make test       # run the suite — no cluster or credentials needed
-make check      # everything CI runs; run this before pushing
+make check      # format, lint, tests, docs; run this before pushing
+make deny       # audit dependencies against deny.toml (needs cargo-deny)
 ```
+
+`make check` is every CI job but one. The other, `make deny`, runs
+[`cargo-deny`](https://github.com/EmbarkStudios/cargo-deny) over the dependency
+tree — known vulnerabilities, licences, duplicate versions, and where crates come
+from — and needs `cargo install --locked cargo-deny@0.20.2` plus network access
+for the advisory database. Run it whenever you add or bump a dependency.
 
 The test suite never touches AWS. See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)
 for the module map and testing approach, and [`CLAUDE.md`](CLAUDE.md) for the

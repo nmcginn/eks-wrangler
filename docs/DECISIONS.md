@@ -4392,3 +4392,61 @@ criterion's. The script's exit status is hyperfine's, so a timed command that
 exits non-zero fails the job. A slow run never does. hyperfine is installed
 with `cargo install --locked hyperfine@1.20.0`, the same way release.yml
 installs `cargo-zigbuild`, rather than through a third-party install action.
+
+### 117. `cargo-deny` denies by default, audits only the shipped targets, and its policy is tested against fixture crates
+
+The roadmap asked for advisories, licences, and duplicate versions, with a
+reason for every allowance. Building it meant five choices.
+
+**Deny, then name the exceptions.** `multiple-versions` is `deny`, not
+cargo-deny's default `warn`: a warning in a job log is read by nobody, and a
+duplicate is a second copy of a crate in the binary and a second thing to
+patch. Today's three (`getrandom`, `hashbrown`, `syn`) each come from two
+upstream crates pinning different majors, which nothing in our Cargo.toml can
+merge, so each is skipped by its *older* version with the crates responsible
+named. Skipping one version rather than the crate means a third version still
+fails. The cost is that a dependabot bump which introduces a new upstream
+split fails until someone adds a skip line with a reason; that is the check
+doing its job, but it is the one place this could get noisy. Flipping it to
+`warn` is a one-word change if it does.
+
+**Licences: an allow-list, one scoped exception.** Every licence on the list
+is permissive and asks nothing of a binary beyond keeping the notice.
+MPL-2.0 (`option-ext`, via `directories`) is file-level copyleft: it binds
+edits to that crate's own files, which we never make, so it is allowed for
+that one crate through `exceptions` rather than for the tree, and the next
+MPL crate gets looked at. `r-efi` offers LGPL-2.1 as one of three
+alternatives, so it passes on MIT without LGPL on the list.
+
+**Shipped targets only.** `[graph] targets` lists the five `release.yml`
+builds. Without it, cargo-deny audits every platform's dependencies: a
+Windows-only duplicate (`windows-sys` 0.52 and 0.61) would need a skip entry,
+and `webpki-root-certs` (wasm32 only, CDLA-Permissive-2.0) a licence
+exception, for code no user of ours ever runs. If a Windows target is ever
+added to the release matrix, it needs adding here too.
+
+**Bans beyond duplicates.** `openssl-sys` and `native-tls` are denied
+outright. Decision 10 chose rustls so the binary needs no system OpenSSL, and
+decision 108 relies on that for the static musl build; a new dependency that
+pulled OpenSSL back in would otherwise show up only as a musl link failure in
+the release workflow, after merge. `*` version requirements and any source
+other than crates.io are denied too.
+
+**Testing the policy, not just the tree.** `cargo deny check` passing on our
+own Cargo.lock proves only that the policy admits what we have; an empty file
+would pass as well. `scripts/tests/deny-policy.sh` builds tiny fixture
+workspaces whose dependencies are local path crates (and one local git
+repository) built to break one rule each, points the real `deny.toml` at them,
+and checks the rule fires by its `<check> FAILED` line — the exit status is a
+bitmask in which a bans failure and a usage error are both 2. It needs no
+network and compiles nothing. Loosening the licence list or setting
+`multiple-versions = "warn"` fails four of its cases.
+
+**Where it runs.** CI's own `supply-chain` job, with `cargo-deny` pinned at
+0.20.2 through `cargo install --locked`, the way hyperfine and cargo-zigbuild
+are. A separate job because a new advisory can land against an unchanged
+Cargo.lock on any PR, and it should read as that rather than as the PR's own
+failure. `make deny` runs the same two steps locally but is not in
+`make check`: it needs `cargo-deny` installed and the network for the
+advisory database, and `make check` needs neither today.
+
