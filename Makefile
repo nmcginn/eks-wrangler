@@ -4,7 +4,7 @@ CARGO ?= cargo
 BIN   := eks
 
 .DEFAULT_GOAL := help
-.PHONY: help build release run test script-test deny snapshots bench bench-process lint fmt fmt-check doc check install dist clean
+.PHONY: help build release run test script-test msrv deny snapshots bench bench-process lint fmt fmt-check doc check install dist clean
 
 help: ## Show this help
 	@grep -hE '^[a-z-]+:.*?## ' $(MAKEFILE_LIST) \
@@ -22,9 +22,13 @@ run: ## Run the dashboard (make run ARGS="contexts")
 test: ## Run the test suite
 	$(CARGO) test --locked --all-features
 
-script-test: ## Test the scripts in scripts/ against stand-in readelf and hyperfine
+script-test: ## Test the scripts in scripts/ against stand-in readelf, hyperfine, cargo, and rustup
 	scripts/tests/verify-glibc-floor.sh
 	scripts/tests/bench-startup.sh
+	scripts/tests/msrv.sh
+
+msrv: ## Build and test on the rust-version Cargo.toml declares (needs that toolchain via rustup)
+	scripts/msrv.sh
 
 deny: ## Audit dependencies with cargo-deny (see deny.toml), then test the policy itself
 	$(CARGO) deny --locked check
