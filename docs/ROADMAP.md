@@ -1931,9 +1931,22 @@ cluster.
   `make check`, because it needs `cargo-deny` installed and the network for
   the advisory database. See decision 117.
 
-- [ ] **MSRV verification job.**
+- [x] **MSRV verification job.**
   Build against the `rust-version` in `Cargo.toml` so it stops being a claim.
   *Acceptance:* CI job pinned to that toolchain.
+  Landed as an `msrv` job in `ci.yml` and `scripts/msrv.sh`, which `make msrv`
+  runs locally. The job reads the version out of `Cargo.toml` with
+  `scripts/msrv.sh --print` (cargo's own `metadata --no-deps`, not a TOML
+  grep) and installs exactly that toolchain, so raising `rust-version` is a
+  one-line change the job follows without `ci.yml` holding a second copy. It
+  then builds every target and runs the tests on it, both `--locked`, so the
+  claim covers the `Cargo.lock` that ships. A missing toolchain, a missing
+  rustup, or no declared `rust-version` each say what to run instead of
+  building; a failed build says how to hold a dependency back or where to
+  record a raised floor. `scripts/tests/msrv.sh` checks all of that against a
+  stand-in cargo and rustup from `make script-test`, and also fails when the
+  README's new "Requires Rust 1.90 or newer" drifts from `Cargo.toml`. The
+  tree builds and all its tests pass on 1.90.0 today. See decision 118.
 
 - [ ] **Install story.**
   An install script and a Homebrew tap formula.

@@ -4450,3 +4450,58 @@ failure. `make deny` runs the same two steps locally but is not in
 `make check`: it needs `cargo-deny` installed and the network for the
 advisory database, and `make check` needs neither today.
 
+
+### 118. The MSRV job reads its toolchain from `Cargo.toml`, builds every target, and runs the tests
+
+The roadmap asked for a CI job pinned to the `rust-version` in `Cargo.toml`.
+Every other job runs the latest stable, so a newer standard-library API or a
+dependency bump that quietly raised the floor would have gone unnoticed until
+someone on an older Rust tried `make install`. Building it meant four choices.
+
+**Pinned by reading, not by copying.** The job's toolchain is whatever
+`scripts/msrv.sh --print` reads out of `cargo metadata --no-deps`, handed to
+`dtolnay/rust-toolchain@master` as its `toolchain` input. Writing `1.90` into
+`ci.yml` as well would have been a second copy that nothing keeps in step, and
+the first time someone raised `rust-version` the job would keep proving the old
+number. `cargo metadata` rather than a `grep` over TOML, because cargo is what
+reads the key in the end, and `--no-deps` keeps it offline. The runner's
+preinstalled cargo does that reading; any recent cargo prints the same field.
+
+**Build everything, then test.** The script runs `cargo +<msrv> build --locked
+--all-targets --all-features` and then `cargo +<msrv> test --locked
+--all-features`. Building the lib and binary alone is the narrow reading of
+"builds on 1.90", and it is what a user running `make install` meets. But
+tests and benches are code a contributor on the MSRV compiles too, and a test
+that only passes on a newer standard library is worth knowing about. `--locked`
+because the claim is about the `Cargo.lock` that ships; a fresh resolution
+might pick different versions and prove something nobody runs. The cost is one
+more full build per PR, about three and a half minutes cold on a laptop and
+less with `rust-cache`, which keys on the compiler version so it never mixes
+this job's artifacts with the stable ones.
+
+**A script, like the other CI steps with logic in them.** `scripts/msrv.sh`
+is what `make msrv` runs locally and what CI runs, the same shape as
+`bench-startup.sh` and `verify-glibc-floor.sh`. It takes cargo and rustup from
+`CARGO` and `RUSTUP`, so `scripts/tests/msrv.sh` checks which toolchain it
+builds on, with which flags, in which order, and what it says when it fails,
+without compiling anything; `make script-test` runs that in `make check` and
+CI's lint job. It asks rustup whether the toolchain is installed with
+`RUSTUP_AUTO_INSTALL=0`, so a contributor without it gets the exact
+`rustup toolchain install` line to run rather than a surprise download. A
+failed build or test is followed by what to do: use an older API, hold the
+dependency back with `cargo update --precise`, or raise `rust-version` and
+record why here. `make msrv` is not in `make check`, for the same reason
+`make deny` is not: it needs something beyond the stable toolchain `make check`
+asks for.
+
+**The README's copy is checked, not trusted.** `README.md` now says "Requires
+Rust 1.90 or newer" rather than pointing at `Cargo.toml`, because someone
+deciding whether to install from source should not have to open a manifest.
+That is a second copy of the number, so the script tests fail when it differs
+from `rust-version`.
+
+The job proves 1.90 is enough; it does not prove 1.90 is the lowest that
+works. `kube` 4.2 declares 1.89, and `cargo +1.89 check --all-targets` on this
+tree finished cleanly when tried while building this (a check, not a test
+run), so the declared floor is probably one release higher than it needs to
+be. Lowering it is the reviewer's call, not this job's.

@@ -23,7 +23,8 @@ cd eks-wrangler
 make install        # puts `eks` in ~/.cargo/bin
 ```
 
-Requires a stable Rust toolchain (see `rust-version` in `Cargo.toml`) and a
+Requires Rust 1.90 or newer (the `rust-version` in `Cargo.toml`, which CI builds
+and tests on) and a
 kubeconfig — `aws eks update-kubeconfig --name <cluster>` if you do not have one.
 
 ## Usage
@@ -657,13 +658,20 @@ make            # list available targets
 make test       # run the suite — no cluster or credentials needed
 make check      # format, lint, tests, docs; run this before pushing
 make deny       # audit dependencies against deny.toml (needs cargo-deny)
+make msrv       # build and test on the oldest supported Rust (needs rustup)
 ```
 
-`make check` is every CI job but one. The other, `make deny`, runs
+`make check` is every CI job but two. The first, `make deny`, runs
 [`cargo-deny`](https://github.com/EmbarkStudios/cargo-deny) over the dependency
 tree — known vulnerabilities, licences, duplicate versions, and where crates come
 from — and needs `cargo install --locked cargo-deny@0.20.2` plus network access
 for the advisory database. Run it whenever you add or bump a dependency.
+
+The second, `make msrv`, builds every target and runs the tests on the
+`rust-version` declared in `Cargo.toml`, the oldest Rust `eks` promises to build
+on. It needs that toolchain beside your usual one — the command tells you the
+`rustup toolchain install` line if it is missing. Run it when you raise a
+dependency or reach for a newer standard-library API.
 
 The test suite never touches AWS. See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)
 for the module map and testing approach, and [`CLAUDE.md`](CLAUDE.md) for the

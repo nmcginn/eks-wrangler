@@ -80,6 +80,33 @@ jobs:
             exit 1
           fi
 
+  # Builds every target and runs the tests on the rust-version Cargo.toml
+  # declares, so the MSRV is proven on every PR rather than claimed
+  # (decision 118). The other jobs all run the latest stable, which would
+  # never notice a newer API or a dependency bump that quietly raised it.
+  msrv:
+    name: MSRV
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      # Read from the manifest, by the runner's preinstalled cargo, rather
+      # than written down again here: raising rust-version is then a
+      # one-line change this job follows by itself.
+      - name: Read the declared MSRV
+        id: msrv
+        run: echo "version=$(scripts/msrv.sh --print)" >> "$GITHUB_OUTPUT"
+
+      - name: Install Rust ${{ steps.msrv.outputs.version }}
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.msrv.outputs.version }}
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build and test on the MSRV
+        run: scripts/msrv.sh
+
   # Advisories, licences, bans, and sources, per deny.toml (decision 117).
   # Its own job so a new advisory against an unchanged Cargo.lock — which can
   # land on any PR, whatever it touches — reads as exactly that, not as the
