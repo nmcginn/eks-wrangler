@@ -184,8 +184,11 @@ jobs:
             cp -r assets/. "dist/${staging}/"
           fi
           tar -czf "dist/${staging}.tar.gz" -C dist "${staging}"
-          # Checksums travel with the artifact so the install story can verify them.
-          shasum -a 256 "dist/${staging}.tar.gz" > "dist/${staging}.tar.gz.sha256"
+          # Checksums travel with the artifact so scripts/install.sh and the
+          # Homebrew formula can verify them. Written from inside dist/ so the
+          # file names the tarball alone, and `shasum -c` works on a user's
+          # download without editing the path.
+          (cd dist && shasum -a 256 "${staging}.tar.gz" > "${staging}.tar.gz.sha256")
 
       - name: Upload artifact
         uses: actions/upload-artifact@v7
@@ -219,3 +222,79 @@ jobs:
             dist/*.sha256
           generate_release_notes: true
           fail_on_unmatched_files: true
+
+  # Formula/eks.rb is tapped straight from master (decision 113), so a release
+  # is not installable through Homebrew until the formula names its tarballs
+  # and digests. Those exist only once the build above has run, so the
+  # formula is rendered here, from the checksums just published, and
+  # committed back (decision 119). It is also attached to the release, so a
+  # push that fails still leaves the rendered file one download away.
+  formula:
+    name: Update the Homebrew formula
+    needs: publish
+    # A pre-release tag (v0.3.0-rc.1) is published but not put in front of
+    # everyone who runs `brew upgrade`.
+    if: ${{ !contains(github.ref_name, '-') }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: master
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+
+      # The formula's `test do` block runs `eks --version` and expects the
+      # formula's version in it, so a tag that disagrees with Cargo.toml
+      # would publish a formula whose own test fails. The static build runs
+      # on this runner, so ask it rather than trusting the tag.
+      - name: Check the tag matches the binary's version
+        shell: bash
+        run: |
+          set -euo pipefail
+          tar -xzf dist/eks-x86_64-unknown-linux-musl.tar.gz -C dist
+          reported="$(dist/eks-x86_64-unknown-linux-musl/eks --version)"
+          if [ "$reported" != "eks ${GITHUB_REF_NAME#v}" ]; then
+            echo "::error::tag $GITHUB_REF_NAME was built from a binary reporting '$reported' — set version in Cargo.toml to ${GITHUB_REF_NAME#v} and tag again"
+            exit 1
+          fi
+
+      - name: Render Formula/eks.rb
+        run: |
+          mkdir -p Formula
+          scripts/render-formula.sh "$GITHUB_REF_NAME" dist > Formula/eks.rb
+          ruby -c Formula/eks.rb
+
+      - name: Attach the formula to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "$GITHUB_REF_NAME" Formula/eks.rb --clobber --repo "$GITHUB_REPOSITORY"
+
+      - name: Commit the formula to master
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Formula/eks.rb
+          if git diff --cached --quiet; then
+            echo "Formula/eks.rb already names $GITHUB_REF_NAME"
+            exit 0
+          fi
+          git commit --message "Update the Homebrew formula to $GITHUB_REF_NAME"
+          if ! git push origin HEAD:master; then
+            {
+              echo "### Homebrew formula not committed"
+              echo
+              echo "Pushing to master was refused. Until Formula/eks.rb is committed,"
+              echo "\`brew install\` keeps installing the previous release. The rendered file"
+              echo "is attached to the $GITHUB_REF_NAME release; commit it as Formula/eks.rb."
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "::error::could not push Formula/eks.rb to master — commit the eks.rb attached to the $GITHUB_REF_NAME release by hand"
+            exit 1
+          fi

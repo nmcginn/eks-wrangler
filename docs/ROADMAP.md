@@ -1948,12 +1948,30 @@ cluster.
   README's new "Requires Rust 1.90 or newer" drifts from `Cargo.toml`. The
   tree builds and all its tests pass on 1.90.0 today. See decision 118.
 
-- [ ] **Install story.**
+- [x] **Install story.**
   An install script and a Homebrew tap formula.
   *Acceptance:* `README.md` documents install for macOS and Linux; the script
   verifies checksums.
   *Decided (2026-09-24):* the formula lives here as `Formula/eks.rb` and is
   tapped by URL, not from a separate `homebrew-tap` repo. See decision 113.
+  Landed as `scripts/install.sh`, POSIX `sh` for `curl | sh`, and
+  `scripts/render-formula.sh`, which a new `formula` job in `release.yml`
+  runs on each non-pre-release `v*` tag to commit `Formula/eks.rb` to master
+  and attach it to the release. The script maps the machine to a release
+  target (static musl on x86_64 Linux, `-gnu` on aarch64 Linux, the native
+  build under Rosetta), downloads the tarball and its `.sha256`, and installs
+  nothing unless the digest matches and the binary starts; a missing
+  checksum or no `sha256sum`/`shasum` stops it rather than skipping the
+  check. It installs to `~/.local` by default (`--prefix`, `--version`,
+  `--target`, or their `EKS_*` variables), with the man page and bash, zsh,
+  and fish completions, asking the binary for them when the tarball has none.
+  `release.yml` now writes checksum files naming the bare tarball, so
+  `shasum -c` works on a hand download. `scripts/tests/install.sh` runs the
+  script under the system `sh` against stand-in `uname`, `curl`, and `wget`
+  serving fixture tarballs; `scripts/tests/render-formula.sh` loads the
+  rendered formula in a Ruby stand-in for Homebrew's DSL and checks each of
+  the four machines gets its own URL and digest. There is no
+  `Formula/eks.rb` until the first release is tagged. See decision 119.
 
 ---
 
