@@ -80,8 +80,10 @@ is separate. If you cannot write that sentence, it was not a follow-up.
 
 ## 5. Ship it
 
-Tick the completed task in `docs/ROADMAP.md`, and add the follow-ups that
-survived the audit. Record notable choices in `docs/DECISIONS.md`. Then commit,
+Move the completed task to **Done** in `docs/ROADMAP.md` as one line with its
+decision numbers, and add the follow-ups that survived the audit. Record notable
+choices in `docs/DECISIONS.md`: what was decided and why, in a few lines. The
+long explanation belongs in the PR description, not in either file. Then commit,
 push, and open a PR against `master` using the repository's PR template.
 
 The PR description is the handover — the reviewer has no other context. Say what

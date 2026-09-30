@@ -1,4576 +1,952 @@
 # Decisions
 
-Short records of choices that would otherwise get re-litigated. Append as they
-are made; amend rather than delete when one is reversed.
+Short records of choices that would otherwise get re-litigated. Each says what
+was decided and why, in a few lines; the PR that landed it has the detail.
+Append as they are made; amend rather than delete when one is reversed. Code
+comments cite these by number, so numbers are never reused or renumbered.
 
 ---
 
 ### 1. Rust, with `ratatui` for the interface
 
-Startup time and steady-state CPU are features here, and a garbage-collected
-runtime makes a sub-50 ms budget a fight. Rust also ships a single static binary,
-which makes the install story trivial. `ratatui` is the mature immediate-mode TUI
-library and its `TestBackend` lets rendering be unit-tested — decisive, given how
-much weight this project puts on validation.
+Startup time is a feature, and a GC runtime makes a sub-50 ms budget a fight.
+Rust ships one static binary. `ratatui`'s `TestBackend` lets rendering be
+unit-tested.
 
 ### 2. Thin binary, fat library
 
-`main.rs` parses arguments and dispatches; everything else lives in the library.
-Code in a binary crate is awkward to test, so keeping `main.rs` trivial is what
-makes the rest testable at all.
+`main.rs` parses arguments and dispatches; everything else lives in the library,
+because code in a binary crate is awkward to test.
 
 ### 3. Panics are denied by lint
 
-`unwrap`, `expect`, and `panic!` are `deny` in `Cargo.toml`. A panic inside a TUI
-leaves the terminal in raw mode with no echo — the user's shell appears broken.
-Every panic is a bug we ship to someone's terminal, so the compiler stops them.
-Tests opt out locally.
+`unwrap`, `expect`, and `panic!` are `deny`: a panic in a TUI leaves the terminal
+in raw mode. Tests opt out locally.
 
 ### 4. Kubeconfig writes go through the untyped YAML tree
 
-We model only the handful of kubeconfig fields we display, but a real config also
-holds exec credential plugins, extensions, and proxy settings. Deserialising into
-our types and re-serialising would silently delete all of it and break the user's
-authentication. So reads use the typed view and writes mutate
-`serde_yaml_ng::Value` in place, touching only `current-context`.
-
-Writes go to a sibling temp file and are renamed into place, because a partial
-write to a kubeconfig is a genuinely bad afternoon.
+Reads use our typed view; writes mutate `serde_yaml_ng::Value` in place, touching
+only `current-context`, so exec plugins, extensions and proxy settings we don't
+model survive. Writes go to a sibling temp file and are renamed into place.
 
 ### 5. Show cluster names, not ARNs
 
-`aws eks update-kubeconfig` names contexts after the cluster ARN. It is precise
-and unreadable. `ClusterView` derives a short name, region, and account from the
-ARN; the UI shows `prod (us-east-1)` and keeps the ARN for when it is asked for.
-`eks use` accepts either, and refuses to guess when a short name is ambiguous.
+`ClusterView` derives short name, region and account from the ARN; the UI shows
+`prod (us-east-1)`. `eks use` accepts either, and refuses to guess when a short
+name is ambiguous.
 
 ### 6. No async runtime until something awaits
 
-`tokio` was added during scaffolding and removed again before the first commit:
-nothing in the tool awaits yet, and an unused runtime is build time and binary
-size for nothing. The first task on the roadmap adds it back deliberately,
-together with the Kubernetes client that needs it.
+`tokio` was removed from the scaffold until the first task that needed it (the
+Kubernetes client) added it back deliberately.
 
 ### 7. `serde_yaml_ng` instead of `serde_yaml`
 
-`serde_yaml` is archived and unmaintained. `serde_yaml_ng` is the maintained fork
-with the same API.
+`serde_yaml` is archived; `serde_yaml_ng` is the maintained fork with the same API.
 
 ### 8. One reviewable pull request per night
 
-Work lands as a nightly PR sized for a human to review over coffee. The
-constraint is the point: it forces tasks to be split into independently valuable
-pieces, keeps `master` releasable, and keeps a human in the loop on every change.
-See `CLAUDE.md`.
-
-*Amended after #15.* The size was stated as 200–500 lines of diff, which measured
-the wrong thing. Tests here run two to four times the length of the code they
-cover, so a 500-line ceiling on the *total* left barely a hundred lines for the
-change itself, and the loop began splitting on the line count rather than at a
-seam. #15 is the example: it landed a note saying an ordering had ranked nothing
-and deferred *pointing that note at the fix* to a second PR — one thought cut in
-half, and half of it below the bar priority 3 sets for error messages. The budget
-was set to 200–400 lines of production change with tests on top, and a slice had
-to be complete before it was asked to be small. Deferral needs a seam to happen
-at: an untouched surface, an open design question, or a night's work of its own.
-
-*Amended again.* The replacement number turned out to be the same failure mode
-one size down: PRs were still being shaped to land under a ceiling rather than
-to finish the thought, and the remainder kept going back onto the roadmap
-instead of into the PR — the roadmap grew faster than it shrank. There is no
-line target now, in this decision or in `CLAUDE.md`. A PR is sized by whether
-it is a complete, reviewable change; nothing here caps how large that is
-allowed to be.
+Work lands as one nightly PR a human reviews over coffee, keeping `master`
+releasable and a human on every change. *Amended twice:* line-count targets
+(200–500, then 200–400) made the loop split on size instead of at a seam. There
+is no line target; a PR is sized by being a complete change. See `CLAUDE.md`.
 
 ### 9. The async runtime is built per command, not around `main`
 
-`#[tokio::main]` would build a runtime for `eks contexts` and `eks use`, which
-never await anything — pure cost against a 50 ms startup budget. Instead
-`commands::block_on` builds a current-thread runtime for the commands that talk
-to a cluster. A one-shot command spends its life waiting on a single request, so
-worker threads would only add startup time.
+`commands::block_on` builds a current-thread runtime only for commands that talk
+to a cluster; `eks contexts`/`eks use` never pay for one.
 
 ### 10. `kube` with `rustls`, `ring`, and `http-proxy`
 
-`rustls` over OpenSSL because a single static binary is the install story, and
-linking the system OpenSSL undoes that. `ring` has to be named explicitly: with
-`default-features = false` no crypto provider feature reaches `rustls`, and it
-then *panics* at the first TLS handshake asking to be told which provider to
-use. `http-proxy` because `kube` refuses to build a client at all when
-`HTTPS_PROXY` is set without it, and corporate proxies in front of EKS are
-common enough that failing there would be a support burden.
+`rustls` keeps the binary static. `ring` must be named explicitly or `rustls`
+panics at the first handshake. `http-proxy` because `kube` refuses to build a
+client when `HTTPS_PROXY` is set without it.
 
 ### 11. Cluster failures are translated at the boundary
 
-`kube` reports an expired SSO session as `ApiError: ... (Status { code: 401 })`.
-Correct, and useless to the person who needs to run `aws sso login`.
-`k8s::client::explain` classifies the error and returns a sentence naming the
-cluster and the next action; the raw error goes to `tracing::debug`, so `-v`
-still has it. The classification is deliberately coarse — five kinds — because
-an arm only earns its place if it leads to advice worth printing, and a
-plausible-but-wrong suggestion costs more time than an honest raw error.
-
-For the same reason the default log filter turns `kube_client` off: it logs
-every failed request at ERROR, and printing that above our own sentence means
-the user reads the unhelpful one first.
+`k8s::client::explain` turns a `kube` error into a sentence naming the cluster
+and the next action; the raw error goes to `tracing::debug`. Kinds stay coarse:
+an arm earns its place only with advice worth printing. The default log filter
+silences `kube_client`, which logs failures at ERROR above our message.
 
 ### 12. Times come from `jiff`, via `k8s-openapi`
 
-`k8s-openapi` 0.28 exposes timestamps as `jiff::Timestamp` and re-exports the
-crate. We use that re-export rather than depending on `jiff` directly, so the
-version can never drift from the one the API types are built against.
-
-`k8s-openapi`'s `latest` feature picks the newest Kubernetes API version it
-knows. The node fields we read — conditions, `nodeInfo`, object metadata — have
-been stable for many releases and are all optional in the generated types, so an
-older EKS control plane deserialises fine. Pin an explicit `v1_NN` feature if we
-ever reach for an API that only exists in newer releases.
+Use `k8s-openapi`'s `jiff` re-export so the version can't drift. The `latest`
+feature is fine because the fields read are old and optional; pin `v1_NN` if we
+ever need a newer-only API.
 
 ### 13. Quantities are integer thousandths in an `i128`
 
-`k8s-openapi` models a resource quantity as a newtype over `String`, so the
-arithmetic is ours. `k8s::quantity::Quantity` holds the value as thousandths of
-a unit — millicores for CPU, thousandths of a byte for memory — in an `i128`.
-
-Integer thousandths rather than an `f64` because a millicore is the smallest
-unit anyone schedules against, and a quantity that survives a round trip
-unchanged is far easier to reason about than one that is `3.9199999999999995`.
-`i128` because thousandths of an exbibyte overflow an `i64`, and `Ei` is in the
-grammar whether or not anyone has the hardware.
-
-The cost is that values finer than a thousandth — a `1n` extended resource —
-round to the nearest thousandth. Nothing displayed is measured that finely, and
-carrying arbitrary precision to hide a rounding nobody can see is machinery
-without a payer.
-
-Two things are deliberately strict. A capital `K` is rejected: the grammar only
-has the lowercase one, and so does `kubectl`, so accepting it would make us the
-odd tool out. And a number too large to represent is `TooLarge` rather than
-`Malformed`, because telling a user their perfectly well-formed value is not a
-quantity would send them looking for a typo that is not there.
+`Quantity` holds thousandths of a unit so values round-trip exactly; `i128`
+because thousandths of an exbibyte overflow `i64`. Sub-thousandth values round.
+Capital `K` is rejected (not in the grammar); an unrepresentable number is
+`TooLarge`, not `Malformed`.
 
 ### 14. Memory is shown in binary units, unlike `kubectl`
 
-`kubectl` prints allocatable memory exactly as the node reported it —
-`7134420Ki`. Precise, and unreadable at a glance, which is the only thing a
-capacity column is for. `quantity::memory` picks the largest binary unit that
-leaves a legible number and shows one decimal: `6.8Gi`. Everything is shown in
-binary units even when the node used a decimal suffix, because a column mixing
-`1G` and `1Gi` is worse than one that is consistently approximate.
-
-The node table shows `allocatable/capacity` in one cell rather than two columns.
-The gap between the two is the kubelet's reservation, which on a small EKS node
-is a surprisingly large slice, and putting the numbers next to each other is
-what makes that visible without a second column of arithmetic.
+`quantity::memory` picks the largest binary unit with one decimal (`6.8Gi`),
+always binary. The node table shows `allocatable/capacity` in one cell so the
+kubelet reservation is visible.
 
 ### 15. Pod requests follow the scheduler, not the obvious sum
 
-`pods::effective_requests` is `max(sum of app containers and sidecars, the peak
-init container)` plus pod overhead, per resource. Every term is there because
-the scheduler reserves it, and the naive "add up every container" is wrong in
-both directions: it double-counts init containers that have already exited, and
-it misses the sandbox overhead a RuntimeClass declares.
-
-The subtle one is sidecars — init containers with `restartPolicy: Always`. They
-never exit, so they belong in the steady-state sum *and* in the footprint of
-every init container that starts after them. Order matters: an init container
-listed before a sidecar never overlaps with it. That ordering is what the
-`an_init_container_before_a_sidecar_is_not_charged_alongside_it` test pins down,
-and it is the clause most likely to be broken by a well-meaning simplification.
-
-The maximum is taken per resource rather than by picking one "largest"
-container, because a pod with a CPU-hungry init container and a memory-hungry
-one needs the peak of each.
-
-Terminating pods still count. They hold their place on the node until the
-kubelet confirms they are gone, and a draining node that reads as empty is a
-worse lie than one that reads as full for a few seconds longer than it is.
+`effective_requests` = max(app containers + sidecars, peak init container) +
+overhead, per resource. A sidecar counts in every init container that starts
+after it, not before (pinned by a test). Terminating pods still count.
 
 ### 16. A failed pod listing empties two columns rather than the command
 
-`eks nodes` now issues two listings. They are concurrent, so the command costs
-one round trip rather than two, and they are not equally fatal: a node listing
-that fails ends the command, while a pod listing that fails leaves `CPU REQ` and
-`MEM REQ` reading `-` with a footnote explaining why.
-
-The asymmetry is deliberate. Read-only roles that cover nodes but not pods in
-every namespace are common, and throwing away a node table that we already have
-in hand would be a worse answer than an honest partial one. `-` and `0 (0%)` are
-kept visibly different for the same reason: "we could not find out" and "nothing
-is running here" are different facts, and a shared rendering would quietly turn
-one into the other.
+Node and pod listings run concurrently. A failed node listing is fatal; a failed
+pod listing leaves `CPU REQ`/`MEM REQ` as `-` with a footnote (RBAC often allows
+nodes but not all pods). `-` and `0 (0%)` stay visibly different.
 
 ### 17. `eks pods` reimplements `kubectl`'s STATUS derivation, faithfully
 
-The word in `kubectl`'s `STATUS` column is not a field. `pod.status.phase` only
-ever holds `Pending`, `Running`, `Succeeded`, `Failed`, or `Unknown`, and none of
-those is what a person is looking for — `CrashLoopBackOff`, `Init:0/2`,
-`Terminating`, `Evicted` and `Completed` are all derived from the container
-statuses underneath by a specific, order-dependent walk.
-
-We copy that walk rather than invent a clearer one. People read a `STATUS`
-column by habit, and a tool that says something subtly different from the
-`kubectl` next to it makes them stop and check — which costs more than any
-improvement in wording would save. The parts that look like bugs are kept on
-purpose and each carries a test: the app containers are walked *backwards* so
-the first container in the spec is the one named; a started sidecar is skipped
-by the init walk but still counts towards the ready fraction; a plain init
-container's restarts are dropped from the total once initialisation is over,
-while a sidecar's survive; and `Initialized` being true ends the init phase even
-when an init container is still reporting.
-
-Two places where a judgement was needed rather than copied:
-
-- **Severity.** `theme::Severity` has to come from somewhere, and the mapping
-  lists the calm words and the settling ones and treats *everything else* as a
-  failure. That way round on purpose: the set of things that can go wrong with a
-  pod grows with every Kubernetes release, and a reason this tool has never
-  heard of should arrive coloured as a problem rather than quietly as fine.
-  `1/2 Running` is a warning, not a success, for the same reason.
-- **An empty status.** A pod caught between admission and its first kubelet
-  report derives to an empty string, where `kubectl` prints nothing. We print
-  `Unknown`, because a blank cell in a table reads like a rendering bug rather
-  than a fact about the pod.
+People read STATUS by habit, so we copy kubectl's order-dependent walk,
+including its quirks, each tested. Severity lists the calm and settling words and
+treats everything else as a failure, so unknown reasons show as problems. An
+empty status prints `Unknown`.
 
 ### 18. `eks pods` lists finished pods; the node totals do not
 
-`k8s::pods` now has two fetches. `fetch` filters the terminal phases out
-server-side, because it exists to total what is *booked* on a node and a
-completed Job holds nothing. `fetch_scope` filters nothing, because the
-`Completed` Job that ran an hour ago and the `Evicted` pod that explains the
-morning are exactly what someone runs `eks pods` to find.
-
-`--namespace` and `--all-namespaces` are rejected together rather than one
-silently winning. kubectl lets `-A` override, which leaves a user reading a list
-they did not ask for and believing they did; a one-line error naming both flags
-costs less than that. And a `403` on `--all-namespaces` adds a sentence
-suggesting `-n <namespace>`, because access bound to a single namespace is the
-usual cause and the cluster-wide list is the only call it cannot serve.
+`fetch` (node totals) filters terminal phases server-side; `fetch_scope` (the
+listing) keeps them. `-n` with `-A` is an error, not silent override. A `403` on
+`-A` suggests `-n <namespace>`.
 
 ### 19. Selectors are parsed here, not handed to the API server raw
 
-`eks pods -l` and `--field-selector` could each be a one-line pass-through:
-take the string, call `ListParams::labels`, let the API server judge it. We
-parse and validate them ourselves in `k8s::selector` first, for the same reason
-`k8s::quantity` reimplements the quantity grammar rather than trusting a parse
-downstream.
-
-A selector is a request, not a guarantee. A malformed one comes back as a `400`
-whose body talks about parse offsets in a string the user cannot see, arriving
-*after* the credential helper has run and a round trip has happened. Validating
-before connecting turns that into an instant, local error that quotes the part
-that is wrong — `"env in"` is missing its value list — which is the whole
-acceptance criterion for the task and, more to the point, the difference between
-a typo you fix in a second and one you debug against a cluster.
-
-Parsing also lets us emit a *canonical* form: `==` folded to `=`, whitespace
-normalised, so `app == api` and `app=api` reach the wire identically. The parser
-is a pure function with no Kubernetes types in its signature, so the two
-grammars — label selectors with set membership and existence, field selectors
-with equality only — are covered by a fixture table rather than by provoking a
-cluster.
-
-Two smaller calls:
-
-- **kube's `Selector` type is not reused.** `kube::core::Selector` models a
-  parsed selector but has no parser from the string form a user types, and its
-  `Display` sorts and de-duplicates set values. We keep our own tiny
-  representation so `env in (prod, staging)` round-trips in the order it was
-  written, which makes a canonicalised selector recognisable rather than
-  reshuffled.
-- **A blank selector is absent, not empty.** `-l ''` folds to `None` rather than
-  being sent as an empty label selector, because an empty selector string is a
-  thing some servers treat differently from no selector at all, and "filter by
-  nothing" is what the user meant. An empty *filtered* listing says which
-  selector emptied it, so a live namespace a filter cleared does not read like an
-  empty one.
+`k8s::selector` validates `-l`/`--field-selector` before connecting, so a typo is
+an instant local error quoting the bad part, and emits a canonical form. `kube`'s
+`Selector` isn't reused (no parser, reorders values). A blank selector is `None`.
+An empty filtered listing names the selector that emptied it.
 
 ### 20. `NodeMetrics` is hand-written, and the fetch sits behind a trait
 
-`metrics.k8s.io` is not part of Kubernetes. It is an aggregated API served by
-metrics-server, an optional add-on that EKS does not install for you, and
-`k8s-openapi` only generates the core API — so there is no `NodeMetrics` type to
-import. We write one: a serde struct plus a `kube::Resource` impl whose group,
-version, and plural are the whole content of the decision, because they are what
-put `/apis/metrics.k8s.io/v1beta1/nodes` on the wire. Get them wrong and every
-cluster looks like it has no metrics-server, which is why there is a test that
-asserts the URL rather than trusting the four strings to be read carefully.
-
-Only `metadata` and `usage` are modelled. `serde` ignores the rest by default, so
-a newer metrics-server adding a field cannot break a listing.
-
-Fetching goes behind a `Source` trait. Not for indirection's sake — there is
-exactly one real implementation, on `Client` — but because the answers worth
-testing are ones a cluster will not give on demand: no metrics-server at all, a
-node the sampler has not reached, a reading that will not parse. A fake source
-makes each of those a fixture. The trait returns `impl Future + Send` rather than
-using `async fn`, so the future can go into the `tokio::join!` beside the node
-and pod listings.
+`metrics.k8s.io` isn't in `k8s-openapi`, so we write the type; a test asserts
+the URL. Only `metadata`/`usage` are modelled. A `Source` trait exists so "no
+metrics-server", "not sampled" and "won't parse" are fixtures.
 
 ### 21. Absent usage costs two columns, not two columns of dashes
 
-A failed *pod* listing leaves `CPU REQ` and `MEM REQ` reading `-` (decision 16).
-A missing metrics API drops `CPU USE` and `MEM USE` from the table entirely.
-
-The asymmetry is about which case is normal. A pod listing failing is unusual —
-a specific RBAC shape — so the columns stay and say they could not be filled.
-metrics-server being absent is the *default* on a fresh EKS cluster, and a
-default that permanently adds two dead columns to everyone's node table is a tax
-on the common case to explain the uncommon one. The columns appear when there is
-something to put in them, and a footnote naming what to install carries the news
-otherwise.
-
-The columns are all-or-nothing across a listing, not per row: one node the
-sampler has not reached yet reads as `-` beside its neighbours rather than
-collapsing the columns for everybody. So the decision is `any`, and it is a pure
-function over the rows.
+No metrics-server is the EKS default, so `CPU USE`/`MEM USE` are dropped with a
+footnote naming what to install, rather than showing dead columns. The choice is
+`any` row across the listing, not per row.
 
 ### 22. Usage and requests share one type, and one denominator
 
-`nodes::Share` — what was `Requested` — now carries both what the pods on a node
-have booked and what the node is actually burning. One type rather than two
-near-identical ones, because the thing that would drift if they were separate is
-the *classification*: `Severity::from_utilisation` deciding that 90% is alarming
-has to mean the same thing in both columns or the table teaches the user nothing.
-
-Both divide by **allocatable**, not capacity. For requests that is simply
-correct — allocatable is what the scheduler hands out. For usage it is a choice:
-a container can and does burn into the kubelet's reservation, so usage can read
-above 100%, and it is measured against a number that is not a hard ceiling. It is
-still the right denominator here, because the two columns sit side by side and a
-reader comparing 80% booked against 40% used is comparing fractions of the same
-thing. A utilisation *bar* asks a different question and wants capacity
-underneath it; that is on the roadmap rather than smuggled in here.
-
-Usage that cannot be read stays `None` rather than folding to zero, unlike a
-missing container request — which really is zero, because a container that asked
-for nothing has asked for nothing. A node with no usage reading is a node we have
-not heard from, and drawing that as an idle machine would be an invention.
+`nodes::Share` carries both, so severity classification can't drift between
+them. Both divide by allocatable (usage may exceed 100%). Unreadable usage is
+`None`, never zero.
 
 ### 23. A pod's usage is all of its containers or none of them
 
-`metrics.k8s.io` reports node usage as one map and pod usage as a *list* of
-per-container maps, so `metrics::pod_usage` has to add the containers up. The
-decision is what to do when one of them cannot be read — absent, or a figure
-that will not parse.
-
-We give up on the whole pod for that resource. The alternative, summing the
-containers that did report, produces a number that is smaller than the truth and
-completely indistinguishable on screen from a correct one: `250m` beside a pod
-whose sidecar was not counted looks exactly like `250m`. A `-` is a worse-looking
-cell and a better answer, because it is the only one that cannot mislead. The
-resources are decided independently, so a pod missing a CPU reading still shows
-its memory.
-
-A pod with *no* containers in the sample is unknown for the same reason it is not
-zero elsewhere (decision 22): that is what metrics-server sends for a pod it has
-registered but not yet scraped, and a fresh pod drawn as idle is exactly the
-wrong answer during an incident.
+If any container's reading is missing, that resource is `-` for the pod: a
+partial sum is indistinguishable from a correct one. Resources are decided
+independently. A pod with no containers sampled is unknown, not idle.
 
 ### 24. The pod metrics listing takes the label selector but not the field one
 
-`eks pods -l app=api` narrows the metrics request too — the aggregation layer
-filters on labels like any other API server, and on a large cluster that is worth
-the payload. `--field-selector` is deliberately not passed on: metrics-server
-does not implement field filtering, and the fields people select on
-(`status.phase`, `spec.nodeName`) are not on a `PodMetrics` in the first place.
-Sending one would ask a server to filter on something it cannot see.
-
-The columns still follow both selectors, because usage is *joined* onto the pod
-rows by namespace and name rather than being a listing in its own right. Only
-pods the API server already returned — after both selectors — have a row that a
-figure can land on. Extra samples in the response simply have nowhere to go.
-
-That join is keyed on namespace *and* name, not name alone: `kube-system/coredns`
-and `payments/coredns` are ordinary, and `-A` puts them in one table.
+metrics-server filters on labels but not fields, so only `-l` is passed on.
+Usage is joined onto pod rows by namespace and name, so both selectors still
+apply to what's shown.
 
 ### 25. Live usage is not fatal to `eks pods`
 
-Same rule as the node table (decision 21), for the same reason: metrics-server is
-an add-on EKS does not install for you, so its absence is the default rather than
-an error. The pod listing is the fatal request; a failed metrics request costs
-`CPU` and `MEMORY` and earns a footnote saying what to install. The two requests
-go out together in a `tokio::join!`, so the columns cost one round trip's worth of
-waiting rather than a second one.
+Same rule as decision 21: a failed metrics request drops `CPU`/`MEMORY` and adds
+a footnote. Both requests go out in one `tokio::join!`.
 
 ### 26. Restart recency is carried by the count, not gathered beside it
 
-`kubectl` prints `RESTARTS` as `9 (5m ago)`, and the parenthesis is the half that
-answers the question — a count with no recency cannot tell a pod that crashed
-nine times last Tuesday from one crashing right now.
-
-The date is the newest `lastState.terminated.finishedAt`, and the interesting
-decision is *which* containers it is taken across. It is exactly the set whose
-restarts survived into the count: during initialisation, every init container
-walked; afterwards, the sidecars plus the app containers, with the plain init
-containers' history dropped. So `Init.last_restart` and `Init.sidecar_last_restart`
-shadow `Init.restarts` and `Init.sidecar_restarts` line for line, and the
-assignment that discards the init counts discards their timestamps in the same
-statement. Gathering the timestamp separately — a `max` over all the statuses —
-would be shorter and would let a finished init container date a count it is no
-longer part of, showing `3 (1m ago)` for a pod whose last real restart was
-twenty minutes back.
-
-A pod that has never restarted keeps a bare `0` rather than gaining a `(— ago)`.
-Most rows in a healthy listing are that row, and there is genuinely nothing to
-date. So is a restart with no `finishedAt`: the count is real, and inventing a
-moment for it would not be.
-
-The formatted age lives on `PodRow` rather than the `Timestamp` it came from, for
-the same reason `age` does — every row in a listing is rendered against the one
-instant handed to `PodRow::from_pod`, so rendering never reaches for a clock.
+`9 (5m ago)` dates from the newest `finishedAt` across exactly the containers
+whose restarts are in the count, so dropped init-container history drops its
+timestamps too. Zero restarts, or no `finishedAt`, prints a bare count. The
+formatted age is computed against one instant per listing.
 
 ### 27. Ordering is a function over rows, and the count is only the tie-break
 
-`--sort restarts` sorts `PodRow`s, not `Pod`s. That is what lets the whole
-ranking be a fixture table — the awkward cases are two `i32`s and two
-`Option<Timestamp>`s rather than container statuses arranged to produce them —
-and it is also what will let the dashboard reorder a listing it already has in
-memory without going back to the API server.
-
-The key is *when*, not *how many*. Sorting by restart count reads like the
-obvious thing and answers the wrong question: it puts the pod that failed two
-hundred times last week above the one that started crashing a minute ago, which
-during an incident is precisely backwards. The count survives as the tie-break,
-where it decides between two containers killed by the same node problem at the
-same instant.
-
-Three ranks, not two. A restart with no `lastState.terminated.finishedAt`
-(decision 26) is neither dated nor absent: the count is real, so sorting it in
-among the healthy pods would bury a genuine crash, but there is no moment to
-rank it against the dated ones, and inventing one — treating it as the epoch, or
-as now — would put a pod somewhere it has not earned. It sits between the two,
-in its own rank.
-
-Every ordering is total, ending in namespace-then-name. An ordering that is only
-*nearly* total shows up as a listing that changes shape between two runs of the
-same command against an unchanged cluster, which reads as a bug in the cluster
-rather than in the sort.
-
-`PodRow` therefore carries both `restart_age` (formatted, for rendering) and
-`last_restart` (the instant, for ordering). They are redundant on purpose:
-`restart_age` rounds, so two pods that crashed forty seconds apart both read
-`5m` and cannot be ordered by what is on screen, while rendering still must not
-reach for a clock of its own.
+Sorts operate on `PodRow`s, so rankings are fixture tables and the dashboard can
+reorder in memory. `restarts` ranks by *when*, count as tie-break. An undated
+restart has its own rank between dated and none. Every ordering is total,
+ending in namespace-then-name. `PodRow` keeps both formatted and raw times.
 
 ### 28. `--sort` is a `clap::ValueEnum` on the domain type
 
-`k8s::pods::Order` derives `ValueEnum` itself rather than `cli.rs` defining a
-parallel enum and converting. The alternative is a translation table that can
-drift, guarding a boundary that is not really there: which order to print a
-listing in is a presentation choice in both directions, not a Kubernetes concept
-being adapted for the command line. Deriving it there also means clap owns the
-"that is not one of the orders" message, listing the ones that are.
+`Order` derives `ValueEnum` itself; no parallel CLI enum to drift, and clap
+writes the "not one of" message.
 
 ### 29. `eks pods`'s flags travel as a struct
 
-`commands::pods::list` takes a `Request` rather than eight positional arguments.
-Past seven, `clippy::too_many_arguments` is denied here, and the lint is right
-for the usual reason: four of the flags are `Option<&str>` and a mistake that
-swaps two of them type-checks. The struct is raw command-line text — validating
-it is still `list`'s first job, before it connects to anything.
+`commands::pods::list` takes a `Request` struct; `too_many_arguments` is denied,
+and swapped `Option<&str>`s would type-check.
 
 ### 30. Reversing an order does not reverse its unrankable tail
 
-`--sort-reverse` flips the comparison between rows an order can rank, and leaves
-everything else where it was. A pod that has never restarted, one with no
-`creationTimestamp`, one metrics-server has not sampled — none of these move out
-of the tail when the listing is reversed.
-
-Reversing the whole comparison would be simpler and is wrong. "Least CPU" is a
-question about which pod is idle; the pod with no sample is not idle, it is
-unmeasured, and putting it first answers a question nobody asked while burying
-the one they did. The same argument holds for `restarts`, where it would open a
-reversed listing on ninety-nine healthy pods.
-
-So each order maps a row to a private `Rank`, either `By(key)` or
-`Unranked(tier)`. Only `By` is flipped; `Unranked` always sorts after `By` and
-its tiers keep their own order. The tiers exist because `restarts` has two kinds
-of blank — a restart the kubelet recorded no `finishedAt` for is a real crash
-with no moment attached, and belongs above a pod that has never restarted at all
-— and reversal must not collapse them either.
-
-The alphabetical tie-break at the end is never reversed. It exists to make every
-order total rather than to say anything, and reversing it would mean the two
-directions of one order disagreed about rows they both consider equal.
+Each order maps a row to `Rank::By(key)` or `Rank::Unranked(tier)`. Only `By` is
+flipped; unranked rows stay last in their tier order (an unmeasured pod is not
+"least CPU"). The alphabetical tie-break is never reversed.
 
 ### 31. `--sort age` puts the youngest pod first
 
-The opposite way round from `kubectl --sort-by=.metadata.creationTimestamp`,
-which prints oldest first. The rule this tool follows is that every order but
-`name` leads with the row the person went looking for — the newest restart, the
-largest usage figure — and during an incident the question behind `AGE` is "what
-changed", which the youngest pod answers. One rule across five orders is worth
-more than matching another tool on one of them, and `--sort-reverse` is the
-`kubectl` reading for anyone who wants it. Both the `--help` text and the README
-say so, because a sort that runs the way you did not expect is indistinguishable
-from a broken one.
+Every order but `name` leads with the row you went looking for; for age that's
+"what changed". Opposite to kubectl; `--sort-reverse` gives kubectl's order.
+Documented in `--help` and the README.
 
 ### 32. `--sort-reverse` rather than a `-` prefix on the order
 
-`--sort -cpu` was the other candidate. It loses: clap has to be told to allow
-hyphenated values before it will accept it, `--sort -cpu` and `--sort=-cpu`
-behave differently once it is, and the accepted-values list clap prints on a typo
-stops matching what the flag really takes. A separate boolean flag composes with
-every order for free, shows up in `--help` next to the one it modifies, and needs
-no parsing at all.
+`--sort -cpu` needs clap hyphen-value handling and breaks its value list; a
+boolean flag composes with every order.
 
 ### 33. `Direction` and `Rank` moved up to `k8s::order`; the keys did not
 
-`eks nodes --sort` needs the same two rules `eks pods --sort` already had — which
-way round an order runs, and that a row an order cannot rank stays in the tail
-under either direction — and those rules are worth exactly nothing if the two
-tables can drift apart on them. So `Direction`, `Rank`, and the comparison that
-keeps ranked and unranked rows apart now live in `k8s::order`, with the rule
-written down once in its module docs and asserted on the primitive rather than
-on one listing's rows.
-
-The keys stayed put. A node has no restart count and a pod has no allocatable
-capacity, so each listing keeps its own `Order` enum, its own `sort`, and its own
-rank functions. A shared trait over "things that can be sorted" would have bought
-nothing here: the only code it would have deduplicated is the four-line `sort`
-that appends the alphabetical tie-break.
+The direction and unranked-tail rules are shared in `k8s::order`; each listing
+keeps its own `Order` enum and rank functions (no shared "sortable" trait).
 
 ### 34. The node orders rank by share; the pod orders rank by the figure
 
-`eks pods --sort cpu` ranks by the figure a pod is using rather than by its share
-of what it asked for. That began as "there is nothing else" — a pod's usage had
-no denominator then — and decision 40 has since given it one, so the choice is
-now a choice, and it stands. A node's denominator is the machine, which makes
-95% of a small node genuinely comparable to 30% of a large one. A pod's
-denominator is whatever somebody typed into a manifest, so a pod at 400% of a 10m
-request is burning 40m and is nobody's problem, while one at 60% of four cores is
-eating the node. The share is a real question about that pod's own sizing, and
-it is a different question from the one `--sort cpu` is asked — which is why a
-share ordering is a roadmap entry rather than a correction to this one.
-
-Doing the same for a node would answer the wrong question: the node table already shows every figure
-as a percentage of allocatable, and a two-core node at 95% is closer to trouble
-than a sixty-four-core node burning twenty times as much at 30%. So the node
-orders rank by `Share::ratio`.
-
-That gives node usage a second kind of blank, and the `Rank::Unranked` tiers
-`restarts` needed are what carry it: a node with a figure but no allocatable to
-divide it by (one still registering) sorts ahead of a node with no figure at all
-(one metrics-server has not reached), and both stay behind every node that has a
-percentage. A node reporting zero allocatable is in the first tier rather than at
-the top of the listing as an infinity, because `Quantity::ratio_of` refuses to
-divide by zero.
-
-`Share::ratio` is an `f64`, and a sort key has to be `Ord`, so the key is a
-private newtype ordered by `f64::total_cmp`. That is total over every `f64` there
-is, including the ones a nonsensical reading from the API server could produce —
-a strange figure then sorts strangely instead of making the comparison
-inconsistent and the whole sort meaningless.
+A node's denominator is the machine, so node orders rank by `Share::ratio`. A
+pod's is whatever a manifest says, so `--sort cpu` ranks by the figure (share
+orderings came separately). Node usage has two unranked tiers: a figure with no
+allocatable, then no figure. The `f64` key sorts by `total_cmp`.
 
 ### 35. `--sort status` puts the unknown node above the cordoned one
 
-Node health has four states and `--sort status` has to put them in some order.
-`NotReady` leads, and `Ready` is last; the argument is about the middle. A node
-whose kubelet has stopped reporting (`Unknown`, usually a node that has only just
-registered — or one that is about to be a problem) sits above a cordoned one,
-because a cordoned node is a node somebody deliberately took out of service and
-the accident belongs above the intention. Nothing is unranked under this order —
-every node has a status — so unlike the usage orders it reverses completely.
+`NotReady`, `Unknown`, cordoned, `Ready`: the accident ranks above the
+intention. Nothing is unranked, so it reverses completely.
 
 ### 36. A reordered listing names its order; the default one stays silent
 
-`eks nodes --sort cpu` and `eks nodes` print the same columns, the same widths
-and the same rows, and to anyone who did not type the command they are the same
-table. `--sort cpu --sort-reverse` is worse: the unrankable tail stays at the
-bottom under either direction, so a reversed listing looks like the ordering
-running the other way with a few odd rows at the end. So a reordered listing now
-carries a line under the table saying which order it is in.
-
-It is silent for the default order in its natural direction, which is what keeps
-every existing command's output unchanged to the byte — a promise worth more than
-the note, since it is what lets anyone paste `eks nodes` into a script or a
-ticket without the tool having an opinion about it. Both halves matter:
-`--sort-reverse` on its own reverses the *default* order and prints Z-to-A, which
-is not the default listing and is the one most easily mistaken for it, so it
-speaks.
-
-`k8s::order::note` is generic over the two `Order` enums rather than written once
-per listing, taking the name from `clap::ValueEnum::to_possible_value`. That is
-the text the user typed after `--sort`, so the note cannot start spelling an
-ordering differently from the flag that produced it — `cpu-requested`, never
-`CpuRequested`. A variant `clap` will not name is one hidden from `--help`; there
-is nothing honest to call it, so the note is dropped rather than guessed at.
-
-It is a *note*, not a header: it joins the existing footnote list that carries
-"no metrics-server" and "could not list pods", which means it lands under the
-table, after the notes about what went wrong — a table nobody could fill in is
-more urgent than the order it came out in — and it disappears entirely on an
-empty listing, where the renderer already drops footnotes because "there is
-nothing here" is the only thing worth reading.
-
-What the note deliberately does not say is whether the ordering actually ranked
-anything. `eks nodes --sort cpu` on a cluster with no metrics-server sorts by a
-column that is not in the table, and every row lands in the tail. That is a
-second, sharper thing to say, it depends on the rows rather than on the flags,
-and it is its own roadmap entry.
-
+A `Sorted by …` footnote appears for any non-default ordering or direction,
+using the clap value name. The default listing is unchanged byte for byte. It
+joins the footnote list after the failure notes and vanishes on empty listings.
 
 ### 37. "Nothing ranked" is a second note, computed by the listing
 
-Decision 36 ends by naming the gap it left: the note says which ordering was
-*asked for*, and says nothing about whether that ordering managed to rank a
-single row. `eks nodes --sort cpu` on a cluster with no metrics-server is the
-case — no `CPU USE` column, every row in the tail, the alphabet deciding the
-whole listing — and `Sorted by cpu.` underneath makes it worse rather than
-better, because it names an ordering over rows it did not arrange. The footnote
-above explains the missing columns and says nothing about the flag the user
-typed, so `--sort` reads as broken.
-
-So there is a second line, `Nothing here has cpu to sort by.`, and it is a
-second function rather than a third argument to `note`. The two questions have
-different inputs: which order was asked for is a fact about the flags, and
-whether it ranked anything is a fact about the rows. Keeping them apart is what
-lets `note` stay pure in the flags alone and testable without a fixture row.
-
-The rows half is `k8s::nodes::ranks_any` and `k8s::pods::ranks_any`, because the
-keys are the part of an ordering `k8s::order` deliberately does not know. Both
-are `any`, not `all`, following the rule the usage columns already use: one
-unsampled row is not a listing the ordering failed to order, and one ranked row
-is enough to put the row somebody went looking for at an end of the table.
-
-Rankability is a second exhaustive `match` over `Order`, sitting beside the
-comparison rather than being derived from it. Two matches are a drift risk, and
-exhaustiveness is the answer — adding an ordering without saying what makes a
-row rankable under it will not compile. They are also not the same function:
-under the pod `restarts` order, a restart the kubelet recorded no `finishedAt`
-for is `Rank::Unranked` — there is no moment to rank it against the dated ones —
-but the count is a key under that ordering as well as a tie-break, so the
-ordering did lift that pod clear of the healthy rows. Deriving rankability
-mechanically from `Rank` would print "nothing here has restarts to sort by" over
-a listing with a crashing pod near the top of it.
-
-The note stops at the diagnosis and does not name the order the rows came out in
-instead. Unranked rows keep their tail tiers, so a listing split across two of
-them is grouped by *something* even when nothing in it ranked, and "this is in
-name order" would be a guess dressed up as an explanation. It is also silent for
-the default ordering: nobody typed a flag, so there is no flag to explain, and
-the byte-for-byte promise of decision 36 holds unchanged.
+`Nothing here has cpu to sort by.` comes from a separate function fed by each
+listing's `ranks_any` (an exhaustive match beside the comparison, `any` not
+`all`). It diagnoses without naming a fallback order, and is silent for the
+default ordering.
 
 ### 38. The "nothing ranked" note advises, and never advises twice
 
-Decision 37 stopped at the diagnosis: `Nothing here has cpu to sort by.` is
-honest, and it is not yet advice. Two things were missing, and they are
-different problems.
-
-The first is repetition. On a cluster with no metrics-server the footnote two
-paragraphs up has already named the cause and linked to metrics-server, so
-saying it again in different words would be the same paragraph twice, a line
-apart. `k8s::order::Cause` is how the listing says which it is, and the note then
-either points back — `…, for the reason above.` — or stands on its own. It is the
-listing's answer rather than `k8s::order`'s because which of a table's footnotes
-covers which column is exactly the knowledge that module does not have:
-`k8s::nodes::cause` and `k8s::pods::cause` are third exhaustive matches over
-`Order`, beside the comparison and the rankability one, so an ordering added
-without saying which failure could account for it will not compile.
-
-The wording is "for the reason above" rather than "the note above says why"
-because the paragraph *directly* above is decision 36's `Sorted by cpu.` line,
-which gives no reason at all. A reason is the one thing up there that can only be
-the failure footnote.
-
-The second is that under `--sort restarts` in a healthy namespace nothing is
-above the note at all — nothing failed, the pods simply have not crashed — so
-pointing upwards would point at nothing. What that listing is owed is the flag
-that *would* have worked, and the note can work it out: `unranked_note` takes the
-`ranks` predicate rather than a bare `ranked: bool` and asks it about every
-variant of the `Order` enum, so the suggestions come from the rows in front of
-the user. It cannot name an ordering that would have failed the same way, and it
-cannot drift as orderings are added.
-
-Two variants are left out. The default is what dropping `--sort` altogether
-gives you, so "sort by name instead" is advice to type a flag in order to get the
-listing you would have had anyway; and a variant hidden from `--help` is a flag
-value the user cannot find any other way. When that leaves nothing, the advice
-line is dropped rather than invented — on a table where no ordering ranks,
-silence says "there is nothing else here to sort by" better than a suggestion
-that would fail identically.
-
-The bar for a suggestion is *rankable*, not *tells the rows apart*, which is the
-same `any`-not-`all` rule decision 37 settled. It has a visible cost: on a
-cluster where every node is `Ready`, `status` is suggested and reorders nothing.
-The alternative bar is a different question about an ordering from the one this
-module has been answering, and it is left as a roadmap entry rather than guessed
-at.
+`k8s::order::Cause`: when a failure footnote already explains it, the note says
+"for the reason above"; otherwise it suggests orderings that would rank these
+rows, drawn from every `Order` variant (excluding the default and hidden ones).
+No suggestion means no advice line.
 
 ### 39. `--wide` lands on both listings, and its columns are a `Column` list
 
-`kubectl -o wide` is where people already go for a pod's IP or a node's AMI, so
-`eks` spells it `--wide` and copies both column sets to the letter, including
-the headings and their order. Two departures, both deliberate:
-
-`NODE` stays in the default pod table, where `kubectl` holds it back for wide,
-because a pod listing that will not say which machine a pod is on answers half
-the question people came with. So `--wide` adds three columns around it rather
-than the four `kubectl` adds. And the node table's wide columns go on the *end*,
-after `AGE`, rather than between `VERSION` and the capacities where `kubectl`
-puts them: the default table is then the wide one with its tail cut off, and
-someone comparing the two does not have to re-find the columns they were already
-reading.
-
-The flag lands on `eks nodes` at the same time as on `eks pods`, though only the
-pod half was on the roadmap. `eks nodes --wide` failing as an unknown argument
-while its twin accepted it would read as a bug rather than as a decision, and
-the node columns raised no question the pod ones had not already settled — this
-is the rule about a flag honoured by one listing and not its twin, in `CLAUDE.md`.
-
-The two tables now build their columns as a `Vec<Column>` from a pure function
-over the listing's conditions, where before each kept parallel lists of headers
-and cells assembled under matching `if`s. That pairing has a failure mode that
-type-checks: a heading pushed under one condition and its cell under a subtly
-different one puts every figure to the right of it under the wrong heading, and
-the table still renders perfectly. A `Column` answers for both halves of itself,
-so the two cannot drift, and the whole layout becomes one value a test can
-assert on rather than a table someone has to read in a terminal.
-
-`format::Width` is a two-variant enum beside `format::table`, not a `bool`, for
-the reason `k8s::order::Direction` is one: one type shared by both listings is
-what keeps `--wide` meaning the same thing on each. It sits in `format` rather
-than in `k8s` because it decides nothing about what is fetched — every field the
-extra columns show already arrived with the nodes and pods, so `--wide` costs no
-request and cannot fail.
-
-Where `kubectl` prints `<none>`, these columns print `-`, which is what every
-other empty cell in the tool prints. Matching `kubectl` mattered for the column
-names and their order, where a reader's habits are; a second spelling of "empty"
-inside one table would cost more than the resemblance is worth.
-
-The wide columns appear whatever is in them, unlike the usage columns, which are
-dropped when no row has a figure. The conditions look alike and are not: usage
-columns arrive unasked for, so an empty pair is clutter charged to someone who
-never wanted them, while `--wide` was typed. A column of `-` under
-`NOMINATED NODE` is the answer "nothing here is being preempted", and dropping it
-would leave the user unable to tell that from a flag that did nothing.
-
-`READINESS GATES` is in the pod set even though the roadmap entry named only two
-columns. The default table cannot explain a pod whose `READY` reads `1/1` while
-the cluster still calls it unready — every container up, an external controller
-withholding its condition — and that is a question the table itself raises. A pod
-with no gates reads `-` rather than `0/0`, which would suggest something
-unsatisfied on nearly every row where there is nothing to satisfy.
+`--wide` copies `kubectl -o wide`'s column names and order, except `NODE` stays
+in the default pod table and the node table's wide columns go at the end. It
+landed on both listings together (a flag honoured by one twin reads as a bug).
+Tables build a `Vec<Column>` from a pure function so header and cell can't drift.
+`format::Width` is an enum shared by both. Empty wide cells print `-` and wide
+columns always appear because the user asked. `READINESS GATES` is included.
 
 ### 40. A pod's usage is shown against its request, in one cell
 
-`eks pods` printed `262m` and left it there. The figure is unreadable on its own:
-a quarter of a core is fine, throttled, or a mistake depending entirely on what
-the pod asked for, and a reader who wants to act on the number has to go and find
-that request in a manifest. The node table has never had this problem — every
-figure in it is a share of allocatable — and the pod table now says
-`262m/500m (52%)`.
-
-The denominator is the **request**, and it comes from `pods::effective_requests`
-— the same function `eks nodes` totals per node. A pod has no allocatable of its
-own, so its request is the only honest denominator available; it is also the
-number somebody would go on to change. Calling the function rather than summing
-the containers again is what keeps `eks pods` and `eks nodes` from quietly
-disagreeing about one pod: that sum is `max(containers + sidecars, peak init
-container)` plus pod overhead, and a second implementation of it would be wrong
-in a way nobody could see.
-
-It is one cell rather than a usage column and a request column beside it, and the
-two are alternatives rather than halves — a `CPU REQ` column beside a
-`262m/500m (52%)` cell would print the same number twice. The pair won because
-its halves are read together or not at all, because the pod table is already the
-wider of the two listings, and because `READY`'s `1/2` and the node table's
-`3800m/4` make `a/b` this tool's existing spelling for a part and its whole.
-
-The other design has one thing this one does not: a request column would show
-what a pod booked on a cluster with no metrics-server, which is the EKS default
-and where this cell shows nothing at all. That is a second question — "what did
-this ask for", not "how is it doing against it" — and answering it means columns
-on every listing, which is a decision about the default table's width rather than
-about a denominator. It is a roadmap entry, and the reviewer who prefers that
-design should say so there.
-
-The heading follows the cell: `CPU/REQ` over a column of pairs, and plain `CPU`
-where no row in the listing has one, so the table itself says what the percentage
-is a share of instead of a manual saying it. A `/REQ` over a column of bare
-figures would name a denominator that is not there, which is the same rule the
-usage columns already follow by being absent rather than empty.
-
-A pod that asked for nothing keeps its bare figure. `Quantity::ratio_of` declines
-a zero denominator, so "asked for nothing" and "cannot be divided" are one branch
-rather than two that could drift; a percentage of zero would be an invention, and
-the pod really did ask for nothing. This is deliberately not the treatment a
-missing *usage* reading gets — that stays `-`, because nobody measured it, and a
-request is not a measurement.
-
-Rounding moved to `format::percentage`, shared with `nodes::Share::cell`. A node's
-share of allocatable and a pod's share of its request are the same kind of figure
-printed in two tables people read one after the other, and them differing by a
-digit would be a bug nobody could explain.
-
-The share is not classified into a `Severity`, unlike the node table's. The
-thresholds would not carry: 90% of a node's allocatable is alarming, while 90% of
-a pod's own request is a well-sized pod. What "hot" means for a pod against its
-request is a decision worth making deliberately, and nothing renders colour yet,
-so this waits for the roadmap entry that lights up both tables.
+`262m/500m (52%)`, dividing by `pods::effective_requests` so `eks pods` and
+`eks nodes` agree. Heading is `CPU/REQ` only when some row has a request; a pod
+that asked for nothing keeps a bare figure. Rounding is shared in
+`format::percentage`. No severity yet: node thresholds don't fit a pod's
+request. (Superseded in part by decision 79: requests became their own columns.)
 
 ### 41. A usage figure is shown with its age, and an empty sample set says so
 
-The usage columns had two states on screen and three in reality. metrics-server
-missing produced a footnote saying what to install; metrics-server answering
-produced the columns. metrics-server answering *with nothing* — a fresh install,
-a node that joined a minute ago, a namespace whose pods have only just started —
-produced neither: the columns vanished exactly as they do when it is absent, and
-nothing was printed, because the footnote was written on the error path and there
-was no error. From the reader's chair that is indistinguishable from the missing
-case, and the advice for the two is opposite. `metrics::Outcome` makes the third
-case a value rather than a gap, and `usage_unsampled` gives it the footnote it
-was owed.
-
-Which of the three a listing is in is asked of the **rendered rows**, not of the
-reply. `eks pods --field-selector spec.nodeName=…` narrows the rows but not the
-metrics request — metrics-server does not implement field filtering — so a reply
-can be full of readings for pods the table does not contain. Asking the reply
-would call that listing sampled while showing no figures at all.
-
-The other half is that a figure which *is* shown carries no date. A number with
-nothing beside it cannot be told from an instantaneous reading, and — the reason
-this matters — metrics-server going quiet does not fail the request that asks it
-for a sample. The same table keeps rendering, with figures that are minutes old
-and look exactly like fresh ones. So every table with usage in it now ends with
-`Usage is up to 12s old, averaged over 20s.`
-
-The age is the **oldest** sample in the listing. The note is a guarantee about
-the whole table and is only as good as its worst row; "up to" is what makes that
-readable. The window is the **longest** any sample reported, since samples that
-disagree mean two scrapers or one being reconfigured, and the slower of them
-decides how long "up to date" lasts.
-
-Stale is more than two windows. metrics-server publishes about one reading per
-window, so one window of lag is what a working scraper looks like and two means a
-scrape did not happen. A listing whose window we could not read is never accused:
-without a window there is no scale to judge an age against, and "your figures are
-stale" is not a sentence to print on a guess. A window of `0s` is treated the same
-way, since it would call a listing taken half a second ago stale.
-
-`metav1.Duration` reaches the wire as a Go duration string — `20.04s`, `1m0s`,
-`500ms` — which is not anything `jiff` parses, so `metrics::parse_duration` is a
-small grammar of its own. Integer arithmetic throughout: `20.04s` is exact in
-nanoseconds and is not exact in binary floating point, and this value is compared
-against another duration rather than merely printed. The unit table is ordered
-longest-spelling-first, because `ms` read as `m` turns half a second into half an
-hour and would call every listing fresh forever. Anything outside the grammar is
-`None` rather than a guess — a wrong window either accuses a healthy cluster or
-excuses a scraper that has stopped.
-
-One consequence worth naming: `Missing::usage`, which decides whether the
-"nothing ranked" note points at a footnote above or explains itself, now means
-"the columns are gone" rather than "the read failed". Both ways of losing them
-leave a footnote for it to point at, so the old reading would have printed the
-same advice twice, a paragraph apart — the thing decision 38 exists to prevent.
+`metrics::Outcome` separates "no metrics-server", "answered with nothing" (own
+footnote), and sampled, judged on the rendered rows. Tables end with `Usage is
+up to 12s old, averaged over 20s.` (oldest sample, longest window). Stale means
+older than two windows; an unknown or `0s` window never accuses. Go durations
+are parsed exactly by `metrics::parse_duration`, longest unit spelling first.
 
 ### 42. A device is one column, and its shape is the pod table's, not this one's
 
-`nvidia.com/gpu` had been parsed correctly since decision 13 and shown nowhere,
-which made `eks nodes` unable to answer the one question a GPU cluster is ever
-asked: is there a card free. A column now appears for every extended resource
-some node in the listing reports, on the `any`-not-`all` rule the usage columns
-already follow, so a cluster of m5.xlarges prints exactly the table it printed
-before and a mixed cluster shows the CPU nodes a `-`.
-
-What counts as "extended" is a naming rule rather than a list of vendors, which
-is the point — the whole reason extended resources exist is that a cluster can
-invent one. `k8s::resource::is_extended` is Kubernetes' own definition: a
-fully-qualified name outside the `kubernetes.io` domain. That leaves `cpu`,
-`memory`, `pods`, `ephemeral-storage`, `hugepages-2Mi`, and the
-`attachable-volumes-*` limits sitting in the same capacity map alone. They are
-not devices, they have native meanings a table should state in native words, and
-a column headed `HUGEPAGES-2MI` reading `0` on every node is exactly the noise
-the condition above exists to avoid.
-
-The cell is `2/4 (50%)` — booked over allocatable — which is the **pod** table's
-usage cell rather than either of this table's two, and that is a deliberate
-inconsistency. `Capacity`'s pair prints allocatable over capacity, and for a
-device those are the same number on every healthy node; the gap between them is
-not the kubelet's routine reservation but a fault, so it belongs in a sentence
-rather than in a pair of figures a reader has to notice are different. `Share`'s
-`2 (50%)` hides the total, and for a device the total is the fact people came
-for: "this node has eight A100s" is not something to work back out of a
-percentage. So the device column shows both numbers, and the denominator is
-still allocatable — the same one CPU REQ and CPU USE divide by, so a percentage
-means one thing across a row.
-
-That choice hides one thing, and it is the thing this column was added for. A
-card the kubelet has and will not hand out — a plugin that marked one unhealthy,
-most often — shrinks allocatable and leaves the cell reading `0/3 (0%)` on a node
-with four. From the table that is a node with three free cards and a pod that
-will not schedule onto any of them. `devices_withheld` says so, names the node
-with the widest gap, counts the rest, and says where to look. It is a footnote
-rather than a third number in the cell because it is not routine: the ordinary
-node offers everything it has and earns no line.
-
-Requests grew the same shape one level down. `pods::Requests` keeps `cpu` and
-`memory` as fields — every caller wants them, every container may have them —
-and carries everything else in a `BTreeMap` keyed by the name the cluster
-invented. `plus` and `max` fold over the union, so a GPU asked for by one init
-container and not the next does not vanish from the pod's footprint, and the
-scheduler's arithmetic from decision 15 applies to devices without a second
-implementation. The cost is that `Requests` is no longer `Copy`; the call sites
-that felt it now borrow the totals rather than cloning a map per row.
-
-Two `-` characters can appear in a device column and they say different things.
-`-` alone is a node that does not report the resource: no such hardware, which is
-a different answer from having none free. `-/4` is a node that has four and a pod
-listing that failed, so only the numerator is unknown — the count came back with
-the nodes and is still good. The footnote that explains the failure names the
-device columns it emptied, for the reason decision 38 gives: a message that
-diagnoses without saying which columns it is about makes the reader find them.
+A column appears for each extended resource any node reports, using Kubernetes'
+own rule (`k8s::resource::is_extended`: fully qualified, outside
+`kubernetes.io`). The cell is `2/4 (50%)`, booked over allocatable, showing the
+total. A device withheld (allocatable below capacity) gets the `devices_withheld`
+footnote. `pods::Requests` carries devices in a `BTreeMap`, folded by the same
+scheduler arithmetic. `-` means no such hardware; `-/4` means the pod listing
+failed.
 
 ### 43. Every listing is paged, through one function
 
-`eks nodes` fetched every node in one request, and `eks pods -A` every pod —
-twice over on the node table, which totals the pods to fill in its request
-columns. On a cluster of any size that is the largest thing this tool asks for,
-and the API server has to hold the whole answer in memory before it sends a byte
-of it. Kubernetes' answer is `limit` and `continue`, and `k8s::page::collect` is
-now the single door every listing goes through: nodes, pods, scoped pods, and
-both metrics endpoints.
-
-`page::SIZE` is 500, which is `kubectl`'s own chunk size. It also settles the
-compatibility question, because a first page that comes back short carries no
-continue token: an ordinary cluster is exactly the one request it always was,
-and only a big one pays for a second.
-
-The loop is deliberately tiny and the decisions are all outside it.
-`page::Listing` holds the items, remembers the token the last request carried,
-and answers `Next::Page`/`Done`/`Stalled` — so a three-page listing, an empty
-one, an empty-string continue token, and a server that repeats its token are
-fixtures, and `collect` itself is four lines of I/O with nothing to get wrong.
-
-`Stalled` is the one case Kubernetes never produces and we handle anyway. A
-server that hands back the token it was given would page for ever, fetching the
-same objects, with the command never returning and nothing on screen to say why.
-It ends the listing with a `tracing::warn!` rather than an error, because the
-pages that did arrive are real: half a listing with a warning beside it beats no
-listing. It is not a footnote under the table — the shape the rest of this tool
-words such things in — because carrying "this may be short" up from the fetch
-would mean every listing function returning a pair, and this is a case a
-conformant server cannot reach.
-
-metrics-server does not chunk its replies: `limit` is a parameter it ignores, so
-those two listings finish after one page regardless. They go through `collect`
-anyway, because what that buys them is the *budget* below. A metrics endpoint
-that has gone quiet should cost the same wait as any other request, not an
-unbounded one, and it is the request whose columns the tool can most afford to
-lose.
+`k8s::page::collect` pages every listing with `limit`/`continue`, size 500
+(kubectl's). `page::Listing` is a pure state machine (`Page`/`Done`/`Stalled`).
+A server repeating its token ends the listing with a warning and keeps what
+arrived. metrics-server ignores `limit` but goes through `collect` for the
+timeout budget.
 
 ### 44. `--timeout` is spent per request, and cannot cover the credential helper
 
-A hung API server left `eks nodes` waiting for ever with no way out but Ctrl-C,
-and the shape of that failure is why it needs a flag rather than a constant: a
-private EKS endpoint reached from outside its VPC does not refuse the
-connection, it simply never answers. The default is 30 seconds — long enough
-that a busy API server is not cut off mid-answer, short enough that a wrong
-network is a sentence rather than a hang — and `--timeout 0` restores the old
-behaviour for anyone who wants it.
-
-Per *request* rather than per command, and decision 43 is why: a listing is now
-several requests, and a cluster large enough to need four pages would be cut off
-for its size rather than for being unreachable. The same reasoning puts `Budget`
-in `k8s::page` rather than in a module of its own — the unit of the budget is
-the unit of the paging.
-
-`Budget` parses `30s`, `500ms`, `2m`, `1h`, and a bare number of seconds, which
-is narrower than the Go duration grammar `kubectl` takes. The missing piece is
-the compound `1m30s`, and it is missing on purpose: `Display` has to print a
-spelling `from_str` reads back, because the timeout message ends with ``allow it
-longer: `--timeout 1m` `` and advice that names a value the flag would reject is
-worse than no advice. One unit in, one unit out, and a test asserts the round
-trip.
-
-What the flag could not promise at first was the part before the first request:
-`kube` resolves a kubeconfig's auth eagerly and runs the exec plugin with a
-blocking `std::process::Command`, so an `aws eks get-token` that hangs blocked
-the thread rather than the future, and a `tokio::time::timeout` wrapped around
-`k8s::connect` would never have fired. Decision 50 covers it, and the flag's
-help now says "step" rather than "request".
+Default 30s, `0` disables, applied per request so big clusters aren't cut off
+for their size. `Budget` accepts single-unit durations only so `Display` round-
+trips into the advice it prints. Coverage of the credential helper came in
+decision 50.
 
 ### 45. `eks contexts` renders through `format::table`, gutter and all
 
-`format::table` came out of `eks nodes` and `commands::contexts` kept its own
-copy of the same column-width arithmetic, which is two chances to decide
-differently what "aligned" means. The table now comes from the shared renderer
-and the output is unchanged to the byte, which a test asserts in full rather
-than by probing with `contains`.
-
-The `*` marker did not move into it. It is not a column: a column would be
-padded to its width and followed by the standard two-space separator, so rows
-would read `*  prod`, and it is the only such marker in the tool — no other
-listing has a row that is more current than its neighbours. So the table is
-rendered without it and each line is prefixed afterwards, header included. That
-keeps the gutter's two characters a fact about this listing rather than a
-feature of every table.
+One renderer, output unchanged byte for byte. The `*` marker is a prefix added
+after rendering, not a column.
 
 ### 46. `Width::Narrow` carries a target width, and the drop rule is the listing's
 
-`eks nodes` at ten columns and around 140 characters wide wraps on the terminal
-every laptop lid narrows to under a docked browser, which is where the request
-and usage columns land — the ones most worth keeping. The other end of `--wide`
-was always going to be a third `Width` variant rather than a listing-specific
-flag; the type already existed as one place both tables agreed on how much to
-show.
-
-`Width::Narrow(u16)` carries the target width, not "narrow yes/no". Deciding
-"which columns fit" from a hidden ambient terminal size would put the answer
-somewhere a test could not name it, and the acceptance criterion for this task
-was a pure function over an available width. So the ioctl lives in one
-`stdout_terminal_cols` function in `main.rs` and the arithmetic lives in
-`k8s::nodes::narrow_to_fit`, which two tests hit at 80, 100, and 1 column with
-no terminal in sight.
-
-`--wide` beats `Narrow` at the type gate: `Width::for_terminal(true, _)`
-returns `Wide`. A `--wide` that widened when asked to and then narrowed itself
-would be a flag that meant nothing on the terminals it exists for. A pipe is
-not a "narrow terminal": `Width::for_terminal(false, None)` returns `Default`,
-so `eks nodes | grep foo` is unchanged to the byte and no script parsing the
-output breaks. Pods is passed the same width value for consistency; the pod
-table has no drop rule yet, and `is_wide()` reads `false` on a `Narrow`
-variant, so the pod table lands on its default columns rather than losing
-some in a way this PR did not design.
-
-The drop order for `k8s::nodes` is a `DROP_ORDER` list of predicates, in this
-sequence: `VERSION`, `AGE`, the `REQ` pair, the `USE` pair, `CPU` and
-`MEMORY`, every device column, `STATUS`. Two rules shaped it:
-
-- **Partner columns leave before their base.** `CPU REQ` is a percentage of a
-  capacity, and dropping the capacity while keeping the percentage leaves a
-  figure of nothing. So `REQ` and `USE` drop before `CPU` and `MEMORY`, and
-  the pair columns drop together — an eye reading `CPU REQ` next to `MEMORY`
-  with no `MEM REQ` pairs the wrong numbers.
-- **The interesting column outlasts the ordinary one.** A device column only
-  exists because somebody installed the plugin that surfaces it; every
-  cluster has `CPU` and `MEMORY`, and only the GPU cluster has `NVIDIA.COM/GPU`.
-  So devices drop after `CPU` and `MEMORY` rather than before them. On a
-  general cluster this step is a no-op. On a GPU cluster with a very narrow
-  terminal, the row keeps the card count and loses `CPU`, which is the right
-  trade — the user typed `eks nodes` for the card, not for the ordinary
-  columns that were going to show up anyway.
-
-`NAME` never drops. A row we cannot fit at all is still a row with a name; the
-terminal wraps it, and dropping the name would leave a listing that has no
-answer for "which node is this".
+`Width::Narrow(u16)` is applied when stdout is a terminal and `--wide` wasn't
+typed; a pipe gets the default table. The terminal size is read once in
+`main.rs`; `narrow_to_fit` is pure. Node `DROP_ORDER`: `VERSION`, `AGE`, `REQ`
+pair, `USE` pair, `CPU`/`MEMORY`, devices, `STATUS`. Partner columns leave before
+their base and in pairs; devices outlast the ordinary columns. `NAME` never drops.
 
 ### 47. The pod table's drop order, and one measurement for both tables
 
-`Width::Narrow` landed with the node table (decision 46) and the pod table
-treated it as `Default`: a `Narrow` reaches `k8s::pods::row::columns`, falls
-through the `is_wide()` check, and prints the full row on a terminal too small
-for it. `eks pods` is the wider of the two listings on a cluster with
-metrics-server, so it wanted the same treatment; what it could not take was the
-node table's list, because none of the columns in it are the same columns.
-
-The pod order is `AGE`, `NODE`, the usage pair, `RESTARTS`, `READY`, `STATUS`,
-with `NAME` and `NAMESPACE` never dropped. Three rules shaped it:
-
-- **The table's own repetition goes first.** `AGE` is the cheapest column on
-  the row and the least of it, and it is the one fact the table already says
-  twice: `RESTARTS` carries `9 (5m ago)`, so "when did this last change"
-  survives it leaving.
-- **A follow-up question goes before a first one.** `NODE` is the widest cell
-  in the table on EKS, where a node is a forty-character DNS name, and which
-  machine a pod is on is what you ask *after* you know which pod you are
-  looking at. Every column that stays is there to find that pod, and dropping
-  `NODE` lands on `kubectl get pods`'s own column set, where a reader's habits
-  already are.
-- **The health columns outlast the rest, and `STATUS` outlasts them.** A
-  listing down to a name and one word keeps the word that names the problem;
-  `READY`'s `0/1` is the detail under `CrashLoopBackOff` rather than a fact of
-  its own, and `RESTARTS` is the widest of the three. This is the one step of
-  the order that is a judgement rather than a deduction — `Running 0/1` is a
-  real pod, and an argument for `READY` outlasting `STATUS` could be made.
-
-`NAMESPACE` never dropping is the pod table's own rule, and it is not the node
-table's `NAME` rule wearing a hat. The column is in the table only under `-A`,
-and there a name is not an identity: `coredns-abc` in `kube-system` and a copy
-of it in another namespace are two pods, and the column the user widened the
-scope to get is the only thing telling them apart. Under `-A` the pair is the
-name, so it drops when `NAME` does, which is never.
-
-The `--wide` columns are not in the list, because they cannot be in the table:
-`Width::for_terminal(true, _)` answers `Wide`, so a `Narrow` listing never
-carried `IP`, `NOMINATED NODE`, or `READINESS GATES` in the first place. A step
-for them would be a step that never fires.
-
-The measurement moved. `k8s::nodes::row_width` mirrored `format::table`'s
-arithmetic by hand, with a comment saying the drop rule was its only caller —
-which was true for one night. A second caller is the condition that changes the
-answer, so the rule lives in `format` now, as the pair `column_widths` (as wide
-as the widest cell, or the header) and `row_width` (two spaces between, and
-none after the last), with `format::table` and both drop rules going through
-them. Two copies of that would be free to drift, and a listing measuring rows
-the renderer disagreed with would drop a column to fit a width nothing prints
-at. A test ties the two to the renderer: a row measured from `column_widths`
-is exactly the longest line `table` actually prints, over a cell wider than its
-header, a ragged row, a header-only table, and a single column with no
-separators to count. Both listings assert the same thing from the other end —
-every line of a `Narrow(80)` render is at most 80 characters — so the guarantee
-is checked against rendered output rather than against the arithmetic that
-chose the columns.
-
-Splitting the two is also what makes narrowing one pass over the listing rather
-than one per drop step. A column is as wide as its own widest cell whatever its
-neighbours do, so dropping one changes which widths are in the sum and not what
-any of them are: each rule measures once, zips the widths onto the columns, and
-then does arithmetic over a dozen numbers. The obvious loop — re-render every
-cell, re-measure, drop, repeat — costs a listing's worth of string formatting
-per step, seven of them on a ten-thousand-pod table, for an answer that cannot
-have changed.
-
+Pod order: `AGE`, `NODE`, usage pair, `RESTARTS`, `READY`, `STATUS`; `NAME` and
+(under `-A`) `NAMESPACE` never drop. Width arithmetic lives once in `format`
+(`column_widths`, `row_width`), shared with `table`, tested against rendered
+output, and measured once per listing rather than per drop step.
 
 ### 48. The pod count rides with the request totals, and is a share like everything else
 
-`PODS` is a count, and every other figure on the node row is a measured
-quantity. Two choices follow from refusing to let that difference matter.
-
-**One walk over the pods, not two.** `pods::by_node` already decided, pod by
-pod, which pods are occupying which node — the terminal phases out, a
-`Terminating` pod still in, an unscheduled one charged to nobody. Counting in a
-second pass would be a second chance to answer that differently, and the failure
-would be invisible: a `PODS` cell saying 12 beside a `CPU REQ` cell totalling 14
-pods' requests is two plausible numbers, and nothing on screen says they
-disagree. So `by_node` returns a `Placed` — a count and a `Requests` — from the
-one loop, and `NodeRow::from_node` takes that one value rather than two
-parameters that could arrive out of step. It is also why a failed pod listing
-empties both halves together: they are the same `Option`.
-
-**The count becomes a `Quantity`.** The denominator, `allocatable["pods"]`, came
-off the wire as a quantity string, and the numerator is an integer we counted
-ourselves. `Quantity::from_count` makes them the same type, which buys the
-column `Share` entire: the ratio, `theme`'s severity thresholds, the cell
-format, and `nodes::order`'s `busiest` key, none of them written twice. The
-alternative — a bespoke pair of integers with its own division — would have been
-a second rule for what counts as hot and a second place to get "the API server
-reported no allocatable" wrong.
-
-The cell is `Share::pair`, `12/58 (21%)`, and not the `12 (21%)` the request
-columns use. `CPU REQ` can leave its denominator out because `CPU` is the column
-next to it; `PODS` has no such neighbour, and the limit is half of what the
-reader came for. It varies by instance type and by CNI configuration, so a bare
-`21%` names a fraction of a number nobody in front of the table knows. That is
-the same argument the device columns made, so `Device::cell` now delegates to
-`Share::pair` rather than keeping its own copy of the formatting.
-
-`allocatable`, not `capacity`, is the denominator. Both are reported and they
-differ: the kubelet's `--max-pods` and the VPC CNI's address budget land in
-allocatable, and it is the number the scheduler counts against. Dividing by
-capacity would flatter exactly the nodes whose CNI is the binding constraint,
-which on EKS is most of them.
-
-The column is unconditional, where the device columns appear only when some node
-reports the resource. `CPU REQ` is the closer analogue: every node has a pod
-limit, so there is no cluster the column would be a row of dashes on, and the
-one state that empties it — a failed pod listing — leaves it reading `-/58`,
-which still carries the limit. That is also why the footnote for that failure
-now names it: `requests_unavailable` says the *booked half* of `PODS` and the
-device columns is empty, because saying the columns were empty would be visibly
-untrue on screen.
-
-`--sort pods` comes with it, and ranks the share rather than the headcount, as
-every other node order does (decision 34). A node with 80 pods out of 234 is not
-the node to look at; the one with 50 out of 58 is. Its unrankable tail is the
-nodes with no count, under `k8s::order`'s existing two-tier rule, and
-`nodes::cause` maps it to the request footnote — the count is the pod listing's,
-so one failure explains all three of `cpu-requested`, `memory-requested`, and
-`pods`.
-
-In `DROP_ORDER` it goes third, after `VERSION` and `AGE` and ahead of the `REQ`
-pair. Two reasons, and the second is the one that settled it. A node runs out of
-CPU or memory long before it runs out of pod slots unless the CNI's address
-budget is what is short — so of the three booked figures this is the least often
-the binding one. And an 80-column node table has been keeping `CPU REQ` and `MEM
-REQ` since decision 46; a column added afterwards should not be what takes them
-away. The existing test asserting that 80 columns keep the request pair failed
-when `PODS` was placed later, which is exactly the signal that test was written
-to give.
+`pods::by_node` returns count and requests from one walk, so they can't
+disagree and fail together. The count becomes a `Quantity` and reuses `Share`
+whole. Cell `12/58 (21%)` over allocatable, always shown. `--sort pods` ranks the
+share. In `DROP_ORDER` it goes after `VERSION`/`AGE`, before the `REQ` pair.
 
 ### 49. Colour is spent on the rows worth looking at, and on nothing else
 
-`nodes::Share::severity` and `PodRow::severity` had classified every percentage
-and every pod status since they were written, and the CLI table then printed the
-answer in plain text. A node at 97% looked exactly like a node at 4%.
-
-The obvious implementation was to reuse `Theme::severity`, which the dashboard
-already draws bars with, and paint each graded cell in it. That is wrong, and the
-reason is what most of this change turns on: `Theme::severity` writes
-`Severity::Ok` in green. A dashboard draws a severity as a *shape* — a bar filled
-green along its length is a quantity, and the green is the fill. A table draws it
-as ink on a line somebody is scanning, and on a healthy cluster nearly every cell
-is `Ok`. Painting all of them green would put the strongest signal a terminal has
-on the rows with nothing to say, and leave the one broken node competing with two
-hundred green neighbours for the eye.
-
-So there is a second mapping, `Theme::severity_ink`, and `Ok` maps to `None`:
-the absence of an escape sequence, so the cell prints in whatever colour the
-user's terminal was already using — which is what the whole table printed in
-before this existed. `Warn` and `Critical` take the theme's warning and danger
-colours. `Unknown` is muted rather than alarming, because it is an absence: a `-`
-where a figure could not be read, and greying it out says so without shouting.
-The consequence, and the point: on a healthy cluster `eks nodes` emits no escape
-sequences at all, and every byte of colour on screen is a row somebody should
-look at.
-
-What that mapping is *not* is a second opinion about what counts as hot. The
-thresholds stay `Severity::from_utilisation`'s, one rule for both surfaces; a
-test asserts the two mappings agree variant for variant, differing only in that a
-table leaves `Ok` alone. `Column::severity` on each table likewise only says
-which cells carry a reading — it re-reads `row.severity` and `Share::severity`
-and invents nothing.
-
-**The severity travels in the cell.** `format::Cell` is a `String` and an
-`Option<Severity>`, rather than `table` taking a parallel grid of colours. Both
-listings narrow themselves to a terminal by `retain`ing over their columns, and a
-parallel grid would be one `retain` away from colouring the wrong column with
-nothing on screen to say so.
-
-**Ink never moves a column.** Every width comes from the cell's text and the
-escapes are wrapped around it after the padding is decided, so a coloured table
-and a plain one have their columns in the same places, character for character.
-Both listings assert it directly: strip the escapes back off and the plain table
-is underneath, at every narrow width as well as the default. It is also why an
-empty graded cell is left alone — a zero-width cell in escapes is a sequence
-`table`'s trailing-space trim cannot see, and it would leave a line ending in ink
-with nothing inside it.
-
-**Headers and footnotes stay plain.** A heading names a column; it is not a
-reading off one. A footnote is prose under the table, and it is usually
-explaining something the table has already coloured — saying it a second time in
-red is shouting.
-
-**The pod table colours `STATUS` and nothing else, on purpose.** `READY` is not a
-second column to colour: `0/1` is *why* a `Running` pod grades `Warn`, so
-colouring it would paint one judgement across two columns. `CPU/REQ` and
-`MEMORY/REQ` are a gap rather than a rule, and the gap is deliberate.
-`Severity::from_utilisation`'s thresholds are about a node's allocatable, where
-90% booked is nearly full; a pod at 90% of the CPU it asked for is a well-sized
-pod, and one at 400% of a 10m request is burning 40m and is nobody's emergency.
-Colouring those cells on the node's thresholds would tell the reader something
-untrue, in red, on most of their rows. What "hot" means for a pod against its own
-request is a decision, and it is on the roadmap rather than in this change.
-
-**`--color`, and who wins.** `auto` is the default and is the rule the tool
-already followed for narrowing: a terminal gets colour, a pipe or a file does
-not, so `eks nodes | grep NotReady` is the bytes it always was. `auto` also
-honours [`NO_COLOR`](https://no-color.org/) — set and *not empty*, because an
-empty value is the spec's own way of saying "not set" and a shell that exports
-`NO_COLOR=` into every process must not silently disable colour everywhere — and
-`TERM=dumb`, the one value that promises no escape sequences are understood.
-`--color always` overrides all three, which is what makes `eks nodes --color
-always | less -R` work; `--color never` overrides them the other way. The flag is
-global rather than per-listing because it describes the output stream and not one
-table, and it is a `clap::ValueEnum` on the domain type for the reason `--sort`
-is one (decision 28): `--color sometimes` is rejected with the three that exist
-listed, before anything connects.
-
-`eks contexts` renders through `format::table` (decision 45) and gains nothing
-from any of this, because none of its cells carries a severity — a context is a
-name, a region, and a namespace read out of a file, and there is nothing about it
-to be alarmed by. `--color always` there is a flag with nothing to do, which is
-honest. The one mark that does single a row out, the `*` gutter, is not a
-severity either, and whether it deserves a colour is a separate question on the
-roadmap.
-
-**The escape sequences are written here rather than taken from `crossterm`.**
-`theme::foreground` maps a `ratatui::style::Color` to an SGR sequence, every
-variant spelled out with no catch-all arm — so a colour added to `ratatui` in a
-future release stops the build rather than silently printing plain — and a test
-asserts the exact bytes for each. A sequence with a typo in it is a column five
-characters out of place on somebody else's terminal, and only an assertion on the
-bytes catches that. The theme's own colours are 24-bit; a terminal that does not
-understand `38;2;r;g;b` ignores the sequence, which leaves the same table in the
-colour it had before, and `NO_COLOR` or `--color never` is there for anything
-stranger.
-
-**The dashboard is out of scope for `NO_COLOR`.** The TUI keeps its colours
-whatever the environment says. `NO_COLOR` is about software that adds colour to
-text it prints; a full-screen interface made of borders, panes, and a selected
-row is not that, and honouring the variable there would mean a monochrome theme
-rather than a switch — which is the light-theme task's problem, not this one's.
-
-**`commands::nodes` grew a `Request` struct** to carry the palette, mirroring
-`eks pods` (decision 29). It was going to have to: `list` was already at seven
-parameters, four of them describing the same one request.
+CLI tables use `Theme::severity_ink`: `Ok` prints no escape at all, `Warn`/
+`Critical` use warning/danger, `Unknown` is muted. Thresholds are the
+dashboard's. Severity travels in `format::Cell`; ink never moves a column
+(tested by stripping escapes). Headers and footnotes stay plain; the pod table
+colours only `STATUS`. `--color auto|always|never` is global; `auto` honours
+non-empty `NO_COLOR` and `TERM=dumb`. SGR bytes are written by
+`theme::foreground` with an exhaustive match. The dashboard ignores `NO_COLOR`.
 
 ### 50. `--timeout` covers the credential helper, on a task that is left behind
 
-`--timeout` bounded every request to the cluster and nothing before them, and
-the gap was the loudest failure the tool had left: a laptop that has lost its
-route to an SSO endpoint runs `aws eks get-token`, the helper sits there, and
-`eks nodes --timeout 5s` waited for ever with no way out but Ctrl-C. Decision 44
-named that as a limitation and this is the other half of it.
-
-The reason it was a limitation and not an oversight is that `kube` runs the exec
-plugin inside `Client::try_from`, with a blocking `std::process::Command::output`,
-on whatever thread asked. Wrapping `k8s::connect` in `tokio::time::timeout`
-compiles and does nothing: the timer and the future it is racing are on the same
-thread, and the thread is in `waitpid`. So the build moves onto
-`tokio::task::spawn_blocking`, and the timeout races the `JoinHandle` instead —
-which is a future that a running timer can actually beat.
-
-**The task is abandoned, not cancelled**, because a blocking task cannot be
-cancelled: dropping its handle stops anyone waiting on it and stops nothing
-else, and the subprocess belongs to `kube` rather than to us, so there is no
-child to kill from here. That makes the shutdown the second half of the fix.
-Dropping a Tokio runtime waits for its blocking tasks, so `commands::block_on`
-now calls `Runtime::shutdown_background` and returns: the thread finishes on its
-own if the helper ever exits, and returning from `main` ends the process either
-way. Without that line the timeout fires, the message prints, and the tool hangs
-at the door — which is the same hang, one frame later. A test in
-`commands::block_on` asserts it with a thirty-second blocking sleep and no
-kubeconfig at all.
-
-**Per step, like the requests.** The helper gets the same `--timeout` value each
-page of the listing after it gets, rather than a share of one command-wide
-budget — the reasoning of decision 44, applied one step earlier. A helper that
-spends twenty seconds refreshing an SSO token has not used up the listing's time,
-any more than one page uses up the next page's.
-
-**It is its own message.** `Failure::Slow` names the budget and then talks about
-VPCs, private endpoints, and VPNs, and none of that is true of a subprocess on
-the user's own laptop. `k8s::client::stalled_helper` sits beside `explain`
-rather than inside it, because there is no `kube::Error` behind this failure to
-classify — nothing has been asked of the cluster yet. It names the command the
-context runs and says to run it by hand, which is the only thing the user can
-usefully do: that is how they find out it is sitting on a browser prompt.
-`helper_command` builds that line out of the `AuthInfo` the kubeconfig produced
-and quotes what a shell would need quoted, since an EKS `exec` block routinely
-carries a profile or a role ARN with a space in it, and a command line the user
-has to repair before it runs is worse than none. The block's `env` comes out in
-front of the command as `NAME=value`, for the same reason and a sharper one: an
-entry that sets `AWS_PROFILE`, pasted without it, runs against whatever profile
-the shell already had and may answer instantly — which sends the user to look
-for a problem somewhere that does not have one. What is *not* in the sentence is
-a guess at which of the several things that hang `aws eks get-token` is hanging
-this one — a blackholed metadata address, an SSO endpoint with no route to it, a
-`credential_process` of the user's own that prompts — because naming the wrong
-one confidently costs more than naming none.
-
-The message also offers `--timeout 0`, which no other message does. It is the
-one failure where "wait for as long as it takes" is a reasonable answer rather
-than a way to reinstate a hang: an interactive helper waiting on a human is
-doing its job, and the tool now has a default that would cut it off after thirty
-seconds. That is the one behaviour change a user could dislike, and it is the
-reason the escape hatch is named in the sentence rather than left in `--help`.
+`kube` ran the helper blocking inside `Client::try_from`, so the build moved to
+`spawn_blocking` and the timeout races its handle; `block_on` uses
+`shutdown_background` so an abandoned helper doesn't hang exit. The budget is per
+step. `stalled_helper` gets its own message naming the exact command (with
+shell-quoted `env`) to run by hand, and offers `--timeout 0` for interactive
+helpers. (Narrowed by decision 110: we now run and kill the helper ourselves.)
 
 ### 51. The dashboard fetches on a plain OS thread, not a shared `tokio` runtime
 
-The node pane needed a way to fetch without the render loop ever awaiting a
-network call — CLAUDE.md's rule that a key press is acknowledged within one
-frame leaves no other option. `commands::spawn` answers it with
-`std::thread::spawn` around a current-thread `tokio` runtime, built and shut
-down exactly the way `commands::block_on` already does for a one-shot command,
-delivering its result over a plain `std::sync::mpsc::Receiver` instead of
-returning it.
-
-The alternative was enabling `tokio`'s `sync` and `rt-multi-thread` features
-now and spawning the fetch as a task on a shared runtime built once at
-startup. That is the more conventional shape for async Rust, and it loses
-here on cost for what it buys: it adds two features and a second
-runtime-lifecycle model to a codebase that has deliberately kept exactly one
-(decision 9), for a task that only ever has one fetch in flight. The worry
-that motivated a second look — that "Background refresh" would need real
-cancellation to discard a stale, still-running fetch when the user asks for
-another — turns out not to bite. `page::Budget` already bounds `gather`'s
-worst-case wall-clock time, covering `k8s::connect` and every paged request
-behind it (decisions 44 and 50), and discarding a stale *result* is free
-either way: replacing a `Receiver` with a new one for the next fetch drops the
-old one, and the abandoned thread's `tx.send` on a disconnected channel simply
-fails silently, exactly as `spawn`'s own doc comment says it will.
-
-`spawn` is deliberately not `block_on` with a different return type. They
-answer different questions — return a value, or promise one later — and nudging
-one to grow into the other for the sake of a shared implementation would blur
-which contract a caller is relying on. What *is* shared is the one invariant
-that actually matters: `shutdown_background` rather than a dropped or joined
-runtime, so a credential helper `kube` left running is abandoned once, not
-waited for a second time on whichever thread happens to be shutting it down.
+`commands::spawn` runs a current-thread runtime on a `std::thread` and delivers
+over `std::sync::mpsc`, keeping one runtime model (decision 9). A stale result
+is dropped by replacing the receiver; `Budget` bounds the abandoned work.
+`shutdown_background` is shared with `block_on`.
 
 ### 52. A dashboard bar divides by allocatable, matching the CLI's percentage
 
-`nodes::Share::ratio()` — what `CPU USE`/`MEM USE` already divide by — is the
-denominator the node pane's utilisation bars use too, rather than capacity.
-Decision 22 left this open on the CLI side, naming capacity as the more
-literal reading of "is this machine busy" and putting it on the roadmap for
-whichever surface asked first: that surface is the dashboard bar, now, and it
-answers the other way.
-
-The reason is the same one decision 40 gives for the pod table's usage cell:
-the two surfaces sit side by side and a reader moving between them must not
-find the same node reading two different numbers. A bar and a CLI column that
-divided by different things could both be defensible in isolation and still
-teach the user something false the first time they compare a hot node in the
-dashboard against the table they just ran — worse than either reading alone,
-because it looks like a bug rather than a choice. Allocatable also costs
-nothing new: `Share` already carries it, so the bar is `Share::ratio()` and
-`Share::severity()` reused whole, not a second computation over
-`Capacity::allocatable_ratio()`, which stays unused and available for the
-"usage against capacity for the dashboard's bars" roadmap entry if a future
-change decides a bar answering "how busy is the box" is worth a second
-reading beside this one.
-
-Superseded by decision 53: that roadmap entry came due and was taken.
+Superseded by decision 53.
 
 ### 53. The dashboard bar now divides by capacity; the CLI table still divides by allocatable
 
-Decision 52 picked allocatable for the bar too, on the strength of "a bar and
-a table that divide by different things teach the user something false the
-first time they compare them." The roadmap task that decision left open —
-"usage against capacity for the dashboard's bars" — asks for exactly that
-divergence anyway, on the grounds decision 22 gave first: a bar answers "is
-this machine busy", a capacity question, and a table cell answers "will
-another pod fit", an allocatable one. Two different questions answered
-honestly is not the same failure as two answers to one question that
-disagree.
-
-`Share::ratio()`/`severity()` are unchanged — they still divide by
-`allocatable`, so `CPU USE`/`MEM USE` and the request columns read exactly as
-before. The choice moved to the call site rather than staying baked into
-`Share`: `ratio_of`/`severity_of` take an explicit denominator, and
-`ui::nodes::bar` is the one caller so far that passes `Capacity::capacity`
-rather than `Share::allocatable`. A future column or pane that wants the
-capacity reading gets it without a second field on `Share` or a second type.
-
-Worth flagging for review rather than assuming settled: decision 52's warning
-about the two surfaces disagreeing still holds in spirit — a node pinned at
-100% of allocatable now draws a bar that is not full, and a reader comparing
-the two side by side has to know why. It is outweighed here by the roadmap
-task's explicit ask, but if a reviewer would rather the two readings match,
-the fix is `bar`'s call site, not `Share`.
+A bar answers "is this machine busy" (capacity); a table cell answers "will
+another pod fit" (allocatable). `Share::ratio_of`/`severity_of` take the
+denominator explicitly; `ui::nodes::bar` passes capacity. A node at 100% of
+allocatable therefore draws a bar that isn't full; if that's unwanted, change
+`bar`'s call site.
 
 ### 54. The node pane's usage note is worded bare, not through the CLI's wrapper
 
-The CLI table's third usage outcome — a metrics read that answered with
-nothing sampled yet — earns `k8s::nodes::usage_unsampled`, which names `CPU
-USE` and `MEM USE` because those are the columns going missing. The node
-pane's bars have no such headings; they are just labelled `CPU` and `MEM`
-already, in the row itself. So `k8s::nodes::usage_note`, the pane's reading of
-the same three-way `metrics::Outcome`, calls `metrics::unsampled` and
-`metrics::freshness_note` directly rather than through the CLI's wrapper,
-which is what the roadmap task asked for by naming those two functions
-specifically rather than their CLI-side callers.
+`k8s::nodes::usage_note` calls `metrics::unsampled`/`freshness_note` directly,
+since the pane has no `CPU USE`/`MEM USE` headings. Built once in `spawn_gather`
+from the same data as the CLI footnotes, carried in the `NodesFetch` struct,
+split on `\n` into lines, silent on an empty list.
 
-The fourth outcome the CLI table has — a read that failed outright, footnoted
-via `usage_unavailable` — is deliberately not carried over. The task was
-scoped to the freshness and unsampled notes, and the pane already says
-"nothing here" for a failed read the only way it currently can: every bar
-reads `-`. Wiring the explanation through would mean giving the pane
-something like the CLI's footnote list, which is the shape question the
-"nothing ranked" and sort-note follow-ups are already waiting on the reviewer
-to settle — bundling it into this change would be answering that question by
-accident rather than on purpose.
+### 55. Background refresh: an immediate refetch on selection, a quiet one on the interval and on `r`
 
-The note lives on `NodesState::Loaded` as a second field beside the rows,
-built once by `commands::nodes::spawn_gather` from the same `Gathered` the CLI
-table's footnotes come from — `k8s_nodes::usage_note(&rows, &usage, &samples,
-now, &label)` — so the pane and the table read one classification, never two.
-The transfer type, `commands::nodes::NodesFetch`, is a struct rather than a
-`(Vec<NodeRow>, Option<String>)` tuple over the channel, so the note is a
-named field at both ends instead of a position to keep straight.
+Selecting another cluster resets to `Loading` and refetches at once. `r` and the
+interval keep the old rows until the answer lands. A failed refresh after a good
+load keeps the rows and shows `refresh_error`. `--refresh` is a
+`RefreshInterval` over `Budget`'s grammar, where `0` means "don't" and `r` still
+works. Fetches go through closures built once in `main`. (Amended by decision 56:
+the closures are boxed.)
 
-`ui::nodes::draw` splits the note on `\n` into one `Line` per sentence before
-handing it to the pane: `ratatui` does not treat an embedded newline as a
-break the way a terminal printing the same string does, and the stale
-reading's second sentence — telling the reader to check metrics-server's pod
-— would otherwise run together with the first. The note sits between the
-`NODES` heading and the rows, in the header a pane has and a footnote list
-does not, and it is silent on an empty node list: there is no usage to date
-when nothing is running, whatever the read answered.
+### 56. Pod browsing needed a focus model first, and the fetch closures became boxed rather than generic
 
-### 55. Background refresh: an immediate refetch on selection, a quiet one on
-the interval and on `r`
+`Tab` toggles `Focus::Sidebar`/`Detail`; `Esc` backs out one level before it
+quits; `q`/`Ctrl-C` always quit. One `detail_selected` index, reset on view
+change and fresh load. The row highlight is a line style under span colours, so
+severity survives it, and shows only while the detail pane has focus. The pods
+pane fetched once per node. Fetch closures are boxed trait objects
+(`NodesFetcher`, `PodsFetcher`) so `run` doesn't grow a type parameter per pane.
 
-The node pane's fetch used to be one-shot: `main` started it before the
-terminal took over and nothing ever asked again. The roadmap task left two
-triggers besides the interval for this change to design — `r`, and the
-sidebar selecting a different cluster — and both needed an answer before
-either could be built.
+### 57. `-l`/`--field-selector` became global flags, and the dashboard combines them with its own scoping rather than replacing it
 
-**Selection change refetches immediately and resets to `Loading`.** The
-alternative — waiting for the interval, or leaving the previous cluster's
-rows on screen until it elapses — reads as a bug: a user who switches
-clusters in the sidebar is looking at the new one's name over the old one's
-node list, which is worse than a blank pane with "Loading nodes…" in it.
-`App::start_loading_nodes` is the pure half of that (a fourth transition
-tested the way `apply_nodes` and `on_key` are); the event loop pairs it with
-an immediate call through `spawn_nodes`, the same closure `r` and the
-interval use.
+The selectors moved to `GlobalArgs`, as `--namespace` already was, and
+`main::run` validates them once, before the terminal initialises.
+`commands::pods::scoped_to_node` ANDs the user's field selector with the node's
+`spec.nodeName`. An empty pane uses the CLI's `selector_note`, built from the
+user's own selectors.
 
-**`r` and the interval do *not* reset to `Loading`.** These refresh a cluster
-the pane is already showing, and blanking a working table to redraw the same
-rows a second later is the flicker background refresh exists to avoid — the
-whole point is that the pane goes on being readable while a request is in
-flight. The old rows stay up until the new fetch answers.
+### 58. Two roadmap entries merged: a pane cannot say which order it is in before it can be put in one
 
-That choice has a consequence `apply_nodes` had to absorb: a failed
-background poll can no longer be presented as "no data at all," because there
-usually *is* data — the last good listing. `apply_nodes` therefore only moves
-to `NodesState::Error` on a failure with nothing loaded yet (the original,
-one-shot case); a failure after a successful load keeps the rows and adds
-`refresh_error`, a message the pane shows as a line under `NODES` without
-touching the table beneath it. A transient blip reads as a transient blip
-instead of as the cluster losing every node.
-
-**The interval is its own type, not a reused `Budget`.** `--timeout` and the
-new `--refresh` parse and print the same grammar — `Budget`'s — so
-`RefreshInterval` is a one-line wrapper delegating both directions rather
-than a second grammar. It stays a distinct type anyway: the two flags mean
-opposite things by `0` on the same underlying number (a timeout of zero would
-never finish; a refresh interval of zero is simply "don't," and `r` still
-works), and a field typed `Budget` at the call site would read as a request
-timeout to a reviewer skimming `ui::mod.rs`. It is global on the CLI, like
-`--color` and `--timeout`, because the flag has to reach the bare `eks`
-invocation, the common case, and `Command::Dashboard` has no arguments of its
-own for a subcommand nobody types to carry.
-
-**Fetching moved from a receiver to a closure.** `ui::run` used to take the
-one `mpsc::Receiver` `main` had already started; it now takes that same
-initial receiver *and* `spawn_nodes: impl Fn(&str) -> mpsc::Receiver<...>`,
-built once in `main` over the config, kubeconfig paths, and budget the CLI
-commands use, so every fetch after the first — `r`, the interval, a new
-selection — goes through `commands::nodes::spawn_gather` the same way the
-startup one did. The event loop stays generic over the closure rather than
-depending on `commands::nodes` directly, which is what keeps `ui::event_loop`
-testable in principle without a `KubeConfig` in scope, even though the loop
-itself is the I/O layer and untested today for the same reason it always was
-— the render loop's job here is only to decide *when* to call the closure.
-A caller who replaces `nodes_rx` while an older fetch is still running simply
-stops listening for it, per `commands::spawn`'s existing contract; the
-abandoned thread finishes on its own and nothing needed a cancellation
-mechanism.
-
-Amended by decision 56: the closure stopped being generic once a second pane
-needed its own, for the reason given there.
-
-### 56. Pod browsing needed a focus model first, and the fetch closures became
-boxed rather than generic
-
-"Pod browsing"'s first slice — `Enter` on a node opens its pods — turned out
-to have a prerequisite the roadmap task had not named: the node list had no
-selection of its own to drill *from*. Only the sidebar could be navigated;
-the detail pane was a fixed list nothing pointed a highlight at. Two
-interaction questions sat behind that gap — how keyboard focus should move
-between the sidebar and the detail pane, and whether `Esc` should keep
-meaning "quit" once there was somewhere to back out to first — and both were
-put to the user rather than guessed at, the same way a reviewer would have
-been asked on a task this shaped. The answers: `Tab` toggles focus, and `Esc`
-backs out one level before it quits.
-
-`Focus` is a two-variant enum, `Sidebar`/`Detail`, toggled by `Tab` and read
-by `App::on_key` to decide which of two sets of movement methods `j`/`k`/
-`Home`/`End` call, and by `draw_cluster_list`/`draw_detail` to decide which
-border gets `Theme::pane_border`'s focus colour — the mechanism the sidebar
-already used alone, now shared rather than duplicated for a second pane.
-`detail_selected` is one `usize` on `App` rather than a field per view,
-because exactly one list is ever on screen in the detail pane at a time; it
-is reset to `0` on every view change and every fresh load specifically so it
-cannot point past the end of a list that just arrived shorter than the one
-before it.
-
-`View` is `Overview | NodePods { node: String }` rather than a stack, on the
-same reasoning `RefreshInterval` got its own type over reusing `Budget`: a
-`Vec<View>` would be guessing at a shape one more case cannot justify, and
-today there is exactly one level of drill-down. The roadmap's own next slice
-— a pod's containers — is what a stack is *for*, and is left to add one
-rather than have this change build it against a single example.
-
-`Esc`'s rule is `back_or_quit`: back out of `View::NodePods` when there is
-one, quit otherwise. `q` and `Ctrl-C` are unconditional either way, so a
-user who wants out does not have to remember how deep they are.
-
-Row highlighting reuses the pattern `Theme::selected` already had for the
-sidebar's `List` widget, adapted for the node and pod panes' hand-built
-`Line`s: `Line::style(theme.selected())` sets the line's own style, which
-`ratatui` patches *underneath* each span's — so a row's severity colouring
-(a `CrashLoopBackOff` in red, say) survives being highlighted, because the
-span's foreground is more specific than the line's and wins, while the
-line's background shows through wherever a span left one unset. The
-highlight itself only appears while `Focus::Detail` holds focus, unlike the
-sidebar's own selection, which stays visible under either focus — the
-sidebar's highlight answers "what is this dashboard showing", a question
-that does not stop being true when `Tab` moves the keys elsewhere, while the
-detail pane's answers "what would `Enter` open right now", which is not true
-the moment focus leaves it.
-
-The pod-browsing pane fetches once per node rather than joining the node
-pane's background refresh: `commands::pods::spawn_gather_for_node` filters
-`Scope::All` on `spec.nodeName`, across every namespace, and carries no
-usage figures — metrics wiring for a third pane, and whether it should
-refresh on the same interval the node pane does, are both weighed better
-once there is a pane to review them against than guessed at alongside the
-navigation this change exists to add. `PodsState`'s `apply_pods` therefore
-always overwrites on failure, unlike `NodesState::apply_nodes`: there is no
-earlier good listing for *this* node to protect, only for whichever one was
-open before it.
-
-`ui::run` and `ui::event_loop` took a `spawn_pods: impl Fn(&str, &str) ->
-...` alongside `spawn_nodes` for exactly as long as it took to notice the
-shape: two closures now, generic on both, and a third pane would make three.
-`NodesFetcher` and `PodsFetcher` are boxed trait objects instead, so `run`'s
-signature does not grow a type parameter every time a pane gains its own
-fetch trigger — a distinction (which closure a function happens to be)
-nothing outside `main` needs at the type level. The dynamic dispatch this
-costs is one call per keypress or refresh tick, not per frame.
-
-### 57. `-l`/`--field-selector` became global flags, and the dashboard combines
-them with its own scoping rather than replacing it
-
-"Carry the pod selectors into the dashboard" asked for one thing the
-pod-drilldown pane did not have: `Selectors` reused rather than the pane
-growing its own filter. The pane had no flags of its own to grow one from —
-`Command::Dashboard` carries no fields — and `Command::Pods` had the only
-`-l`/`--field-selector` definitions in the parser. Two ways to give the
-dashboard the same flags: a second, dashboard-only pair, or moving the
-existing pair up to `GlobalArgs`, beside `--namespace`, which already sits
-there accepted by every command and acted on by fewer than all of them. The
-second was the smaller change and the more honest one: `--namespace` had
-already established that a global flag some commands ignore is this
-project's answer to "a flag that means the same thing everywhere it applies,"
-rather than a design question this task needed to reopen. `eks pods -l
-app=api` still parses exactly as before — clap resolves a global arg from a
-subcommand the same way — and `eks nodes -l app=api` now parses too, doing
-nothing, which is what `eks nodes -n payments` already did.
-
-Validating them is `main::run`'s job, once, before either `dashboard` or
-`pods::list` is reached: `commands::pods::selectors_for` is the same function
-both call, so a malformed `-l` is rejected in the same words whichever
-surface it was typed for, and the dashboard's terminal never initialises on
-one that cannot parse — first paint stays free of a request `ratatui::init`
-would otherwise have to unwind out of.
-
-The pane's own `spec.nodeName` filter could not simply be replaced by the
-user's field selector, because it is not optional: it is the reason this is
-*this node's* pane and not the whole cluster's. `commands::pods::
-scoped_to_node` is the pure function that composes the two — a comma joins
-two field requirements as an `AND` the same way it already joins two label
-ones, so `--field-selector status.phase!=Running` narrows what a node's pane
-shows rather than being silently overridden by the node scoping, or silently
-dropped in favour of it. Pulling the combination out of the async
-`gather_for_node` and into its own function is what let the rule be a
-fixture — three cases, no cluster — instead of something only a live fetch
-could exercise.
-
-An empty pod list is ambiguous without knowing why it is empty, which the CLI
-table already had an answer for: `k8s::pods::row::selector_note`, private
-until now, phrases whichever of a label and a field selector are active. Made
-`pub` and re-exported, it is what lets the pane say "No pods here match label
-selector `app=api`." instead of "This node has no pods." — sharing the
-phrase itself, not just the shape of the fix, with the CLI's `empty()`. The
-note travels from the *user's* `Selectors`, computed once in `gather_for_node`
-before `scoped_to_node` folds in the node filter, because that filter is
-implicit in "this is the node's pane" and would be a strange thing to explain
-back to someone as a reason their list came up empty. `PodsFetch` and
-`PodsState::Loaded` both carry it as an `Option<String>`, the same shape
-`NodesFetch::usage_note` already established for a fact a fetch computes once
-and a pane reads without recomputing.
-
-Left for later, deliberately: editing the selector without restarting `eks`.
-The dashboard has no text-input mechanism yet — fuzzy search (`/`) is the
-first roadmap task that will need one — and guessing at its shape to serve
-this task alone would very likely guess wrong. Tracked in the roadmap as its
-own entry, to be built once there is an input mechanism to hang it on.
-
-### 58. Two roadmap entries merged: a pane cannot say which order it is in
-before it can be put in one
-
-The roadmap carried "Carry `--sort` into the dashboard" and, listed as
-higher priority, "Carry the sort note into the dashboard's panes" as
-separate entries. Reading them together made the ordering an accident
-rather than a priority call: the note entry's own acceptance criterion —
-"the default order is as silent in a pane as it is on the command line" —
-presupposes a pane that has *an* order to be silent about, which is exactly
-what the other entry builds. Taking the note task first would have meant
-wiring `k8s::order::note` to a call site that could only ever hand it
-`Order::default()`, passing its own test by construction and proving
-nothing. This is decision 55's shape again — background refresh and the
-freshness note it dates were two entries with the same dependency — so the
-same answer applies: build the mechanism, and the note that explains it
-lands in the same PR rather than describing a flag that does not exist yet.
-
-Sorting is client-side and costs no request, same as `--sort` on the CLI
-costs no second listing: `App` gained `node_order`/`node_direction` and
-`pod_order`/`pod_direction`, and `k8s_nodes::sort`/`k8s_pods::sort` run
-over whatever rows are already in `NodesState::Loaded`/`PodsState::Loaded`
-— on a fresh fetch (`apply_nodes`/`apply_pods`), and again whenever the
-ordering itself changes. `commands::nodes::spawn_gather` and
-`commands::pods::spawn_gather_for_node` are untouched: the fetch closures
-main builds know nothing about ordering, exactly as the acceptance
-criterion asked, and a fetch already in flight when the user reorders is
-sorted by whatever is active the moment it lands rather than the moment it
-was requested.
-
-Two independent orderings, not one shared field, because the node pane and
-the pod-drilldown pane hold different rows and are never both on screen at
-once — `View::Overview` shows one, `View::NodePods` the other. `s` and `S`
-dispatch on `App::view()` rather than on which pane holds keyboard focus,
-matching `r`: refreshing and reordering are both about *what the detail
-pane is showing*, not about where `j`/`k` currently move a highlight.
-
-`s` cycles through `O::value_variants()` — the same list `--sort`'s
-`--help` prints, read as a ring instead of parsed from text — one key press
-at a time, wrapping back to the default; `S` flips `Direction`, mirroring
-`--sort-reverse`. A single key for "reverse" rather than a second flag: a
-pane has no argv to add one to, and `Shift+<letter>` beside a plain
-`<letter>` is the closest a keybinding gets to the same relationship
-`--sort-reverse` has to `--sort`. The footer hint reads `s/S  sort` rather
-than spelling both out — `sort` and `shift+s reverse` together overflowed
-an 80-column footer, clipping `quit` off the end of a 90-column test
-terminal, and the shorter form follows `j/k`'s own precedent for "two keys,
-one hint" already sitting beside it.
-
-The highlighted row in the detail pane is deliberately left where it is
-across a reorder, index and all, rather than reset to the top. That reads
-backwards next to `leave_node_pods` and `drill_into_pods`, which do reset
-it — but those change *which* rows are on screen; a reorder changes only
-what order the same rows print in, the same situation `apply_nodes` is
-already in on every background refresh, and that path was decided (see
-decision 55) to hold the index steady rather than jump the selection around
-under the user. Resetting only on a reorder would make the pane's own two
-list-changing operations disagree about which counts as "the same list."
+Dashboard sorting and its note shipped together. Sorting is client-side, in
+`App`, with separate node and pod orders. `s` cycles `value_variants()`, `S`
+flips direction, keyed on the view (like `r`), not on focus. The footer reads
+`s/S  sort`. The highlight index is kept across a reorder, as on refresh.
 
 ### 59. Huge-page columns are conditioned on being nonzero, not merely reported
 
-`ephemeral-storage` and `hugepages-*` sit in a node's `capacity`/`allocatable`
-maps beside `cpu` and `memory`, but they are not shaped alike. Every real
-node reports `ephemeral-storage`, so its column follows the same `any`-row
-condition [`shows_usage`] already uses — the ordinary case gains it, and a
-node still registering does not cost everyone else the column. `hugepages-*`
-is different: the kernel reports an entry for every size it was built with,
-almost always at `0`, whether or not an administrator ever reserved a pool.
-Conditioning the column on *presence*, the way a device column is, would put
-`HUGEPAGES-2MI` on every EKS listing, full of zeroes — exactly the noise
-`resource::is_extended` already excludes `hugepages-*` from the device
-treatment to avoid. So `hugepage_names` conditions on the pair being
-*nonzero* in at least one row instead: the same `any`-not-`all` shape, one
-level further in.
-
-Both columns are shaped like `Capacity` — an `allocatable/capacity` pair
-formatted with `quantity::memory` — rather than like `Device`'s
-`booked/offered` count. Neither resource has a request tracked against it
-yet, so there is no numerator to pair a capacity against; a `REQ` column for
-either is the same undecided question the roadmap already leaves open for a
-device's own request ("What a pod asked for, when nothing has measured it"),
-not one this change answers by inventing a shape for it.
-
-Placement: both sit after `PODS` and before `AGE`, ephemeral storage first as
-the one every node has, then the device columns, then whichever huge-page
-sizes qualified — grouped with `PODS` and the devices as "what this machine
-can give out" rather than spliced between `MEMORY` and its `REQ` column, so
-the existing pairing of a capacity with the share beside it is undisturbed.
-In `DROP_ORDER` they are the very first columns to go on a narrow terminal —
-ahead of even `VERSION` — because they are the newest facts on the row and
-were not visible at all before tonight; a reviewer resizing a terminal on an
-existing listing should see no difference until it is genuinely tight.
+`ephemeral-storage` shows when any row reports it; `hugepages-*` only when some
+row is nonzero, since kernels report zero pools. Both are `allocatable/capacity`
+pairs (no request tracked yet), placed after `PODS` and before `AGE`, and first
+in `DROP_ORDER`.
 
 ### 60. `View` grew a third variant instead of becoming a stack
 
-The pod-browsing task that added `View::NodePods` left its own doc comment a
-prediction: a pod's containers, the next drill-down level, was "the natural
-place this grows into a `Vec<View>`". Building that here would have been
-guessing at a shape for a depth this tool still does not have — the roadmap's
-next drill-down candidate, a container's logs or its own detail view, is not
-scheduled, and nothing today asks how a third level backs out or what happens
-if a fetch fails partway down a stack two levels deep. A fixed three-variant
-enum answers the actual question — `Overview`, `NodePods { node }`,
-`PodContainers { node, namespace, pod }` — and keeps `back_or_quit` and
-`draw_detail` each one exhaustive `match`, so the compiler catches a missing
-arm the way an unbounded stack never would. A stack earns its keep once a
-third level is a real task rather than a hypothetical one; two known levels
-were not that point.
+`Overview | NodePods | PodContainers` keeps every match exhaustive. Backing out
+one level (`Esc`, no refetch) and resetting to `Overview` on a cluster switch
+(`leave_detail_view`) are deliberately separate operations.
 
-The consequence worth a reviewer's attention: `App::leave_node_pods` split
-into two distinct operations that a `Vec<View>` would have collapsed into
-one. `App::leave_detail_view` (its new name) resets the detail pane all the
-way to `Overview` and discards both the pods and the containers panes in one
-call — the shape a cluster switch needs, since a stale drill-down at either
-depth is equally wrong under a newly selected cluster. `Esc`'s one-level-at-
-a-time backing out is a separate path in `back_or_quit`, and deliberately so:
-going from `PodContainers` back to `NodePods` does not refetch the pod
-listing, because nothing about it changed — it is exactly the pods pane that
-was already on screen a moment ago. Collapsing the two into a single "pop the
-stack" operation would have made that distinction one `if` statement's worth
-of ceremony instead of two clearly-named methods, at the cost of hiding the
-fact that they answer different questions: "the user asked to back up" and
-"the ground moved out from under them" are not the same event, and do not
-deserve the same amount of state thrown away.
-
-`ContainerRow` lives beside `PodRow` in `k8s::pods`, not inside `row.rs`
-itself: `row.rs`'s whole point is deriving one `STATUS` for a pod by picking
-which of several unhappy containers gets to speak for it, and a per-container
-state is the opposite operation — every container reports for itself, in
-spec order, nothing chosen on its behalf. The two modules share one thing,
-`exit_reason`, which moved from private to `pub(super)` so a `Terminated`
-container and an app-container's contribution to a pod's own `STATUS` are
-guaranteed to use the same word for the same termination rather than two
-independent spellings drifting apart over time.
-
-The fetch is a plain `kube::Api::get` on the one pod's name, not a second
-listing: the node-pods pane already read every field a container row needs
-out of the `Pod`s it fetched to build `PodRow`s, but keeps none of that
-around once reduced — a `PodRow` sized for a listing of many pods has no
-room for one pod's full container list, and carrying every pod's raw
-containers through a pane that almost never needs them would cost more than
-asking again for the one the reader actually drilled into. It goes through
-the same `Budget::wrap`/`k8s::explain` path every other fetch in the tool
-does, so a pod that was deleted between the listing and the drill-down reads
-as an ordinary API failure rather than a special case invented for this one
-pane.
+`ContainerRow` lives beside `PodRow` and shares `exit_reason` with it. The pane
+fetches the one pod with `Api::get` through the usual `Budget`/`explain` path.
 
 ### 61. A container's requests and limits are its own spec, not `effective_requests`
 
-The pod-detail task asked for "resource requests/limits" per container, and
-`k8s::pods::effective_requests` already turns a pod's containers into
-numbers — but it answers a scheduling question (what does this *pod* have
-booked, sidecars and the init peak and pod overhead folded in) that nobody is
-asking of one row in a container list. `ContainerRow` reads each container's
-own `resources.requests`/`limits` directly instead, reusing `Requests::read`
-for the request half so a container that declared none reads the same real
-zero every other request figure in this tool gives an absent entry.
-
-Limits do not get the same treatment, on purpose. `Requests::read` defaults
-an absent entry to zero because that is the right reading for a request — the
-scheduler reserves nothing for one nobody made — but a limit nobody set means
-nothing bounds the container, which is a different fact and one Kubernetes
-does not even let a manifest spell as "limit: 0". `cpu_limit` and
-`memory_limit` are `Option<Quantity>`, and the sentence built from them says
-`unlimited` for `None` rather than `0`, so the two absences read as the two
-different things they are. `resources_summary` builds both sentences as
-plain text in `k8s::pods::containers` — computation, not rendering — and the
-pod-containers pane prints them as a second, dimmed line under each
-container's identity, wrapped by the pane's existing `Paragraph` rather than
-a new widget.
-
-"Recent events", the other half of the task's original wording, is not here:
-nothing in this tool reads the `Event` API yet, and it wants its own fetch, a
-dedup/count rule, and a decision about what "no events" should say next to a
-pod too young for the API server to have kept any — a night of its own
-rather than a fact to bolt onto a container's row. See `docs/ROADMAP.md`'s
-follow-up entry.
+Each container row reads its own `resources`: an absent request is zero, an
+absent limit is `None` and reads `unlimited`. `resources_summary` builds the text
+and the pane prints it dimmed under the container. Events were left for their own
+task.
 
 ### 62. Arrow keys joined `Tab`/`Esc`, and quitting at the top level needs two presses
 
-Live use against real clusters turned up two problems with the scheme
-decision 56 settled on: `Left`/`Right` did nothing at all, which reads as
-broken once `j`/`k` have already trained a user that arrow keys work here
-too, and a single `Esc` at `View::Overview` quit immediately, which is too
-easy to trigger by accident. Both were reported directly rather than found
-as a roadmap task, and the fix touches the same keys decision 56 chose, so
-it revises that decision's rule rather than adding beside it.
-
-`Right`/`Tab` are now two names for one motion (`App::advance`): switch
-focus from `Sidebar` to `Detail` if the sidebar has it, or drill in
-(`drill_in`) if the detail pane already does. `Left`/`Esc` are two names
-for the reverse (`App::retreat`), but not the exact mirror — drilling out
-of the current view wins over moving focus back to the sidebar, regardless
-of which pane is focused, so backing out of a two-level drill-down is still
-one press per level exactly as before. Only once the view is already back
-at `Overview` does a `Left`/`Esc` press move focus to the sidebar first,
-and only once focus is *also* already on the sidebar does it reach the quit
-step. Making focus-switching win first, the more literal reading of
-"`Left`/`Esc` do pane-switching too", was tried and rejected: `Focus`
-usually still points at `Detail` right after drilling in, since drilling
-never changes it, so that ordering would have cost a spare `Esc` on every
-"back out immediately" press — the exact interaction decision 56 was
-written to preserve — in exchange for a pane-switch nobody was reaching for
-in the same breath as backing out.
-
-The quit step itself changed too: decision 56's "`q` and `Ctrl-C` are
-unconditional either way" no longer holds for `q`. `Esc` and `q` at the top
-level now arm a pending quit (`App::quit_or_arm`, backed by one
-`Option<Instant>` field, `quit_armed_at`) rather than quitting outright, and
-only a second `Esc`/`q` within `QUIT_CONFIRM_WINDOW` (600ms) confirms it —
-either key confirms the other's arm, so a user reaching for whichever one
-comes to mind first does not have to remember which one they already
-pressed. `q` stays gated on `View::Overview` alone, unlike `Esc`, since `q`
-never had focus-aware behaviour to preserve; it is a no-op while drilled
-into anything, rather than the unconditional quit it used to be. Any key
-that is not `q`/`Esc`/`Left` clears a pending arm, so a navigation press in
-between two quit-family presses cancels it instead of letting a much later,
-unrelated `Esc` confirm a stale one. `Ctrl-C` is untouched and still
-unconditional — the one part of decision 56's rule this change keeps
-exactly, since an immediate, no-questions-asked way out was the point of
-having it at all.
-
-The footer (`draw_footer`, now taking `&App` instead of `Theme` so it can
-read the new `App::quit_pending`) replaces its hint line with "press esc/q
-again to quit" for as long as a quit stays armed, styled with
-`theme.severity(Severity::Warn)` rather than a new `Theme` method. Shipping
-the double-press rule without this would leave a user's first `Esc`/`q`
-looking like it did nothing.
-
----
+`Right`/`Tab` = `advance` (focus the detail pane, else drill in). `Left`/`Esc` =
+`retreat`: drill out first, then move focus to the sidebar, then arm quit. At the
+top level, `Esc`/`q` arm a quit that a second `Esc`/`q` confirms within 600 ms;
+any other key clears it; `q` does nothing while drilled in. `Ctrl-C` always quits.
+The footer shows "press esc/q again to quit" while armed.
 
 ### 63. A pane's `Cause::Explained` is narrower than the CLI's, and honestly so
 
-The roadmap task for carrying the "nothing ranked" note into the dashboard's
-panes flagged one thing the CLI never had to decide: what `order::Cause::
-Explained` means when the thing it points at — "the reason above" — is a
-footnote list the pane does not have.
-
-The CLI table has two footnotes that can explain an empty usage column (a
-failed read, and one that answered with nothing) and one that explains a
-failed pod-requests listing, and `k8s_nodes::cause`/`k8s_pods::cause` point
-the relevant orderings at whichever applies. Both dashboard panes have far
-less to point at. The node pane has exactly one note, `usage_note`, and it is
-only ever printed for the *unsampled* case — its own doc comment already
-left a failed read silent, out of an earlier task's scope, because there was
-no footnote list yet to add `usage_unavailable`'s explanation to. The
-pod-drilldown pane has no usage note of any kind, because it does not sample
-usage for its rows at all yet.
-
-Rather than widen either pane tonight to make more of `Cause::Explained`
-true, this change makes it true only where a note the reader can already see
-actually says why: `k8s_nodes::usage_missing_explained(rows, usage_note)` is
-`true` only in the unsampled case, `Missing::requests` is unconditionally
-`false` in the node pane (no note there explains a failed pod listing), and
-the pod pane passes `Missing::default()` outright. A pane that has not
-explained something must not claim it has — the module's own docs call this
-out as the whole point of `Cause::Unexplained` being the default — so the
-narrower reading was the only honest one available without inventing a new
-footnote surface neither pane has earned yet. Both gaps are now their own
-roadmap entries, so the two Missing.requests being uniformly `false` and the
-pod pane's uniform `Missing::default()` are not left looking like a wrong
-answer: they are today's honest one, waiting on surface that has not been
-built.
-
-`usage_missing_explained` reads `rows` and `usage_note` rather than
-threading a new field through `NodesFetch`/`NodesState` end to end: `usage_
-note`'s own three-way match already makes the answer recoverable — the
-unsampled and unreadable cases both leave every row's `shows_usage` false,
-and only the unsampled branch of `usage_note` is ever `Some` — so the
-existing field carries enough information without a second one duplicating
-it.
+A pane claims "for the reason above" only when a visible note says why: the node
+pane only for unsampled usage (`usage_missing_explained`), never for requests
+(until decision 98), and the pod pane never (until decision 99).
 
 ### 64. Log streaming gets real cancellation; decision 51's "discard is free" does not apply
 
-Every other background fetch answers once, and stopping early is free: drop
-the `Receiver`, and the abandoned thread's `tx.send` on a disconnected
-channel fails silently (decision 51). A `follow`ed log is not that shape — it
-is a live connection that keeps costing the API server a request for as long
-as nobody tells it to stop, so leaving the pane has to actually end it, not
-merely stop listening to it.
-
-`commands::spawn_stream` is `spawn`'s counterpart for that: the task gets a
-`tokio::sync::oneshot::Receiver<()>` alongside the sender, and
-`commands::pods::stream_logs` races it against `lines.next()` inside a
-`tokio::select!` loop. Dropping the `StreamHandle` the caller is handed back
-fires the oneshot, the `select!` never polls the read again, and the
-underlying `AsyncBufRead` — and with it the HTTP request — drops on the spot.
-This works *because* a log stream is ordinary async I/O, unlike the one thing
-in this tool that genuinely cannot be cancelled: the credential helper `kube`
-runs as a blocking `std::process::Command` inside `Client::try_from`, which
-is why `--timeout` covering it (decision 50) could only ever abandon it
-rather than stop it. `stream_logs` has no such blocking step in its own read
-loop, so the oneshot signal has something to interrupt.
-
-`Inflight` in `ui::mod` is where the event loop keeps the handle alive —
-`logs_handle` is never read, only held and eventually dropped or overwritten,
-which is the cancellation. Every place a drill-down view changes away from
-`ContainerLogs` clears it unconditionally rather than only when backing out,
-because drilling *forward* past a level that never had a stream running
-finds nothing there to clear either way, and writing the two cases
-separately would be two chances for one of them to forget.
+A followed log holds an API request open, so `commands::spawn_stream` hands the
+task a oneshot; dropping the `StreamHandle` ends the `select!` loop and the
+request. `Inflight` holds the handle, and every view change away from logs drops
+it.
 
 ### 65. A paused log view is pinned by a hidden-line count, not a remembered index
 
-The scrollback buffer is a bounded `VecDeque` (decision-adjacent to nothing
-before this — the first bounded buffer in the tool), and the awkward
-question is what "scrolled up two lines" should still mean once the buffer
-keeps moving underneath it: new lines keep arriving at the bottom while
-paused, and past `MAX_LINES` every arrival also evicts one from the front.
-An absolute index into `lines` survives neither: a `VecDeque` index means
-different content after either kind of change.
-
-`Log::hidden_below` is a *count* — how many of the newest lines are below the
-bottom of the view — rather than a position, and `Log::push` increments it by
-one on every arrival while the view is paused, regardless of whether that
-arrival also evicted the oldest line. That one rule is what makes both cases
-come out right: while the buffer is still growing, `len` and `hidden_below`
-grow together, so `len - hidden_below` — the window's bottom edge — stays put
-and a paused reader keeps looking at exactly the lines they were looking at.
-Once the buffer is at capacity, `len` stops growing but `hidden_below` still
-climbs, so the bottom edge retreats by one exactly when eviction has shifted
-every surviving line's true index back by one. Two situations that move the
-underlying deque in opposite senses are handled by the same increment,
-because the quantity being counted was never a position to begin with.
-
-`Log::visible` still has to decide what "there is nothing older to reveal"
-means, and that answer needs the pane's row count, which only the renderer
-has — so `hidden_below` is never clamped at scroll time. `scroll_up` and
-`jump_to_start` simply record how far the reader asked to go, including past
-the oldest line that exists; `visible(rows)` is where the window's bottom
-edge is floored at `len.min(rows)`, which is what stops a `PageUp` on a short
-log from blanking the pane and is exactly the reading `jump_to_start` relies
-on to show everything rather than one line clinging to the top.
+The log buffer is a bounded `VecDeque`. `Log::hidden_below` counts the newest
+lines below the view and grows by one per arrival while paused, which holds the
+view still both while the buffer grows and once it evicts. Clamping happens only
+in `visible(rows)`.
 
 ### 66. `View` grew a fourth variant, still not a stack
 
-Decision 60 picked a fixed enum over a `Vec<View>` because a third level was
-hypothetical at the time — "a container's logs or its own detail view" was
-named as the next candidate and explicitly not scheduled. Tonight scheduled
-it. The reasoning that decided against a stack was about the *cost* of one
-outrunning its benefit at a known, small depth, not about three being some
-natural ceiling, and nothing about a fourth `View::ContainerLogs { node,
-namespace, pod, container }` arm changes that trade: `back_out_one_level`,
-`next_view`, and `draw_detail` are still one exhaustive `match` apiece, and
-the compiler still catches a level added to one without the others. A stack
-starts paying for itself once a *fifth* level is a real task rather than a
-guess at one — nothing on the roadmap names one yet.
-
-The one new wrinkle a stack would not have had either: `View::ContainerLogs`
-is the first variant whose detail pane is not a list of selectable rows.
-`App::detail_row_count` reads `0` for it and `j`/`k`/`Home`/`End` are
-special-cased in `on_key` to scroll the log instead of moving a highlight
-that does not exist there — `PageUp`/`PageDown` are new for the same reason,
-since a highlight-based pane never needed a "move by more than one" key. The
-footer hints branch on the same distinction, showing `f`/`w` in place of
-`enter`/`s`/`S`, which have nothing to do in a view with no rows to open
-further and no ordering to change.
+`ContainerLogs` joins the enum: matches stay exhaustive, and a stack would earn
+its place at a fifth level. It's the first view with no selectable rows, so
+`j`/`k`/`Home`/`End`/`PageUp`/`PageDown` scroll and the footer shows `f`/`w`.
 
 ### 67. The `/` filter narrows what a pane draws, not what its footnotes reason about
 
-`fuzzy::rank` reduces a pane's rows to the ones the query matches, and the
-question it raised was whether `order::unranked_note`, `cause`, and the node
-pane's `usage_note` should read that same narrowed set or the full listing
-each pane already had in `NodesState`/`PodsState`. They read the full
-listing. `--sort cpu` on a node pane filtered down to two nodes still says
-"Nothing here has cpu to sort by" on the strength of the other eight the
-filter is hiding, which can look wrong at a glance — the note is answering
-"could this ordering ever rank anything here", not "did it rank one of the
-rows currently on screen", and those are different questions once a filter
-exists to ask the second one.
-
-The alternative — threading the filtered subset into `ranks_any`/`cause` too
-— was rejected for the same reason `ranks_any`/`cause` take `&[NodeRow]`/
-`&[PodRow]` today: changing that to accept whatever shape a filtered `Vec<&
-NodeRow>` is would touch the CLI table's call sites for a question the CLI
-table does not have, since `eks nodes`/`eks pods` have no live filter to
-narrow by. Keeping the footnotes over the whole pane means one clear rule —
-"this note is about the listing, the rows below it are about what you
-typed" — rather than a note whose meaning silently changes depending on
-whether a filter happens to be active. Worth a second look if it reads as
-confusing in practice; the fix, if so, is `ranks_any`/`cause` taking an
-iterator rather than a slice, which the CLI callers already satisfy for
-free (`&[T]` is `IntoIterator<Item = &T>`) without changing their call
-sites at all.
+Sort and usage notes judge the full listing, not the filtered rows: the note is
+about the listing, the rows are about what you typed. If that confuses people,
+make `ranks_any`/`cause` take an iterator.
 
 ### 68. Clearing an applied filter is its own `Esc` press, ahead of backing out
 
-Decision 62 made `Esc` at the top level a two-press confirm, and mid-drill an
-`Esc` already backs out one level rather than jumping straight to `Overview`
-— both readings of the same rule, that one press should undo the single
-most recent thing rather than everything at once. A filter is one more thing
-that can be "the most recent" state a press should undo first: `Esc` while
-`Filter::Applied` clears the filter and leaves the view exactly where it
-was, and only a second `Esc` — with no filter left to clear — backs out of
-the drill-down. Making the two presses do both at once (clear and retreat
-together) was the other option, and was rejected because it makes `Esc`'s
-meaning depend on whether a filter happens to be set, which is exactly the
-kind of surprise decision 62 was written to avoid: a user mid-search who
-presses `Esc` expecting to leave the search box, and instead finds
-themselves a level shallower in the dashboard too, has no way to tell the
-two apart afterwards. `Filter::Editing` — text still being typed — is
-different again: `Esc` there cancels outright rather than clearing-then-
-backing-out, since there is nothing committed yet to "back out of" one step
-at a time.
+`Esc` with a filter applied clears it and stays put; the next `Esc` backs out.
+While still typing, `Esc` cancels the edit.
 
 ### 69. The previous-log toggle lives on `View`, and always flips
 
-`p` switches the container-logs pane between a container's current log and
-its previous instance's (`kubectl logs -p`). The obvious place to keep
-"which one" is a field on `App`, the way `Filter` and the sort orders are —
-but every one of those is read by a `draw` function and nothing else decides
-whether to fetch on its account. A log's mode decides *what gets fetched*,
-and `event_loop` already has exactly one trigger for that: "the view just
-changed, so ask `start_drill_fetch` what it needs now." Putting `previous`
-on `View::ContainerLogs` itself means flipping it is a view change like
-drilling in or backing out, and reuses that wiring outright rather than
-teaching `event_loop` a second reason to refetch.
+`previous` lives on `View::ContainerLogs`, so `p` is a view change and reuses
+the refetch wiring. `p` always flips; with no restarts it shows
+`LogsState::Unavailable` (information, not an error) without fetching. Previous
+logs use `follow: false`.
 
-The harder call was what happens when there is nothing to switch to. A
-container that has never restarted has no previous instance, and opening a
-connection that could only ever answer "not found" would read as a hung
-fetch until it did — so `toggle_log_previous` checks the restart count
-(read from `App::containers`, the listing this pane's own drill-down already
-left in place, rather than a second copy carried on `View`) and refuses
-before anything is sent. The first version of that refusal left `previous`
-unchanged and only overwrote `self.logs` with a message — which meant a
-second `p` re-ran the identical refusal forever, because nothing about the
-state that decides "am I trying to switch" had moved. `p` now always flips
-`previous`, refusal or not; a switch that lands on "previous" with nothing
-there sets `LogsState::Unavailable` instead of fetching, and a second press
-flips back to `false` and fetches the current log exactly as it would from
-any other starting point. `Unavailable` is deliberately not `Error`: an
-`Error` is a connection that was attempted and failed, styled to match, and
-this is neither — the connection was never opened, and the message is
-information, not a fault. Flipping `previous` unconditionally also means the
-refusal is a real view change, so `start_drill_fetch`'s unconditional drop
-of the previous fetch still runs and the stream that was showing the current
-log is not left running unread behind the message.
+### 70. `--sort` advice is filtered by `distinguishes`, a second and stricter predicate than `ranks_any`
 
-`k8s::pods::logs::params` answers the one question the roadmap entry left
-open, whether opening a previous log should force `follow: false`: yes,
-unconditionally, because a terminated container's log has already stopped
-growing and a `follow`ed read of one would sit open waiting for a line that
-is never coming. The current log's own `follow: true` is untouched.
+An alternative is suggested only if it both ranks some row and puts two rows in
+a different order (`distinguishes`, one pass comparing each rank with the
+first). All other uses keep `ranks_any`. A one-row listing never gets
+suggestions.
 
-### 70. `--sort` advice is filtered by `distinguishes`, a second and stricter
-predicate than `ranks_any`
+### 71. A vacuous ordering the user actually typed gets its own diagnosis, in `unranked_note` rather than a second function
 
-`k8s::order::unranked_note`'s "sort by X instead" line used to suggest any
-ordering `ranks_any` said yes to — has at least one row it can rank. `--sort
-status` on a cluster where every node is `Ready` exposed the gap: every node
-has a status, so `ranks_any` is trivially true for it, and offering it as the
-fix for a failed ordering sends the reader to a table that looks exactly like
-the one that just told them nothing worked. The roadmap entry behind this
-posed two questions and left both to whoever picked the task up.
+A ranked but non-distinguishing order prints `Every row here ranks the same
+under {name}, so sorting by it changed nothing.`, with no `Cause`. It's a branch
+of `unranked_note`, so every listing and pane got it with no call-site changes.
 
-The first: whether "the rows differ under this ordering" is the right bar for
-a *suggestion*, given "one row ranked" is deliberately the bar everywhere
-else `k8s::order` asks it — whether the flag itself is honoured, whether the
-diagnosis fires, which tail tier an unranked row lands in. It is, and only
-there: `unranked_note` now takes a second closure, `distinguishes`, asked
-only inside `alternatives`, and ANDed with the existing `ranks` rather than
-replacing it — an ordering has to both have something to rank a row by *and*
-actually put two rows in a different arrangement before it earns a place in
-the advice. Every other use of `ranks_any` — deciding whether the user's own
-chosen ordering counts as unranked, deciding a row's tail tier, deciding
-`cause` — is untouched. The advice line is the one place in the tool that
-promises the reader something will look different if they type this, so it
-is the one place held to a promise the rest of `--sort` does not make.
+### 72. A dashboard pane's `--wide` facts move to the detail view they are about, rather than growing a wide mode
 
-The second: whether an ordering that puts every row in one group is really
-saying nothing, given "everything here is `Ready`" is an answer of a kind.
-It is not treated as one here. The advice list exists to name a flag worth
-typing next, and an ordering that provably rearranges nothing is not that,
-whatever true thing it could be read as saying about the cluster instead. A
-note that answered "is everything healthy" would be a different, useful
-feature — closer to a summary line than to sort advice — and it is not this
-one; building it would have been guessing at a feature the task never asked
-for under the cover of answering the one it did.
-
-`distinguishes(rows, order)` is implemented once per listing, beside its
-`ranks_any`, by comparing every row's `rank` against the first row's rather
-than comparing every pair: `rank` is already a total order (it is what `sort`
-itself uses before the alphabetical tie-break), so if every row compares
-equal to the first they compare equal to each other, and one pass is enough.
-`ranks_any` and `distinguishes` genuinely diverge, not only on the uniform-
-status case the roadmap entry named: two nodes tied at the same share of
-allocatable both rank under `cpu` and distinguish nothing between them,
-proven directly in `k8s::nodes::order`'s tests.
-
-The consequence worth flagging rather than discovering later: a listing of
-exactly one row can never be distinguished by anything, so a single-node or
-single-pod cluster now gets the bare diagnosis with no "sort by X instead" at
-all, where before it got whichever alternatives `ranks_any` allowed regardless
-of how many rows were on screen. Sorting one row was always a no-op, so the
-new note is arguably the honest one — but it is a real behaviour change
-beyond the literal example the roadmap entry gave, and several existing tests
-in `k8s::nodes` that used single-row fixtures needed a second, contrasting row
-added to keep testing what they were written to test rather than quietly
-starting to test the single-row case instead.
-
-Left open, and its own roadmap entry: `unranked_note`'s gate on the user's
-*own* chosen ordering is still `ranks_any` alone, so `--sort status` typed
-directly against a uniform cluster still prints `Sorted by status.` with
-nothing said about the fact that it changed nothing. That is a different
-question — whether a working-but-vacuous ordering deserves a note at all,
-given the line is not lying — and answering it was not this decision's to
-make.
-
-### 71. A vacuous ordering the user actually typed gets its own diagnosis, in
-`unranked_note` rather than a second function
-
-Decision 70 left one gap on purpose: `unranked_note`'s gate on the order the
-user typed was still `ranks_any` alone, so `--sort status` against a cluster
-where every node is `Ready` printed only `Sorted by status.` — true, and
-silent about the fact that the table looks exactly like it did before the
-flag. This decision closes it.
-
-The two questions worth separating were whether a working-but-vacuous
-ordering deserves a note at all, given `note`'s line is not lying, and — if
-so — what it should say that is not `unranked_note`'s existing wording
-reused for a different reason. Both are answered yes and "something
-different": `note` stays honest about *what was asked for*, and a second
-line, alongside the one that already exists for "nothing to rank", answers
-the question `note` cannot — *whether it mattered*. Silence there reads as
-success, and for a vacuous ordering it is not one.
-
-The mechanical choice was whether that second line is a new function or a
-second branch on `unranked_note`. It is the latter. `unranked_note` already
-takes `ranks` and `distinguishes` as closures — `distinguishes` was, before
-this decision, read only inside `alternatives`, to build the advice — so the
-guard `if order == O::default() || ranks(order) { return None; }` became `if
-order == O::default() { return None; }` followed by a diagnosis chosen from
-three cases: nothing to rank (unchanged, `Cause` still applies), ranked but
-`!distinguishes(order)` (new; `Cause` does not apply — the column is not
-missing, so nothing above the table could be pointing at it), and both
-(silent, unchanged). A second function would have needed its own copy of
-`alternatives`'s advice-building, for advice that is identical either way —
-an ordering has to clear `ranks` and `distinguishes` to be offered whichever
-diagnosis is asking. The four call sites (`commands::nodes`,
-`commands::pods`, `ui::nodes`, `ui::pods`) needed no changes at all: they
-already pass `distinguishes` as the fourth argument, so the new case reaches
-every listing and every dashboard pane in one change rather than four.
-
-The wording is deliberately not `unranked_note`'s existing "nothing here has
-X to sort by" reused: that sentence is false when `ranks(order)` is true —
-there *is* something to sort by, and every row has it. The new line —
-`Every row here ranks the same under {name}, so sorting by it changed
-nothing.` — names the actual fact: not an absent column, but one where
-every value ties.
-
-The consequence worth flagging, an extension of the one decision 70 already
-named: a listing of exactly one row can never be *distinguished* by
-anything, so a single-row cluster now gets the "changed nothing" diagnosis
-for any non-default ordering it ranks under, where before it printed only
-`Sorted by cpu.` and stopped. `k8s::nodes::mod` and `ui::nodes`/`ui::pods`
-each had one existing test built on a single ranked row that asserted
-silence beyond the "Sorted by" line; each needed a second, contrasting row
-to keep testing what it was written to test — the same shape of fix decision
-70 needed for `k8s::nodes`'s own single-row fixtures — plus a new test
-against the single-row case to cover what actually changed. Sorting one row
-was always a no-op, so the new line is the honest one, and it is now said in
-the one place `--sort` speaks rather than left to the reader to notice.
-
-### 72. A dashboard pane's `--wide` facts move to the detail view they are
-about, rather than growing a wide mode
-
-The roadmap left "Decide what `--wide` means in a dashboard pane" open on
-purpose: `format::Width::Wide` reserves five columns on `eks nodes` and three
-on `eks pods` for facts most listings never need, and whether a pane meets
-the same flag with the same mechanism — a wider table — or with something
-else was called out as a question a pane's own shape should answer, not one
-the CLI's answer could be guessed forward from.
-
-It answers "something else", and only for pods tonight. A CLI table earns a
-wide mode because every row is a line the reader either reads or skips, and
-five more columns are five more things to skip past on a hundred rows that
-did not need them. A dashboard pane showing one pod's containers has already
-committed to that one row — the breadcrumb names it, `Enter` chose it — so
-its extra facts are not competing with anything else on screen for space.
-There is nothing left to widen *away from*.
-
-So `IP`, `NOMINATED NODE`, and `READINESS GATES` — `k8s::pods::row::Column`'s
-three `--wide`-only pod columns — now appear as plain lines above the
-container list in the pod-containers pane (`ui::containers::identity_lines`),
-unconditionally, with no `--wide` equivalent key to press. `IP` always shows,
-`-` included, because a pod with no address yet is itself the answer to "why
-can't anything reach this pod". `NOMINATED NODE` and `READINESS GATES` follow
-the CLI columns' own judgement of when they are worth print space — neither
-line appears for the ordinary pod that has neither — which is the one thing
-this change keeps rather than reopens: nearly every pod would print nothing
-new, and the pane should not either.
-
-The values themselves come from the same three functions the CLI's `Column`
-already called, not a second reading of `pod.status`: `k8s::pods::row::pod_ip`
-and `::readiness_gates` were private free functions and are now `pub(crate)`,
-and the nominated-node lookup — inlined before tonight, directly in
-`PodRow::from_pod` — is now its own function, `nominated_node`, beside them,
-so `PodRow::from_pod` and the pane's fetch call the identical three functions
-rather than one of them keeping a second copy of the field it reads.
-`commands::pods::gather_containers` already fetches the one full `Pod` these
-need; it was building a `ContainerRow` list from it and discarding the rest,
-so nothing new is fetched — `ContainersFetch` just keeps three more fields of
-what it already has, and `ContainersState::Loaded` carries them to the pane
-the same way.
-
-What this does not settle: the node table's five `--wide` columns
-(`INTERNAL-IP`, `EXTERNAL-IP`, `OS-IMAGE`, `KERNEL-VERSION`,
-`CONTAINER-RUNTIME`) have nowhere to land by the same reasoning, because the
-node pane has no equivalent of the pod-containers pane — `Enter` on a node
-drills into its pods, not into a detail view of the node itself. The
-"detail view already exists" argument above depends on that view existing,
-and for nodes it does not; a new roadmap entry below builds that surface
-before this question can be answered for it, rather than this change
-guessing at a view's shape to hang five facts on. The pod half above is the
-complete answer to its half of the question, not a partial answer to the
-whole of it.
+There's no wide mode in panes. The pod-containers pane shows `IP` always, and
+`NOMINATED NODE`/`READINESS GATES` when present, as lines above the containers,
+read through the same `pub(crate)` functions the CLI columns use, with no new
+fetch. (Nodes: decision 78.)
 
 ### 73. `eks contexts` honours `--color`, and the `*` gutter still does not
 
-`commands::contexts::render_table` hardcoded `Palette::Plain` even though
-`--color` has been a global flag since the CLI colour task landed — `eks
-contexts --color always` and `eks contexts --color never` printed the same
-bytes, silently ignoring what the user typed. That was always going to be
-invisible rather than wrong, because nothing in `NAME`/`REGION`/`NAMESPACE`
-is a reading off a cluster's health: a context is a name, a region, and a
-namespace read out of a file, so every cell is `format::Cell::plain` and a
-palette has nothing to paint. But "invisible" and "correct" are different
-claims, and a table that only happens to look right under `--color` because
-it never looks at the flag would stop looking right the day a graded column
-is added here. `list` and `render_table` now take the `Palette` the caller
-was given, `main::run` passes `stdout_palette(cli.global.color)` exactly as
-`nodes::list` and `pods::list` already do, and a new test asserts the two
-palettes render identically — the property this relies on, not an
-accident of today's columns.
+`contexts` now takes the caller's `Palette`; a test asserts both palettes render
+identically. Colouring the `*` identity marker was left to the theme work.
 
-The `*` gutter is the one mark in this table that does single a row out,
-and it is not a `format::Cell` — it is written outside `format::table`
-entirely, the same way the dashboard's sidebar draws its own current-cluster
-marker in `Severity::Ok` green. The roadmap task this closes noticed that
-inconsistency and asked whether the gutter should match. It stays
-uncoloured. Colouring it is not "does this table honour the palette it is
-given" — that question is now answered, plainly, by the fix above — it is
-"is an identity marker, as opposed to a health reading, colour's business at
-all", and that question already has a claimant: the Milestone 3 light-theme
-task, which is where headings, a selection highlight, and a cluster's own
-name would all get decided together against a WCAG contrast budget this
-task was never given. Deciding the gutter alone, tonight, would be one more
-guess in the direction that task exists to settle deliberately.
 ### 74. `eks` does not own credential resolution; it owns knowing when it will fail
 
-The open question in the roadmap's "Stop the credential helper" entry — whether
-`eks` wants to own credential resolution at all — is answered *no*, and this
-change is what makes the no affordable.
-
-Owning it would mean implementing the `client.authentication.k8s.io` exec
-protocol, or the IAM Identity Center OIDC device flow over `aws-sdk-ssooidc`,
-and handing `kube` a resolved `Config`. Both were weighed and both lost to the
-same two objections. The first is cost: `aws-config` and the smithy stack pull a
-second hyper/rustls tree into a binary whose startup time is priority one in
-`CLAUDE.md`, and the commands that touch nothing but the filesystem currently do
-not even build a runtime. The second is worse: a native device flow has to write
-the token cache in the format `aws eks get-token` reads back, and that format is
-`botocore`'s private contract. We would be pinning ourselves to an
-implementation detail of the tool we are trying to cooperate with, and a change
-to it would show up as "logging in silently does nothing".
-
-So `aws::login` shells out to `aws sso login --profile X`. The AWS CLI is
-already a hard requirement of every EKS context this tool opens — the `exec`
-block runs it — so this adds no dependency the user did not already have, and it
-inherits the browser handling, the device-code flow, and the cache format for
-free. Always the `--profile` spelling and never `--sso-session`: it works for
-both spellings of an Identity Center profile and on older CLI v2 builds, and one
-form is one thing to print in the message offering it.
-
-What `eks` does own is the *question*. That half needs no SDK at all, because
-the answer is on disk.
-
-Narrowed by decision 110: `eks` now runs the kubeconfig `exec` helper itself,
-and still does not own logging in.
+No AWS SDK: it adds a second hyper/rustls tree to startup, and writing
+`botocore`'s private token cache is fragile. `aws::login` shells out to `aws sso
+login --profile X`. `eks` owns detecting the expiry, which needs only files on
+disk. (Narrowed by decision 110: we now run the `exec` helper ourselves.)
 
 ### 75. The session check reads two files, and matches on `startUrl` rather than a hash
 
-`aws::config` reads `~/.aws/config` for four keys, and `aws::sso` reads the AWS
-CLI's token cache for two. Both are pure functions over file contents with an
-explicit `now`, which is what lets the check run *before* connecting instead of
-in reaction to a `401` the user has already waited for. Measured against a
-31-entry cache the whole pre-flight is under a tenth of a millisecond, so it
-sits before the dashboard's first paint without troubling the 50 ms budget.
-
-Two choices inside it are worth writing down.
-
-**The config reader is hand-written, not a dependency.** AWS's format looks like
-INI and is not: a value may be empty and continue as an indented block beneath
-it (`s3 =` followed by `addressing_style = path`), which a general-purpose
-reader either rejects or folds into the section as bare keys. We want four keys,
-none of which is ever written that way, so the parser skips indented lines
-rather than modelling sub-properties. Eighty lines, and it earns its place under
-`CLAUDE.md`'s dependency rule where a crate would not. `serde_json` was promoted
-from a dev-dependency for the cache, which is genuinely JSON and somebody
-else's; hand-rolling a reader for that would have been the worse trade.
-
-**Cache entries are matched on the `startUrl` inside them, not on the
-filename.** The AWS CLI names each file after the SHA-1 of the session name or
-start URL. That is a `botocore` implementation detail rather than a documented
-contract, and a tool that recomputed the hash would break silently the day it
-changed — while reading a hash of a value it is already holding. Matching the
-field costs a scan of a few small files, cannot drift, and skips the
-`botocore-client-id-*.json` registrations in the same directory for free, since
-they carry no `startUrl`. Every failure in that scan is a skip: a directory that
-does not exist means nobody has logged in yet, and a file we cannot parse
-belongs to a newer CLI than the one we were written against. The worst case of
-being wrong is offering a login that was not needed.
-
-A token with under sixty seconds left counts as expired. It would be refused
-partway through a paged listing otherwise, and a credential error about a
-session that was alive when the user pressed Enter is the worst of both answers.
-That folds two readings into one `Session::Expired`, so the wording function
-says "signs out in 40s" as readily as "signed out 9h ago".
+`aws::config` (a hand-written reader for four keys; AWS's format isn't INI) and
+`aws::sso` (the JSON token cache) are pure over contents and `now`, and take
+under 0.1 ms, so the check runs before connecting. Cache entries match on
+`startUrl`, not botocore's filename hash; unreadable entries are skipped. Under
+60 s left counts as expired.
 
 ### 76. A browser never opens without a yes, and the policy is a pure function
 
-`--login` is `auto`, `always`, or `never`, spelled to match `--color`'s three
-rather than inventing a second vocabulary for the same shape of choice.
-
-`aws::decide` is the entire policy as one pure function over the session, the
-flag, and whether there is a human at the terminal — the last passed in rather
-than asked for, so the table is a test. The row that matters is `auto` with no
-terminal: it proceeds, and the user gets the message this tool has always
-printed. A listing being redirected into a file has nobody to answer a question,
-and a tool that opened a browser there — or worse, sat waiting on a keystroke
-nobody would type — is one people work around rather than use. "Interactive"
-means both stdin *and* stderr are terminals, since that is where the answer
-comes from and where the question goes.
-
-Everything user-facing goes to stderr, and when stdout is not a terminal the
-child's stdout is redirected there too: `eks nodes | column -t` prints the same
-bytes it printed before. `--login never` keeps that promise literally — it does
-not read `~/.aws` at all, and the dashboard does not even build the runtime the
-pre-flight would need.
-
-The offer is made at most once per command. The retry after a cluster refuses is
-real and worth having — a token revoked centrally still reads as live in the
-cache until something tries to use it — but it is gated on `Outcome::NothingToDo`
-rather than on "no login has run yet". Three outcomes rather than a `bool`,
-because a user who has just answered "no" and a pre-flight that found nothing to
-say mean opposite things to the retry. Asking the identical question twice in
-one command is how a tool teaches people to reach for `--login never`.
-
-`aws sso login` is deliberately outside `--timeout`. That budget is about a
-cluster that will not answer; this is a human at a browser, and bounding it
-would recreate the hang-versus-give-up problem decision 50 solved, on the one
-path where waiting is the correct behaviour.
+`--login auto|always|never`. `aws::decide` is pure over session, flag, and
+interactivity (stdin and stderr both terminals). With `auto` and no terminal it
+proceeds without asking. Prompts go to stderr, keeping stdout clean. `never`
+doesn't read `~/.aws`. The offer is made at most once per command (three-way
+`Outcome`). `aws sso login` isn't bounded by `--timeout`.
 
 ### 77. The dashboard asks before it opens, and offers `L` after
 
-A one-shot command can ask a question wherever it likes. The dashboard cannot:
-its fetches run on background threads that do not own the terminal, and a login
-offered from one would be shouting over the pane it was trying to fill. So the
-two halves are split by *who owns the screen*.
-
-Before `ui::run` opens the alternate screen, `credentials::preflight` puts the
-question with ordinary stdio. Every fetcher built after that point is pinned to
-`LoginMode::Never` — not the user's flag — so a worker thread can never reach
-the prompt at all. That is a construction-time guarantee rather than a rule
-somebody has to remember.
-
-A session that dies while the dashboard is open is `L`, and deliberately not an
-automatic suspend: seizing the terminal from under somebody who is reading a
-container's log, to open a browser they did not ask for, is worse than the
-failure. `App::on_key` returns a new `Flow::Login` — its own variant for the
-reason `Flow::Quit` is one, the state machine decides and the event loop acts —
-and only when the failure on screen is credential-shaped. `credentials_lost` is
-one flag on `App` rather than a field threaded through four pane states: the
-session belongs to the cluster, not to whichever pane happened to be the one
-that asked, so a refusal from any of them offers the key and a success anywhere
-withdraws it.
-
-Carrying that flag across the thread boundary is why `commands::FetchError`
-replaced the bare `String` the fetchers used to hand back. The classification
-exists while the typed `k8s::client::Error` is still in hand and is gone by the
-time the receiving end has a message to print, so it is asked once, at the
-boundary, rather than re-derived by matching on English prose later.
-`k8s::client::Error::Cluster` grew a `failure` field for the same reason, and
-`Error::explained` gives the listings that run *after* a client exists the same
-pairing — an expired token is refused by the API server as readily as by the
-credential helper, and which of the two noticed is not something the user should
-have to care about.
-
-`ui::run` owns the suspend, because it is the only function here that knows a
-real terminal is involved. It hands `event_loop` a closure; `event_loop` stays
-generic over the backend and a test passes one that does nothing, so every
-keypress test still runs against `TestBackend`. The closure leaves raw mode and
-the alternate screen and re-enters them around the login rather than calling
-`ratatui::restore()`/`init()`, which would hand back a *new* `Terminal` the loop
-would have to swap in mid-iteration.
-
-Two smaller things fell out of touching that pane. The credential footer is its
-own short hint list, beside the ones `/` and the log view already have, rather
-than one more hint appended to the default: prepending `L log in` pushed `q
-quit` off an 80-column terminal, which the default list is explicitly ordered to
-protect, and when the session is gone `j/k` and `s/S` are moving around a
-listing nothing can refill anyway. And `NodesState::Error` is now drawn as one
-line per sentence: every message from `explain` diagnoses and then advises, and
-`ratatui` draws an embedded newline as one unbroken line, which had been putting
-the half that says what to do next off the right-hand edge of the pane.
+The pre-flight asks on plain stdio before the alternate screen opens; every
+fetcher after that is pinned to `LoginMode::Never`. A session lost mid-dashboard
+sets `credentials_lost` and offers `L` (`Flow::Login`), never an automatic
+suspend. `commands::FetchError` carries the classification across threads.
+`ui::run` owns the suspend closure (leave raw mode and alternate screen, then
+re-enter). There's a separate credential footer; error text is drawn one
+sentence per line.
 
 ### 78. The node's `--wide` facts land on the pod-drilldown pane, not a new `View`
 
-Decision 72 answered the pod half of "what does `--wide` mean in a dashboard
-pane" and left the node half open: a pod-containers pane could hold its wide
-facts because it already committed to one pod, and nothing played that role
-for a node — `Enter` on one drills into its pods, not into a view of the node
-itself. The roadmap entry this closes framed the missing piece as "a node's
-own detail view", which reads like a new surface. It turned out not to need
-one.
-
-`View::NodePods { node }` already commits to exactly one node the same way
-`View::PodContainers` commits to exactly one pod — the breadcrumb names it,
-`Enter` chose it, and nothing else is competing for the pane's space. The
-only reason it did not already look like a detail view is that nothing had
-put node-level facts in it yet; once something does, it *is* the view decision
-72 was waiting on, not a stand-in for one. A fifth `View` variant naming a
-node whose pods `NodePods` already names would have been two views with one
-identity, and `App::retreat`/`back_out_one_level` would have gained a level
-that backs out to nowhere new.
-
-So `INTERNAL-IP`, `EXTERNAL-IP`, `OS-IMAGE`, `KERNEL-VERSION`, and
-`CONTAINER-RUNTIME` — `k8s::nodes::Column`'s five `--wide`-only columns —
-now draw as plain lines above the pod list in `ui::pods::draw`
-(`node_facts_lines`), the same shape decision 72 used for the pod side. They
-are unconditional, unlike that decision's `NOMINATED NODE`/`READINESS GATES`:
-the node table's `--wide` tail prints every column whatever is in the cell,
-never dropping one because a row has nothing to say, and the detail view
-inherits that rule along with the columns rather than the pod side's
-any-not-all one. `k8s::nodes::wide_facts` is the pure function that reads
-them off a `NodeRow` through the same `Column::header`/`Column::text` the
-table calls, so the two surfaces cannot describe a node's addresses or AMI
-differently — this is a second presentation of already-computed fields, not
-a second reading of `Node`.
-
-The facts need no second fetch. `View::NodePods` is reached only from a
-highlighted row in the node pane's own listing, which already holds a full
-`NodeRow` — including the five wide fields, always computed, never gated on
-`--wide` there either. `App::drilled_node` looks it up by name from
-`App::nodes()` rather than `View` carrying a copy, so a background refresh
-that changes the row is picked up for free and one that drops the node
-entirely — scaled down mid-session — reads as no facts rather than stale
-ones. Drawing them ahead of the pod fetch's own result, including while it is
-still `Loading`, was a deliberate choice rather than an oversight: they were
-known before that fetch even started, and making a reader wait for the pods
-to answer before showing facts about the node they are already looking at
-would cost first paint for no reason.
+`View::NodePods` already commits to one node, so its five wide facts draw
+unconditionally above the pod list via `k8s::nodes::wide_facts`, through the
+table's own `Column` accessors, from the `NodeRow` already in hand.
+The node is looked up by name (`App::drilled_node`), so a refresh updates it and a
+vanished node shows nothing. The facts draw while the pods are still loading.
 
 ### 79. A pod's request gets its own columns; the usage pair loses its half
 
-The roadmap entry framed this as a choice between two designs: a `CPU REQ`
-column beside the existing `262m/500m (52%)` cell, which would print the
-request twice, or a column and a plainer usage cell — the node table's own
-shape, where `CPU REQ` and `CPU` sit side by side rather than one cell
-carrying both halves. The second was the only one that survives its own
-premise: the whole point of the task is that a request has to be visible
-*without* a sample behind it, and a number that lives only inside a usage
-cell cannot do that — a cluster with no metrics-server would still print
-nothing about what anything booked, the exact complaint the roadmap entry
-opened with.
+`CPU REQ`/`MEMORY REQ` show the bare request whether or not anything is sampled;
+the usage cell becomes `250m (50%)` under plain `CPU`. The two request columns
+are gated together on any nonzero request. Device request columns come from the
+union of the rows' `extended_requested`, and a pod that didn't ask reads `0`, not
+`-`. Drop order: request pair before usage pair, then all devices together,
+before the health columns.
 
-So `k8s::pods::row::Column` gained `CpuRequested` and `MemoryRequested`,
-carrying `PodRow::cpu_requested`/`memory_requested` — already there as the
-usage cell's denominator — through `quantity::cpu`/`quantity::memory`
-directly, with no percentage of their own: a request is not a share of
-anything, it is the number itself. `Column::Cpu`/`Column::Memory` (the usage
-cells) lost the `against_request: bool` field their heading used to switch
-on: `CPU/REQ` over `250m/500m (50%)` becomes plain `CPU` over `250m (50%)`,
-always — the heading no longer needs to promise a denominator it might not
-have, because the denominator has its own column now. `usage_cell` dropped
-the branch that printed `requested` a second time; `ratio_of`'s existing
-zero-denominator check still decides when there is no percentage to show at
-all, unchanged from before.
+### 80. Pod events land in the existing pod-containers pane, as a section that can fail on its own
 
-The two new columns are gated together, on whether *any* row in the listing
-has a nonzero request in either resource — the same `any`-not-`all` shape
-`shows_usage` already used, so a namespace where nobody set a request does
-not grow two columns of `0`. They are gated as a pair rather than per
-resource: unlike the extended-resource columns below, which answer "did a
-pod ask for this specific thing", a request is one question — "what did this
-book?" — and a pod that set a memory request and left CPU unbounded still
-belongs beside a `CPU REQ` reading `0`, its own honest answer, rather than
-losing the column a neighbouring row earned. A pod's own `CPU`/`MEMORY`
-usage cell still falls back to its bare figure when *that pod's* request is
-zero, through the same `ratio_of` check as before — the pairing decides
-whether the column exists, not what any one row's cell says.
-
-The device half followed the node table's own device columns exactly:
-`PodRow` gained `extended_requested: BTreeMap<String, Quantity>`, the
-`Requests::extended` map `effective_requests` already computed and
-`cpu_requested`/`memory_requested` already draw from, just never carried
-through to the row before. `Column::Device(&str)` borrows the resource name
-from the rows the way `k8s::nodes::Column::Device` does, and the set of
-names worth a column is `device_names`'s union across every row's map — no
-nonzero filter, unlike `k8s::nodes::hugepage_names`: a pod's extended map
-only ever holds a resource some container's spec actually named, so there is
-no "every pod reports this at zero" noise to filter the way huge-page sizes
-have on every node. One genuine divergence from the node table: a pod that
-never asked for a device reads `0` in that column, not `-`. A node's `-`
-tells "no such hardware" apart from "hardware nobody is using" — two
-different facts about a machine. A pod has no hardware to have or not have;
-every pod could in principle request any resource, so not asking is itself
-a real, honest zero, the same reading `cpu_requested`/`memory_requested`
-already give a pod that set no request at all.
-
-`DROP_ORDER` needed two new steps rather than one, and they sit in the
-opposite order from how the columns are gated: `CpuRequested`/
-`MemoryRequested` drop *before* `Cpu`/`Memory`, leaving usage on its own —
-"what is this pod doing right now" is the question the tool exists to
-answer, so it is the resource pair that survives longest, exactly as the
-node table's own `CPU REQ`/`MEM REQ` step drops ahead of its `CPU USE`/`MEM
-USE` step. The device columns get their own step, all of them together, and
-it sits after the request and usage pairs but ahead of the health columns —
-a GPU cluster wants every device column or none, the same reasoning that
-keeps the node table's device columns as one step, and losing a pod's status
-to make room for its GPU count would be the wrong trade at any width.
-
-Nothing here touches the dashboard. `k8s::pods::row::Column` and its
-`columns`/`render` are `eks pods`-only — the pod-drilldown pane draws
-`PodRow` through its own hand-written lines in `ui::pods`, which never
-reads `cpu_requested`/`cpu_used` today (that pane does not sample usage at
-all yet; see the open "Wire `metrics.k8s.io` into the pod-drilldown pane"
-entry) — so this change is contained to the one table and its command-layer
-caller in `commands::pods::list`, neither of which needed to change beyond
-picking up the new columns.
-
-What "hot" means for a pod's own usage against its own request stays exactly
-where the roadmap already left it, deliberately unresolved: `CpuRequested`,
-`MemoryRequested`, and the device columns carry no percentage at all, so
-there is nothing pending for them to grade — they are plain facts, like
-`AGE`. Sorting a pod listing by a share of what it asked for, and sorting
-either table by an extended resource, are both still open for the same
-reason they were before: `Requests::extended`'s names are not known until
-the rows arrive, which is a `--sort` design question this change did not
-need to answer to give a request its own column.
-
-### 80. Pod events land in the existing pod-containers pane, as a section that
-can fail on its own
-
-The roadmap task built the case for a genuinely new surface — nothing in this
-tool reads the `Event` API yet — but stopped short of saying where the
-result should live. Decision 72 already answered the closest version of this
-question for `--wide`'s pod facts: a dashboard pane that has committed to one
-pod, via a breadcrumb and an `Enter` press, has nowhere to widen *away from*,
-so new facts about that pod are plain lines rather than a second view behind
-a new key. Events are the same shape of fact — true of the one pod already on
-screen, not a reason to make the reader navigate anywhere — so they became a
-second heading in the same pane, `EVENTS` under `CONTAINERS`, rather than a
-fifth `View` variant. Unlike the `--wide` facts, though, an event is not a
-field already sitting in the `Pod` `gather_containers` fetches; it needs its
-own request, and that request can fail on its own terms.
-
-That independence is the decision with real teeth. `commands::pods::
-ContainersFetch` used to be one `Result`: the pod existed or it did not, and
-every field the pane showed came from that one object. Splitting the events
-listing out as its own `Result`, joined concurrently with `budget.wrap(api.
-get(pod))` via `tokio::join!`, means a pod whose containers this tool can read
-perfectly well can still show `events_error` where an RBAC role granted
-`pods/get` but not `events/list` — a boundary this tool already treats as
-ordinary everywhere else (a node listing that fails does not empty a working
-pod listing; metrics.k8s.io failing does not empty either). Coloured as
-information (`theme.dim()`) rather than `Severity::Critical`, matching
-`ui::logs::LogsState::Unavailable`'s own reasoning: the pane itself did not
-fail, so painting the message in the colour reserved for that would overstate
-what went wrong. The alternative — folding the events failure into the
-pane's existing top-level `ContainersState::Error` — was rejected outright:
-it would turn a partial, ordinary permission gap into the same "this pod
-could not be found" sentence a failed `get` produces, for two failures that
-call for different next steps.
-
-Grouping settled on `(reason, message)` as the collapsing key, over the
-simpler "read each `Event` object's own `count` field and print one row per
-object." `EventSeries` — the mechanism a modern control plane uses to batch
-repeated occurrences into one object's `count`/`lastObservedTime` rather than
-minting a new object each time — already does most of this collapsing
-server-side, but nothing guarantees every event source on every cluster this
-tool will meet uses it: an older or third-party controller can still emit the
-same `BackOff` as several distinct objects. Grouping client-side on the
-content rather than trusting one server mechanism is what makes "matching
-`kubectl`'s own collapsing" — the acceptance criterion's own phrase — true
-regardless of which one produced the events, at the cost of a `BTreeMap` walk
-`k8s::pods::by_node` already established as an ordinary shape for this
-codebase to reach for.
-
-The empty case needed its own answer rather than reusing `LogsState::
-Unavailable`'s wording verbatim, because "no events" is not one claim — it
-depends on the *pod's* age relative to the API server's retention, a fact
-external to the events listing itself. `events::empty_note` reads the pod's
-own `creationTimestamp`, already in hand from the same `get` that built the
-container rows, against a constant, documented assumption
-(`RETENTION_SECS`, an hour) rather than anything this tool can actually
-observe — `kube-controller-manager`'s `--event-ttl` is not exposed by any API
-this tool reads, so the constant is a best-effort default rather than a
-measured fact, and a cluster operator who changed it would see this tool's
-hedge fire at the wrong boundary. Accepted because the two wordings it
-produces are each honest about what they know: a pod younger than the
-assumed window gets the confident one, and everything else gets the
-hedge — never a false "nothing has happened" for a pod old enough that
-something could have happened and already expired.
-
-The field selector doubles up deliberately:
-`involvedObject.name={pod},involvedObject.namespace={namespace}` is sent to
-an `Api::namespaced(client, namespace)` that already scopes the request to
-that namespace. Belt and braces rather than an oversight — `involvedObject.
-namespace` is one of the handful of fields the events API actually indexes
-on, specifically so a query naming it does not have to fall back to scanning
-every event in the namespace for one whose `involvedObject.name` matches — so
-naming it costs nothing and guards against the one server implementation
-detail this tool has no way to verify from here. `core::v1::Event`, not
-`events.k8s.io/v1::Event`, is the type read: the roadmap task left both
-open, and the older type's field names (`reason`, `message`, `count`,
-`lastTimestamp`) are the ones `kubectl describe pod` itself prints, which
-keeps this tool's wording recognisable rather than translating between two
-API generations' vocabularies for no reader-facing benefit.
-
-What this does not settle: the pane's existing `/` filter does not reach the
-new section, because an event is not a row `App`'s highlight or `Enter` can
-land on the way a container is — extending `fuzzy::rank`'s "narrow a list of
-selectable rows" to a block of read-only text is a question of its own, left
-as a follow-up rather than guessed at here.
+`EVENTS` sits under `CONTAINERS`. It's fetched concurrently and has its own
+`Result`, so missing `events/list` RBAC shows a dimmed `events_error` without
+breaking the pane. Events are grouped client-side on `(reason, message)`, like
+kubectl. An empty list is worded by pod age against an assumed 1 h retention
+(`RETENTION_SECS`). The query sets both `involvedObject.name` and `.namespace`;
+it reads `core::v1::Event`.
 
 ### 81. A pod's usage sorts by share too, and the wrapper for it moves to `k8s::order`
 
-"Sort a pod listing by its share of what it asked for" left two questions
-open: whether the share is two more `--sort` values or a modifier over `cpu`/
-`memory`, and whether the node orders — which already rank by share of
-allocatable — should gain the opposite reading, a raw-figure sort, for
-symmetry.
-
-The first is `CpuShare`/`MemoryShare`, two more variants on `k8s::pods::
-order::Order` (`--sort cpu-share`/`--sort memory-share`), rather than a second
-flag or a modifier bit on the existing two. A modifier would have made every
-call site that reads `Order` — `rank`, `ranked`, `cause`, the dashboard's `s`
-cycle, the CLI's `--help` listing — carry a `(Order, bool)` pair instead of one
-value `clap::ValueEnum` already knows how to parse, reject, and print by name;
-a plain fifth and sixth variant costs nothing beyond the match arms an added
-ordering always costs, and `Order::value_variants()` — what `s` cycles and
-`--help` lists — grows for free.
-
-The second is answered "not tonight, and not as a mechanical follow-up
-either." A raw-figure sort for nodes is not a small addition to what this
-task built; it is a new reading of `eks nodes --sort cpu` that nobody asked
-for, on a listing whose whole point (decision-worthy enough to get its own
-module-doc section in `k8s::nodes::order`) is that a node's raw figure is a
-worse question than its share. Bolting on a `--sort cpu-raw` because the pod
-side now has two readings would be guessing at a demand this roadmap entry
-never stated, so it is left off entirely — not even as a new roadmap line —
-rather than invented as a "symmetry" nobody is asking to use.
-
-What the two listings do now share is the mechanism: `Ratio`, the `f64`
-newtype with a `total_cmp`-based `Ord` that a share ordering needs and `f64`
-itself does not provide, moved from a private struct in `k8s::nodes::order` to
-a crate-private one in `k8s::order` beside `Rank` and `Direction`. Both
-listings were about to carry the identical eleven lines — the same
-`PartialEq`/`Eq`/`PartialOrd`/`Ord` boilerplate wrapping a `total_cmp` call —
-for the same reason: a node's share is usage over allocatable, a pod's new
-share is usage over its own request, and neither denominator changes what
-"order these ratios, including whatever a strange API response produces,
-without panicking or making the sort inconsistent" means. `k8s::order`
-already existed as the seam for exactly this — the *shape* of an ordering
-shared between the two listings, as opposed to the keys, which are not — so
-`Ratio` is shape, and moved there rather than staying duplicated or being
-`pub(crate) use`d one way across a module boundary that would have hidden
-which module actually owned it.
-
-`share`, the function that turns a pod's `(cpu_used, cpu_requested)` pair into
-a `Rank<Reverse<Ratio>>`, draws the same two-tier tail `k8s::nodes::order`'s
-`busiest` draws for a node's `(amount, allocatable)`: a pod sampled but asking
-for nothing is a different blank from a pod nobody has sampled at all, and
-conflating them would let an unsampled pod's absence read as a confirmed
-zero — a claim about the pod rather than about the scraper. `Quantity::
-ratio_of` already declines a zero denominator, so, as with the existing
-`usage_cell` it sits beside, the two failures fall out of one `match` rather
-than a second explicit zero check that could drift from it.
+`--sort cpu-share`/`memory-share` are new `Order` variants, not a modifier. No
+raw-figure sort for nodes. The `Ratio` (`total_cmp`) newtype moved to
+`k8s::order`. Share has two unranked tiers: sampled with no request, then
+unsampled.
 
 ### 82. A stale sample gets a text marker on its own cell, not a column or a colour
 
-"A row whose sample is old, rather than a listing that is" left the shape open
-on purpose: an age column, or a marker on the row, and the marker option was
-explicitly blocked on `Severity` colour existing to make it legible. Colour now
-exists, which looked at first like the marker's design was already settled —
-paint the stale cell the way a hot one already is. It is not, for a reason the
-original wording did not anticipate: both tables already spend `Severity` on
-these exact cells, or are deliberately saving it for a decision not yet made.
-
-`eks nodes`' `CPU USE`/`MEM USE` are graded by `Share::severity`, one of
-`Severity::from_utilisation`'s thresholds — a node at 95% of allocatable reads
-as `Critical` today, on purpose. Staleness is an orthogonal fact about the
-*reading*, not a rival judgement about the *node*, and `format::Cell` carries
-exactly one `Severity` per cell. Making a stale-but-idle node's usage cell
-red would tell the reader the node is busy, which the sample cannot actually
-support — it might be busy, or idle, or anything else, because the only
-honest thing metrics-server's silence says is "ask again later." Overwriting
-the utilisation colour with a "stale" one the other way loses the reading the
-column exists to show. Blending the two into a third colour is a fabricated
-severity level with no threshold behind it, invented for one column.
-
-`eks pods`' `CPU`/`MEMORY` cells carry no `Severity` at all yet — "What 'hot'
-means for a pod against its own request", a few tasks below this one on the
-roadmap, is the open question of whether a pod's share of its own request
-should be graded, and on what thresholds. Answering "is a stale figure
-alarming" for that column first, as a side effect of this task, would have
-pre-empted a decision this change has no basis to make; the honest answer
-today is that pod usage carries no judgement of any kind, staleness included.
-
-Text sidesteps both problems: `k8s::metrics::mark_stale` appends `" (stale)"`
-to the cell `usage_cell`/`Share::cell` already built, which is legible under
-`Palette::Plain` as well as `Palette::Colour`, and it says nothing about
-whether the figure it decorates is otherwise good or bad. It is also `String`
-in, `String` out — a function beside `freshness_note`, not a new field on
-`format::Cell` or a second severity channel threaded through the render path.
-
-The follow-on cost is real and is written down rather than absorbed: the node
-pane's utilisation bars read `Share` directly, not through this cell text, so
-they carry no marker today. A bar's colour is even more fully spent than a
-CLI cell's — it is the *only* way a bar says anything — so the same "two
-judgements, one signal" problem applies there with no text fallback to reach
-for. That is its own roadmap entry rather than a guess at whether a stale bar
-wants a label, a hatch pattern, or a border mark.
+A cell's one `Severity` already means utilisation, so staleness is text:
+`metrics::mark_stale` appends ` (stale)` to the cell. It's legible without colour
+and passes no judgement on the figure.
 
 ### 83. The node pane's bars get the same text marker, on the figure they already print
 
-Decision 82 left the node pane's bars unmarked on the premise that a bar has
-no text to fall back on the way a table cell does — its colour is the only
-signal it has, and colour was already ruled out for the reason decision 82
-gives at length. That premise does not hold for `ui::nodes::bar` specifically:
-it draws the fill, then a separate `Span` carrying the figure itself — `1.5`,
-or `-` when there is no reading — beside it. That span is exactly the kind of
-cell `mark_stale` was written for.
-
-So the fix is the same one decision 82 chose, reached the same way: `bar` now
-takes the row's `usage_stale` and passes its trailing figure through
-`k8s::metrics::mark_stale` before drawing it, giving `1.5 (stale)` beside an
-unchanged fill and colour. One `bool` argument, no new field, no second
-staleness rule — `NodeRow::usage_stale` is still the one fact both surfaces
-read, and `mark_stale` is still the one wording that decorates it. A node
-whose sample is fresh renders exactly as it did before this change; the CPU
-and memory bars take the same flag independently, since one sample governs
-both figures on a node and `usage_stale` is already true or false for the
-row as a whole, not per resource.
-
-The follow-on cost decision 82 wrote down for this task — "a bar's colour is
-even more fully spent... with no text fallback to reach for" — turns out to
-have been about a bar's *fill*, which is still true and still untouched here;
-it was not about the bar as a whole, which had a text component the whole
-time. Worth naming so a future reader does not read decision 82 as having
-already ruled this shape out.
+`ui::nodes::bar` passes its trailing figure through `mark_stale` when
+`usage_stale`: `1.5 (stale)`, with the fill and colour unchanged.
 
 ### 84. `--sort-resource` is a second flag, not a free-form `--sort` value
 
-`eks nodes --sort` is a `clap::ValueEnum` (decision 28) precisely so a bad
-value is rejected with the good ones listed, before anything connects. A
-GPU's fully-qualified name — `nvidia.com/gpu`, `amd.com/gpu`, whatever a
-cluster's device plugins invent — cannot join that vocabulary: it is not
-known until the nodes have been fetched, which is after `--sort` has already
-been parsed. The roadmap task left the shape to the reviewer: a free-form
-`--sort` value validated against the rows after the fact, or a second flag.
-
-A free-form value was rejected because it would have made `--sort` two
-different grammars wearing one flag: every other value is checked by `clap`
-and rejected before the process does anything else, and a resource name would
-be checked later, against rows the command has not fetched yet, with a
-different kind of error at a different point in the command's life. `--help`
-would have had to describe both halves of that at once.
-
-`--sort-resource <RESOURCE>` is the second flag instead, and it is mutually
-exclusive with a non-default `--sort` — a resource already answers "sort by
-what", so a fixed ordering alongside it is a contradiction, not a modifier.
-That conflict is caught by `commands::nodes::ordering_for`, a pure function
-run before `gather` connects to anything, printing `` `--sort` and
-`--sort-resource` ask for different things. Drop one: ... `` — the same
-"reject before anything connects" bargain `--sort`, `--color`, and `--timeout`
-already make, and the same shape `commands::pods::scope_for` uses for
-`--namespace` versus `--all-namespaces`. It is enforced in Rust rather than
-through clap's `conflicts_with`, since `--sort` carries a `default_value` and
-mixing a default-value argument into a conflict group is exactly the kind of
-"is it present or not" ambiguity `ordering_for`'s explicit check sidesteps
-without having to find out which way clap resolves it.
-
-Ranking a device reuses `k8s::nodes::order`'s existing `busiest`, over
-`Device::share()`, rather than a new comparison — the two failure tiers
-`busiest` already draws (a measured figure with no allocatable, and no figure
-at all) collapse a device's two blanks onto the second tier without a third
-tier of their own: a node whose booking is unknown because the pod listing
-failed, and a node that never advertised the hardware, both read as "nothing
-to rank this row by". The distinction never mattered to any other caller of
-`busiest` because every other resource it ranks is one every node reports;
-here, where that stops being true, both blanks earning the same tail spot is
-the simpler answer and the one the roadmap task's own "not a zero" wording
-was already asking for.
-
-`device_note` and `device_unranked_note`, in the same module, mirror
-`k8s::order::note`/`unranked_note` for a name that never passed through
-`clap::ValueEnum`. They reuse `Cause` — the pod listing that would explain an
-empty device ordering is the same one `CpuRequested`/`MemoryRequested`/`Pods`
-already point at — but they do not offer `unranked_note`'s alternatives
-suggestion: that list is generated from `Order::value_variants()`, a fixed,
-`--help`-listed vocabulary, and a resource name is deliberately outside it.
-Building that half for a free-form flag is its own design question, left to a
-roadmap follow-up rather than guessed at here — matching how the original,
-`Order`-based version of this note shipped without alternatives first and
-grew them in a later, deliberate change.
-
-Scope stayed at the node table for the same reason: the roadmap task's own
-acceptance criteria named only `eks nodes`, and a pod's device column reads
-absence as a real zero rather than the "no such hardware" blank a node's does
-(decision 79) — porting `--sort-resource` there wants its own `sort_by_device`
-in `k8s::pods::order`, not the node one reused, and is its own roadmap entry.
-The dashboard's node pane, whose `s` key cycles `Order::value_variants()`
-(decision 58), has no way to type a resource name at all yet — also left open,
-alongside the pod-drilldown pane's own still-open device-sorting gap.
+Device names aren't known until after fetching, so `--sort` stays a closed
+`ValueEnum`. `--sort-resource <NAME>` conflicts with a non-default `--sort`,
+checked by the pure `ordering_for` before connecting (not clap's
+`conflicts_with`, because of the default value). Ranking reuses `busiest` over
+`Device::share()`, and both blanks share the second tier. `device_note`/
+`device_unranked_note` reuse `Cause` but offer no alternatives.
 
 ### 85. `--sort-resource` in the node pane is a second prompt, `R`, mirroring `/`'s life cycle — and `s` reclaims it
 
-Decision 84 left the node pane's own `--sort-resource` open: `s` cycles a
-fixed, `--help`-listed vocabulary a key press can select from
-(`Order::value_variants()`, decision 58), and a device's name is the opposite
-of that by design — not known until the nodes have been fetched, and typed
-freely rather than chosen. The pane's only existing text-input mechanism was
-`/`, the fuzzy row filter, and reusing it for a second, unrelated purpose was
-rejected outright: `/` already means "narrow what's on screen", and folding
-"pick what sorts it" into the same keystroke would make one key mean two
-things depending on context nothing on screen explains.
+`/` isn't reused, so one key keeps one meaning. `R` opens `ResourceSort`
+(`Inactive`/`Editing`/`Applied`, like `Filter`). `App::sort_nodes` resolves an
+applied resource over the fixed order; the two share `node_direction`. `s` clears
+an applied resource; `S` reverses without clearing. `ui::nodes::Sort` picks
+which notes the header prints.
 
-`R` opens a second, independent prompt instead, and `ResourceSort` — a new
-`App` field — mirrors `Filter`'s own three-state life cycle exactly:
-`Inactive`, `Editing(String)` capturing keystrokes, `Applied(String)`
-governing the pane once `Enter` commits it. Copying `Filter`'s shape rather
-than inventing a new one was deliberate — a second, differently-behaved text
-input beside the first would have cost the reader a second mental model for
-no real difference in what either one is doing keystroke by keystroke.
+### 86. `eks pods --sort-resource` ranks a real zero directly, with no tail and no unranked note
 
-Unlike a filter, applying or clearing a resource name changes what the rows
-are actually sorted by, not just what is drawn — so `App::sort_nodes` is a new
-seam both `apply_nodes` and every `ResourceSort` transition go through,
-matching `commands::nodes::SortBy`'s own resolution of `--sort` versus
-`--sort-resource`: a resource ordering, if applied, always wins over the
-fixed one. `node_direction` stays the one field both share, exactly as
-`--sort-reverse` composes with either flag on the command line — a second
-direction nothing could disagree with would only be a second thing to keep in
-sync.
-
-The mutual exclusivity the CLI enforces by rejecting `--sort` and
-`--sort-resource` together has no error path in the pane — there is nothing
-to reject, only a key to press — so it is enforced by what each key does
-instead: `s` (cycling the fixed order) clears any applied resource prompt,
-since leaving it in effect while `s` silently did nothing would read as a
-broken key; `S` (reversing) does not, since reversing is the one thing that
-should never need to fight `R` for control. Whichever ordering is active is
-exposed to `ui::nodes::draw` as a new `Sort` enum, `Order`/`Resource`, so the
-pane's header can print `device_note`/`device_unranked_note` for a resource
-ordering and `order::note`/`unranked_note` for a fixed one without the two
-notes ever needing to agree on a shared shape — the same split
-`commands::nodes::list` already draws between its two footnote branches.
-
-Scope stopped at the node pane, matching decision 84's own stopping point:
-`k8s::pods::order` has no `sort_by_device` yet (a pod's absent entry is a
-real zero rather than a node's "no such hardware" blank, so it needs its own
-function rather than the node one reused), and porting `R` to the
-pod-drilldown pane is that task's to open, not this one's to guess at.
-
-### 86. `eks pods --sort-resource` ranks a real zero directly, with no tail and no
-unranked note
-
-Decision 84 left this as its own roadmap entry, because a pod's device column
-reads an absent entry as a real `0` (decision 79) rather than the "no such
-hardware" blank a node's does — `k8s::nodes::order::sort_by_device` ranks
-`Device::share()` through `busiest`, which puts an unmeasured or
-hardware-absent node in the tail behind every ranked one, and neither tier
-applies to a pod that simply never asked for a GPU.
-
-`k8s::pods::order::sort_by_device` therefore does not reuse `busiest`, `Rank`,
-or `compare` at all: it ranks `Reverse<Quantity>` directly, reading a missing
-`extended_requested` entry as `Quantity::default()` the same way
-`Column::Device::text` already does, then falls back to the namespace/name
-tie-break every other pod ordering uses. There is no `Rank::Unranked` tier
-because there is nothing here that can fail to be known — every pod's request
-is a fact the pod listing already carries, unlike a live usage sample or a
-node's allocatable, which really can be absent.
-
-That absence of a tail also meant leaving out `device_unranked_note`. The
-node one exists to say "nothing here has this resource to sort by" when no
-node advertises it at all — a real gap in the data. A pod-side equivalent
-would fire only when every pod in the listing asked for exactly the same
-amount (usually zero), which is not a missing column, just an uninteresting
-one; inventing a note for it would be answering a question nobody asked with
-a made-up justification. `device_note` — the unconditional "Sorted by
-nvidia.com/gpu." line — is kept, matching the node table and giving the same
-answer to "why does this table look unsorted": there was nothing to
-distinguish, not a flag that silently failed.
-
-`commands::pods::ordering_for` and `SortBy` are close copies of
-`commands::nodes`' versions, rejecting `--sort` and `--sort-resource`
-together before `list` connects to anything, in the same wording. Carrying
-`--sort-resource` into the dashboard's pod-drilldown pane — the gap decision
-85 left open on the node side's `R` key — is its own roadmap entry: a second
-surface this change does not touch, and the same "what does `R` mean here"
-design question the node pane's own prompt already had to answer once.
+A pod's missing device request is a real `0`, so `k8s::pods::order::
+sort_by_device` ranks `Reverse<Quantity>` directly, with the usual tie-break
+and no `Rank` tail. There's no `device_unranked_note`; `device_note` is kept.
+`commands::pods::ordering_for` mirrors the node version.
 
 ### 87. `R` in the pod-drilldown pane answers the same as decision 85 did for the node pane
 
-The roadmap entry left the question open on its own terms — whether `R` is
-the right key here too, and whether the pane's own `/` filter and `s`/`S`
-want to agree with a second pane's ordering UI before it copies the first's
-answer. Nothing about the pod-drilldown pane's `s`/`S`/`/` turned out to
-disagree with the node pane's: both panes already hold their own independent
-`order`/`direction` pair (`pod_order`/`pod_direction` beside
-`node_order`/`node_direction`) because the two never share a screen, and a
-`--sort-resource` prompt is the same kind of pane-local state — so it gets
-the same answer, `pod_resource_sort` beside `node_resource_sort`, both
-`ResourceSort`. That type's own doc comment no longer calls itself "the node
-pane's prompt" now that a second pane holds one.
-
-`ui::pods::Sort` (`Order`/`Resource`) is the new type `ui::pods::draw` reads,
-mirroring `ui::nodes::Sort` exactly — `App::pod_sort` resolves the applied
-prompt against the fixed cycle the same way `App::node_sort` and
-`commands::pods::ordering_for` both already do. The pane's device ordering
-draws through `k8s_pods::sort_by_device` and `k8s_pods::device_note` only:
-unlike the node pane, there is no `device_unranked_note` to call, because
-decision 86 never built one — a pod's absent device request reads as a real
-`0` rather than an unranked blank, so there is nothing here for an "unranked"
-line to say.
-
-`s` reclaims the fixed cycle from an applied resource prompt in either pane,
-matching decision 85's reasoning exactly: leaving one in effect while `s`
-silently did nothing would read as a broken key. `S` reverses whichever
-ordering is active in either pane without clearing it, for the same reason
-decision 85 gave — reversing should not have to fight `R` for control. The
-footer's `R sort resource` hint now gates on `Overview | NodePods` rather
-than `Overview` alone, and the `the_footer_offers_r_only_over_the_node_pane`
-test became `the_footer_offers_r_over_both_panes_with_a_device_ordering`,
-now also asserting the hint disappears again over the pod-containers pane —
-the one detail-pane level down from `NodePods` that still has no ordering of
-its own.
-
-The one piece with no node-pane precedent: `App::edit_resource_sort` used to
-be one `match` arm's worth of keystroke handling, all of it for
-`node_resource_sort`. With a second field needing the identical `Enter`/
-`Esc`/`Backspace`/`Char` handling, the choice was between two near-duplicate
-arms or factoring the keystroke logic itself out from the two-arm dispatch —
-taken here as `advance_resource_sort`, a free function over `(text, key)`
-returning the next `ResourceSort`, with `edit_resource_sort` left to decide
-which field it writes into and which pane's rows it re-sorts. `Filter` and
-`ResourceSort` stayed two separate types rather than one shared shape
-despite looking alike (both `Inactive`/`Editing`/`Applied`) — a search query
-and a sort key are different things that happen to share a life cycle, and
-collapsing them would have made a filter answer to `R` or a resource prompt
-answer to `/` a type-level possibility that never should have been one. The
-keystroke *step*, unlike the concept, had no such reason to diverge: `Filter`
-has no second copy of itself to keep in sync with, so `edit_filter` stays as
-it was.
+`pod_resource_sort` beside `node_resource_sort`, `ui::pods::Sort`, with the
+same `s`/`S` rules. The footer's `R` hint shows over both panes. Keystroke
+handling is factored into `advance_resource_sort`; `Filter` and `ResourceSort`
+stay separate types.
 
 ### 88. A hidden column gets a second line under the sort note, not an exemption from `DROP_ORDER`
 
-The roadmap entry left two readings open: exempt an ordering's own column
-from narrowing, or say the column is hidden and leave the drop rule alone.
-The exemption reading does not stop at one column. `--sort cpu` ranks `CPU
-USE`, and `CPU USE` is meaningless without the `CPU` it is a share of — so
-protecting `CPU USE` from `DROP_ORDER` means protecting `CPU` too, which is
-exactly the "request or usage figure left without the capacity it is a share
-of" pairing `DROP_ORDER`'s own module docs already forbid. Answering the
-first case would have meant re-deriving that rule for every ordering rather
-than leaving it as the one thing `DROP_ORDER` states. The note reading has no
-such cascade: it changes what a listing says, never what it drops.
-
-`k8s::order::hidden_note` is the new function, deliberately not a parameter
-added to `note` itself: `note` is called from the dashboard's panes too
-(`ui::nodes`, `ui::pods`), which never narrow a column away, so folding the
-question into `note`'s own signature would have made every one of those call
-sites answer a question that can never be true for them. `hidden_note` takes
-the same `(order, direction)` `note` does, plus a `hidden: bool` the listing
-already knows the answer to, and returns a second line — `That column is not
-shown at this width; run with --wide or widen the terminal to see it.` — or
-`None` under the identical silence rule `note` follows, asserted by a test
-that walks every `(order, direction)` pair and checks the two agree. The two
-lines join into one footnote paragraph at the CLI call sites
-(`commands::nodes::list`, `commands::pods::list`) rather than printing as a
-second, independent footnote — a listing wide enough to have kept every
-column is unchanged to the byte, and the two sentences read as one thought
-about one line under the table rather than as two footnotes that happen to
-agree.
-
-Telling `hidden` from "nothing to rank" needed its own function, because from
-inside `k8s::order` the two look identical: an ordering with nothing to rank
-already has `unranked_note` explaining it, and blaming a column's absence on
-`--wide` when the real cause is that metrics-server never sampled anything
-would be a second, contradictory diagnosis for the same blank. `k8s::nodes::
-order_hidden` and `k8s::pods::row::order_hidden` are the listing-specific
-answer: each asks its own `columns()` twice, once at the listing's actual
-width and once at `Width::Default`, and calls a column hidden only when it
-was in the first set and is not in the second. A column absent from both was
-never going to be there regardless of the terminal, so narrowing gets no
-credit — or blame — for it. Each carries its own small `order_column` match,
-deliberately exhaustive and beside the existing `ranked`/`cause` matches, for
-the same reason those are: an ordering added without saying which column it
-needs should fail to compile rather than silently answer `false` forever.
-
-`requests_unavailable` gained the same comparison for a different footnote.
-Its `CPU REQ, MEM REQ, and the booked half of PODS are empty because …`
-sentence already names columns that, unlike the usage pair, can never be
-missing for want of a figure — they are unconditional in the node table's own
-column set — so an absence in the actually-printed columns is always
-narrowing's doing and needed no `order::cause`-style disambiguation. It took
-a `width: format::Width` parameter rather than a precomputed column list, so
-every existing call site — five of them, all tests — only had to add the
-width they were already rendering at. The added line says "Some" or "None of
-those columns are shown at this width" rather than re-naming which ones,
-since the sentence directly above it already did that; a two-way count
-(`0`, "all of them", or "some of them") was enough, and re-deriving the exact
-subset a second time would have said nothing the reader could not already
-work out.
-
-Left out: the same treatment for `--sort-resource`'s `device_note` and
-`device_unranked_note`, which decision 84 built as a deliberately separate
-mechanism from `k8s::order::note`/`unranked_note` and which the roadmap
-entry's own acceptance criteria — "through `k8s::order::note` as now" — never
-asked this change to touch. It is its own roadmap entry rather than a guess
-at whether `device_note`'s unconditional wording wants the same second line,
-worded the same way, given decision 86 already chose to leave that note
-lighter than its fixed-ordering counterpart on purpose.
+Exempting a sort column would cascade to its base column, so the drop rule
+stands and `k8s::order::hidden_note` adds `That column is not shown at this
+width; run with --wide or widen the terminal to see it.`, joined to the sort
+note (CLI only). A column is hidden only if it's present at `Width::Default` and
+absent at the actual width (`order_hidden`, an exhaustive `order_column`
+match). `requests_unavailable` says whether some or none of its columns are
+shown.
 
 ### 89. `device_note` gets the same hidden-column line, worded the same way, through its own function
 
-Decision 88 stopped at `k8s::order::note`'s fixed orderings because
-`device_note` is a deliberately separate mechanism (decision 84) that
-`hidden_note`'s `O: ValueEnum` bound cannot reach — a `--sort-resource` name
-is exactly the free-form value `Order`'s vocabulary excludes. The roadmap
-entry this time asked the question decision 88 left open on purpose: whether
-the second line belongs on `device_note` too, and whether it is worded the
-same way or differently.
-
-Worded the same way, and factored so the two cannot drift onto two sentences
-for one fact: the misleading case is identical — a column present at full
-width and gone at the terminal's actual width — so a reader moving from
-`--sort cpu` to `--sort-resource nvidia.com/gpu` has no reason to learn a
-second sentence for it. `k8s::order::HIDDEN_COLUMN` is the shared constant
-`hidden_note` now builds its `Some` from, and `device_hidden_note(hidden:
-bool) -> Option<String>` is `device_note`'s counterpart to it — no
-`order`/`direction` parameters, because unlike `hidden_note` there is no
-default resource for `device_note` to compare against and fall silent
-about; the caller passes only whether the column is hidden, and gets the
-sentence or nothing.
-
-This is not decision 86's question again. Decision 86 dropped
-`unranked_note`'s *advice* half from `device_unranked_note` because that
-list is built from `Order::value_variants()`, a fixed vocabulary a resource
-name is deliberately not — there was no way to build the equivalent
-advice for a free-form name, so leaving it out was the only honest answer.
-The hidden-column line names no alternative ordering; it states a fact about
-one column at one width, which a resource name is just as able to carry as a
-fixed one, so there was no equivalent gap here to leave open.
-
-`k8s::nodes::device_hidden` and `k8s::pods::row::device_hidden` are the
-listing-specific half, keyed on `Column::Device(resource)` rather than
-routed through `order_column`'s exhaustive match — a device's column is not
-one of `Order`'s own variants, so extending that match was never the right
-shape for it. Writing them surfaced a second, private `hidden` in each
-module: `order_hidden` and `device_hidden` both ask `columns()` twice, once
-at `Width::Default` and once at the listing's actual width, and call the
-column hidden only when it was in the first set and not the second, and
-that comparison was worth naming once rather than copying — `order_hidden`
-now calls it with `order_column`'s match, `device_hidden` with a `Column::
-Device(resource)` one, and neither repeats the "ask twice, compare" shape
-the other already had. A resource nobody in the listing reports is absent
-from both calls, so `device_hidden` correctly leaves that case to
-`device_unranked_note` rather than also blaming it on `--wide`.
-
-The join itself moved out of both call sites entirely, for both arms.
-`k8s::order::note_with_hidden(order, direction, hidden) -> Option<String>`
-replaces the `if let Some(mut line) = note(…) { if let Some(hidden) =
-hidden_note(…) { line = format!(…) } … }` block the `SortBy::Order` arm had
-spelled out inline since decision 88; `device_note_with_hidden(line, hidden)
--> String` is its `device_note` counterpart, taking the line rather than
-computing it, since `device_note` returns a bare `String` and has one fewer
-case to handle than `note`'s `Option<String>` does. Both now live in
-`k8s::order` beside `hidden_note` and `device_hidden_note`, and
-`commands::nodes::list`/`commands::pods::list` call whichever matches the
-arm in one line apiece.
-
-This was not a style preference: `commands::pods::list` failed
-`clippy::too_many_lines` once this task's inline join sat beside the
-existing one, and the fix was to notice both call sites were already
-writing the same fold `k8s::order` had already named half of
-(`hidden_note`) but never finished (the join with `note`) — so the second
-copy of that block was the sign the whole thing belonged in one place, not
-that the function needed trimming elsewhere.
+The shared constant is `HIDDEN_COLUMN`; `device_hidden_note(hidden)` is the
+device counterpart and `device_hidden` the per-listing check (one private
+"ask twice, compare" helper). The joins `note_with_hidden`/
+`device_note_with_hidden` live in `k8s::order`.
 
 ### 90. A pod's own request gets its own severity thresholds: `Warn` at 150%, `Critical` at 300%
 
-`eks pods`' `CPU`/`MEMORY` cells carried a percentage and no colour since the
-CLI-colour work landed, because `Severity::from_utilisation`'s thresholds —
-`Warn` at 75% of a node's allocatable, `Critical` at 90% — answer "how full is
-this node", and a pod at 90% of its own request is a well-sized pod, not
-nearly full. Colouring the cell on the node's numbers would have told the
-reader something untrue, in red, on most rows of a healthy listing, so the
-roadmap left the column ungraded until "hot" meant something for a request.
-
-No cluster to calibrate against and no existing convention in the codebase to
-lean on, so the thresholds are a judgement call rather than a measurement:
-`1.5` (150% of request) is where a burst stops looking ordinary — CPU is
-compressible, so running above a request some of the time is exactly what
-headroom is for, and punishing that with colour would repeat the "90% is
-fine, not full" mistake in the other direction. `3.0` (300%) is a request
-undersized enough that the pod is running on borrowed capacity most of the
-time, which is the point a burstable pod becomes the first thing evicted
-under memory pressure or throttled under CPU contention. Both numbers can
-move if real usage says otherwise; what should not move without a second
-decision is the shape — one pure function over a ratio, tested at its
-boundaries, the same contract `from_utilisation` already keeps.
-
-The direction is deliberately one-sided. `from_utilisation` only grades
-upward too, but a node has no symmetrical "too empty" to worry about either,
-so this was not a new asymmetry so much as the same one restated: a request
-is a floor a scheduler holds open on the pod's behalf, not a ceiling it is
-expected to stay under, so nothing under 100% earns a colour no matter how
-idle the pod is. A pod using 5% of a 10m request is not "cold"; it is a
-request that was never going to be the tight one.
-
-`k8s::pods::row::usage_severity(used, requested)` is the seam:
-`Some(Severity::from_request_share(used?.ratio_of(requested)?))`, reading the
-exact `Option<f64>` `usage_cell`'s own text is built from rather than a
-second computation of the same ratio, so the number printed and the colour
-painted around it cannot drift apart. Returning `None` rather than
-`Some(Severity::Unknown)` for a pod with no sample or no request matters:
-`Unknown` paints muted ink, which would tell the reader "this figure could
-not be read" about a cell that is not showing a figure at all — the same
-"no judgement, not a false answer" reasoning `Column::severity` already
-applies to every other ungraded column.
-
-Left open, and written up as its own roadmap entry rather than guessed at
-here: whether a container's *limit* — read today only per-container in the
-pod-detail view, never as a pod-wide total — is the more honest denominator
-once a pod is over its request. A pod at 150% of a 10m request and a 10x
-limit is nowhere near an OOM-kill; this task's thresholds cannot see that
-difference, because a listing row does not carry a limit to compare against.
-Building that fetch and deciding how a limit changes the rule (a third tier,
-a different threshold, its own column) is a decision this task had no reason
-to make on its way to giving the column a colour at all.
+`Severity::from_request_share`: a judgement call, not a measurement. Bursting
+above a request is what headroom is for; 300% means the pod is living on borrowed
+capacity. It grades upward only. `usage_severity` reads the same ratio as the
+cell text and returns `None` (not `Unknown`) with no sample or request.
 
 ### 91. A known limit replaces the request-share reading once a pod is over its request, rather than adding a tier or a column
 
-Decision 90 left three shapes open for the day a pod-wide limit total
-existed: a third grading tier, a different set of thresholds, or a column of
-its own. A column was the first one out: `CPU`/`MEMORY` already carry a
-percentage of the request in their text, and a second percentage in the same
-cell — or a fourth and fifth column beside `CPU REQ`/`MEMORY REQ` — answers a
-question ("how close to the limit") most rows have no limit to ask, on a
-table already dense enough that a whole "Suggest orderings that tell the rows
-apart" entry exists to keep `--sort` from pointing at columns that say
-nothing. Nothing in `PodRow` needed a place to put a limit's own text; only
-its *colour* needed a place to put a verdict, so the fetch (`Limits`,
-`effective_limits`, `k8s::pods::mod.rs`) went in beside `effective_requests`
-and the verdict went into the cell's existing severity, not a new cell.
-
-That left a tier or a swap. A third tier — `Ok`/`Warn`/`Critical` staying the
-request-based rule below some boundary and a limit-based one taking over
-above it — would need its own boundary chosen with no more to go on than
-decision 90 had for 150%/300%, and would still leave the request-based
-`Warn` at 150%/300% sitting underneath a limit reading of the same pod, two
-verdicts computed and one silently discarded. A straight swap needs no new
-number: `Severity::from_utilisation` already exists, already means "how full
-is a hard ceiling", and a limit *is* that ceiling in a way a request is not
-— the two facts decision 90 built `from_request_share` specifically to keep
-separate from `from_utilisation`'s "nearly full" reading. So the rule is a
-swap, gated on the one condition the roadmap task's own title named: "once
-it is over its request". Below 100% of request, `from_request_share` is the
-whole answer and a limit is not consulted at all — a pod nowhere near its
-request has nothing to be closer to. Over 100%, a known limit takes over
-outright; an unknown one leaves `from_request_share` exactly as decision 90
-built it, byte for byte, which is what "a pod with no limit set reads
-exactly as it does today" in the roadmap's acceptance criteria was asking
-for.
-
-The `Limits` fetch mirrors `effective_requests`' fold on purpose — init
-peak, sidecars into the steady-state sum, overhead on top — but cannot reuse
-its `Requests` type, because a request nobody made is a real zero and a
-limit nobody set is not a limit at all; conflating the two the way `Requests`
-does would report a pod with one uncapped container as capped at whatever
-its neighbours declared. `Limits`' fields are `Option<Quantity>`, and `plus`
-and `max` propagate `None` from either side — one unbounded container is
-enough to make the pod's own total for that resource unbounded, on the
-identical principle `ContainerRow::resources_summary` already applies
-per-container with its own `unlimited`. `Limits::zero()` (`Some(0)`,
-`Some(0)`), not `Limits::default()` (`None`, `None`), is the fold's seed:
-the identity for "nothing summed yet" is a bound of zero, and starting from
-"unbounded" would make the very first container's own limit vanish behind
-`None`'s propagation rule before it had a chance to count.
-
-The threshold for "over its request" is `> 1.0`, not `>= 1.5`: a pod sitting
-exactly at its request is not yet over it, and the two readings agree there
-regardless — `from_request_share(1.0)` is already `Ok` and no limit reading
-below `from_utilisation`'s own 90% boundary would say otherwise for a
-sanely-set limit — so the boundary only matters for the pods in between, and
-the roadmap's own wording ("once it is over its request") settled it rather
-than this task inventing a second number decision 90 did not ask for.
+Below 100% of request, `from_request_share` is the whole answer. Above it, a
+known pod-wide limit swaps the reading to `from_utilisation` against the limit.
+With no limit, nothing changes. `effective_limits` mirrors `effective_requests`'
+fold, but `Limits` is `Option`s, where any unbounded container makes the pod
+unbounded, seeded with `Limits::zero()`.
 
 ### 92. The progress line is governed by the colour switches, not by one of its own
 
-`eks nodes` on a large cluster now spends real time in several places — a
-credential helper on the same clock as a request, then a listing read in
-pages — and said nothing about any of it. The roadmap entry that asked for a
-progress line left one question open deliberately: `theme::Palette` already
-answers "is anybody watching this", but it answers it about **stdout**, and
-this line is written to **stderr**, where that answer does not transfer.
-
-Two switches, then, and they are asked in a fixed order. The first is not a
-preference at all: **both** stdout and stderr have to be terminals, or nothing
-is drawn. Stdout because a listing being piped or redirected is one nobody is
-watching arrive, and because `eks nodes | grep NotReady` with a spinner on
-stderr is two programs drawing on one row of the same screen. Stderr because
-the whole line depends on being rewritable in place — written into a file it
-would be a column of half-erased duplicates. That first rule is what makes the
-roadmap's acceptance criterion absolute: a piped listing is unchanged to the
-byte, and `--color always` does not override it, because `--color` is about how
-bytes are written and this is about who is reading them.
-
-The second is the one that was open: **movement is ink**. `--color never` and
-`NO_COLOR` turn the progress line off, and `TERM=dumb` does too. The
-alternative was a `--progress` flag of its own, and it was rejected on the
-ground that it invents a second three-way switch for the same underlying
-question — "should this tool decorate a terminal, or write plainly?" — that a
-user would have to discover separately and set twice. `NO_COLOR`'s own spec is
-narrower than this reading, and there is no settled convention either way; the
-tie was broken by which answer is easier to explain in one sentence and
-impossible to get half-right. The known cost is that colour and movement cannot
-be had one without the other, which is a real if small loss for somebody who
-wants a coloured table and no spinner. `progress::wanted` is the whole rule as
-one pure function, reusing `Palette::choose` rather than restating it, so the
-two can never come to disagree about what `NO_COLOR=` set-but-empty means.
-
-There is a third condition, and it is not a preference either: **`-v` and
-`RUST_LOG` turn the line off**, because they turn stderr into a stream of log
-lines and the two cannot share a row. A log line lands wherever the cursor was
-left and the next redraw writes back over it, so `eks nodes -vv` on a large
-cluster came out with every row shredded from both directions — found by
-running it, not by reasoning about it. Between a line the tool decided to draw
-and lines the user explicitly asked for, the user's win: a tool being debugged
-should print what it is being debugged for. The quiet default is deliberately
-not included, even though a `warn!` can still fire there — one of them does, in
-`page::collect`, when a server repeats its page marker — because that is a
-once-in-a-listing event that leaves a single row behind an erase, against a
-`-v` that leaves every row that way.
-
-A terminal that reports **zero** columns is treated as one that did not answer,
-not as one with no room: `progress::width` falls back to eighty. This is not
-hypothetical — a pty opened without a window size does it, and the first run of
-this feature under `script` drew five erases and no words, which is exactly
-what "believing the zero" looks like from the outside.
+It draws only when both stdout and stderr are terminals; `--color always`
+doesn't override that. Movement counts as ink: `--color never`, `NO_COLOR`, and
+`TERM=dumb` turn it off too, so there's no separate `--progress` flag. `-v` and
+`RUST_LOG` turn it off because log lines would shred it. A terminal reporting 0
+columns is treated as 80. `progress::wanted` is pure and reuses `Palette::choose`.
 
 ### 93. A progress step is a handle that ends when it is dropped, and it is counted inside the paging loop
 
-The count has to come from `k8s::page::collect`, because that is the only place
-that knows a page has landed; `k8s::nodes::fetch` knows only that it asked for
-nodes. So `collect` takes a `progress::Task` — by value, because the step is
-*that listing's* and ends with it.
-
-By value and not by reference because of the error path. A listing that fails
-at its third page has to take its line off the screen just as surely as one
-that finishes, and the sentence explaining the failure is printed to the same
-stderr the line is on; an erase written by hand would have to appear at every
-`?` in the module, and would be missing from the next one somebody adds.
-Dropping is the one thing that cannot be forgotten. `Progress::none()` hands
-back a detached `Task` whose every method is a no-op, so the dashboard's
-background fetches — which have no business writing to a screen `ui` owns —
-and every piped command pay nothing at all: no lock, no timer, no allocation.
-
-The elapsed count needs a different driver, because the credential helper
-produces no events at all between "started" and "answered": `Task::tick` races
-the awaited future against a 250 ms timer and redraws. A redraw whose text is
-identical to what is on screen writes nothing, so the ticks between two
-seconds cost a string comparison rather than four flickers. `tick` boxes the
-future it is given — a `kube` request future is measured in kilobytes, and
-holding one inline inside every `collect` frame pushed `eks nodes`' joined
-three-listing future past `clippy::large_futures`; the allocation is one per
-page, against a page that is an HTTP round trip.
-
-The wording is a spinner's job done by the numbers instead: no frames, no
-animation, and nothing that has to be timed to look right. `reading 1,500
-nodes, 12,000 pods… 4s` moves because the figures do. The one step with
-nothing to count is the credential helper, and it is named rather than
-animated — `running aws eks get-token`, from `client::helper_name`, which is
-`helper_command` without the environment assignments in front of it, because
-that line is there to be *recognised* on a row eighty columns wide rather than
-pasted into a shell.
-
-The width is read once, at construction, rather than tracked. A terminal
-resized in the middle of a three-second listing would get one wrapped line, and
-noticing that would mean either a signal handler this tool does not have or an
-ioctl inside the redraw loop — both a poor trade against how rarely it happens
-and how completely the next erase recovers from it.
+`page::collect` takes a `progress::Task` by value, so any exit path erases the
+line on drop. `Progress::none()` costs nothing for the dashboard and pipes.
+`Task::tick` redraws every 250 ms while awaiting (boxing the future) and skips
+identical text. The wording counts (`reading 1,500 nodes, 12,000 pods… 4s`), and
+the helper step is named (`running aws eks get-token`). Width is read once.
 
 ### 94. `SIGINT` is trapped only where `progress` draws — a new `block_on`, not a change to it
 
-`eks nodes` and `eks pods` draw a progress line, and the default `SIGINT`
-disposition kills the process mid-draw: the last row it wrote stays on screen
-above the shell's next prompt, since nothing runs to erase it. Fixing that
-needed this tool's first signal handler anywhere, and the roadmap entry left
-open exactly how far it should reach — the dashboard reads Ctrl-C as a *key*,
-since raw mode disables the terminal's `SIGINT` delivery entirely, so nothing
-there was broken, but `commands::block_on` is the one function every blocking
-command — the two listings and the dashboard's `preflight`/`retry_login` calls
-alike — already goes through.
-
-The choice was between changing `block_on` itself and adding a second function
-next to it. Changing `block_on` would have made every caller interruptible for
-free, including the dashboard's pre-flight login question and `L`'s retry —
-both real terminal states with a case to be made for catching Ctrl-C there too.
-It was rejected because those two run against an *ordinary* terminal, mid
-`std::io::stdin().read_line` for one of them, and racing a blocking read
-against a signal inside `tokio::select!` cannot interrupt it — the read
-itself has to finish before the runtime looks at the other branch again. A
-`block_on` that answers Ctrl-C promptly in the two commands that call it today
-and not at all in a synchronous prompt it does not yet reach would be a
-correctness gap dressed as a feature, discovered by a user mid-keystroke rather
-than by a test. `block_on_interruptible` is the new function instead, called
-only where `progress` draws, so the promise it makes — "the terminal is clean
-the instant Ctrl-C is pressed" — is one it can actually keep everywhere it is
-used. Widening it to the login prompts is left for whoever takes that on
-directly, as its own question about *that* I/O rather than a side effect of
-this one.
-
-No erase is written by hand anywhere in the new code. `tokio::select!` racing
-the listing against `tokio::signal::ctrl_c()` drops the losing future the
-instant Ctrl-C wins, and a `progress::Task` still outstanding at that point is
-a local binding alive across an `.await` — part of the future's own state, so
-it is torn down by the same `Drop` a listing that fails partway already relies
-on (decision 93). The racing itself is pulled into its own function, `race`,
-generic over what it is racing against, specifically so the guarantee that
-matters — losing the race drops the loser — could be proven with a future that
-holds a drop-flagging guard and never touches a signal, a cluster, or a clock,
-rather than by raising a real `SIGINT` at a test and hoping the timing lines
-up. A handler that fails to install — no controlling terminal, a platform this
-has never been exercised on — makes `ctrl_c()` a future that never resolves,
-so a command runs to completion the old way rather than becoming an instant
-no-op everywhere `tokio::signal::ctrl_c()` cannot be installed.
-
-`eks nodes`/`eks pods` exit `130` — the conventional 128 + `SIGINT` — on
-interruption, after printing nothing past the erase. Carrying that out cleanly
-through the existing `?`-based dispatch in `main::run` meant its return type
-moving from `Result<()>` to `Result<ExitCode>`, rather than reaching for
-`std::process::exit` partway through a function that otherwise composes with
-`?`. `SIGWINCH` stays untouched, exactly as decision 93 left it: nothing here
-argues the trade it made should be revisited.
+`block_on_interruptible` races the work against `ctrl_c()` for `eks nodes`/
+`eks pods` only: a blocking `read_line` in the login prompts couldn't be
+interrupted, so they stay on `block_on`. Dropping the loser erases the progress
+line (tested via a generic `race`). A handler that can't install never fires.
+Exit code 130; `main::run` returns `Result<ExitCode>`.
 
 ### 95. A listing's footnotes are assembled by a private function over a bundled params struct, not a shared `Footnotes` builder
 
-`commands::nodes::list` and `commands::pods::list` each assembled their table's
-footnotes inline, between two network calls, which meant the order they came
-out in — and `unranked_note`'s "for the reason above" depends on it — was
-guaranteed only by reading the lines in the right order, not by a test. The
-roadmap task itself left the shape open: a plain function taking every input
-the assembly needs is eight or nine arguments, which it called "not obviously
-better than the ten lines it replaces," and offered a small `Footnotes`
-builder both commands push into as the alternative.
-
-The builder was rejected. The two tables' footnotes are not the same list:
-`commands::nodes` has `devices_withheld` and a `requests_unavailable` that
-takes the rows and a width to know which columns it emptied, neither of which
-`commands::pods` has any use for; `commands::pods`'s `order_hidden` and
-`device_hidden` need a `Scope` that `commands::nodes` has no equivalent of. A
-builder generic enough to hold both shapes would have needed almost as many
-command-specific methods as the plain function had arguments — the "ten
-lines" the roadmap task was already unconvinced a function beat, wearing a
-different name.
-
-The fix instead pulls each command's own assembly block out into a private
-function — `commands::nodes::footnotes`, `commands::pods::notes` — taking a
-`FootnoteInputs`/`NoteInputs` struct rather than positional arguments. The
-struct is not a generic accumulator either; it is the specific handful of
-already-resolved values (`rows`, the two-or-one `Result<_, String>` failures,
-`samples`, `now`, `label`, `width`, the resolved `SortBy`, `direction`) each
-command's own assembly needs, named the way `Request` and `LogTarget` already
-bundle a call site's arguments (decision 29) — one struct literal to build,
-rather than nine parameters to keep in the right order. Both commands get the
-same shape of change: a struct, a function, and a test that builds fixture
-rows and asserts the exact sequence of notes for a listing with column
-failures and an active sort, for a silent default ordering over a failed
-column, and for a listing with nothing to say at all. `commands::pods::list`
-also lost its early, one-off push of `usage_unavailable` — `usage` is now
-held as a `Result<_, String>` the whole way through, the same shape
-`commands::nodes` already used, so both commands' failures reach the
-extracted function the same way instead of one being footnoted on the spot
-and the other later.
-
-Nothing that constructs a `FootnoteInputs`/`NoteInputs` needs a cluster: every
-field is a value `list` already has in hand once its two requests have
-answered, which is what makes the extracted functions testable with fixture
-rows and no client at all.
+The two tables' notes differ too much for a shared builder.
+`commands::nodes::footnotes` and `commands::pods::notes` take
+`FootnoteInputs`/`NoteInputs` structs of already-resolved values, and tests
+assert the exact note order. Pod usage failure is held as a `Result` like the
+node one.
 
 ### 96. The pod-containers pane's events section shares the container list's `/` query, matched against the event's reason
 
-The roadmap task left open whether one `/` query narrowing both the container
-list and the `EVENTS` section beneath it was the right model, since an event
-is not a row `App` highlights or drills into the way a container is — the
-worry being one key press affecting a selectable list and a plain block of
-text at once.
-
-That turned out not to be a real conflict once looked at directly: nothing in
-`App` reads the events list at all — no highlight indexes into it, `Enter`
-from `View::PodContainers` only ever drills through `visible_containers()` —
-so a query narrowing both sections changes what two independent blocks of
-text show, and nothing about selection or drill-down behaviour. Splitting the
-query would have bought a distinction the pane has no way to observe.
-
-`events_lines` now takes the same `filter` `draw` already threads through to
-the container list, ranking events through `crate::fuzzy::rank` against
-`EventRow::reason` — matching a container by name and an event by the field
-that names it (`BackOff`, `Pulled`, `Killing`) reads as the same idea in both
-places, and it is the roadmap task's own example ("narrow it to, say,
-`BackOff`"). The empty-events note and a failed events fetch both stay
-unfiltered: neither has anything for a query to narrow, and a filter that
-happened to make a failure message vanish would read as a bug rather than a
-feature. A filter that matches nothing gets `events`'s own "No events match
-…" line, distinct from `events_empty_note`'s answer to "did nothing happen,
-or did something happen and expire" — the two questions stay separate even
-though a filtered-empty and a genuinely-empty listing now look similar at a
-glance.
+Nothing in `App` selects events, so one query can narrow both. `events_lines`
+ranks through `fuzzy::rank` on `EventRow::reason`. The empty note and fetch
+errors stay unfiltered; no match prints its own "No events match …".
 
 ### 97. A node's pressure conditions land on the pod-drilldown pane, unconditionally, coloured by `Theme::severity`
 
-`NodeRow` carried only `Ready`, derived into `status`/`severity`; `kubectl
-describe node` shows four more conditions beside it — `MemoryPressure`,
-`DiskPressure`, `PIDPressure`, `NetworkUnavailable` — that nothing in this
-tool parsed. The roadmap task left two things open: where a node's own
-detail belongs, since `Enter` on one drills into its pods rather than into a
-view of the node itself, and how to read a condition nobody has reported at
-all — its own acceptance criteria required that reading the same as an
-explicit `False`.
-
-The placement question was already answered by decision 78, for "A node's own
-detail view, and its `--wide` facts in it": `View::NodePods`, the
-pod-drilldown pane, commits to one node the moment `Enter` opens it, and its
-wide facts already live there as plain lines above the pod list rather than
-behind a new key or a fifth `View` variant. Pressure conditions are the same
-kind of fact about the same node, so they join the same block rather than
-opening a second surface — a node pane `Enter` press still means exactly one
-thing.
-
-`k8s::nodes::Pressure` is the new struct — four plain `bool`s — read by a
-`condition_is_true` helper that treats a condition's absence and an explicit
-`False` as the same `false`. That is the opposite of `Ready`'s own
-`ready_condition`, which keeps a three-way `Option<bool>` because absence
-there means "not yet registered" and is worth telling apart from a healthy
-`False`; for these four, a node that has never reported `MemoryPressure` and
-one reporting it `False` both mean "not under memory pressure" for every
-practical purpose, and the acceptance criteria said so directly. Folding the
-two into one `bool` up front is what makes that bar hold without a third
-state riding along through every call site that reads it.
-
-`k8s::nodes::pressure_facts` mirrors `wide_facts`'s label/value shape with a
-`Severity` beside each pair — `Critical` for `True`, `Ok` for `False` and
-absence alike — and prints unconditionally, the same rule decision 78 gave
-the node's `--wide` facts in this same pane rather than the pod side's
-any-not-all one: a node reporting nothing alarming still gets all four
-lines, so the first `True` is not also the first time the section has
-appeared. `ui::pods::node_facts_lines`
-draws it through `Theme::severity`, not `Theme::severity_ink`: this is the
-dashboard, where a healthy reading is drawn in its own colour the way a
-`Running` pod's `STATUS` already is (decision 49's table-only reasoning for
-suppressing `Ok` — a healthy cluster is nearly every cell, so painting them
-all green wastes the signal — does not transfer to a pane showing one node's
-own four lines rather than scanning hundreds of rows for the one that
-differs).
+`k8s::nodes::Pressure` holds four `bool`s (Memory, Disk, PID,
+NetworkUnavailable); absent counts as `False`. `pressure_facts` always prints
+all four beside the wide facts: `Critical` for true, `Ok` otherwise. It uses
+`Theme::severity` (dashboard) rather than `severity_ink`.
 
 ### 98. The node pane's failed-pod-listing note is worded for what the pane shows, not the CLI table's column names
 
-The roadmap task pointed at `k8s_nodes::requests_unavailable` as the note's
-neighbour and left open what it should actually say. That footnote names
-`CPU REQ`, `MEM REQ`, and a device column by heading — the right words for a
-table where those are literally the headings above the empty cells. The node
-pane has never drawn any of them: `ui::nodes::node_line` prints a name, a
-status, the two usage bars, and a pod count, and nothing else — `cpu_requested`
-and `memory_requested` reach the pane only as sort keys, never as text on
-screen. A note built by wrapping `requests_unavailable`'s own sentence would
-tell the reader to go looking for a `CPU REQ` cell that does not exist in this
-view.
-
-`k8s_nodes::requests_note` is a second function rather than a second reading
-of the first one, and it names the two things a failed pod listing actually
-costs *this* surface: the `PODS` cell reading `- pods`, and the three
-orderings — `cpu-requested`, `memory-requested`, `pods` — that lose their
-explanation for ranking nothing. It takes the same `Result<(), String>`
-`requests_unavailable` takes a rendered explanation from, so the two can never
-disagree about *why*, only about which columns they are allowed to mention.
-
-Getting the note from `Gathered::requests` to the pane meant carrying it the
-same way `usage_note` already travels: computed once in
-`commands::nodes::spawn_gather`, carried on `NodesFetch`, and stored on
-`NodesState::Loaded` beside `usage_note` and `refresh_error` — surviving a
-failed background refresh over good rows for the same reason those two do,
-since a transient poll failure must not erase news about an *earlier*
-successful fetch's own gap. `ui::nodes::draw` prints it above `usage_note`,
-matching the order the CLI's own two footnotes already print in
-(`requests_unavailable` then `usage_unavailable`), and `Missing::requests` —
-which had been hardcoded `false` in the pane since the note had nowhere to
-live — now reads `requests_note.is_some()`, which is the one line the whole
-task was building toward: `cpu-requested`/`memory-requested`/`pods` ranking
-nothing now reads "for the reason above" in the pane exactly as it already
-does in the CLI table.
+`k8s_nodes::requests_note` names the `- pods` cell and the three booked
+orderings, not CLI headings, from the same `Result` as `requests_unavailable`.
+It's carried on `NodesFetch` → `NodesState::Loaded`, printed above
+`usage_note`, and sets `Missing::requests`.
 
 ### 99. The pod-drilldown pane's usage fetch is scoped like `eks pods`'s, and its refresh cadence is left for its own decision
 
-Wiring `metrics.k8s.io` into `commands::pods::gather_for_node` raised two
-questions the roadmap task left open, and both had an existing answer to
-borrow rather than invent.
-
-The first was what to scope the metrics request to. The pod listing itself is
-scoped with `spec.nodeName=<node>` ANDed onto the user's own field selector
-(`scoped_to_node`), because it needs exactly this node's pods. The metrics
-endpoint cannot take that filter at all — `k8s_metrics::pod_params`'s own doc
-comment says so: metrics-server does not implement field filtering, and
-`spec.nodeName` is not a field `PodMetrics` carries in the first place. Asking
-it with the node-scoped selector would have sent a filter the server cannot
-honour for no benefit; asking it with `Scope::All` and the user's own
-selectors, exactly as `commands::pods::list` already does for the CLI table,
-lets the existing namespace/name join narrow the result to this node's rows,
-the same way it already narrows out everything a `-l`/`--field-selector` kept
-off the table.
-
-The second was refresh cadence: the node pane refreshes on `RefreshInterval`,
-and this pane still fetches once per node, unchanged. The roadmap task's own
-wording flagged this as a real decision rather than a detail this PR could
-guess at, and building a second refresh loop here would have been exactly
-that guess — worse, a guess made *before* the pane had any usage figures
-worth refreshing. Reopening it is the follow-up entry left in
-`docs/ROADMAP.md`, now that there is something on screen to keep current.
-
-One more small call fell out of drawing the figures at all: `k8s::pods::row`'s
-`usage_cell`/`usage_severity` moved from module-private to `pub(crate)` rather
-than the pane growing a second copy of "a bare figure when there is no
-request to be a share of, `metrics::mark_stale`'s marker when the sample is
-old." `k8s::pods::row::Column::Cpu`'s own `text`/`severity` methods stayed
-private — they are `Column`'s business, tied to the CLI table's cell/heading
-shape — but the two pure functions underneath them belong to neither renderer
-in particular, and a second reading of "150% of request is a `Warn`, 300% is a
-`Critical`, and a known limit overrides both past 100%" is exactly the kind of
-drift `CLAUDE.md` asks this codebase to avoid.
+Metrics are fetched with `Scope::All` plus the user's selectors (metrics-server
+can't filter by `spec.nodeName`) and joined onto the node's rows. `usage_cell`/
+`usage_severity` became `pub(crate)` rather than copied. Cadence: decision 100.
 
 ### 100. The pod-drilldown pane shares the node pane's refresh triggers, and keeps its rows over a failed one
 
-Decision 99 left the pod-drilldown pane's refresh cadence open, on the
-grounds that reopening it before the pane had usage figures worth refreshing
-would have been a guess made too early. The roadmap task that came back to it
-named three shapes: a `RefreshInterval` of its own, sharing the node pane's,
-or refreshing only while it is the focused view.
-
-The answer taken is the second and third together, not a choice between them:
-`event_loop` already has exactly one refresh clock — the interval tick, `r`,
-and a successful login all already refetch the node listing through
-`refetch` — and the pod-drilldown pane now rides the same three triggers
-through a new `refetch_pods`, rather than a second `RefreshInterval` a config
-file does not exist yet to carry (see the `Config file` entry still open in
-`docs/ROADMAP.md`) or a `--pod-refresh` flag nobody asked for. "Only while
-focused" was not a separate design to weigh against that — it falls out of
-`pods_refresh_target`, the pure function every trigger reads first: it names
-the node behind `View::NodePods` and nothing else, so a reader who has
-drilled further in, into a pod's containers or a container's log, or backed
-out to the node listing, is not charged for a fetch nothing on screen would
-show. `commands::pods::spawn_gather_for_node`'s own doc comment is updated to
-match — it no longer claims to run once per node.
-
-Refreshing in the background raised the question `apply_pods` had
-deliberately answered the other way: its doc comment used to justify
-overwriting on any failure by pointing at the pane's own one-shot fetch, which
-this task removes. `apply_pods` now follows `apply_nodes`'s rule instead — a
-failure after an earlier fetch had already succeeded keeps the last good rows
-on screen as a new `PodsState::Loaded::refresh_error` field, `NodesState`'s
-own field mirrored rather than reinvented, so one bad poll does not read as
-the node having lost every pod. `ui::pods::draw` shows it the same way
-`ui::nodes::draw` shows `refresh_error` — a "Last refresh failed: …" line in
-`Severity::Warn` above the row list — with the same gap left standing rather
-than papered over: an empty listing's own branch is matched before the
-refresh-error branch runs, so a node whose last known pod count was genuinely
-zero and then suffers a failed refresh reads as "This node has no pods."
-with no mention of the failure, exactly as an empty node listing already does
-on the node pane. Threading a login hint into this pane's inline text, the
-way `ui::nodes::draw` does with `hint_lines`, is left alone: the pane had no
-such text on a bare `PodsState::Error` before tonight either, `L` is already
-offered in the footer regardless of which pane is showing, and wiring one in
-is a pre-existing gap this task did not create rather than a thought it left
-unfinished.
+`refetch_pods` rides the node pane's interval, `r`, and login triggers, but only
+while `View::NodePods` is showing (`pods_refresh_target`). `apply_pods` now keeps
+the last good rows with `refresh_error`, like `apply_nodes`. Known gap: an empty
+listing hides a later refresh error, as on the node pane.
 
 ### 101. `l`/`F` retype the dashboard's selectors as two independent prompts, and a commit refetches immediately
 
-"Edit the dashboard's selector without restarting it" left two questions open:
-whether a selector reuses `/`'s keystroke-capture machinery or gets its own,
-and whether committing one refetches immediately or waits for the pane's own
-refresh. Both had a precedent already sitting in the codebase to follow rather
-than a call to make from nothing.
-
-The first is decision 84's own question, asked and answered for
-`--sort-resource`: reusing `/` for a second, unrelated purpose would make one
-key mean two things depending on context, and a selector is validated grammar
-sent to the API server, not a client-side ranking over rows already in hand —
-a real difference in kind from a fuzzy filter, not just a second use of the
-same shape. `l` and `F` each open their own prompt, `SelectorEdit`, mirroring
-`ResourceSort`'s `Inactive`/`Editing` life cycle (there is no third,
-`Applied`, state to mirror: unlike a resource name, a selector can be
-*rejected*, and `Editing`'s own `error` field is what a resource prompt never
-needed). One `SelectorEdit` covers both keys rather than two, since only one
-of the pane's two selectors can be mid-retype at a time — the same reason
-`Filter` and `ResourceSort` are each a single field rather than one per key.
-
-The second follows the precedent already sitting in `event_loop`: a cluster
-selection or a view change already refetches immediately rather than waiting
-for `RefreshInterval`, on the reasoning that showing stale rows under a
-newly-typed answer for however long the interval takes would read as broken,
-not merely slow. A committed selector is exactly that kind of change — it
-changes what is being asked for, not how the pane displays what it already
-has — so it gets the same immediate trigger, noticed the same way the
-existing ones are: `pod_selectors_before` is captured beside `view_before` at
-the top of each iteration, and a mismatch after `on_key` fires `refetch_pods`
-on its own, independent `if` rather than another arm of the cluster/view
-chain, since committing a selector never changes either of those.
-
-Validation goes through `commands::pods::selectors_for`, unconditionally, on
-every `Enter` — including the selector that is *not* being retyped, read back
-out of the already-canonical `App::pod_selectors` rather than skipped. This
-costs nothing (a canonical selector parses back to itself) and avoids a
-second, narrower validation path that would have had to prove, separately,
-that it agreed with the CLI's own. A rejection keeps the prompt's text and
-attaches the rejection's own sentence as `SelectorEdit::Editing`'s `error`
-field, cleared on the next keystroke, rather than losing the typed text or
-reverting silently to whatever was last applied — the same "don't discard
-what the user typed" bar `edit_filter` and `edit_resource_sort` never had to
-clear, since neither of theirs can fail to parse.
-
-The applied selector's own display reuses `PodsState::Loaded::selector_note`
-— already built for the pane's "no pods here match …" empty-state wording —
-as a persistent `Selector: …` header line whenever it is `Some` and nothing
-is mid-edit, rather than `App` keeping a second, redundant copy of the same
-sentence to hand `ui::pods::draw`. This shifted one existing test's
-assumption: `a_filter_with_no_match_is_distinguishable_from_an_empty_selector_result`
-asserted that a `/`-filter miss never mentions "label selector" at all, which
-was only ever true because nothing else printed that phrase yet. The test now
-asserts the narrower, still-true claim — the filter-miss sentence itself never
-says "No pods here match label selector `…`" — since the persistent header
-line legitimately says "label selector" whenever one is active, filter or no
-filter.
+Selectors are server-side grammar, so they don't reuse `/`. One `SelectorEdit`
+(`Inactive`/`Editing` with an `error` field) serves both keys. `Enter`
+validates both selectors through `commands::pods::selectors_for`; a rejection
+keeps the typed text and shows the reason. A committed change refetches at once
+(`pod_selectors_before` is compared each loop). The applied selector shows as a
+`Selector: …` header, reusing `selector_note`.
 
 ### 102. The container-logs pane's `/` is a plain substring jump-to-match, not a second `fuzzy::rank`
 
-The roadmap left two questions open for "Search the container-logs pane":
-whether `/` here reuses the row-list `Filter`'s fuzzy ranking or reads as
-plain text, and whether a match highlights or a scored subsequence would be
-the more familiar answer for "find this text" in a scrolling log. Both read
-the same way once the actual difference between a log and a row list is
-named: a log's order is the one thing about it nobody wants re-ranked or
-thinned — restarting a pod does not re-sort its own log — so `/` here can
-only ever mean "jump to the next matching line," never "show only the
-matching ones." Scored, order-preserving subsequence matching solves a
-problem (which of many candidates is *closest*) that does not exist when
-there is exactly one candidate list and it is never reordered; plain,
-case-insensitive substring matching is what is left, and it happens to be
-the reading `less`'s own `/` already trained every likely user on.
-
-This produced its own state machine, `logs::LogSearch`, rather than a second
-caller of `crate::fuzzy::rank` or reuse of `super::Filter`: `Filter`'s
-`Editing`/`Applied` life cycle carries over unchanged (seeded from the last
-query on a second `/`, `Esc` cancelling outright rather than reverting to
-what was applied before, `Esc`/`Left` clearing an applied one before a
-drill-down backs out), but what committing it *does* differs enough that
-sharing the type would have meant branching on which pane was open inside
-methods that should not need to know. `Log::jump_to_match` is the pure
-stepping rule, `step`, parameterised over `SearchDirection` and an
-`inclusive` flag so the one commit-time jump (which should count the line
-already in view as a hit, or it would surprise a reader already looking at a
-match) and the two `n`/`N` steps (which must move to a *different* line even
-when the one on screen still matches) share one function rather than three
-near-copies. Matches are recomputed fresh from `Log`'s own `VecDeque` on
-every commit and every `n`/`N` — not cached alongside the query — because the
-buffer evicts from the front as new lines arrive, which would renumber a
-cached index list on every push; a full scan of at most `MAX_LINES` short
-strings costs nothing next to redrawing the frame that already needs one,
-the same trade-off `fuzzy::rank` already makes for the row-list filter every
-frame it is active.
-
-Highlighting is the whole line a match was found on, not the matched
-substring within it, via a new `Theme::match_highlight` (bold, underlined,
-the same accent colour `Theme::heading` uses) — the acceptance criterion
-asks only that a match "highlights without removing the lines around it,"
-and per-character span-splitting would have meant reworking how
-`log_lines` builds each row for a distinction a reader scanning a log is
-unlikely to need over the coarser one. One implementation note worth
-recording since it cost a debugging pass: `Line::styled` in this `ratatui`
-version carries its style on the `Line` itself, not on its one `Span` the
-way `Span::styled` (used by, e.g., `containers::event_lines`) does — a test
-asserting on `spans[0].style` for a `Line::styled` line silently compares
-against the default and always fails the "matches" branch, so
-`logs::tests`'s own style assertions compare `line.style` instead.
+A log is never reordered or thinned, so `/` jumps like `less`: case-insensitive
+substring, `n`/`N` to step. `logs::LogSearch` has `Filter`'s life cycle.
+`Log::jump_to_match` is one `step` function (direction, inclusive on commit).
+Matches are recomputed per step because eviction renumbers lines. The whole
+matched line gets `Theme::match_highlight`. Note: `Line::styled` puts the style
+on the `Line`, not its span.
 
 ### 103. The config file's path is `~/.config/eks/config.toml` on every platform, not a platform-varying one
 
-`config::path` builds the config file's location from `directories::
-UserDirs::home_dir()` and a literal `.config/eks/config.toml`, the same
-choice `kubeconfig::search_paths` already made for `~/.kube/config` over
-`directories::BaseDirs::config_dir()` — which would put the file under
-`~/Library/Application Support` on macOS and `%APPDATA%` on Windows. Both
-crate functions were one call away; the reason to match `kubeconfig`'s
-answer rather than reach for the more "correct" platform-native one is the
-same reason `kubeconfig` gave it originally, just inherited rather than
-re-litigated: this tool's other config file already lives at a literal
-path every `kubectl` user's muscle memory already points at, and a second
-config file one `find ~/.config` away from the first is a smaller surprise
-than a technically-more-correct one a user would have to look up per
-platform. `directories` stays a dependency either way, so this cost nothing
-extra to choose.
-
-"Theme" in the roadmap task's own wording became the `color` key, aliased to
-`colour`, rather than a new name: the only thing in this codebase that
-answers to "theme" today is `ColourChoice` (`auto`/`always`/`never`), since
-no light or dark variant exists yet — "Light theme and auto-detection" is
-still its own, unstarted roadmap entry. Naming the key `theme` would have
-promised a selector this tool cannot honour yet; naming it `color` says
-exactly what it does, and leaves the eventual theme-variant task free to
-either extend this same key's grammar or add its own, rather than guessing
-which one it wanted from inside a task that was never about theming.
-
-A malformed file — unparsable TOML, an unknown key, or one of the three
-values failing its own flag's grammar — discards the whole file's settings
-rather than keeping whichever fields did parse. The acceptance criterion
-only asked for "falls back to defaults," not for partial recovery, and a
-file that is half-honoured is a harder thing to reason about from the
-warning alone: "namespace was ignored, the other two were not" needs a
-sentence per field, where "the file could not be used, so nothing in it
-took effect" is one. If a genuinely malformed-but-mostly-fine file turns out
-to be a real complaint, per-field recovery is a small, separable follow-up
-— the shape of `RawConfig::resolve` does not fight it, since each field is
-already parsed independently before any of them are combined.
-
-The warning goes out through the existing `tracing::warn!` machinery
-(`k8s::page::collect`'s stalled-page notice is the precedent) rather than a
-bespoke `eprintln!`: the default log filter already shows `warn`-level
-events on stderr, so this costs no new plumbing and stays off when
-`-v`/`RUST_LOG` redirect logging elsewhere the same way every other warning
-already does. The parsing itself — `config::parse`, `RawConfig::resolve` —
-stays a pure function returning `(Config, Option<Warning>)` regardless, so
-"a bad file falls back and says why" is asserted on the return value in a
-test, not on captured log output; only the one line in `main::user_config`
-that calls `tracing::warn!` is impure, and it is three lines that do nothing
-but relay a value already computed.
-
-Each config value is parsed through the exact `FromStr`/`ValueEnum` grammar
-its CLI flag already uses — `ColourChoice::from_str`, `RefreshInterval::
-from_str` — rather than a second table of accepted spellings for the file.
-That is also why `--color`, `--refresh`, and `--namespace` needed to stop
-carrying their own `default_value`/`default_value_t` in `cli.rs`: a value
-`clap` fills in before anybody asked is indistinguishable from one the user
-typed, which would have made the file's own setting permanently
-unreachable. All three are `Option<T>` on `GlobalArgs` now — `namespace`
-already was — and `GlobalArgs::effective_color`/`effective_refresh`/
-`effective_namespace` are the one place per setting that chains flag, then
-file, then built-in default; every call site in `main.rs` reads through
-those rather than the raw fields.
+The literal path matches `~/.kube/config` habits. Keys are `color` (alias
+`colour`), `refresh`, and `namespace` (and later `theme`). A malformed file
+discards all its settings, with one `tracing::warn!`; parsing is pure
+(`(Config, Option<Warning>)`). Values reuse each flag's own `FromStr`. The flags
+lost their clap defaults (`Option<T>`), and `GlobalArgs::effective_*` chains
+flag → file → default.
 
 ### 104. Terminal-background detection reads `COLORFGBG`, not an OSC 11 query, and falls back to dark
 
-"Light theme and auto-detection" wanted the terminal's own background asked
-for "where possible" — the honest reading of that phrase, once the two ways
-of asking were weighed, is `COLORFGBG` and nothing more. The reliable
-answer, an OSC 11 query, means writing an escape sequence to the terminal
-and blocking on its reply: real I/O, on the one path CLAUDE.md is strictest
-about — "never block first paint on a network call" is written about a
-network call specifically because that was the I/O this tool had at the
-time, but the budget it protects (first paint under 50ms) does not care
-whether the wait is a socket or a terminal that never answers a query it
-does not understand. A `--timeout`-style budget around the query would have
-made it safe but not free, and worse, not testable the way everything else
-in this tool is: CLAUDE.md's testing standard is "no live AWS credentials,"
-not "no terminal, either," but a query-response protocol has no fixture to
-stand in for a terminal's raw-mode reply the way `page::collect`'s tests
-stand in for a cluster's paged one. `COLORFGBG` costs neither: it is an
-environment variable some terminals and multiplexers already export
-unasked, read the same way `NO_COLOR`/`TERM` already are in `main.rs`, and
-`theme::detect_background` is a pure function over it exactly like
-`Palette::choose` is over its own three.
-
-The honest cost: most terminal emulators people actually use day to day
-(iTerm2, Terminal.app, GNOME Terminal, Windows Terminal, Alacritty, kitty)
-do not set `COLORFGBG` at all, so `auto` will read as "cannot be told" for
-most users most of the time and fall back to dark — the same fallback a
-`false` "is this a light background" bit would have given, and the safer
-wrong guess: a dark theme's ink is unreadable on a light terminal, but not
-catastrophically so the way a light theme's ink would be on a genuinely
-dark one, painted in colours picked to clear WCAG AA against white. Where
-detection is silent, `--theme light`/the config file's own `theme` is the
-answer, the same "the flag is the override, not the fallback" shape
-`--color` already has. An OSC 11 query is not ruled out for good — it is a
-real follow-up, and a bigger one than this task's own wording suggested,
-since it needs the timeout-and-fixture machinery above before it can ship
-at all — but it was never this task's to build, only to leave room for:
-`theme::resolve` takes `Option<Background>` from whatever answers
-`detect_background`'s question, so a second, richer detector slots in
-beside it without `Palette::choose` or `App::set_theme` changing at all.
-
-`Theme::light()` is not `Theme::dark()`'s palette lightened — a pastel
-tuned to read on black goes nearly invisible on white, so each colour was
-picked against its own theme's assumed background rather than derived from
-the other's. Neither theme paints a background of its own: `Theme::
-background` stays `Color::Reset` in both, trusting whatever the terminal
-already shows, the same choice `dark()` already made before this task and
-the reason `--theme light` on a terminal that is not actually light will
-still look wrong — the override fixes a wrong *guess*, not a mismatched
-terminal, and painting an explicit background to cover that case was ruled
-out as its own, larger decision (real risk to first paint's "render from
-empty state" rule, and untested territory `TestBackend` covers today only
-because nothing paints one) rather than folded in here.
-
-Wiring stopped at neither surface alone. `Palette::choose` gained a `Theme`
-parameter rather than keeping its internal `Theme::default()`, so `eks
-nodes --theme light` and a light-mode dashboard pane draw `STATUS`/severity
-ink in the same colours — `--color` already reaches both the CLI table and
-the dashboard through one `Theme`, and a `--theme` that only reached one of
-them would have been the exact gap CLAUDE.md's "what one pull request
-means" warns against: a flag honoured by one listing and not its twin.
-`App::set_theme` mirrors `App::set_pod_selectors`'s own shape — seeded once
-in `main::dashboard` right after `App::new`, so every existing test still
-gets the dark default without a second constructor parameter to thread
-through five call sites.
-
-Amended by decision 111: the OSC 11 query now runs in the dashboard, off the
-paint path, and re-themes after first paint. Decision 115 records how.
+`COLORFGBG` costs no I/O; an OSC 11 query would have blocked first paint with no
+fixture to test it. Most terminals don't set `COLORFGBG`, so `auto` usually
+falls back to dark, the safer wrong guess; `--theme light` and the config key
+are the override. `Theme::light()` is picked for a light background, not derived
+from dark, and neither theme paints a background. `Palette::choose` takes the
+`Theme`, so CLI and dashboard agree; `App::set_theme` seeds it. (Amended by
+decisions 111 and 115: the dashboard now also queries OSC 11 after first paint.)
 
 ### 105. Startup benchmarks measure the pure computation, not the process; CI reports through a branch-keyed cache, never fails
 
-"Startup budget and benchmarks" asked for `criterion` benchmarks over
-kubeconfig parsing and first paint, with CI reporting regressions rather
-than failing on them. Two decisions the task's own wording left open:
-
-**What "first paint" means to a benchmark that cannot open a terminal.**
-`ui::run`'s real first paint is `ratatui::init()` — raw mode, an alternate
-screen — followed by one `terminal.draw`. `criterion` runs in an ordinary
-process with no controlling terminal at all in CI, so benchmarking the real
-sequence was never on the table; the honest alternative was the one the
-UI's own rendering tests already established: `TestBackend`, exactly as
-every `ui::mod` test already uses it, drawing the same `ui::draw(frame,
-&app)` a real frame would call. `benches/startup.rs`'s `first_paint`
-benchmark is therefore `KubeConfig::parse` → `contexts::views` → `App::new`
-→ `set_theme` → one `terminal.draw` — the full computed path `main::
-dashboard` walks before handing control to `ui::run`, minus the raw-mode
-and alternate-screen syscalls neither this tool's architecture nor a CI
-runner's environment can put a number on honestly. `kubeconfig_parse`
-benchmarks the same parse alone, so a regression in one cannot hide behind
-the other's noise. Both come out around 0.6–0.9ms against a synthetic
-50-cluster kubeconfig — comfortably inside CLAUDE.md's 50ms budget, but
-that number is not the budget's own: real process startup (the dynamic
-linker, `exec`, the kernel handing back a terminal) is the majority of what
-a user actually waits on and is exactly the part no benchmark run inside
-`cargo bench` can see. This is a computation-only instrument, consistent
-with "separate computation from I/O and rendering" — it catches an
-accidental O(n²) in `KubeConfig::parse` or a widget that got expensive, not
-a regression in exec overhead.
-
-Both benchmarks build their own synthetic kubeconfig — 50 ARN-style EKS
-contexts — rather than reusing `kubeconfig.rs`'s two-cluster `SAMPLE`: a
-benchmark's fixture should be shaped like the input that makes the cost
-worth measuring, which for kubeconfig parsing is a multi-account operator's
-config, not a unit test's minimal one.
-
-**How CI reports a regression without a persistent benchmark server.**
-`criterion` already refuses to fail a build over a regression — it only
-ever prints one — so meeting "reports rather than failing" needed no flag
-at all. The open question was making that report say anything: `criterion`
-compares each run against whatever it finds under `target/criterion`, and
-that directory does not survive between CI runs on its own. Rather than
-stand up an external benchmark-tracking service (a new secret, a new
-account, a dependency this tool's contributors cannot inspect), the new
-`bench` job in `ci.yml` caches `target/criterion` itself through `actions/
-cache`, keyed by OS and branch and falling back to `master`'s latest — so a
-pull request's numbers compare against master's own history rather than
-starting from nothing, and master's own runs build up a real trend over
-time. The comparison output is written into the job's `$GITHUB_STEP_
-SUMMARY` rather than a PR comment, which would have needed a token with
-write access this job has no other reason to hold. `criterion`'s default
-feature set was trimmed to `cargo_bench_support` alone — `plotters`,
-`rayon`, and HTML report generation buy nothing when the only reader is a
-CI log, and CLAUDE.md's "earn its place" is about weight as much as
-necessity.
-
-Extended by decision 112: CI's `bench` job also measures wall-clock process
-startup with `hyperfine`.
+`benches/startup.rs`: `kubeconfig_parse` and `first_paint` (parse → views →
+`App::new` → `set_theme` → one `TestBackend` draw) over a synthetic 50-context
+kubeconfig, about 0.6–0.9 ms. They don't measure process startup (see decision
+112). The CI `bench` job caches `target/criterion` by branch, falling back to
+`master`, and writes the comparison to the step summary. `criterion` is trimmed
+to `cargo_bench_support`.
 
 ### 106. Completions and the man page skip kubeconfig entirely; the man page is a hidden command; CI generates both only for native targets
 
-"Shell completions and a man page" asked for `eks completions bash|zsh|fish`
-and a man page generated from the `clap` definition, with `make dist`
-including both. Three things the task's own wording left to fill in:
-
-**Where the man page lives as a command.** `clap_mangen::Man` needs the same
-`clap::Command` tree `clap_complete::generate` walks for completions, and the
-simplest way to get one inside this binary at packaging time — no build
-script, no `OUT_DIR` path to locate across a hashed build directory the way
-`ripgrep`'s does — is to ask the binary itself, the same way `eks completions`
-already does. `eks man`, printing roff to stdout, is that ask: a real
-subcommand, but `#[command(hide = true)]`, because it exists for `make dist`
-to pipe into a `.1` file, not for a user to find in `--help`. `commands::
-completions` holds both functions beside each other (`shell`/`man`) since they
-are the same kind of thing — a pure render of `Cli::command()` into a
-different text format — and both are `String`-returning like every other
-command in `commands::`, with no `Result` to thread: `clap_mangen::Man::
-render`'s only failure mode is a write error, which a `Vec<u8>` cannot
-produce.
-
-**Neither reads a kubeconfig, so neither is allowed to fail because of one.**
-`main::run` loaded `paths`/`config` unconditionally before dispatching on the
-parsed command, which would have made `eks completions bash` fail on a
-malformed `KUBECONFIG` it has no reason to care about — exactly the kind of
-machine a shell's own setup script installs completions from, possibly with
-no kubeconfig in sight at all. `Completions`/`Man` are now matched and
-returned on before that load, the same "costs nothing at all" bargain
-`--login never` already makes elsewhere in that function; the exhaustive
-match further down still has to name both variants, so it does with
-`unreachable!` rather than a wildcard, since NLL proves the two `return`
-arms above are the only way that code could have been reached.
-
-**CI generates them only where the binary can run.** `release.yml`'s build
-matrix already draws exactly this line for its smoke test:
-`x86_64-apple-darwin` is cross-compiled on an arm64 runner and cannot be
-executed without Rosetta, so `if: matrix.native` skips running it at all.
-Completions and the man page are pure renders of the same `Cli` regardless of
-target, so there is nothing target-specific to lose by generating them once on
-a runner that can actually run what it just built — reusing `matrix.native`
-rather than adding a fourth job to share one text file across a matrix that
-already runs its three legs in parallel. The one cross-compiled leg ships its
-tarball without them, a real, pre-existing gap in that matrix (the smoke test
-has the same one) rather than one this task introduced trying to paper over
-with Rosetta or a second build. `make dist` mirrors the same three files
-locally, from a plain `cargo build --release` with no cross-compilation
-question to answer.
+`eks completions <shell>` and a hidden `eks man` render `Cli::command()` to a
+`String`. They return before kubeconfig/config load, so a broken kubeconfig
+can't break them. Release CI generates them only on `matrix.native` legs; the
+cross-compiled darwin tarball ships without them. `make dist` includes both.
 
 ### 107. Golden snapshots are text first, colour by role name, and live beside `ui`'s own tests
 
-"Golden-file rendering tests" asked for `insta` snapshots over `TestBackend`
-for the main views. Three choices the wording left open:
-
-**What a snapshot holds.** `Buffer`'s `Debug` output — what `insta` would
-snapshot for free — interleaves every cell's colour with the text in
-`ratatui`'s own format, which makes every snapshot churn whenever a palette
-entry is tuned and every snapshot churn at once if a `ratatui` release rewords
-that output. Most snapshots here are therefore the characters on screen and
-nothing else, which is the part a reviewer can actually read in a diff. Colour
-gets four snapshots of its own, one per drill-down level, in a format this
-module writes itself: the same text, then one line per run of styled cells.
-
-**Colours are printed by role, not by value.** Each colour in a styled
-snapshot is written as the `Theme` field it equals — `fg=muted
-bg=selection_bg` — and only falls back to its `Debug` spelling when it is none
-of them. That makes the snapshot readable, and it turns `CLAUDE.md`'s "never
-hardcode a `Color` in a widget" into something mechanical: two ordinary tests
-sweep every view in both themes, one failing on any colour without a role
-name, the other if the light theme gives a cell a different role than the
-dark one. The second is the reason there is no separate light-theme snapshot:
-once colours are named by role, it would be byte-identical to the dark one,
-and the test says so more directly than a duplicate file would. One wrinkle:
-both themes give `accent` and `border_focused` the same value today, so a
-focused border reads as `accent`. The name is taken from the first field that
-matches, and the order is fixed, so this is stable; if the two ever diverge,
-the snapshots will show `border_focused` where they now show `accent`, and
-that diff will be correct.
-
-**Where the tests live.** `src/ui/tests/golden.rs`, declared as `mod golden;`
-inside `ui`'s existing `#[cfg(test)] mod tests`, rather than an integration
-test under `tests/` or a sibling of `ui::tests`. As a child it can use the
-fixtures that module already builds — `node_row`, `pod_row`, `container_row`,
-`app`, `press` — without moving them or making them `pub`, and it reaches
-`App` through the same methods a user's key presses do. `insta` puts the
-snapshots in `snapshots/` beside that file.
-
-`cargo-insta` is not a requirement: `make snapshots` runs the golden tests
-with `INSTA_UPDATE=always`, and `git diff` is the review. It is documented as
-the nicer path, not the only one, because installing another tool should not
-stand between a contributor and a one-line layout fix. CI needs nothing new —
-GitHub Actions sets `CI=true`, under which `insta` writes nothing and fails on
-any mismatch or missing snapshot, and `cargo test` already runs these.
+Most `insta` snapshots are screen text only; four (one per drill-down level)
+add styled runs, with colours written as `Theme` role names (`fg=muted`). Two
+tests sweep every view in both themes: every colour must have a role, and the
+light theme must use the same roles as dark (so there's no light snapshot).
+`accent` and `border_focused` share a value, so the first match wins. Tests
+live in `src/ui/tests/golden.rs`; `make snapshots` updates them, and
+`cargo-insta` is optional. CI fails on any mismatch.
 
 ### 108. The new Linux targets cross-compile with the distribution's own toolchains, aarch64 runs under QEMU, and "static" is read from the ELF headers
 
-"More release targets" asked for `aarch64-unknown-linux-gnu` and
-`x86_64-unknown-linux-musl` in the release workflow, cross-compiled in CI, with
-the musl binary verified static. Four things the wording left open:
-
-**No new build tool.** Both legs build on `ubuntu-latest` with plain `cargo
-build --target`, plus the Ubuntu packages that target needs:
-`gcc-aarch64-linux-gnu` (and its `libc6-dev-arm64-cross` sysroot) for aarch64,
-`musl-tools` for musl. The only C this tree compiles is `ring`'s, and `cc`
-already looks for `aarch64-linux-gnu-gcc` and `musl-gcc` by the target's own
-name, so the one setting the workflow has to spell out is aarch64's linker
-(`CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER`, inert on every other leg).
-`cross` (Docker images per target) and `cargo-zigbuild` (zig as the linker)
-were the alternatives; each is a tool the release job would have to install
-and trust, and neither was needed to get either target to build. A native
-arm64 runner (`ubuntu-24.04-arm`) was the other: it would build without
-cross-compiling at all, but the task asked for cross-compilation, and the
-arm runners' availability depends on the repository's plan in a way an
-`ubuntu-latest` runner's does not.
-
-**The aarch64 binary is run, under QEMU, not skipped.** The existing
-`x86_64-apple-darwin` leg ships without a smoke test or completions because
-it cannot run what it built (decision 106). The aarch64 leg could have taken
-the same `native: false` exemption; instead it names an `emulator` —
-`qemu-aarch64 -L /usr/aarch64-linux-gnu`, the user-mode emulator pointed at
-the cross sysroot the build already installed — and the smoke test and the
-completions step run under `matrix.native || matrix.emulator`, prefixing the
-binary with `matrix.emulator` (empty on every other leg). Emulation costs a
-second or two for `--version`, `--help`, and four renders; the alternative
-was a tarball nobody had ever executed, missing files every other Linux
-tarball has.
-
-**"Static" is checked from the ELF headers, by a script.**
-`scripts/verify-static.sh` fails if the binary has a `PT_INTERP` program
-header (it asks for a dynamic loader) or any `DT_NEEDED` entry (it names a
-shared library). `file`'s "statically linked" would have been shorter, but
-Rust's musl target builds a *static-pie*, which `file` describes differently
-across versions, and which still has a dynamic section of its own — for its
-own relocations — so "has no dynamic section" would have been the wrong
-test. It is a script in the tree rather than inline YAML so it can be run
-against a local build and against a binary that should fail it; the PR that
-added it did both.
-
-**The glibc build is only as portable as the runner.** A `-gnu` binary needs
-at least the glibc its build host had, and on `ubuntu-latest` (24.04) that is
-2.39: `std` binds `pidfd_spawnp`/`pidfd_getpid` weakly, but the version
-requirement it records is not weak, so the loader refuses the binary on an
-older glibc — including Amazon Linux 2023's 2.34, the obvious host for an EKS
-tool on Graviton. The existing `x86_64-unknown-linux-gnu` leg has the same
-floor for the same reason. The musl build has no floor at all, which is what
-it is for; lowering the `-gnu` floor means choosing a toolchain that can link
-against an older glibc (`cargo-zigbuild`'s `target.2.17` suffix, `cross`'s
-older images, or an older runner that only moves the floor a little), which
-is the build-tool question this change deliberately did not reopen, and it
-is a roadmap entry of its own.
+`aarch64-unknown-linux-gnu` and `x86_64-unknown-linux-musl` build on
+`ubuntu-latest` with Ubuntu's cross packages, not `cross` or zigbuild. The
+aarch64 binary is smoke-tested and generates completions under
+`qemu-aarch64`. `scripts/verify-static.sh` fails on any `PT_INTERP` or
+`DT_NEEDED` (musl builds static-pie, so "no dynamic section" would be wrong).
+The glibc floor was 2.39; fixed in decision 109.
 
 ### 109. The `-gnu` release binaries link against glibc 2.17 through `cargo zigbuild`, and the floor is read back out of the binary
 
-Both `-gnu` tarballs used to need the glibc of the `ubuntu-latest` runner that
-built them — 2.39 — so neither started on Amazon Linux 2023 (2.34), and the
-aarch64 one had no musl sibling to fall back on (decision 108). Three choices:
-
-**`cargo zigbuild`, not `cross` or an older runner.** zig ships stub
-libraries for every glibc release and links against whichever one the target
-names, so `cargo zigbuild --target x86_64-unknown-linux-gnu.2.17` binds each
-symbol to the oldest version that has it, on the same `ubuntu-latest` runner,
-with no container. zig is also the C compiler `ring` gets, so the aarch64 leg
-dropped `gcc-aarch64-linux-gnu` and the `CARGO_TARGET_…_LINKER` setting it
-needed; it keeps `libc6-arm64-cross` only as the sysroot QEMU runs the result
-against. `cross`'s images would pin the floor to whatever glibc each image
-happens to carry, and put a Docker pull in front of every build; an older
-runner (`ubuntu-22.04`, 2.35) does not reach 2.34 at all and is retired on
-GitHub's schedule, not ours. The cost is two tools installed per build — zig
-through `mlugg/setup-zig`, `cargo-zigbuild` through `cargo install --locked` —
-both pinned (zig 0.16.0, cargo-zigbuild 0.23.4, the pair this was built and
-checked with) so a new release of either never arrives on an unrelated merge.
-
-**2.17, not 2.34.** The roadmap entry asked for 2.34 because that is Amazon
-Linux 2023's. But 2.17 is Rust's own documented minimum for both targets, zig
-links it with no extra work, and it reaches Amazon Linux 2 (2.26) and older
-bastion images too, which the same person running `eks` on Graviton is as
-likely to be sitting on. Declaring anything newer than the toolchain's own
-floor would buy nothing but a smaller audience.
-
-**The floor is checked, then exercised.** `scripts/verify-glibc-floor.sh`
-reads the binary's version-needs section (`readelf --version-info`), takes the
-newest `GLIBC_x.y` it asks for, and fails when that is newer than the floor
-the matrix declares — naming each symbol above it, from the dynamic symbol
-table, so the failure says which call raised it. Versions compare component
-by component as numbers: text order would put `2.9` after `2.17`. This is
-what turns "the build asked for 2.17" into a guarantee: a zig release whose
-stubs change, a dependency that starts calling `getrandom`, or a leg that
-quietly loses the suffix fails the release build instead of shipping. Like
-`verify-static.sh` it is a script so it runs against a local build; unlike
-it, it has tests (`scripts/tests/verify-glibc-floor.sh`, run by `make check`
-and by CI's lint job), which feed it fixture readelf output through a
-`READELF` override so they run on a macOS laptop with no readelf at all.
-After the check, each `-gnu` binary is started with `--version` and `--help`
-inside `amazonlinux:2023`, pulled from `public.ecr.aws` rather than Docker
-Hub, the aarch64 one under QEMU via `docker/setup-qemu-action` — the host the
-roadmap named, rather than a proxy for it. Nothing in CI runs the binaries on
-glibc 2.17 itself; the ELF check is the evidence for the declared floor, the
-container run is the evidence for the named host.
+`cargo zigbuild --target <triple>.2.17` on `ubuntu-latest`, with zig 0.16.0 and
+cargo-zigbuild 0.23.4 pinned. 2.17 is Rust's own minimum and reaches Amazon
+Linux 2 and 2023. `scripts/verify-glibc-floor.sh` reads the newest `GLIBC_x.y`
+the binary needs (compared numerically) and names the symbols that raise it;
+its tests use fixture readelf output. Each `-gnu` binary then runs
+`--version`/`--help` in `amazonlinux:2023` (from `public.ecr.aws`), aarch64 under
+QEMU.
 
 ### 110. `eks` runs the kubeconfig `exec` helper itself; it still does not own logging in
 
-Decided by the reviewer on 2026-09-24. This narrows decision 74 without reversing it.
+Decided by the reviewer on 2026-09-24. Narrows decision 74 without reversing it.
 
-Decision 74 said no to owning credential resolution and gave two objections. The
-first was the AWS SDK's weight: a second hyper/rustls tree on a binary whose
-startup time comes first. The second was `botocore`'s private token-cache format,
-which a native device flow would have to write. Both objections are about
-*logging in*. Neither applies to *running the `exec` block*. The
-`client.authentication.k8s.io` protocol is small: spawn the command the
-kubeconfig names, with the environment and arguments it names, and read one
-`ExecCredential` JSON document from its stdout. `serde_json` is already a
-dependency (decision 75), so this adds no crate and writes no cache.
-
-Owning the child answers the two roadmap entries that decision 74 left waiting
-on this question:
-
-- **Stopping the helper.** A child we spawned is a child we can kill. On
-  `--timeout` the helper is killed, not abandoned, so it no longer holds the
-  terminal's stdin after the shell gets its prompt back.
-- **Refreshing mid-listing.** We hold the `ExecCredential`'s
-  `expirationTimestamp`, so a listing can re-run the helper between pages when
-  the token is close to expiry. It no longer needs one token for the whole
-  client's life.
-
-What stays as decision 74 had it: `aws sso login --profile X` is still a
-shell-out, the pre-flight still reads the token cache without writing it, and
-failures are still worded through `k8s::client::explain`,
-`k8s::client::stalled_helper` and `helper_command`. There is no second
-spelling. Both token and client-certificate credentials must be handled,
-because the protocol allows either. A helper we cannot parse is an error that
-names the command, not a fallback to letting `kube` run it.
+Decision 74's objections (SDK weight, writing botocore's cache) are about
+logging in, not about running the `exec` block. The
+`client.authentication.k8s.io` protocol is small: spawn the named command with
+its env and args, and read one `ExecCredential` from stdout. No new crate, no
+cache writes. Owning the child means `--timeout` kills the helper instead of
+abandoning it, and a listing can re-run it near `expirationTimestamp`.
+Unchanged: `aws sso login --profile X` is still a shell-out, the pre-flight
+still only reads the cache, and failures are still worded through `explain`/
+`stalled_helper`/`helper_command`. Token and client-certificate credentials are
+both handled. An unparseable helper is an error naming the command, never a
+fallback to `kube`.
 
 ### 111. The OSC 11 background query runs off the paint path, and a light answer re-themes after first paint
 
-Decided by the reviewer on 2026-09-24. This lifts decision 104's deferral.
+Decided by the reviewer on 2026-09-24. Lifts decision 104's deferral.
 
-When `theme` is `auto` and `COLORFGBG` says nothing, the dashboard paints first
-in dark (decision 104's fallback). It then sends the OSC 11 query on the input
-side, never on the render path. If a reply arrives that reads as a light
-background, the dashboard switches through `App::set_theme` and redraws. The
-query spends **none** of the 50 ms first-paint budget. The accepted cost is
-that on a light terminal that answers, a user may see a single frame drawn in
-dark before it flips. No reply, a reply we cannot parse, or a terminal that
-never answers all leave the dark theme in place, and none of them is an error.
-
-This also answers decision 104's testing objection. Parsing the reply is a pure
-function over bytes, tested against fixture replies (`rgb:ffff/ffff/ffff`,
-4-digit and 2-digit forms, BEL and ST terminators, garbage). The re-theme is
-an `App` state change fed an event, tested like any other key. What "never
-delays first paint" means is asserted by the order of events, not by a timer.
-A terminal that `COLORFGBG` already answered is not queried. The CLI's
-one-shot tables keep `COLORFGBG` only: they have no event loop to receive a
-late answer, and a blocking query there would be the trade this decision
-declined for the dashboard.
+With `theme = auto` and nothing from `COLORFGBG`, the dashboard paints dark,
+then sends OSC 11 on the input side. A light reply switches through
+`App::set_theme` and redraws, spending none of the first-paint budget; one dark
+frame before the flip is accepted. No reply or an unparseable one keeps dark
+silently. The reply parser is pure and tested on fixture bytes; ordering is
+asserted by events, not timers. A terminal `COLORFGBG` already answered isn't
+queried. CLI tables keep `COLORFGBG` only.
 
 ### 112. Wall-clock startup is measured with `hyperfine` in CI's `bench` job, reported and never gated
 
-Decided by the reviewer on 2026-09-24. This extends decision 105.
+Decided by the reviewer on 2026-09-24. Extends decision 105.
 
-`benches/startup.rs` measures the computation. `hyperfine` measures the
-process: `exec`, dynamic linking, and the real binary's own startup, which
-together are most of what a user waits on. The `bench` job installs a pinned
-`hyperfine`, like `cargo-zigbuild` in decision 109, so a new release never
-turns up in an unrelated merge. It times the release `eks` against the same
-synthetic 50-cluster kubeconfig the criterion benches use, on commands that
-need no terminal and no cluster (`eks contexts`, `eks --version`). The result
-goes to the job summary beside criterion's, and CI never fails a build over
-it. A hand-rolled spawn-and-time harness was the alternative. It lost because
-it would be our own statistics code with nothing to show for it that
-`hyperfine` does not already do. Opening a real terminal
-(`ratatui::init()`'s raw-mode setup) is still unmeasured, because CI has no
-TTY. The number is labelled as excluding it rather than implying it covers
-it.
-
-Built as decision 116.
+A pinned `hyperfine` times the release binary (`eks contexts`, `eks --version`)
+against the same synthetic 50-cluster kubeconfig, and reports to the job summary
+without ever failing CI. Terminal setup (raw mode) isn't measured, and the
+report says so. Built as decision 116.
 
 ### 113. The Homebrew formula lives in this repository, not a separate tap
 
 Decided by the reviewer on 2026-09-24.
 
-`Formula/eks.rb` is committed here, and users tap it by URL:
-`brew tap nmcginn/eks-wrangler https://github.com/nmcginn/eks-wrangler`, then
-`brew install nmcginn/eks-wrangler/eks`. A separate `homebrew-tap` repository
-is the more conventional setup and would allow the shorter `brew tap`. It would
-also mean a second repository to keep in step and a release-workflow token
-with push rights outside this one. For one formula that trade is not worth it
-yet. If more formulae ever appear, moving to a dedicated tap is a rename, not a
-redesign. The formula installs the release tarballs from decisions 108 and
-109, with their published checksums, and ships the completions and man page
-that are already inside them. The install script verifies the same checksums
-before it installs anything.
+`Formula/eks.rb` lives here, tapped by URL: `brew tap nmcginn/eks-wrangler
+https://github.com/nmcginn/eks-wrangler`, then `brew install
+nmcginn/eks-wrangler/eks`. A separate `homebrew-tap` repo would mean a second
+repo to keep in step and a release token with push rights outside this one; if
+more formulae appear, moving is a rename. The formula installs the release
+tarballs (decisions 108, 109) with their published checksums, and ships the
+completions and man page inside them. The install script verifies the same
+checksums before installing anything.
 
 ### 114. The token is refreshed by a layer on every request, and a refused page is asked for once more
 
-Decision 110 said `eks` runs the `exec` helper itself and watches the
-`expirationTimestamp` between pages. What landed does that in a slightly
-different place, and a few choices along the way are the reviewer's to check.
-
-**Where the refresh lives.** The keeper sits in a `tower` layer on the client
-(`k8s::auth`), not in `page::collect`. Every request asks it for the token, so
-a listing, a log stream, a metrics call and a dashboard left open all stay
-fresh through one mechanism. Putting it in `collect` would have meant passing a
-refresher alongside every `kube::Client` the tool uses, and it would still have
-left the non-paged requests without one. `collect` keeps one job: when a page
-after the first comes back `401`, it asks once more, because the layer has
-already retired the refused token. A `401` on the first page is not retried,
-since the token was minted for this command a moment earlier and the refusal is
-the answer. The login offer in `commands::credentials` then handles it as
-before.
-
-**One deadline for the request and its refresh.** A refresh runs inside the
-request that needed it. If each of them timed itself, two timers set
-microseconds apart for the same length would fire in either order, and the
-user would randomly read "the cluster did not answer" instead of "the helper
-stalled". `Budget::wrap` publishes its deadline in a task-local
-(`page::deadline`) and the refresh uses the same instant. Both fire on the same
-tick, and the helper is polled first, so its error is the one reported. A
-refresh with no wrapping budget falls back to the keeper's own.
-
-**Killing.** `kill_on_drop` sends `SIGKILL` to the helper's own process. A
-helper that forks a grandchild and exits would leave the grandchild running.
-None of the EKS helpers do this: `aws` and `aws-iam-authenticator` are single
-processes. Putting the child in its own process group would fix it, but an
-interactive helper in a background group gets `SIGTTIN` the moment it reads
-the terminal, so that trade was not taken.
-
-**`interactiveMode` as client-go reads it.** `kube` treated anything but
-`Never` as interactive. The protocol says `IfAvailable` (also the default)
-means "if stdin is a terminal", and that is what `exec::interactive` does. A
-piped `eks nodes` now gives a helper `/dev/null` rather than the pipe, and its
-stderr is captured so the last line can appear in logs. The dashboard's stdin
-is a terminal, so its helpers still inherit it. That was true before, and it
-is now a roadmap entry.
-
-**JSON first, then YAML.** Decision 110 named `serde_json`, and JSON is what the
-protocol specifies. `kube` 4.2 decodes helper output as YAML, because client-go
-does and some helpers print YAML. So `exec::parse` tries JSON, then falls back
-to `serde_yaml_ng` (already a dependency) only if the YAML actually has a
-`status`. YAML reads `Enter MFA code:` as a one-key map, so without that check
-a prompt would be reported as "no status" instead of "not an ExecCredential".
-
-**Certificates are not refreshed.** A client certificate is part of the TLS
-connection, so replacing it needs a new client. It is held for the life of the
-client, as `kube` did (`kube` never refreshed one either). EKS helpers issue
-tokens.
-
-**Dependencies.** `tower` (no features, for the `Layer` and `Service` traits),
-`http`, and `base64` (the protocol sends PEM, and a kubeconfig, which is what
-`kube` reads it from, holds base64 of PEM). All three were already in the tree
-at the same versions through `kube`, so none of them adds compiled code.
-`tokio` gains `process`.
+- **Where.** A `tower` layer (`k8s::auth`) supplies the token to every request
+  (listings, log streams, metrics, the dashboard). `page::collect` retries a
+  `401` once, but only on a page after the first.
+- **One deadline.** `Budget::wrap` publishes its deadline in a task-local
+  (`page::deadline`); a refresh uses the same instant and the helper is polled
+  first, so "helper stalled" beats "cluster did not answer".
+- **Killing.** `kill_on_drop` kills the helper process only, not a forked
+  grandchild. No process group, because an interactive helper in a background
+  group gets `SIGTTIN`.
+- **`interactiveMode`.** Read as client-go does (`exec::interactive`):
+  `IfAvailable` (the default) means "if stdin is a terminal". A non-interactive
+  helper gets `/dev/null` stdin and captured stderr. The dashboard case is
+  decision 119.
+- **Parsing.** JSON first, then YAML only if it has a `status` (so `Enter MFA
+  code:` isn't read as a map).
+- **Certificates** are held for the client's life, not refreshed.
+- **Dependencies:** `tower`, `http`, and `base64`, all already in the tree via
+  `kube`; `tokio` gains `process`.
 
 ### 115. The OSC 11 reply is read back out of crossterm's key events, asked once with BEL, and judged by which theme reads better
 
-Decision 111 settled *when* the dashboard asks. Building it turned up four
-choices of its own.
-
-**Reading the reply.** crossterm 0.29 has no notion of an OSC reply. The
-terminal's answer arrives on stdin like typing and is parsed as keys: `ESC ]`
-is Alt+`]`, each body character its own key (uppercase hex with SHIFT), BEL is
-Ctrl+G, and ST (`ESC \`) is Alt+`\`. Reading the reply from `/dev/tty`
-ourselves would race crossterm's own reader for the same bytes, and replacing
-crossterm's input handling is far more than this task. So
-`ui::background::ReplyReader` sits in front of `App::on_key` and the refresh
-check, and swallows exactly the keys that spell a reply. It holds an Alt+`]`
-until the next keys confirm `11;`, and gives everything back if they do not,
-so a user's own Alt+`]` is delayed by one key rather than lost. After `11;`, a
-reply that breaks off is dropped rather than replayed as keystrokes, since
-replaying `rgb:…` is the damage the reader exists to prevent. Once one reply
-has been read, the reader steps aside for the rest of the session. The mapping
-from bytes to keys was checked against crossterm's parser source and by running
-the binary under a pty that answered the query. It is still the one place this
-leans on crossterm internals that a crossterm upgrade could change.
-
-**BEL, not ST.** xterm answers with the terminator the query used. Both work in
-every terminal that answers at all. BEL has the longest history in `screen`
-and in `tmux` passthrough, and it is what Vim and Neovim send. Both
-terminators are accepted in the reply.
-
-**Who is not asked.** Only `auto` with a silent `COLORFGBG`, as decision 111
-says. There are also two `TERM` exclusions: unset or `dumb`, and the Linux
-virtual console (`linux`, `linux-*`). The Linux console does not implement OSC
-11 and prints the query's tail onto the screen instead of ignoring it. The
-query is also Unix-only, because crossterm on Windows reads console input
-records rather than a byte stream, and no release target is Windows.
-
-**Light or dark.** A reply is a colour, not a verdict. `Background::of_rgb`
-calls it light when `Theme::light().text` has more WCAG contrast against it
-than `Theme::dark().text` does. That makes the answer "the theme that reads
-better here," and the crossover (a relative luminance near 0.18, about
-`#777777`) moves by itself if either palette is retuned. A tie is dark, the
-safer wrong guess, as in decision 104.
+- **Reading.** crossterm parses the reply as keys, so
+  `ui::background::ReplyReader` sits before `App::on_key` and swallows exactly
+  the keys that spell a reply. A user's own Alt+`]` is delayed one key, not
+  lost; a broken-off reply is dropped, not replayed. The reader steps aside
+  after one reply. This relies on crossterm internals that an upgrade could
+  change.
+- **BEL** terminator on the query; both BEL and ST accepted in the reply.
+- **Not asked:** anything but `auto` with silent `COLORFGBG`; `TERM` unset,
+  `dumb`, or `linux*`; non-Unix.
+- **Verdict.** `Background::of_rgb` is light when `Theme::light().text` has
+  more WCAG contrast against the colour than `Theme::dark().text` (crossover
+  near `#777777`); a tie is dark.
 
 ### 116. The wall-clock benchmark is a tested shell script over a committed fixture, and it times the binary without a shell or the user's home
 
-Decision 112 chose `hyperfine` in CI's `bench` job. Building it turned up four
-choices of its own.
-
-**One fixture, as a file.** Decision 112 said the binary is timed against "the
-same synthetic 50-cluster kubeconfig the criterion benches use". That kubeconfig
-was a Rust function inside `benches/startup.rs`, which a process started by
-`hyperfine` cannot call. It is now `benches/fixtures/kubeconfig-50.yaml`, which
-the criterion benches `include_str!` and the script passes as `KUBECONFIG`. Its
-bytes are the old generator's output exactly (checked by asserting the two
-equal before the generator was removed), plus a four-line YAML comment at the
-top saying who reads it. The comment makes `kubeconfig_parse` very slightly
-slower than master's cached history, so the first run after this lands may
-report a small regression that is not one. Generating the file in CI instead
-would have kept the generator, but then the bench and the script could drift
-onto different inputs without anything noticing.
-
-**A script, not inline YAML.** The timing lives in `scripts/bench-startup.sh`,
-beside the release scripts, so `make bench-process` runs on a laptop exactly
-what CI runs. Like `verify-glibc-floor.sh`, it takes its tool from an
-environment variable (`HYPERFINE`) so `scripts/tests/bench-startup.sh` can
-check what it asks hyperfine to do without timing anything, and `make
-script-test` runs those tests in `make check` and CI's lint job.
-
-**No shell, no home.** The commands run with `--shell=none`. A shell in
-between would add its own startup to rows that take 2 to 3 ms, which is the
-noise hyperfine's documentation warns about. `HOME` points at an empty
-directory, so a contributor's own `~/.config/eks/config.toml` cannot make
-their numbers differ from CI's.
-
-**What goes where.** hyperfine's progress output goes to stderr and only the
-Markdown table (under a heading, with the "excludes opening a terminal" label)
-goes to stdout. That lets CI append stdout straight to the job summary next to
-criterion's. The script's exit status is hyperfine's, so a timed command that
-exits non-zero fails the job. A slow run never does. hyperfine is installed
-with `cargo install --locked hyperfine@1.20.0`, the same way release.yml
-installs `cargo-zigbuild`, rather than through a third-party install action.
+The kubeconfig fixture is the file `benches/fixtures/kubeconfig-50.yaml`,
+shared by criterion (`include_str!`) and the script. `scripts/bench-startup.sh`
+(`make bench-process`) takes `HYPERFINE` from the environment so
+`scripts/tests/bench-startup.sh` can test it. It runs with `--shell=none` and an
+empty `HOME`. The Markdown table goes to stdout for the job summary. A failing
+command fails the job; a slow one never does. `hyperfine@1.20.0` is installed
+via `cargo install --locked`.
 
 ### 117. `cargo-deny` denies by default, audits only the shipped targets, and its policy is tested against fixture crates
 
-The roadmap asked for advisories, licences, and duplicate versions, with a
-reason for every allowance. Building it meant five choices.
-
-**Deny, then name the exceptions.** `multiple-versions` is `deny`, not
-cargo-deny's default `warn`: a warning in a job log is read by nobody, and a
-duplicate is a second copy of a crate in the binary and a second thing to
-patch. Today's three (`getrandom`, `hashbrown`, `syn`) each come from two
-upstream crates pinning different majors, which nothing in our Cargo.toml can
-merge, so each is skipped by its *older* version with the crates responsible
-named. Skipping one version rather than the crate means a third version still
-fails. The cost is that a dependabot bump which introduces a new upstream
-split fails until someone adds a skip line with a reason; that is the check
-doing its job, but it is the one place this could get noisy. Flipping it to
-`warn` is a one-word change if it does.
-
-**Licences: an allow-list, one scoped exception.** Every licence on the list
-is permissive and asks nothing of a binary beyond keeping the notice.
-MPL-2.0 (`option-ext`, via `directories`) is file-level copyleft: it binds
-edits to that crate's own files, which we never make, so it is allowed for
-that one crate through `exceptions` rather than for the tree, and the next
-MPL crate gets looked at. `r-efi` offers LGPL-2.1 as one of three
-alternatives, so it passes on MIT without LGPL on the list.
-
-**Shipped targets only.** `[graph] targets` lists the five `release.yml`
-builds. Without it, cargo-deny audits every platform's dependencies: a
-Windows-only duplicate (`windows-sys` 0.52 and 0.61) would need a skip entry,
-and `webpki-root-certs` (wasm32 only, CDLA-Permissive-2.0) a licence
-exception, for code no user of ours ever runs. If a Windows target is ever
-added to the release matrix, it needs adding here too.
-
-**Bans beyond duplicates.** `openssl-sys` and `native-tls` are denied
-outright. Decision 10 chose rustls so the binary needs no system OpenSSL, and
-decision 108 relies on that for the static musl build; a new dependency that
-pulled OpenSSL back in would otherwise show up only as a musl link failure in
-the release workflow, after merge. `*` version requirements and any source
-other than crates.io are denied too.
-
-**Testing the policy, not just the tree.** `cargo deny check` passing on our
-own Cargo.lock proves only that the policy admits what we have; an empty file
-would pass as well. `scripts/tests/deny-policy.sh` builds tiny fixture
-workspaces whose dependencies are local path crates (and one local git
-repository) built to break one rule each, points the real `deny.toml` at them,
-and checks the rule fires by its `<check> FAILED` line — the exit status is a
-bitmask in which a bans failure and a usage error are both 2. It needs no
-network and compiles nothing. Loosening the licence list or setting
-`multiple-versions = "warn"` fails four of its cases.
-
-**Where it runs.** CI's own `supply-chain` job, with `cargo-deny` pinned at
-0.20.2 through `cargo install --locked`, the way hyperfine and cargo-zigbuild
-are. A separate job because a new advisory can land against an unchanged
-Cargo.lock on any PR, and it should read as that rather than as the PR's own
-failure. `make deny` runs the same two steps locally but is not in
-`make check`: it needs `cargo-deny` installed and the network for the
-advisory database, and `make check` needs neither today.
-
+`multiple-versions = "deny"`; each current duplicate is skipped by its older
+version with the responsible crates named. Flip to `warn` if dependabot makes
+this noisy. Licences are an allow-list of permissive licences, with MPL-2.0
+allowed for `option-ext` alone. `[graph] targets` is the five release triples;
+add a target there if the matrix grows. `openssl-sys`/`native-tls`, `*`
+requirements, and non-crates.io sources are denied.
+`scripts/tests/deny-policy.sh` proves each rule fires against fixture
+workspaces. It runs as CI's own `supply-chain` job (cargo-deny 0.20.2) and
+`make deny`, not in `make check` (it needs network).
 
 ### 118. The MSRV job reads its toolchain from `Cargo.toml`, builds every target, and runs the tests
 
-The roadmap asked for a CI job pinned to the `rust-version` in `Cargo.toml`.
-Every other job runs the latest stable, so a newer standard-library API or a
-dependency bump that quietly raised the floor would have gone unnoticed until
-someone on an older Rust tried `make install`. Building it meant four choices.
-
-**Pinned by reading, not by copying.** The job's toolchain is whatever
-`scripts/msrv.sh --print` reads out of `cargo metadata --no-deps`, handed to
-`dtolnay/rust-toolchain@master` as its `toolchain` input. Writing `1.90` into
-`ci.yml` as well would have been a second copy that nothing keeps in step, and
-the first time someone raised `rust-version` the job would keep proving the old
-number. `cargo metadata` rather than a `grep` over TOML, because cargo is what
-reads the key in the end, and `--no-deps` keeps it offline. The runner's
-preinstalled cargo does that reading; any recent cargo prints the same field.
-
-**Build everything, then test.** The script runs `cargo +<msrv> build --locked
---all-targets --all-features` and then `cargo +<msrv> test --locked
---all-features`. Building the lib and binary alone is the narrow reading of
-"builds on 1.90", and it is what a user running `make install` meets. But
-tests and benches are code a contributor on the MSRV compiles too, and a test
-that only passes on a newer standard library is worth knowing about. `--locked`
-because the claim is about the `Cargo.lock` that ships; a fresh resolution
-might pick different versions and prove something nobody runs. The cost is one
-more full build per PR, about three and a half minutes cold on a laptop and
-less with `rust-cache`, which keys on the compiler version so it never mixes
-this job's artifacts with the stable ones.
-
-**A script, like the other CI steps with logic in them.** `scripts/msrv.sh`
-is what `make msrv` runs locally and what CI runs, the same shape as
-`bench-startup.sh` and `verify-glibc-floor.sh`. It takes cargo and rustup from
-`CARGO` and `RUSTUP`, so `scripts/tests/msrv.sh` checks which toolchain it
-builds on, with which flags, in which order, and what it says when it fails,
-without compiling anything; `make script-test` runs that in `make check` and
-CI's lint job. It asks rustup whether the toolchain is installed with
-`RUSTUP_AUTO_INSTALL=0`, so a contributor without it gets the exact
-`rustup toolchain install` line to run rather than a surprise download. A
-failed build or test is followed by what to do: use an older API, hold the
-dependency back with `cargo update --precise`, or raise `rust-version` and
-record why here. `make msrv` is not in `make check`, for the same reason
-`make deny` is not: it needs something beyond the stable toolchain `make check`
-asks for.
-
-**The README's copy is checked, not trusted.** `README.md` now says "Requires
-Rust 1.90 or newer" rather than pointing at `Cargo.toml`, because someone
-deciding whether to install from source should not have to open a manifest.
-That is a second copy of the number, so the script tests fail when it differs
-from `rust-version`.
-
-The job proves 1.90 is enough; it does not prove 1.90 is the lowest that
-works. `kube` 4.2 declares 1.89, and `cargo +1.89 check --all-targets` on this
-tree finished cleanly when tried while building this (a check, not a test
-run), so the declared floor is probably one release higher than it needs to
-be. Lowering it is the reviewer's call, not this job's.
+`scripts/msrv.sh --print` reads `rust-version` via `cargo metadata --no-deps`,
+so `ci.yml` holds no second copy. The job runs `build --locked --all-targets
+--all-features`, then `test --locked --all-features`, on that toolchain. The
+script (`make msrv`, not in `make check`) takes `CARGO`/`RUSTUP` from the
+environment for its tests, never auto-installs a toolchain, and says what to do
+on failure. The README's "Requires Rust 1.90 or newer" is checked against
+`Cargo.toml`. 1.89 probably works too (`kube` declares it); lowering the floor
+is the reviewer's call.
 
 ### 119. The install script verifies before it writes, picks musl on x86_64 Linux, and the release job renders and commits the formula
 
-The roadmap asked for an install script that verifies checksums and a Homebrew
-formula, with decision 113 settling that the formula lives here as
-`Formula/eks.rb`. Five choices went into building them.
+- **POSIX `sh`.** `scripts/install.sh` targets whatever `sh` runs `curl | sh`
+  (dash, BusyBox); its tests run under the system `sh` so a bashism fails CI.
+- **Verify, run, then write.** The tarball and `.sha256` land in a temp dir,
+  the digest is compared, and the binary runs `--version` before anything is
+  renamed into the prefix. A missing or malformed checksum, or neither
+  `sha256sum` nor `shasum`, stops the install. Only the digest is read, so
+  both the old `dist/`-prefixed and the new bare checksum names work; the bare
+  name makes `shasum -c` work by hand.
+- **Targets.** x86_64 Linux gets the static musl build, aarch64 Linux gets
+  `-gnu`, and aarch64 musl is pointed at `cargo install`. macOS reads
+  `sysctl.proc_translated` so Rosetta shells still get the native build. The
+  formula makes the same choices. The default prefix is `~/.local`; for zsh the
+  script says how to extend `fpath`.
+- **The formula is rendered, never hand-edited.**
+  `scripts/render-formula.sh <version> <dir>` prints it from the release's
+  `.sha256` files and refuses if one is missing. Completions and the man page
+  come from `generate_completions_from_executable`, because the darwin x86_64
+  tarball has none (decision 106).
+- **Release commits it.** On non-pre-release `v*` tags, the `formula` job in
+  `release.yml` checks the tag against the binary's version, renders the
+  formula, attaches it to the release, and pushes it to master with
+  `GITHUB_TOKEN`. That's no new token (decision 113's objection), but it is an
+  unreviewed push; if branch protection refuses it, the job says to commit the
+  attached file by hand. Switching to a PR is a change to that one step. There
+  is no `Formula/eks.rb` until the first release.
 
-**POSIX `sh`, not bash.** `curl … | sh` runs whatever `sh` is: dash on Debian
-and Ubuntu, BusyBox in Alpine and many container images. `scripts/install.sh`
-is written for that, and its tests run it under the system `sh` (dash on the
-Ubuntu runner) so a bashism fails CI rather than a user's install.
+### 120. Inside the dashboard a credential helper never prompts; `L` runs it in the foreground
 
-**Nothing is written until the download has been verified and has run.** The
-tarball and its `.sha256` are fetched into a temporary directory; the digest is
-compared; the binary is started with `--version`; only then is anything copied
-under the prefix, through a temporary name renamed into place. A missing
-checksum file, a file that holds no digest, and a machine with neither
-`sha256sum` nor `shasum` all stop the install — verification is never skipped
-because it could not be done. Starting the binary first catches the one that
-cannot run here (an old glibc, a `--target` forced to the wrong architecture)
-while the previous `eks` is still in place. The script reads only the digest
-from the checksum file, so it accepts both the `dist/`-prefixed names
-`release.yml` wrote until now and the bare names it writes from this change on;
-the bare name is what makes `shasum -c` work on a hand download.
+Decided by the reviewer on 2026-09-30. Settles the case decision 114 left open.
 
-**x86_64 Linux gets the static musl build; aarch64 Linux gets `-gnu`.** The
-musl build runs on every distribution, glibc or not, and starts without a
-dynamic loader — the startup budget is CLAUDE.md's first priority, and one
-fewer thing to load is the cheap end of it. aarch64 has no musl build (decision
-108), so an aarch64 musl system is told so and pointed at `cargo install`
-rather than handed a binary that cannot start. The formula makes the same
-choice, so the two install paths hand a Linux machine the same binary. On
-macOS a Rosetta shell reports x86_64; `sysctl.proc_translated` is read so
-Apple silicon gets the native build either way. The default prefix is
-`~/.local` — `bin/` is on the PATH of most login shells already, and
-`share/bash-completion` and `share/fish/vendor_completions.d` under it are
-where bash-completion and fish look without being told. zsh needs `fpath`
-extended, and the script says how when `$SHELL` is zsh.
+Once `ui::run` owns the terminal, every `exec` helper the dashboard starts runs
+non-interactively, whatever its `interactiveMode` says: `/dev/null` stdin,
+captured stderr, `interactive: false` in `KUBERNETES_EXEC_INFO`. That covers the
+first connect as well as a refresh an hour in. It is fixed when the dashboard's
+fetchers are built, the same construction-time guarantee `LoginMode::Never`
+gives (decision 77), so no background thread can reach the terminal. A helper
+that needed input fails, and the failure is credential-shaped: it sets
+`credentials_lost`, and the message says to press `L` rather than the CLI's
+advice to set `interactiveMode`.
 
-**The formula is rendered, never hand-edited.** A release changes four digests
-together, and a hand edit that updates three of them is a formula that fails on
-the fourth platform only. `scripts/render-formula.sh <version> <dir>` prints it
-from the release's `.sha256` files, and refuses to print anything if one is
-missing or malformed. The formula renders completions and the man page from the
-installed binary with Homebrew's `generate_completions_from_executable` rather
-than copying them from the tarball, because the `x86_64-apple-darwin` tarball
-has none (decision 106) and every Homebrew machine can run its own binary.
-`install.sh` copies the tarball's files where there are any and asks the
-binary for the rest.
+`L` suspends the screen as `Flow::Login` already does. It runs `aws sso login`
+first when the context's SSO session has expired, as today. It then runs the
+helper once in the foreground, with its own `interactiveMode` and the real
+terminal, so it can prompt. The credential it prints seeds the auth layer's
+keeper (decision 114), so the dashboard refetches with it and doesn't re-run the
+helper non-interactively straight away. When that token expires, the next
+background refresh fails the same way and offers `L` again.
 
-**The release job commits the formula to master.** `Formula/eks.rb` is only
-correct once a release's tarballs exist, so the `formula` job in `release.yml`
-runs after `publish` on a `v*` tag: it checks the tag matches the version the
-built binary reports (the formula's own `brew test` would fail otherwise),
-renders the formula, attaches it to the release, and pushes a one-file commit
-to master with the workflow's own `GITHUB_TOKEN` — the `contents: write` the
-publish job already needed, not a new token with rights elsewhere, which was
-decision 113's objection to a separate tap. Pre-release tags skip it. A
-reviewer-free push to master is the part most open to question: if branch
-protection refuses it, the job fails, and its summary says to commit the
-attached `eks.rb` by hand. Opening a pull request instead would keep master
-review-only, at the cost of a formula that lags each release until someone
-merges it — and since `GITHUB_TOKEN` pull requests do not trigger CI, one that
-arrives unchecked. This change takes the direct push; switching is a change to
-that one step.
-
-Until the first `v*` tag there is no release, so there is no `Formula/eks.rb`
-yet and `install.sh` stops at a 404 that points at the releases page. The
-README says so rather than documenting a command that cannot work today.
+The alternatives were forcing `Never` with no way to answer a prompt from inside
+the dashboard, which left only "go to a shell" for non-SSO helpers, and
+suspending automatically whenever a helper wanted to prompt. The second meant a
+new channel from background tasks to the UI thread, and a prompt taking over
+the screen with no key pressed, which decision 77 already refused for logging
+in. The CLI commands are unchanged.
