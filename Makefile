@@ -22,10 +22,12 @@ run: ## Run the dashboard (make run ARGS="contexts")
 test: ## Run the test suite
 	$(CARGO) test --locked --all-features
 
-script-test: ## Test the scripts in scripts/ against stand-in readelf, hyperfine, cargo, and rustup
+script-test: ## Test the scripts in scripts/ against stand-in readelf, hyperfine, cargo, rustup, curl, and Homebrew
 	scripts/tests/verify-glibc-floor.sh
 	scripts/tests/bench-startup.sh
 	scripts/tests/msrv.sh
+	scripts/tests/install.sh
+	scripts/tests/render-formula.sh
 
 msrv: ## Build and test on the rust-version Cargo.toml declares (needs that toolchain via rustup)
 	scripts/msrv.sh

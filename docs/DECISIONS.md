@@ -4505,3 +4505,72 @@ works. `kube` 4.2 declares 1.89, and `cargo +1.89 check --all-targets` on this
 tree finished cleanly when tried while building this (a check, not a test
 run), so the declared floor is probably one release higher than it needs to
 be. Lowering it is the reviewer's call, not this job's.
+
+### 119. The install script verifies before it writes, picks musl on x86_64 Linux, and the release job renders and commits the formula
+
+The roadmap asked for an install script that verifies checksums and a Homebrew
+formula, with decision 113 settling that the formula lives here as
+`Formula/eks.rb`. Five choices went into building them.
+
+**POSIX `sh`, not bash.** `curl … | sh` runs whatever `sh` is: dash on Debian
+and Ubuntu, BusyBox in Alpine and many container images. `scripts/install.sh`
+is written for that, and its tests run it under the system `sh` (dash on the
+Ubuntu runner) so a bashism fails CI rather than a user's install.
+
+**Nothing is written until the download has been verified and has run.** The
+tarball and its `.sha256` are fetched into a temporary directory; the digest is
+compared; the binary is started with `--version`; only then is anything copied
+under the prefix, through a temporary name renamed into place. A missing
+checksum file, a file that holds no digest, and a machine with neither
+`sha256sum` nor `shasum` all stop the install — verification is never skipped
+because it could not be done. Starting the binary first catches the one that
+cannot run here (an old glibc, a `--target` forced to the wrong architecture)
+while the previous `eks` is still in place. The script reads only the digest
+from the checksum file, so it accepts both the `dist/`-prefixed names
+`release.yml` wrote until now and the bare names it writes from this change on;
+the bare name is what makes `shasum -c` work on a hand download.
+
+**x86_64 Linux gets the static musl build; aarch64 Linux gets `-gnu`.** The
+musl build runs on every distribution, glibc or not, and starts without a
+dynamic loader — the startup budget is CLAUDE.md's first priority, and one
+fewer thing to load is the cheap end of it. aarch64 has no musl build (decision
+108), so an aarch64 musl system is told so and pointed at `cargo install`
+rather than handed a binary that cannot start. The formula makes the same
+choice, so the two install paths hand a Linux machine the same binary. On
+macOS a Rosetta shell reports x86_64; `sysctl.proc_translated` is read so
+Apple silicon gets the native build either way. The default prefix is
+`~/.local` — `bin/` is on the PATH of most login shells already, and
+`share/bash-completion` and `share/fish/vendor_completions.d` under it are
+where bash-completion and fish look without being told. zsh needs `fpath`
+extended, and the script says how when `$SHELL` is zsh.
+
+**The formula is rendered, never hand-edited.** A release changes four digests
+together, and a hand edit that updates three of them is a formula that fails on
+the fourth platform only. `scripts/render-formula.sh <version> <dir>` prints it
+from the release's `.sha256` files, and refuses to print anything if one is
+missing or malformed. The formula renders completions and the man page from the
+installed binary with Homebrew's `generate_completions_from_executable` rather
+than copying them from the tarball, because the `x86_64-apple-darwin` tarball
+has none (decision 106) and every Homebrew machine can run its own binary.
+`install.sh` copies the tarball's files where there are any and asks the
+binary for the rest.
+
+**The release job commits the formula to master.** `Formula/eks.rb` is only
+correct once a release's tarballs exist, so the `formula` job in `release.yml`
+runs after `publish` on a `v*` tag: it checks the tag matches the version the
+built binary reports (the formula's own `brew test` would fail otherwise),
+renders the formula, attaches it to the release, and pushes a one-file commit
+to master with the workflow's own `GITHUB_TOKEN` — the `contents: write` the
+publish job already needed, not a new token with rights elsewhere, which was
+decision 113's objection to a separate tap. Pre-release tags skip it. A
+reviewer-free push to master is the part most open to question: if branch
+protection refuses it, the job fails, and its summary says to commit the
+attached `eks.rb` by hand. Opening a pull request instead would keep master
+review-only, at the cost of a formula that lags each release until someone
+merges it — and since `GITHUB_TOKEN` pull requests do not trigger CI, one that
+arrives unchecked. This change takes the direct push; switching is a change to
+that one step.
+
+Until the first `v*` tag there is no release, so there is no `Formula/eks.rb`
+yet and `install.sh` stops at a 404 that points at the releases page. The
+README says so rather than documenting a command that cannot work today.
