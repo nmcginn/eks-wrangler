@@ -25,7 +25,7 @@ follow-up, and it belongs in the PR that raised it.
   on a refresh an hour in, writes over the panes and competes with
   `App::on_key` for keystrokes.
   *Decided (2026-09-30):* dashboard helpers never prompt; `L` runs the helper
-  in the foreground so it can. See decision 119.
+  in the foreground so it can. See decision 120.
   *Acceptance:* every helper the dashboard's fetchers start runs
   non-interactively (`/dev/null` stdin, captured stderr, `interactive: false`
   in `KUBERNETES_EXEC_INFO`), guaranteed when the fetchers are built and
@@ -34,13 +34,6 @@ follow-up, and it belongs in the PR that raised it.
   runs `aws sso login` when that session has expired, then runs the helper in
   the foreground with its own `interactiveMode`, seeds the auth layer with the
   credential it prints, and refetches. CLI commands are unchanged.
-
-- [ ] **Install story.**
-  (Milestone 4.) An install script and a Homebrew formula.
-  *Decided (2026-09-24):* the formula lives here as `Formula/eks.rb`, tapped by
-  URL. See decision 113.
-  *Acceptance:* `README.md` documents install for macOS and Linux; the script
-  verifies checksums.
 
 ---
 
@@ -141,6 +134,7 @@ follow-up, and it belongs in the PR that raised it.
 - [x] glibc 2.17 floor for the `-gnu` binaries. (109)
 - [x] Supply-chain checks with cargo-deny. (117)
 - [x] MSRV verification job. (118)
+- [x] Install story: checksum-verifying `install.sh` and a release-rendered `Formula/eks.rb`. (113, 119)
 
 ---
 

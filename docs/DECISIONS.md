@@ -894,7 +894,35 @@ on failure. The README's "Requires Rust 1.90 or newer" is checked against
 `Cargo.toml`. 1.89 probably works too (`kube` declares it); lowering the floor
 is the reviewer's call.
 
-### 119. Inside the dashboard a credential helper never prompts; `L` runs it in the foreground
+### 119. The install script verifies before it writes, picks musl on x86_64 Linux, and the release job renders and commits the formula
+
+- **POSIX `sh`.** `scripts/install.sh` targets whatever `sh` runs `curl | sh`
+  (dash, BusyBox); its tests run under the system `sh` so a bashism fails CI.
+- **Verify, run, then write.** The tarball and `.sha256` land in a temp dir,
+  the digest is compared, and the binary runs `--version` before anything is
+  renamed into the prefix. A missing or malformed checksum, or neither
+  `sha256sum` nor `shasum`, stops the install. Only the digest is read, so
+  both the old `dist/`-prefixed and the new bare checksum names work; the bare
+  name makes `shasum -c` work by hand.
+- **Targets.** x86_64 Linux gets the static musl build, aarch64 Linux gets
+  `-gnu`, and aarch64 musl is pointed at `cargo install`. macOS reads
+  `sysctl.proc_translated` so Rosetta shells still get the native build. The
+  formula makes the same choices. The default prefix is `~/.local`; for zsh the
+  script says how to extend `fpath`.
+- **The formula is rendered, never hand-edited.**
+  `scripts/render-formula.sh <version> <dir>` prints it from the release's
+  `.sha256` files and refuses if one is missing. Completions and the man page
+  come from `generate_completions_from_executable`, because the darwin x86_64
+  tarball has none (decision 106).
+- **Release commits it.** On non-pre-release `v*` tags, the `formula` job in
+  `release.yml` checks the tag against the binary's version, renders the
+  formula, attaches it to the release, and pushes it to master with
+  `GITHUB_TOKEN`. That's no new token (decision 113's objection), but it is an
+  unreviewed push; if branch protection refuses it, the job says to commit the
+  attached file by hand. Switching to a PR is a change to that one step. There
+  is no `Formula/eks.rb` until the first release.
+
+### 120. Inside the dashboard a credential helper never prompts; `L` runs it in the foreground
 
 Decided by the reviewer on 2026-09-30. Settles the case decision 114 left open.
 

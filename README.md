@@ -15,7 +15,46 @@ assembling `kubectl` incantations.
 
 ## Install
 
-From source, until there are published binaries:
+### Install script (macOS and Linux)
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/nmcginn/eks-wrangler/master/scripts/install.sh | sh
+```
+
+It downloads the release build for your machine, checks it against the
+release's published SHA-256 checksum, and only then installs `eks` into
+`~/.local/bin`, with its man page and bash, zsh, and fish completions under
+`~/.local/share`. If the checksum does not match, nothing is installed. Options
+go after `sh -s --`:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/nmcginn/eks-wrangler/master/scripts/install.sh \
+  | sh -s -- --version 0.2.0 --prefix /usr/local
+```
+
+`--version` pins a release (default: the latest), `--prefix` changes where it
+goes, and `--target` overrides the detected build. It needs `curl` or `wget`,
+`tar`, and `sha256sum` or `shasum`. Run it again to upgrade.
+
+To verify a download by hand instead, fetch the tarball and its `.sha256` from
+the [releases page](https://github.com/nmcginn/eks-wrangler/releases) and run
+`sha256sum -c eks-<target>.tar.gz.sha256` beside them (`shasum -a 256 -c` on
+macOS).
+
+### Homebrew (macOS and Linux)
+
+```sh
+brew tap nmcginn/eks-wrangler https://github.com/nmcginn/eks-wrangler
+brew install nmcginn/eks-wrangler/eks
+```
+
+The formula lives in this repository and is updated by the release workflow on
+every tagged release; completions and the man page come with it.
+
+Both need a published release: until the first one is tagged, build from
+source.
+
+### From source
 
 ```sh
 git clone https://github.com/nmcginn/eks-wrangler
@@ -24,8 +63,10 @@ make install        # puts `eks` in ~/.cargo/bin
 ```
 
 Requires Rust 1.90 or newer (the `rust-version` in `Cargo.toml`, which CI builds
-and tests on) and a
-kubeconfig — `aws eks update-kubeconfig --name <cluster>` if you do not have one.
+and tests on).
+
+Whichever way you install it, `eks` needs a kubeconfig —
+`aws eks update-kubeconfig --name <cluster>` if you do not have one.
 
 ## Usage
 
