@@ -54,6 +54,11 @@ pub enum LogEvent {
     /// which covers both a connection that never opened and one that broke
     /// partway through.
     Ended(Option<String>),
+    /// The stream never opened, for a reason signing in again could fix —
+    /// a refused credential, or a helper the dashboard would not let prompt.
+    /// Read like `Ended(Some(_))`, and kept apart so the dashboard can offer
+    /// `L` for it as it does for every other pane's refusal.
+    Refused(String),
 }
 
 #[cfg(test)]

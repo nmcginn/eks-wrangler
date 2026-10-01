@@ -14,6 +14,7 @@ use crate::aws::LoginMode;
 use crate::cluster::ClusterView;
 use crate::commands::{self, StreamHandle, credentials, nodes::target_cluster};
 use crate::format::Width;
+use crate::k8s::auth::Store;
 use crate::k8s::metrics::{self as k8s_metrics};
 use crate::k8s::order::Direction;
 use crate::k8s::page;
@@ -392,6 +393,7 @@ pub fn spawn_gather_for_node(
     node: String,
     selectors: Selectors,
     budget: page::Budget,
+    store: Store,
 ) -> mpsc::Receiver<Result<PodsFetch, commands::FetchError>> {
     commands::spawn(async move {
         gather_for_node(
@@ -401,6 +403,7 @@ pub fn spawn_gather_for_node(
             &node,
             &selectors,
             budget,
+            &store,
         )
         .await
         .map_err(|error| commands::FetchError::of(&error))
@@ -416,10 +419,11 @@ async fn gather_for_node(
     node: &str,
     selectors: &Selectors,
     budget: page::Budget,
+    store: &Store,
 ) -> Result<PodsFetch> {
     let target = target_cluster(config, cluster)?;
     let label = target.label();
-    let client = k8s::connect(paths, &target, budget, &Progress::none()).await?;
+    let client = k8s::client::connect_kept(paths, &target, budget, store).await?;
 
     let scoped = scoped_to_node(node, selectors);
     let progress = Progress::none();
@@ -546,6 +550,7 @@ pub fn spawn_gather_containers(
     namespace: String,
     pod: String,
     budget: page::Budget,
+    store: Store,
 ) -> mpsc::Receiver<Result<ContainersFetch, commands::FetchError>> {
     commands::spawn(async move {
         gather_containers(
@@ -555,6 +560,7 @@ pub fn spawn_gather_containers(
             &namespace,
             &pod,
             budget,
+            &store,
         )
         .await
         .map_err(|error| commands::FetchError::of(&error))
@@ -570,10 +576,11 @@ async fn gather_containers(
     namespace: &str,
     pod: &str,
     budget: page::Budget,
+    store: &Store,
 ) -> Result<ContainersFetch> {
     let target = target_cluster(config, cluster)?;
     let label = target.label();
-    let client = k8s::connect(paths, &target, budget, &Progress::none()).await?;
+    let client = k8s::client::connect_kept(paths, &target, budget, store).await?;
 
     let api: Api<Pod> = Api::namespaced(client.clone(), namespace);
     // Concurrently, not in sequence: the pod and its events are independent
@@ -663,6 +670,7 @@ pub fn spawn_stream_logs(
     cluster: Option<String>,
     request: LogRequest,
     budget: page::Budget,
+    store: Store,
 ) -> (mpsc::Receiver<LogEvent>, StreamHandle) {
     commands::spawn_stream(move |tx, stop| async move {
         let target = LogTarget {
@@ -672,7 +680,7 @@ pub fn spawn_stream_logs(
             container: &request.container,
             previous: request.previous,
         };
-        stream_logs(&config, &paths, target, budget, &tx, stop).await;
+        stream_logs(&config, &paths, target, budget, &store, &tx, stop).await;
     })
 }
 
@@ -690,6 +698,7 @@ async fn stream_logs(
     paths: &[PathBuf],
     target: LogTarget<'_>,
     budget: page::Budget,
+    store: &Store,
     tx: &mpsc::Sender<LogEvent>,
     mut stop: tokio::sync::oneshot::Receiver<()>,
 ) {
@@ -704,12 +713,21 @@ async fn stream_logs(
 
     // `connect`'s own `Error` already carries a full, user-facing sentence in
     // every variant — including a cluster failure, which it has already run
-    // through `explain` internally — so this is a message, not a second
-    // classification of one.
-    let client = match k8s::connect(paths, &cluster, budget, &Progress::none()).await {
+    // through `explain` internally — so this is a message, and the only
+    // question asked of it is the one that decides whether `L` is offered.
+    let client = match k8s::client::connect_kept(paths, &cluster, budget, store).await {
         Ok(client) => client,
         Err(error) => {
-            let _ = tx.send(LogEvent::Ended(Some(error.to_string())));
+            let refused = matches!(
+                &error,
+                k8s::client::Error::Cluster { failure, .. } if failure.fixed_by_signing_in()
+            );
+            let message = error.to_string();
+            let _ = tx.send(if refused {
+                LogEvent::Refused(message)
+            } else {
+                LogEvent::Ended(Some(message))
+            });
             return;
         }
     };
@@ -719,7 +737,12 @@ async fn stream_logs(
     let stream = match budget.wrap(api.log_stream(target.pod, &lp)).await {
         Ok(stream) => stream,
         Err(error) => {
-            let _ = tx.send(LogEvent::Ended(Some(k8s::explain(&error, &label))));
+            let message = k8s::explain(&error, &label);
+            let _ = tx.send(if k8s::Failure::of(&error).fixed_by_signing_in() {
+                LogEvent::Refused(message)
+            } else {
+                LogEvent::Ended(Some(message))
+            });
             return;
         }
     };

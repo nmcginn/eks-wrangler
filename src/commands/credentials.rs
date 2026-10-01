@@ -24,7 +24,9 @@
 //! at most once, so a cluster that refuses a freshly minted token is an error
 //! rather than a loop. [`connect`] takes it itself, right after `client::build`
 //! refuses; the dashboard's `L` key takes the same retry later, through
-//! [`retry_login`], once a background fetch has refused instead.
+//! [`retry_login`], once a background fetch has refused instead — and then
+//! runs the credential helper in the foreground, the one place in a dashboard
+//! it may prompt.
 //!
 //! The decisions are all next door in [`crate::aws::decide`] and
 //! [`crate::aws::after_refusal`], as pure functions. What lives here is the I/O
@@ -39,7 +41,9 @@ use kube::{Client, Config};
 
 use crate::aws::{self, Action, LoginMode};
 use crate::cluster::ClusterView;
+use crate::k8s::auth::Store;
 use crate::k8s::client;
+use crate::k8s::exec::{self, Prompt};
 use crate::k8s::page::Budget;
 use crate::progress::Progress;
 
@@ -90,6 +94,37 @@ pub async fn connect(
     }
 }
 
+/// How a command gets its client, decided where the command is built.
+///
+/// One type for both rather than two functions, so a listing shared by the
+/// command line and the dashboard — `commands::nodes::gather` — cannot reach
+/// for the command line's half by accident.
+#[derive(Debug, Clone, Copy)]
+pub enum Via<'a> {
+    /// A command-line listing: offer a login as `LoginMode` says, and run the
+    /// helper as its `interactiveMode` says.
+    Command(LoginMode),
+    /// A dashboard fetch: never offer a login, never let the helper prompt,
+    /// and share the credential through `store` (decision 120). The
+    /// dashboard's own chances to ask are [`preflight`] before the terminal
+    /// opens and [`retry_login`] after `L`.
+    Dashboard(&'a Store),
+}
+
+/// Build a client the way `via` says.
+pub async fn open(
+    paths: &[PathBuf],
+    cluster: &ClusterView,
+    budget: Budget,
+    via: Via<'_>,
+    progress: &Progress,
+) -> Result<Client> {
+    match via {
+        Via::Command(login) => connect(paths, cluster, budget, login, progress).await,
+        Via::Dashboard(store) => Ok(client::connect_kept(paths, cluster, budget, store).await?),
+    }
+}
+
 /// What [`Context::act`] did about an [`Action`].
 ///
 /// Three outcomes rather than a `bool`, because the two that did not log
@@ -114,7 +149,7 @@ enum Outcome {
 /// fetches happen on background threads that have no business owning the
 /// terminal, so the question is put *here* — before `ui::run` opens the
 /// alternate screen, while stdin and stderr are still ordinary — and every
-/// fetcher after it is built with [`LoginMode::Never`]. A session that dies
+/// fetcher after it is built with [`Via::Dashboard`]. A session that dies
 /// later is [`retry_login`]'s problem, not this function's: the cache this
 /// reads is exactly what a later refusal proves stale, so this is never the
 /// right check for `L` to repeat.
@@ -125,55 +160,113 @@ pub async fn preflight(paths: &[PathBuf], cluster: &ClusterView, login: LoginMod
     Ok(())
 }
 
-/// What the `L` key runs: the **retry**'s question, not the pre-flight's.
+/// What the `L` key runs: log in to AWS if that is what is wrong, then run the
+/// credential helper in the foreground and hand what it prints to the
+/// dashboard's `store` (decision 120).
 ///
-/// `L` only appears once a fetch has already been refused for a credentials
-/// reason (`App::credentials_lost`), so calling [`preflight`] here would ask
-/// the wrong question: its `before` reads the token cache and proceeds
-/// whenever the cache still calls the session valid — which is nearly always
-/// true right after a dashboard's own refusal, since a token revoked
-/// centrally still reads as live in the cache until something tries to use
-/// it, and something already did. Consulting the cache a second time would
-/// leave `L` doing nothing, silently, in exactly the case it exists for.
+/// Called with the terminal handed back — out of raw mode, off the alternate
+/// screen — which is the one moment in a dashboard a helper can be allowed to
+/// prompt. Every fetch the dashboard starts runs it through `store`, and so
+/// with [`exec::Prompt::Never`]; a helper that needs an MFA code, or anything
+/// else typed, fails there, and this is where it gets its answer.
 ///
-/// This runs `Context::after_refusal` instead — the same question
-/// [`connect`]'s own retry asks after a one-shot command's request is
-/// refused — which does not look at the cache at all: it logs in whenever
-/// the profile has an Identity Center session to refresh, because the
-/// refusal that put `L` on screen is already the evidence the cache's own
-/// answer was wrong.
+/// **The login** is the **retry**'s question, not the pre-flight's. `L` only
+/// appears once a fetch has already been refused for a credentials reason
+/// (`App::credentials_lost`), so calling [`preflight`] here would ask the wrong
+/// question: its `before` reads the token cache and proceeds whenever the cache
+/// still calls the session valid — which is nearly always true right after a
+/// dashboard's own refusal, since a token revoked centrally still reads as live
+/// in the cache until something tries to use it, and something already did.
+/// `Context::after_refusal` does not look at the cache: it logs in whenever the
+/// profile has an Identity Center session to refresh, because the refusal that
+/// put `L` on screen is already the evidence the cache's own answer was wrong.
 ///
-/// Always [`LoginMode::Always`], not a flag the caller passes in: pressing
-/// `L` *is* the yes, and asking a second question over a dashboard that has
-/// just given the screen back would be asking it twice. Fixed here rather
-/// than left to `main.rs` to remember, so `Context::act` never has a question
-/// to ask and `Outcome::Declined` never happens.
+/// Always [`LoginMode::Always`], not a flag the caller passes in: pressing `L`
+/// *is* the yes, and asking a second question over a dashboard that has just
+/// given the screen back would be asking it twice.
 ///
-/// `Outcome::NothingToDo` is turned into an error here rather than being
-/// swallowed the way [`preflight`] swallows it. A pre-flight finding nothing
-/// to do is the ordinary case — most sessions are fine — so proceeding
-/// quietly is correct there. `L` is different: it is only ever pressed
-/// because `is_credentials` already classified a real refusal, so
-/// `NothingToDo` here means the profile behind it has no Identity Center
-/// session for `aws sso login` to refresh at all — a static-key or
-/// instance-role profile whose credentials went bad some other way — and
-/// that is worth a sentence on screen instead of a silent flicker with
-/// nothing for the user to act on.
-pub async fn retry_login(paths: &[PathBuf], cluster: &ClusterView) -> Result<()> {
+/// **The helper** runs next, under `budget` as every other run of it does, as
+/// its own `interactiveMode` says and with the real terminal, so it can ask.
+/// What it prints goes into `store`, so the refetch `L` triggers sends it
+/// rather than running the helper again without a terminal straight away.
+///
+/// A profile with no Identity Center session *and* no helper is an error, as
+/// it was before the helper step existed: there was nothing `L` could do, and
+/// that is worth a sentence on screen rather than a silent flicker.
+pub async fn retry_login(
+    paths: &[PathBuf],
+    cluster: &ClusterView,
+    budget: Budget,
+    store: &Store,
+) -> Result<()> {
     let config = client::resolve(paths, cluster).await?;
+    let label = cluster.label();
     let context = Context::of(&config, LoginMode::Always);
-    match context.act(&context.after_refusal(&cluster.label()))? {
-        Outcome::LoggedIn => Ok(()),
-        Outcome::NothingToDo => bail!(
-            "profile {:?} has no IAM Identity Center session to refresh; \
-             its credentials need fixing some other way.",
+    let login = context.act(&context.after_refusal(&label))?;
+
+    match after_login(login, exec::helper_of(&config.auth_info).is_some()) {
+        Next::Done => Ok(()),
+        Next::NothingToDo => bail!(
+            "profile {:?} has no IAM Identity Center session to refresh, and its context runs no \
+             credential helper; its credentials need fixing some other way.",
             context.profile
         ),
         // `LoginMode::Always` never produces `Action::Ask`, so `Context::act`
         // never has a question to decline. Worded rather than `unreachable!`,
         // as everything in this crate is: a defensive branch should say what
         // is wrong if it is ever proven wrong, not stop the terminal cold.
-        Outcome::Declined => bail!("logging in to AWS did not run"),
+        Next::Declined => bail!("logging in to AWS did not run"),
+        Next::RunHelper => {
+            let auth = &config.auth_info;
+            let credential = client::credential(
+                auth,
+                &label,
+                budget,
+                &Progress::none(),
+                Prompt::AsConfigured,
+            )
+            .await?;
+            let command = client::helper_command(auth).unwrap_or_default();
+            store
+                .seed(
+                    &cluster.context_name,
+                    &command,
+                    auth.clone(),
+                    budget,
+                    credential,
+                )
+                .await;
+            Ok(())
+        }
+    }
+}
+
+/// What `L` does once the login step is over.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Next {
+    /// Run the helper in the foreground and seed the store.
+    RunHelper,
+    /// A login ran, and there is no helper to run after it.
+    Done,
+    /// No login to run and no helper either.
+    NothingToDo,
+    /// The login was declined, which `L` never asks.
+    Declined,
+}
+
+/// The rule [`retry_login`] follows after its login step, as a table.
+///
+/// A helper runs whenever there is one, logged in or not: an expired session
+/// is only one reason a helper fails, and one that wanted an MFA code has had
+/// nothing done about it until it runs where it can ask. A login that did run
+/// is not skipped past either — the helper after it is what proves it worked,
+/// and its token is what the dashboard refetches with.
+fn after_login(login: Outcome, has_helper: bool) -> Next {
+    match (login, has_helper) {
+        (Outcome::Declined, _) => Next::Declined,
+        (_, true) => Next::RunHelper,
+        (Outcome::LoggedIn, false) => Next::Done,
+        (Outcome::NothingToDo, false) => Next::NothingToDo,
     }
 }
 
@@ -187,18 +280,17 @@ fn worth_retrying(before: Outcome, error: &client::Error) -> bool {
 
 /// Whether a failed build is the kind a fresh login could put right.
 ///
-/// Only [`client::Failure::Credentials`]. A `403` means the cluster knows
-/// exactly who you are and will not let you in, which logging in again cannot
-/// change; an unreachable endpoint is about a VPC; and a stalled helper has not
-/// failed yet. Offering a login for any of those would be the
-/// wrong-but-plausible suggestion `k8s::client::explain` is careful to avoid.
+/// [`client::Failure::fixed_by_signing_in`]: a refused credential, or — only
+/// ever in the dashboard — a helper that was not allowed to prompt. A `403`
+/// means the cluster knows exactly who you are and will not let you in, which
+/// logging in again cannot change; an unreachable endpoint is about a VPC; and
+/// a stalled helper has not failed yet. Offering a login for any of those would
+/// be the wrong-but-plausible suggestion `k8s::client::explain` is careful to
+/// avoid.
 fn is_credentials(error: &client::Error) -> bool {
     matches!(
         error,
-        client::Error::Cluster {
-            failure: client::Failure::Credentials,
-            ..
-        }
+        client::Error::Cluster { failure, .. } if failure.fixed_by_signing_in()
     )
 }
 
@@ -537,11 +629,11 @@ mod tests {
 
     #[test]
     fn a_profile_with_no_identity_centre_session_leaves_after_refusal_nothing_to_do() {
-        // The state `retry_login` turns into an error rather than a silent
-        // `Ok`: a profile behind static keys or an instance role still gets
+        // A profile behind static keys or an instance role still gets
         // classified `Failure::Credentials` when those credentials go bad,
         // and there is no Identity Center session for `aws sso login` to
-        // refresh.
+        // refresh. `L` goes on to the helper if there is one (`after_login`),
+        // and says so plainly if there is not.
         let context = Context {
             mode: LoginMode::Always,
             profile: "prod".to_owned(),
@@ -566,5 +658,146 @@ mod tests {
         assert!(!is_credentials(&client::Error::HelperStalled(
             "took too long".to_owned()
         )));
+    }
+
+    #[test]
+    fn a_helper_the_dashboard_would_not_let_prompt_is_something_l_can_fix() {
+        assert!(is_credentials(&client::Error::Cluster {
+            message: "the credential helper for prod failed".to_owned(),
+            failure: client::Failure::HelperMuted,
+        }));
+    }
+
+    #[test]
+    fn l_runs_the_helper_whenever_there_is_one_logged_in_or_not() {
+        // Logged in: the helper is what proves it worked, and its token is
+        // what the refetch sends. Nothing to log in to: the helper may only
+        // have wanted an MFA code, which it can ask for now.
+        assert_eq!(after_login(Outcome::LoggedIn, true), Next::RunHelper);
+        assert_eq!(after_login(Outcome::NothingToDo, true), Next::RunHelper);
+    }
+
+    #[test]
+    fn l_with_no_helper_is_done_after_a_login_and_an_error_without_one() {
+        assert_eq!(after_login(Outcome::LoggedIn, false), Next::Done);
+        assert_eq!(after_login(Outcome::NothingToDo, false), Next::NothingToDo);
+    }
+
+    #[test]
+    fn a_declined_login_never_goes_on_to_the_helper() {
+        // `L` never asks, so this cannot happen; if it ever does, the user
+        // said no, and running something else in its place would ignore it.
+        assert_eq!(after_login(Outcome::Declined, true), Next::Declined);
+        assert_eq!(after_login(Outcome::Declined, false), Next::Declined);
+    }
+
+    // --- The dashboard's fetchers, as built ---------------------------------
+
+    use std::path::Path;
+    use std::time::Duration;
+
+    use crate::commands::{nodes, pods};
+    use crate::k8s::exec::fixtures::{recorded, recording_kubeconfig};
+    use crate::k8s::pods::{LogEvent, Selectors};
+    use crate::kubeconfig::KubeConfig;
+
+    /// A kubeconfig whose one context runs a recording helper, which wants
+    /// to prompt and fails when it cannot. The server is never reached.
+    fn prompting_kubeconfig(dir: &Path) -> (KubeConfig, Vec<PathBuf>) {
+        let yaml = recording_kubeconfig(dir, "https://127.0.0.1:9", "exit 1");
+        let path = dir.join("config");
+        std::fs::write(&path, &yaml).unwrap();
+        (KubeConfig::parse(&yaml).unwrap(), vec![path])
+    }
+
+    /// What one fetcher delivered, once it has failed.
+    fn failed<T: std::fmt::Debug>(
+        rx: &std::sync::mpsc::Receiver<std::result::Result<T, crate::commands::FetchError>>,
+    ) -> crate::commands::FetchError {
+        rx.recv_timeout(Duration::from_secs(10))
+            .expect("the fetch finished")
+            .expect_err("the helper exits 1")
+    }
+
+    /// The acceptance criterion's guarantee, asserted of each of the four
+    /// fetchers `main::dashboard` builds: given the dashboard's store, a
+    /// helper whose block says `interactiveMode: Always` still gets
+    /// `/dev/null` for stdin and `interactive: false`, and its failure is one
+    /// `L` is offered for, with a message that says so.
+    #[test]
+    fn every_dashboard_fetcher_runs_its_helper_without_the_terminal() {
+        let budget = Budget::default();
+        let context = Some("prod".to_owned());
+        let mut messages = Vec::new();
+
+        let dir = tempfile::tempdir().unwrap();
+        let (config, paths) = prompting_kubeconfig(dir.path());
+        let error = failed(&nodes::spawn_gather(
+            config,
+            paths,
+            context.clone(),
+            budget,
+            Store::new(),
+        ));
+        assert!(error.credentials, "nodes: {error:?}");
+        messages.push(("nodes", error.message, dir));
+
+        let dir = tempfile::tempdir().unwrap();
+        let (config, paths) = prompting_kubeconfig(dir.path());
+        let error = failed(&pods::spawn_gather_for_node(
+            config,
+            paths,
+            context.clone(),
+            "ip-10-0-0-1".to_owned(),
+            Selectors::default(),
+            budget,
+            Store::new(),
+        ));
+        assert!(error.credentials, "pods: {error:?}");
+        messages.push(("pods", error.message, dir));
+
+        let dir = tempfile::tempdir().unwrap();
+        let (config, paths) = prompting_kubeconfig(dir.path());
+        let error = failed(&pods::spawn_gather_containers(
+            config,
+            paths,
+            context.clone(),
+            "default".to_owned(),
+            "web-0".to_owned(),
+            budget,
+            Store::new(),
+        ));
+        assert!(error.credentials, "containers: {error:?}");
+        messages.push(("containers", error.message, dir));
+
+        let dir = tempfile::tempdir().unwrap();
+        let (config, paths) = prompting_kubeconfig(dir.path());
+        let (rx, _handle) = pods::spawn_stream_logs(
+            config,
+            paths,
+            context,
+            pods::LogRequest {
+                namespace: "default".to_owned(),
+                pod: "web-0".to_owned(),
+                container: "web".to_owned(),
+                previous: false,
+            },
+            budget,
+            Store::new(),
+        );
+        // `Refused` rather than `Ended`, which is what arms `L` in the logs
+        // pane as `FetchError::credentials` does in the others.
+        let Ok(LogEvent::Refused(message)) = rx.recv_timeout(Duration::from_secs(10)) else {
+            panic!("the log stream did not end with a refusal");
+        };
+        messages.push(("logs", message, dir));
+
+        for (fetcher, message, dir) in messages {
+            assert!(message.contains("L runs `sh -c"), "{fetcher}: {message}");
+            let (interactive, stdin, group) = recorded(dir.path());
+            assert!(!interactive, "{fetcher}");
+            assert_eq!(stdin, "null", "{fetcher}");
+            assert_eq!(group, "own", "{fetcher}");
+        }
     }
 }

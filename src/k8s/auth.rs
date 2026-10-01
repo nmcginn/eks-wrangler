@@ -25,10 +25,19 @@
 //! deadline — see [`crate::k8s::page::deadline`]. A refresh that stalls ends
 //! at the same instant the request would have, and it is killed rather than
 //! abandoned because the future that owns the child is dropped.
+//!
+//! A command-line listing builds one client and one keeper. The dashboard
+//! builds a client per fetch, so its keepers live in a [`Store`] that every
+//! fetch shares: one token per context for the whole session, refreshed by
+//! whichever fetch finds it due, and replaced by `L` with one the helper
+//! printed in the foreground (decision 120). A [`Store`] cannot be made to
+//! let a helper prompt; that is the guarantee the dashboard's fetchers are
+//! built on.
 
+use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, PoisonError};
 use std::task::{Context, Poll};
 
 use http::header::AUTHORIZATION;
@@ -39,7 +48,7 @@ use kube::config::AuthInfo;
 use tokio::sync::Mutex;
 use tower::{BoxError, Layer, Service};
 
-use crate::k8s::exec::{self, Credential, Secret};
+use crate::k8s::exec::{self, Credential, Prompt, Secret};
 use crate::k8s::page::{self, Budget};
 
 /// The token a client is sending, and what it takes to get another.
@@ -53,6 +62,9 @@ pub struct Keeper {
     auth: Arc<AuthInfo>,
     /// Spent on a refresh only when the request has no deadline of its own.
     budget: Budget,
+    /// Whether a refresh may prompt. Fixed when the keeper is made, so a
+    /// refresh an hour into a dashboard runs exactly as the first fetch did.
+    prompt: Prompt,
 }
 
 impl std::fmt::Debug for Keeper {
@@ -81,9 +93,16 @@ pub enum Before {
 }
 
 impl Keeper {
-    /// Keep `token`, which came from `auth`'s helper with this expiry.
+    /// Keep `token`, which came from `auth`'s helper with this expiry, and
+    /// run that helper under `prompt` when it needs replacing.
     #[must_use]
-    pub fn new(token: String, expires: Option<Timestamp>, auth: AuthInfo, budget: Budget) -> Self {
+    pub fn new(
+        token: String,
+        expires: Option<Timestamp>,
+        auth: AuthInfo,
+        budget: Budget,
+        prompt: Prompt,
+    ) -> Self {
         Self {
             held: Arc::new(Mutex::new(Held {
                 token,
@@ -93,7 +112,21 @@ impl Keeper {
             })),
             auth: Arc::new(auth),
             budget,
+            prompt,
         }
+    }
+
+    /// Replace the token every clone of this keeper sends, with one that was
+    /// fetched somewhere else — `L`'s foreground run of the helper.
+    ///
+    /// A new generation, so a `401` still in flight for the old token cannot
+    /// retire this one.
+    pub async fn seed(&self, token: String, expires: Option<Timestamp>) {
+        let mut held = self.held.lock().await;
+        held.token = token;
+        held.expires = expires;
+        held.generation += 1;
+        held.stale = false;
     }
 
     /// Whether to refresh before sending: the whole policy, as a pure
@@ -138,7 +171,7 @@ impl Keeper {
     /// when the request has none.
     async fn refresh(&self) -> Result<Credential, exec::Error> {
         tracing::debug!("refreshing the credential helper's token");
-        let run = exec::run(&self.auth);
+        let run = exec::run(&self.auth, self.prompt);
 
         let stalled = |limit| exec::Error::Stalled {
             command: crate::k8s::client::helper_command(&self.auth).unwrap_or_default(),
@@ -167,6 +200,150 @@ impl Keeper {
         if held.generation == generation {
             held.stale = true;
         }
+    }
+}
+
+/// The credentials the dashboard's fetches share, one per context.
+///
+/// Cheap to clone; every clone is the same store. Made with [`Store::new`],
+/// which takes no [`Prompt`]: whatever builds a client through a store runs
+/// its helper with [`Prompt::Never`], and nothing can ask it otherwise. The
+/// only way a credential from a helper that *was* allowed to prompt gets in
+/// is [`Store::seed`], handed one that was fetched in the foreground.
+#[derive(Clone, Default)]
+pub struct Store {
+    kept: Arc<std::sync::Mutex<HashMap<String, Entry>>>,
+}
+
+impl std::fmt::Debug for Store {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Store").finish_non_exhaustive()
+    }
+}
+
+/// What a [`Store`] holds for a context, and the helper command it came from.
+#[derive(Clone)]
+struct Entry {
+    command: String,
+    kept: Kept,
+}
+
+/// A context's credential, in the form a client is built from.
+#[derive(Clone)]
+pub enum Kept {
+    /// A token, with the keeper that refreshes it. Every client built from
+    /// this shares the keeper.
+    Token(Keeper),
+    /// A client certificate and its key, both PEM, used until `expires` and
+    /// then fetched again.
+    Certificate {
+        certificate: String,
+        key: String,
+        expires: Option<Timestamp>,
+    },
+}
+
+impl std::fmt::Debug for Kept {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Never the secret, for the same reason `exec::Secret` writes its own.
+        match self {
+            Self::Token(_) => f.write_str("Token(..)"),
+            Self::Certificate { .. } => f.write_str("Certificate(..)"),
+        }
+    }
+}
+
+impl Store {
+    /// An empty store. Every helper run through it is [`Prompt::Never`].
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The policy every helper run for this store runs under. A method rather
+    /// than a field, so there is nothing to set.
+    #[must_use]
+    pub fn prompt(&self) -> Prompt {
+        Prompt::Never
+    }
+
+    /// What `context` can be built from without running its helper, if
+    /// anything.
+    ///
+    /// `command` is the helper's command line now; an entry made from a
+    /// different one — a kubeconfig edited while the dashboard was open — is
+    /// not used. A certificate inside its last minute is not either: unlike a
+    /// token, nothing on the request path can replace it.
+    #[must_use]
+    pub fn get(&self, context: &str, command: &str, now: Timestamp) -> Option<Kept> {
+        let kept = self.lock();
+        let entry = kept.get(context).filter(|entry| entry.command == command)?;
+        match &entry.kept {
+            Kept::Certificate { expires, .. } if exec::due(*expires, now) => None,
+            kept => Some(kept.clone()),
+        }
+    }
+
+    /// Remember what a context's client was built from.
+    pub fn put(&self, context: &str, command: &str, kept: Kept) {
+        self.lock().insert(
+            context.to_owned(),
+            Entry {
+                command: command.to_owned(),
+                kept,
+            },
+        );
+    }
+
+    /// Hand the store a credential the helper printed in the foreground, so
+    /// the next fetch sends it instead of running the helper again without a
+    /// terminal.
+    ///
+    /// A token goes into the keeper already there, when there is one for the
+    /// same command, so a client already built from it — a log stream that is
+    /// still open — sends the new token too. `auth` and `budget` make the
+    /// keeper when there is not.
+    pub async fn seed(
+        &self,
+        context: &str,
+        command: &str,
+        auth: AuthInfo,
+        budget: Budget,
+        credential: Credential,
+    ) {
+        let existing = match self.lock().get(context) {
+            Some(Entry {
+                command: was,
+                kept: Kept::Token(keeper),
+            }) if was == command => Some(keeper.clone()),
+            _ => None,
+        };
+
+        let kept = match (credential.secret, existing) {
+            (Secret::Token(token), Some(keeper)) => {
+                keeper.seed(token, credential.expires).await;
+                return;
+            }
+            (Secret::Token(token), None) => Kept::Token(Keeper::new(
+                token,
+                credential.expires,
+                auth,
+                budget,
+                self.prompt(),
+            )),
+            (Secret::Certificate { certificate, key }, _) => Kept::Certificate {
+                certificate,
+                key,
+                expires: credential.expires,
+            },
+        };
+        self.put(context, command, kept);
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, Entry>> {
+        // Nothing panics while holding this — every critical section is a
+        // map lookup or insert — but a poisoned map is still a correct one.
+        self.kept.lock().unwrap_or_else(PoisonError::into_inner)
     }
 }
 
@@ -320,6 +497,7 @@ mod tests {
             None,
             AuthInfo::default(),
             Budget::default(),
+            Prompt::AsConfigured,
         );
         {
             let mut held = keeper.held.lock().await;
@@ -341,9 +519,191 @@ mod tests {
             None,
             AuthInfo::default(),
             Budget::default(),
+            Prompt::AsConfigured,
         );
         assert!(!format!("{keeper:?}").contains("secret-token"));
         assert!(!format!("{:?}", Authorise(keeper)).contains("secret-token"));
+    }
+
+    fn token(kept: Option<Kept>) -> Keeper {
+        match kept {
+            Some(Kept::Token(keeper)) => keeper,
+            other => panic!("{other:?}"),
+        }
+    }
+
+    fn keeper(token: &str) -> Keeper {
+        Keeper::new(
+            token.to_owned(),
+            None,
+            AuthInfo::default(),
+            Budget::default(),
+            Prompt::Never,
+        )
+    }
+
+    #[tokio::test]
+    async fn a_store_hands_every_fetch_for_a_context_the_same_keeper() {
+        let store = Store::new();
+        store.put("prod", "aws eks get-token", Kept::Token(keeper("t1")));
+
+        let first = token(store.get("prod", "aws eks get-token", at("2026-09-25T06:00:00Z")));
+        first.seed("t2".to_owned(), None).await;
+        let second = token(store.get("prod", "aws eks get-token", at("2026-09-25T06:00:00Z")));
+
+        assert_eq!(second.current().await.unwrap().0, "t2");
+    }
+
+    #[test]
+    fn a_store_keeps_contexts_apart_and_forgets_a_helper_the_kubeconfig_no_longer_runs() {
+        let store = Store::new();
+        let now = at("2026-09-25T06:00:00Z");
+        store.put(
+            "prod",
+            "aws eks get-token --cluster-name prod",
+            Kept::Token(keeper("t")),
+        );
+
+        assert!(
+            store
+                .get("staging", "aws eks get-token --cluster-name prod", now)
+                .is_none()
+        );
+        // Edited while the dashboard was open: the old token is not this
+        // command's to send.
+        assert!(
+            store
+                .get("prod", "aws eks get-token --cluster-name prod-2", now)
+                .is_none()
+        );
+        assert!(
+            store
+                .get("prod", "aws eks get-token --cluster-name prod", now)
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn a_kept_certificate_is_used_until_its_last_minute_and_not_after() {
+        let store = Store::new();
+        store.put(
+            "prod",
+            "helper",
+            Kept::Certificate {
+                certificate: "cert".to_owned(),
+                key: "key".to_owned(),
+                expires: Some(at("2026-09-25T06:10:00Z")),
+            },
+        );
+
+        assert!(
+            store
+                .get("prod", "helper", at("2026-09-25T06:00:00Z"))
+                .is_some()
+        );
+        assert!(
+            store
+                .get("prod", "helper", at("2026-09-25T06:09:30Z"))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn a_store_never_lets_a_helper_prompt() {
+        // There is no constructor that takes a policy, and this is the one
+        // it answers with; the fetcher tests check what a helper is given.
+        assert_eq!(Store::new().prompt(), Prompt::Never);
+        assert_eq!(Store::default().prompt(), Prompt::Never);
+    }
+
+    #[tokio::test]
+    async fn seeding_a_store_reaches_clients_already_built_from_it() {
+        // A log stream opened before `L` holds a clone of the keeper; it should
+        // send the token `L` fetched, not the one that was refused.
+        let store = Store::new();
+        let open = keeper("refused");
+        store.put("prod", "helper", Kept::Token(open.clone()));
+
+        store
+            .seed(
+                "prod",
+                "helper",
+                AuthInfo::default(),
+                Budget::default(),
+                Credential {
+                    secret: Secret::Token("from-l".to_owned()),
+                    expires: None,
+                },
+            )
+            .await;
+
+        assert_eq!(open.current().await.unwrap().0, "from-l");
+    }
+
+    #[tokio::test]
+    async fn a_refusal_of_the_token_l_replaced_does_not_retire_what_l_fetched() {
+        let open = keeper("refused");
+        let (_, generation) = open.current().await.unwrap();
+
+        open.seed("from-l".to_owned(), None).await;
+        open.refused(generation).await;
+
+        assert!(!open.held.lock().await.stale);
+    }
+
+    #[tokio::test]
+    async fn seeding_an_empty_store_keeps_the_credential_for_the_next_fetch() {
+        let store = Store::new();
+        let now = at("2026-09-25T06:00:00Z");
+
+        store
+            .seed(
+                "prod",
+                "helper",
+                AuthInfo::default(),
+                Budget::default(),
+                Credential {
+                    secret: Secret::Token("from-l".to_owned()),
+                    expires: None,
+                },
+            )
+            .await;
+        let seeded = token(store.get("prod", "helper", now));
+        assert_eq!(seeded.current().await.unwrap().0, "from-l");
+        // And a refresh of it, later, is still the dashboard's kind.
+        assert_eq!(seeded.prompt, Prompt::Never);
+
+        store
+            .seed(
+                "prod",
+                "helper",
+                AuthInfo::default(),
+                Budget::default(),
+                Credential {
+                    secret: Secret::Certificate {
+                        certificate: "cert".to_owned(),
+                        key: "key".to_owned(),
+                    },
+                    expires: None,
+                },
+            )
+            .await;
+        assert!(matches!(
+            store.get("prod", "helper", now),
+            Some(Kept::Certificate { .. })
+        ));
+    }
+
+    #[test]
+    fn a_kept_credential_never_prints_its_secret_when_debugged() {
+        let certificate = Kept::Certificate {
+            certificate: "cert-body".to_owned(),
+            key: "key-body".to_owned(),
+            expires: None,
+        };
+        let debugged = format!("{certificate:?} {:?}", Kept::Token(keeper("secret-token")));
+        assert!(!debugged.contains("key-body"), "{debugged}");
+        assert!(!debugged.contains("secret-token"), "{debugged}");
     }
 
     // --- End to end: a real helper, a real socket, no cluster ---------------
@@ -734,5 +1094,147 @@ users:
             gone_soon(&pid),
             "the helper {pid} outlived the command that ran it"
         );
+    }
+
+    // --- The dashboard's store, end to end ------------------------------------
+
+    /// One dashboard fetch through `store`: build a client the way the panes
+    /// do and read every node.
+    fn fetch(paths: &[PathBuf], store: &Store) -> Result<Vec<String>, String> {
+        let paths = paths.to_vec();
+        let store = store.clone();
+        crate::commands::block_on(async move {
+            let mut config = client::resolve(&paths, &view()).await?;
+            config.proxy_url = None;
+            let client = match client::build_kept(
+                config,
+                "prod (us-east-1)",
+                Budget::default(),
+                &store,
+                "prod",
+            )
+            .await
+            {
+                Ok(client) => client,
+                Err(error) => return Ok(Err(error.to_string())),
+            };
+            let api: Api<Node> = Api::all(client);
+            Ok(
+                match page::collect(
+                    &api,
+                    &ListParams::default(),
+                    Budget::default(),
+                    crate::progress::Task::default(),
+                )
+                .await
+                {
+                    Ok(nodes) => Ok(nodes
+                        .into_iter()
+                        .filter_map(|node| node.metadata.name)
+                        .collect()),
+                    Err(error) => Err(client::explain(&error, "prod (us-east-1)")),
+                },
+            )
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn every_dashboard_fetch_sends_the_token_the_first_one_fetched() {
+        // Before the store, each pane's fetch built its own client and ran
+        // `aws eks get-token` again — an interpreter starting per pane, per
+        // refresh — and there was nowhere for `L` to put a token.
+        let dir = tempfile::tempdir().unwrap();
+        let (url, seen) = serve(vec![(None, node_page(&["a"], None))], |_| false);
+        let paths = kubeconfig(
+            dir.path(),
+            &url,
+            &counting_helper(dir.path(), Some("2999-01-01T00:00:00Z")),
+        );
+        let store = Store::new();
+
+        for _ in 0..3 {
+            assert_eq!(fetch(&paths, &store).unwrap(), ["a"]);
+        }
+
+        assert_eq!(runs(dir.path()), 1);
+        assert_eq!(*seen.lock().unwrap(), ["token-1", "token-1", "token-1"]);
+    }
+
+    #[test]
+    fn a_token_refused_in_one_fetch_is_replaced_in_the_next() {
+        // The refusal retires the shared token, so the next refresh runs the
+        // helper again rather than sending what was just refused.
+        let dir = tempfile::tempdir().unwrap();
+        let (url, seen) = serve(vec![(None, node_page(&["a"], None))], |token| {
+            token == "token-1"
+        });
+        let paths = kubeconfig(dir.path(), &url, &counting_helper(dir.path(), None));
+        let store = Store::new();
+
+        let message = fetch(&paths, &store).expect_err("token-1 is refused");
+        assert!(message.contains("rejected your credentials"), "{message}");
+        assert_eq!(fetch(&paths, &store).unwrap(), ["a"]);
+
+        assert_eq!(runs(dir.path()), 2);
+        assert_eq!(*seen.lock().unwrap(), ["token-1", "token-2"]);
+    }
+
+    #[test]
+    fn the_next_fetch_after_l_sends_what_l_fetched_without_running_the_helper() {
+        let dir = tempfile::tempdir().unwrap();
+        let (url, seen) = serve(vec![(None, node_page(&["a"], None))], |token| {
+            token == "token-1"
+        });
+        let paths = kubeconfig(dir.path(), &url, &counting_helper(dir.path(), None));
+        let store = Store::new();
+        fetch(&paths, &store).expect_err("token-1 is refused");
+
+        // What `credentials::retry_login` does once the foreground helper has
+        // printed a credential.
+        let auth = crate::commands::block_on(async {
+            Ok(client::resolve(&paths, &view()).await?.auth_info)
+        })
+        .unwrap();
+        let command = client::helper_command(&auth).unwrap();
+        crate::commands::block_on(async {
+            store
+                .seed(
+                    "prod",
+                    &command,
+                    auth.clone(),
+                    Budget::default(),
+                    Credential {
+                        secret: Secret::Token("from-l".to_owned()),
+                        expires: Some("2999-01-01T00:00:00Z".parse().unwrap()),
+                    },
+                )
+                .await;
+            Ok(())
+        })
+        .unwrap();
+
+        assert_eq!(fetch(&paths, &store).unwrap(), ["a"]);
+        assert_eq!(runs(dir.path()), 1);
+        assert_eq!(*seen.lock().unwrap(), ["token-1", "from-l"]);
+    }
+
+    #[test]
+    fn a_helper_that_wanted_to_ask_fails_a_dashboard_fetch_with_the_advice_to_press_l() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = exec::fixtures::recording_kubeconfig(dir.path(), "http://127.0.0.1:9", "exit 1");
+        let path = dir.path().join("config");
+        std::fs::write(&path, yaml).unwrap();
+
+        let message = fetch(&[path], &Store::new()).expect_err("the helper exits 1");
+
+        assert!(
+            message.contains("may not ask you anything: Enter MFA code:"),
+            "{message}"
+        );
+        assert!(message.contains("L runs `sh -c"), "{message}");
+        let (interactive, stdin, _) = exec::fixtures::recorded(dir.path());
+        assert!(!interactive);
+        assert_eq!(stdin, "null");
     }
 }
