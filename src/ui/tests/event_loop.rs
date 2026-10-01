@@ -89,6 +89,9 @@ struct Run {
     /// How many node fetches the loop started — `r`, and nothing else in
     /// these scripts, starts one.
     node_fetches: usize,
+    /// How many container fetches and log streams the loop started.
+    container_fetches: usize,
+    log_streams: usize,
 }
 
 /// Drive `event_loop` over `app` with `script` as everything the terminal
@@ -119,9 +122,22 @@ fn run_loop(app: App, script: Vec<Event>, terminal_answers: Option<&[u8]>) -> Ru
         })
     };
     let spawn_pods: PodsFetcher = Box::new(|_, _, _| mpsc::channel().1);
-    let spawn_containers: ContainersFetcher = Box::new(|_, _, _| mpsc::channel().1);
-    let spawn_logs: LogsFetcher =
-        Box::new(|_, _, _, _, _| crate::commands::spawn_stream(|_tx, _stop| async {}));
+    let container_fetches = Rc::new(Counter::new(0));
+    let spawn_containers: ContainersFetcher = {
+        let container_fetches = Rc::clone(&container_fetches);
+        Box::new(move |_, _, _| {
+            container_fetches.set(container_fetches.get() + 1);
+            mpsc::channel().1
+        })
+    };
+    let log_streams = Rc::new(Counter::new(0));
+    let spawn_logs: LogsFetcher = {
+        let log_streams = Rc::clone(&log_streams);
+        Box::new(move |_, _, _, _, _| {
+            log_streams.set(log_streams.get() + 1);
+            crate::commands::spawn_stream(|_tx, _stop| async {})
+        })
+    };
     let drill = DrillFetchers {
         spawn_pods: &spawn_pods,
         spawn_containers: &spawn_containers,
@@ -179,6 +195,8 @@ fn run_loop(app: App, script: Vec<Event>, terminal_answers: Option<&[u8]>) -> Ru
         log,
         screen,
         node_fetches: node_fetches.get(),
+        container_fetches: container_fetches.get(),
+        log_streams: log_streams.get(),
     }
 }
 
@@ -326,4 +344,47 @@ fn keys_given_back_by_the_reader_are_each_handled() {
         None,
     );
     assert_eq!(moved.screen, direct.screen);
+}
+
+/// `L`, then enough `Esc` to back out of any drill-down and quit — `q` is a
+/// no-op while drilled in.
+fn l_then_back_out() -> Vec<Event> {
+    let mut script = vec![Event::Key(press(KeyCode::Char('L')))];
+    script.extend(std::iter::repeat_n(Event::Key(press(KeyCode::Esc)), 6));
+    script
+}
+
+#[test]
+fn a_successful_l_reopens_the_log_whose_refusal_offered_it() {
+    let mut app = app_with_container();
+    app.on_key(press(KeyCode::Enter));
+    app.apply_log_event(LogEvent::Refused("refused".to_owned()));
+
+    let run = run_loop(app, l_then_back_out(), None);
+
+    assert_eq!(run.log_streams, 1);
+    // The node pane refetches on `L` as it always has.
+    assert_eq!(run.node_fetches, 1);
+}
+
+#[test]
+fn a_successful_l_refetches_the_containers_whose_refusal_offered_it() {
+    let mut app = app_with_pod();
+    app.on_key(press(KeyCode::Enter));
+    app.apply_containers(Err(refused("prod rejected your credentials")));
+
+    let run = run_loop(app, l_then_back_out(), None);
+
+    assert_eq!(run.container_fetches, 1);
+}
+
+#[test]
+fn l_leaves_a_container_pane_that_loaded_alone() {
+    let mut app = app_with_container();
+    app.apply_nodes(Err(refused("prod rejected your credentials")));
+
+    let run = run_loop(app, l_then_back_out(), None);
+
+    assert_eq!(run.container_fetches, 0);
+    assert_eq!(run.node_fetches, 1);
 }

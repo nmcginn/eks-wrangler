@@ -950,3 +950,31 @@ suspending automatically whenever a helper wanted to prompt. The second meant a
 new channel from background tasks to the UI thread, and a prompt taking over
 the screen with no key pressed, which decision 77 already refused for logging
 in. The CLI commands are unchanged.
+
+### 121. The dashboard's fetchers share one credential per context through a `Store`, and `L` seeds it
+
+Carries out decision 120.
+
+- **Where the guarantee lives.** `exec::Prompt` is `AsConfigured` (the CLI and
+  `L`) or `Never`. `k8s::auth::Store` has no constructor that takes one; every
+  helper run through it is `Never`. Each dashboard fetcher takes a `Store`
+  (`credentials::Via::Dashboard` for the listing the CLI shares), so a fetcher
+  built without one does not compile. A test drives all four.
+- **`Never` also means its own process group** on Unix, so a helper that opens
+  `/dev/tty` itself (Python's `getpass`) is refused by the terminal rather than
+  reading the dashboard's keys. Observed: `EIO` at once, so it fails as muted.
+  `AsConfigured` keeps decision 114's no-group rule.
+- **Muted.** A helper that fails or prints a non-credential after `Never` took
+  away a terminal its `interactiveMode` would have given it is
+  `exec::Error::Muted` → `Failure::HelperMuted`: credential-shaped (it arms
+  `L`), and worded to press `L`. A block that says `Never` itself loses nothing
+  and fails in the CLI's words. A stall stays `HelperStalled`.
+- **One keeper per context.** Decision 120's "seeds the keeper" needs one that
+  outlives a fetch, so the store keeps it, keyed by context and checked against
+  the helper's command line. Fetches reuse it instead of running the helper
+  each time. A certificate is kept until its last minute.
+- **`L`** runs `aws sso login` as before (always, for an Identity Center
+  profile: the refusal is the evidence), then the helper whenever there is one,
+  under `--timeout`, then `Store::seed`. It errors only with neither. After it,
+  a failed container or log pane is refetched too, and a log stream refused
+  for credentials arms `L` (`LogEvent::Refused`).

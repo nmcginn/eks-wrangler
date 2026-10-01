@@ -742,7 +742,7 @@ impl App {
     #[must_use]
     pub fn login_hint(&self) -> Option<&'static str> {
         self.credentials_lost
-            .then_some("Press L to log in to AWS and try again.")
+            .then_some("Press L to sign in again and retry.")
     }
 
     /// Record that a login the user asked for did not happen.
@@ -877,8 +877,38 @@ impl App {
     /// for the same reason [`Self::cycle_sort`] delegates to `k8s_nodes::sort`
     /// rather than reordering rows itself: the shape of "what does this event
     /// do to what is already on screen" belongs beside the data it changes.
+    ///
+    /// A [`LogEvent::Refused`] also arms `L`, as a refused fetch does in every
+    /// other pane. Nothing here disarms it: a line arriving says this stream's
+    /// credential is fine, not that some other pane's is.
     pub fn apply_log_event(&mut self, event: LogEvent) {
+        if matches!(event, LogEvent::Refused(_)) {
+            self.credentials_lost = true;
+        }
         self.logs.apply(event);
+    }
+
+    /// After a successful `L`: put a container or log pane that failed back
+    /// to `Loading`, so the event loop refetches it. Returns whether it did.
+    ///
+    /// The node and pod panes refetch on `L` already, through the same calls
+    /// `r` makes. These two do not refresh on `r` — they fetch once per pod or
+    /// container they are asked to show — so without this the pane whose
+    /// refusal put `L` on screen would go on showing that refusal after the
+    /// login that fixed it. Only a failed pane is retried: one that loaded is
+    /// not what `L` was pressed for.
+    pub fn retry_failed_detail(&mut self) -> bool {
+        match self.view {
+            View::PodContainers { .. } if matches!(self.containers, ContainersState::Error(_)) => {
+                self.containers = ContainersState::Loading;
+                true
+            }
+            View::ContainerLogs { .. } if matches!(self.logs, LogsState::Error(_)) => {
+                self.logs = LogsState::Loading;
+                true
+            }
+            _ => false,
+        }
     }
 
     /// `s`: cycle to the next ordering for whichever pane [`View`] is
@@ -2143,14 +2173,9 @@ where
                     // refetching immediately is what turns the banner back
                     // into rows without a second keystroke.
                     Ok(()) => {
-                        refetch(spawn_nodes, &mut nodes_rx, selected_context.as_deref());
-                        refetch_pods(
-                            drill,
-                            app.view(),
-                            app.pod_selectors(),
-                            selected_context.as_deref(),
-                            &mut inflight,
-                        );
+                        let context = selected_context.as_deref();
+                        refetch(spawn_nodes, &mut nodes_rx, context);
+                        refetch_after_login(&mut app, drill, context, &mut inflight);
                         next_refresh = schedule(refresh);
                     }
                     Err(message) => app.apply_login_failure(message),
@@ -2275,6 +2300,21 @@ fn start_drill_fetch(
             }
         }
         View::Overview => inflight.clear(),
+    }
+}
+
+/// After a successful `L`, refetch whichever detail pane is on screen: the
+/// pod listing, as `r` would, or a container or log pane whose own failure is
+/// what `L` was pressed for — see [`App::retry_failed_detail`].
+fn refetch_after_login(
+    app: &mut App,
+    drill: &DrillFetchers<'_>,
+    context: Option<&str>,
+    inflight: &mut Inflight,
+) {
+    refetch_pods(drill, app.view(), app.pod_selectors(), context, inflight);
+    if app.retry_failed_detail() {
+        start_drill_fetch(app, drill, context, inflight);
     }
 }
 
@@ -3208,6 +3248,85 @@ mod tests {
         let mut containers = app();
         containers.apply_containers(Err(refused("prod rejected your credentials")));
         assert!(containers.credentials_lost());
+    }
+
+    #[test]
+    fn a_log_that_could_not_open_for_want_of_a_sign_in_offers_l() {
+        let mut app = app_with_container();
+        app.on_key(press(KeyCode::Enter));
+
+        app.apply_log_event(LogEvent::Refused(
+            "L runs `aws` in the foreground".to_owned(),
+        ));
+
+        assert!(app.credentials_lost());
+        assert_eq!(
+            app.logs(),
+            &LogsState::Error("L runs `aws` in the foreground".to_owned())
+        );
+        assert_eq!(app.on_key(press(KeyCode::Char('L'))), Flow::Login);
+    }
+
+    #[test]
+    fn a_log_that_failed_for_any_other_reason_does_not_offer_l() {
+        let mut app = app_with_container();
+        app.on_key(press(KeyCode::Enter));
+
+        app.apply_log_event(LogEvent::Ended(Some("container not found".to_owned())));
+
+        assert!(!app.credentials_lost());
+    }
+
+    #[test]
+    fn a_line_from_one_log_does_not_withdraw_an_offer_another_pane_made() {
+        // The node pane's refusal stands until the node pane is refetched; a
+        // stream opened earlier on the old token says nothing about it.
+        let mut app = app();
+        app.apply_nodes(Err(refused("prod rejected your credentials")));
+
+        app.apply_log_event(LogEvent::Line("still streaming".to_owned()));
+
+        assert!(app.credentials_lost());
+    }
+
+    #[test]
+    fn after_l_a_container_pane_that_failed_goes_back_to_loading() {
+        let mut app = app_with_pod();
+        app.on_key(press(KeyCode::Enter));
+        app.apply_containers(Err(refused("prod rejected your credentials")));
+
+        assert!(app.retry_failed_detail());
+        assert_eq!(app.containers(), &ContainersState::Loading);
+    }
+
+    #[test]
+    fn after_l_a_log_pane_that_failed_goes_back_to_loading() {
+        let mut app = app_with_container();
+        app.on_key(press(KeyCode::Enter));
+        app.apply_log_event(LogEvent::Refused("refused".to_owned()));
+
+        assert!(app.retry_failed_detail());
+        assert_eq!(app.logs(), &LogsState::Loading);
+    }
+
+    #[test]
+    fn after_l_a_pane_that_loaded_is_left_alone() {
+        // The container list on screen is not what `L` was pressed for, and
+        // neither is a log already streaming.
+        let mut containers = app_with_container();
+        assert!(!containers.retry_failed_detail());
+        assert!(matches!(
+            containers.containers(),
+            ContainersState::Loaded { .. }
+        ));
+
+        let mut logs = app_with_container();
+        logs.on_key(press(KeyCode::Enter));
+        logs.apply_log_event(LogEvent::Line("hello".to_owned()));
+        assert!(!logs.retry_failed_detail());
+
+        // And the overview's panes refetch on `L` by themselves.
+        assert!(!app().retry_failed_detail());
     }
 
     #[test]

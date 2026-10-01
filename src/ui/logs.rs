@@ -62,6 +62,12 @@ impl LogsState {
     /// should not need to know a log has an "ended, but only after showing
     /// something" case in order to route an event to it.
     pub fn apply(&mut self, event: LogEvent) {
+        let event = match event {
+            // Whether `L` is offered is `App`'s business; to this pane a
+            // refusal is a failure like any other.
+            LogEvent::Refused(message) => LogEvent::Ended(Some(message)),
+            event => event,
+        };
         match event {
             LogEvent::Line(line) => {
                 if matches!(self, Self::Loading) {
@@ -93,6 +99,7 @@ impl LogsState {
                 // as `Error`'s.
                 (Self::Error(_) | Self::Unavailable(_), _) => {}
             },
+            LogEvent::Refused(_) => {}
         }
     }
 

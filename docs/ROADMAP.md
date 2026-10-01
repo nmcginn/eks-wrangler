@@ -19,21 +19,7 @@ follow-up, and it belongs in the PR that raised it.
 
 ## Open
 
-- [ ] **Keep the dashboard's credential helper off the terminal it has drawn on.**
-  (Milestone 3.) Inside the dashboard, stdin is a terminal in raw mode behind
-  the alternate screen. A helper allowed to prompt there, at first connect or
-  on a refresh an hour in, writes over the panes and competes with
-  `App::on_key` for keystrokes.
-  *Decided (2026-09-30):* dashboard helpers never prompt; `L` runs the helper
-  in the foreground so it can. See decision 120.
-  *Acceptance:* every helper the dashboard's fetchers start runs
-  non-interactively (`/dev/null` stdin, captured stderr, `interactive: false`
-  in `KUBERNETES_EXEC_INFO`), guaranteed when the fetchers are built and
-  asserted by a test. A helper that fails for want of input sets
-  `credentials_lost` with a message pointing at `L`. `L` suspends the screen,
-  runs `aws sso login` when that session has expired, then runs the helper in
-  the foreground with its own `interactiveMode`, seeds the auth layer with the
-  credential it prints, and refetches. CLI commands are unchanged.
+Nothing is scheduled. Pull the next task up from **Ideas** below.
 
 ---
 
@@ -127,6 +113,7 @@ follow-up, and it belongs in the PR that raised it.
 - [x] Wall-clock startup benchmarks with hyperfine. (112, 116)
 - [x] Shell completions and a man page. (106)
 - [x] Golden-file rendering tests. (107)
+- [x] Dashboard credential helpers never prompt; `L` runs the helper in the foreground and seeds a shared store. (120, 121)
 
 ### Milestone 4 — Distribution and hardening
 

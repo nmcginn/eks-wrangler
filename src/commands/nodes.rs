@@ -10,6 +10,7 @@ use crate::aws::LoginMode;
 use crate::cluster::ClusterView;
 use crate::commands::{self, contexts, credentials};
 use crate::format::Width;
+use crate::k8s::auth::Store;
 use crate::k8s::metrics::{self as k8s_metrics};
 use crate::k8s::order::Direction;
 use crate::k8s::page;
@@ -95,13 +96,13 @@ async fn gather(
     paths: &[PathBuf],
     selector: Option<&str>,
     budget: page::Budget,
-    login: LoginMode,
+    via: credentials::Via<'_>,
     progress: &Progress,
 ) -> Result<Gathered> {
     let target = target_cluster(config, selector)?;
     let label = target.label();
 
-    let client = credentials::connect(paths, &target, budget, login, progress).await?;
+    let client = credentials::open(paths, &target, budget, via, progress).await?;
 
     // Concurrently, not in sequence: the three requests are independent, and the
     // command should cost one round trip's worth of waiting rather than three.
@@ -399,7 +400,15 @@ pub async fn list(
         usage,
         samples,
         now,
-    } = gather(config, paths, selector, budget, login, &progress).await?;
+    } = gather(
+        config,
+        paths,
+        selector,
+        budget,
+        credentials::Via::Command(login),
+        &progress,
+    )
+    .await?;
 
     // Ordering lives in `k8s::nodes::order` rather than here, so the default and
     // the one `--sort` asks for are decided in the same place and by the same
@@ -452,27 +461,31 @@ pub struct NodesFetch {
 /// cannot drift about what a node's row means. Parameters are owned, unlike
 /// `gather`'s borrowed ones, because the future has to outlive this call —
 /// [`commands::spawn`] moves it onto another thread.
+///
+/// `store` is the dashboard's: the credential comes from it, and a helper run
+/// to fill it never prompts (decision 120).
 #[must_use]
 pub fn spawn_gather(
     config: KubeConfig,
     paths: Vec<PathBuf>,
     selector: Option<String>,
     budget: page::Budget,
+    store: Store,
 ) -> mpsc::Receiver<Result<NodesFetch, commands::FetchError>> {
     commands::spawn(async move {
-        // `Never`, always, and `Progress::none()` for the same reason. This
+        // `Via::Dashboard` and `Progress::none()` for the same reason. This
         // runs on a background thread that does not own the terminal, so it
-        // must never stop to ask a question, hand a browser prompt to a screen
-        // the dashboard is drawing on, or write a progress line across a pane.
-        // The dashboard's own login paths are `credentials::preflight` before
-        // the terminal opens, and the `L` key once it has; its own "still
-        // loading" is the pane's, drawn by `ui`.
+        // must never stop to ask a question, let a credential helper prompt
+        // on a screen the dashboard is drawing on, or write a progress line
+        // across a pane. The dashboard's own login paths are
+        // `credentials::preflight` before the terminal opens, and the `L` key
+        // once it has; its own "still loading" is the pane's, drawn by `ui`.
         gather(
             &config,
             &paths,
             selector.as_deref(),
             budget,
-            LoginMode::Never,
+            credentials::Via::Dashboard(&store),
             &Progress::none(),
         )
         .await

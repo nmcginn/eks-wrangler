@@ -103,10 +103,17 @@ is `botocore`'s to change.
 The dashboard cannot do this the way a one-shot command does, because its
 fetches run on background threads that do not own the terminal. So it splits:
 `credentials::preflight` puts the question once in `main::dashboard`, before
-`ui::run` opens the alternate screen, and every fetcher after it is built with
-`LoginMode::Never`. A session that dies mid-session becomes `Flow::Login` from
-`App::on_key`, and `ui::run` — the one function that knows a real terminal is
-involved — hands it back, runs the login, and takes it again. `event_loop` stays
+`ui::run` opens the alternate screen, and every fetcher after it is built over
+a `k8s::auth::Store` (`credentials::Via::Dashboard`): no login offer, and a
+credential helper that runs with `/dev/null` stdin, captured stderr, its own
+process group and `interactive: false`, whatever its `interactiveMode` says
+(decision 120). The store holds one keeper per context, so every fetch sends
+the same token. A refusal, or a helper that failed without the terminal it
+would have prompted on, becomes `Flow::Login` from `App::on_key`, and `ui::run`
+— the one function that knows a real terminal is involved — hands the terminal
+back while `credentials::retry_login` logs in if there is an Identity Center
+session, runs the helper in the foreground where it can prompt, and seeds the
+store with what it prints; then it takes the terminal again and refetches. `event_loop` stays
 generic over the backend, taking the suspend as a closure, so every keypress
 test still runs against `TestBackend` with no terminal anywhere near it.
 
@@ -374,8 +381,9 @@ client in place of the `exec` block, so `kube` never runs the helper itself
 
 A token is then held by `k8s::auth::Keeper`, which `k8s::auth::Authorise` — a
 `tower` layer on the client — asks for on every request. The keeper runs the
-helper again when the token is inside the last minute of its
-`expirationTimestamp`, and when a `401` retires it; `page::collect` asks once
+helper again — under the same `exec::Prompt` the first run had — when the token
+is inside the last minute of its `expirationTimestamp`, and when a `401`
+retires it; `page::collect` asks once
 more for a page refused partway through a listing, so a token that lapses on
 page four costs one page rather than three. A refresh spends the deadline of the
 request it happens inside, shared through `page::deadline`, so a helper that

@@ -40,8 +40,8 @@ use kube::{Client, Config};
 
 use crate::cluster::ClusterView;
 use crate::format;
-use crate::k8s::auth::{Authorise, Keeper};
-use crate::k8s::exec::{self, Credential, Secret};
+use crate::k8s::auth::{Authorise, Keeper, Kept, Store};
+use crate::k8s::exec::{self, Credential, Prompt, Secret};
 use crate::k8s::page::{self, Budget};
 use crate::progress::Progress;
 
@@ -134,6 +134,61 @@ pub async fn connect(
     build(config, &cluster.label(), budget, progress).await
 }
 
+/// [`connect`] for the dashboard: the credential comes from `store` when it
+/// holds one for this context, and when it does not, the helper runs without
+/// a terminal ([`Prompt::Never`]) and what it prints is kept there for the
+/// next fetch.
+///
+/// No `progress`: a dashboard fetch draws its own loading state.
+pub async fn connect_kept(
+    paths: &[PathBuf],
+    cluster: &ClusterView,
+    budget: Budget,
+    store: &Store,
+) -> Result<Client, Error> {
+    let config = resolve(paths, cluster).await?;
+    build_kept(
+        config,
+        &cluster.label(),
+        budget,
+        store,
+        &cluster.context_name,
+    )
+    .await
+}
+
+/// [`build`] for the dashboard: the half of [`connect_kept`] after the
+/// kubeconfig is read, keeping the credential under `context` in `store`.
+pub async fn build_kept(
+    config: Config,
+    label: &str,
+    budget: Budget,
+    store: &Store,
+    context: &str,
+) -> Result<Client, Error> {
+    let source = Source::Store { store, context };
+    build_from(config, label, budget, &Progress::none(), source).await
+}
+
+/// Where [`build_from`] gets a credential, and whether its helper may prompt.
+#[derive(Debug, Clone, Copy)]
+enum Source<'a> {
+    /// Run the helper, as its `interactiveMode` says. The command line.
+    Helper,
+    /// Use what `store` holds for `context`, or run the helper without a
+    /// terminal and keep what it prints. The dashboard.
+    Store { store: &'a Store, context: &'a str },
+}
+
+impl Source<'_> {
+    fn prompt(self) -> Prompt {
+        match self {
+            Self::Helper => Prompt::AsConfigured,
+            Self::Store { store, .. } => store.prompt(),
+        }
+    }
+}
+
 /// Read the kubeconfig and settle which cluster, user, and auth a context
 /// names — without running anything.
 ///
@@ -176,85 +231,151 @@ pub async fn build(
     budget: Budget,
     progress: &Progress,
 ) -> Result<Client, Error> {
-    // The step the whole progress line exists for. A user waiting thirty
-    // seconds on a laptop that has lost its route to the SSO endpoint is
-    // waiting on a subprocess nothing on screen has ever mentioned; naming it
-    // here is what turns that into something they can act on before the
-    // timeout does it for them. A context with no `exec` block has no
-    // subprocess to name, and says what it is doing instead.
-    let step = match helper_name(&config.auth_info) {
-        Some(command) => progress.waiting(&format!("running {command}")),
-        None => progress.waiting(&format!("connecting to {label}")),
-    };
+    build_from(config, label, budget, progress, Source::Helper).await
+}
 
-    let credential = if exec::helper_of(&config.auth_info).is_some() {
-        let run = exec::run(&config.auth_info);
-        let finished = match budget.limit() {
-            // `--timeout 0`: the user asked to wait, so wait.
-            None => step.tick(run).await,
-            Some(limit) => {
-                // Losing the race drops `run`, and the child with it — which
-                // is what kills the helper rather than leaving it.
-                let Ok(finished) = step.tick(tokio::time::timeout(limit, run)).await else {
-                    tracing::debug!(?limit, "the credential helper outlived the budget");
-                    return Err(Error::HelperStalled(stalled_helper(
-                        label,
-                        helper_command(&config.auth_info).as_deref(),
-                        limit,
-                    )));
-                };
-                finished
-            }
-        };
-        Some(finished.map_err(|error| {
-            tracing::debug!(%error, "the credential helper failed");
-            Error::explained(&error.into(), label)
-        })?)
+async fn build_from(
+    config: Config,
+    label: &str,
+    budget: Budget,
+    progress: &Progress,
+    source: Source<'_>,
+) -> Result<Client, Error> {
+    let command = helper_command(&config.auth_info).unwrap_or_default();
+
+    // A dashboard fetch after the first: the token is already held, and its
+    // keeper replaces it on the request path when it is due. Running the
+    // helper here as well would be one `aws eks get-token` per pane per
+    // refresh, for a token nobody asked to replace.
+    if let Source::Store { store, context } = source
+        && exec::helper_of(&config.auth_info).is_some()
+        && let Some(kept) = store.get(context, &command, k8s_openapi::jiff::Timestamp::now())
+    {
+        return assemble(config, Some(kept)).map_err(|source| {
+            tracing::debug!(%source, "building a client failed");
+            Error::explained(&source.into(), label)
+        });
+    }
+
+    // A context with no `exec` block has no subprocess to name, and says what
+    // it is doing instead, until the client is built.
+    let (credential, _connecting) = if exec::helper_of(&config.auth_info).is_some() {
+        let printed = credential(&config.auth_info, label, budget, progress, source.prompt());
+        (Some(printed.await?), None)
     } else {
-        None
+        (
+            None,
+            Some(progress.waiting(&format!("connecting to {label}"))),
+        )
     };
 
-    // Off the screen before anything below can print — the sentence explaining
-    // a refused credential, or the second login offer `commands::credentials`
-    // makes after one.
-    drop(step);
+    let kept = credential.map(|credential| keep(&config, credential, budget, source.prompt()));
+    if let (Source::Store { store, context }, Some(kept)) = (source, &kept) {
+        store.put(context, &command, kept.clone());
+    }
 
-    assemble(config, credential, budget).map_err(|source| {
+    assemble(config, kept).map_err(|source| {
         tracing::debug!(%source, "building a client failed");
         Error::explained(&source.into(), label)
     })
 }
 
-/// Build the client itself, from a context and the credential its helper
-/// printed, if it has one.
+/// Run a context's credential helper once under `budget`, as `prompt` allows,
+/// and explain it if that fails.
+///
+/// [`build`]'s first step, and the whole of what the dashboard's `L` asks of
+/// the helper: there the credential is not made into a client but handed to
+/// the dashboard's [`Store`] — see [`crate::commands::credentials`].
+pub async fn credential(
+    auth: &AuthInfo,
+    label: &str,
+    budget: Budget,
+    progress: &Progress,
+    prompt: Prompt,
+) -> Result<Credential, Error> {
+    // The step the whole progress line exists for. A user waiting thirty
+    // seconds on a laptop that has lost its route to the SSO endpoint is
+    // waiting on a subprocess nothing on screen has ever mentioned; naming it
+    // here is what turns that into something they can act on before the
+    // timeout does it for them.
+    let step = progress.waiting(&format!(
+        "running {}",
+        helper_name(auth).unwrap_or_default()
+    ));
+
+    let run = exec::run(auth, prompt);
+    let finished = match budget.limit() {
+        // `--timeout 0`: the user asked to wait, so wait.
+        None => step.tick(run).await,
+        Some(limit) => {
+            // Losing the race drops `run`, and the child with it — which
+            // is what kills the helper rather than leaving it.
+            let Ok(finished) = step.tick(tokio::time::timeout(limit, run)).await else {
+                tracing::debug!(?limit, "the credential helper outlived the budget");
+                return Err(Error::HelperStalled(stalled_helper(
+                    label,
+                    helper_command(auth).as_deref(),
+                    limit,
+                )));
+            };
+            finished
+        }
+    };
+
+    // Off the screen before anything after this can print — the sentence
+    // explaining a refused credential, or the second login offer
+    // `commands::credentials` makes after one.
+    drop(step);
+
+    finished.map_err(|error| {
+        tracing::debug!(%error, "the credential helper failed");
+        Error::explained(&error.into(), label)
+    })
+}
+
+/// What a client is built from, given the credential its helper printed: a
+/// keeper for a token, so it can be refreshed; a certificate as it is.
+fn keep(config: &Config, credential: Credential, budget: Budget, prompt: Prompt) -> Kept {
+    match credential.secret {
+        Secret::Token(token) => Kept::Token(Keeper::new(
+            token,
+            credential.expires,
+            // The keeper runs the helper again later, so it keeps the block.
+            config.auth_info.clone(),
+            budget,
+            prompt,
+        )),
+        Secret::Certificate { certificate, key } => Kept::Certificate {
+            certificate,
+            key,
+            expires: credential.expires,
+        },
+    }
+}
+
+/// Build the client itself, from a context and what its helper printed, if
+/// it has one.
 ///
 /// Nothing here starts a process: the `exec` block is taken out of the config
 /// before `kube` sees it, and replaced with what running it produced. Left in,
 /// `kube` would run the helper again — three more times, in fact, once each
 /// for the TLS identity, the auth layer, and the identity's expiry.
-fn assemble(
-    mut config: Config,
-    credential: Option<Credential>,
-    budget: Budget,
-) -> Result<Client, kube::Error> {
-    let Some(credential) = credential else {
+fn assemble(mut config: Config, kept: Option<Kept>) -> Result<Client, kube::Error> {
+    let Some(kept) = kept else {
         return Client::try_from(config);
     };
 
-    // The keeper runs the helper again later, so it keeps the block.
-    let auth = config.auth_info.clone();
     config.auth_info.exec = None;
 
-    match credential.secret {
-        Secret::Token(token) => {
-            let keeper = Keeper::new(token, credential.expires, auth, budget);
-            Ok(ClientBuilder::try_from(config)?
-                .with_layer(&Authorise(keeper))
-                .build())
-        }
+    match kept {
+        Kept::Token(keeper) => Ok(ClientBuilder::try_from(config)?
+            .with_layer(&Authorise(keeper))
+            .build()),
         // The protocol sends PEM; a kubeconfig — which is what `kube` reads
         // this from — holds base64 of PEM.
-        Secret::Certificate { certificate, key } => {
+        Kept::Certificate {
+            certificate, key, ..
+        } => {
             let base64 = base64::engine::general_purpose::STANDARD;
             config.auth_info.client_certificate_data = Some(base64.encode(certificate));
             config.auth_info.client_key_data = Some(base64.encode(key).into());
@@ -424,6 +545,10 @@ pub enum Failure {
     /// The credential helper ran and printed something that is not a
     /// credential.
     HelperUnreadable,
+    /// The credential helper failed after being refused the terminal its
+    /// `interactiveMode` would have let it prompt on — the dashboard's case,
+    /// where `L` runs it in the foreground instead.
+    HelperMuted,
     /// Anything we have no specific advice for.
     Other,
 }
@@ -454,7 +579,21 @@ impl Failure {
             exec::Error::Failed { .. } => Self::Credentials,
             exec::Error::Unreadable { .. } => Self::HelperUnreadable,
             exec::Error::Stalled { limit, .. } => Self::HelperStalled(*limit),
+            exec::Error::Muted { .. } => Self::HelperMuted,
         }
+    }
+
+    /// Whether signing in again could put this right — what decides whether
+    /// the dashboard offers `L`, and whether a command offers a login after a
+    /// refusal.
+    ///
+    /// A refused credential, and a helper that may only have needed somebody
+    /// to answer it. Nothing else: a `403` is about permissions, an
+    /// unreachable endpoint about a VPC, and a stalled helper has not said
+    /// what it wanted.
+    #[must_use]
+    pub fn fixed_by_signing_in(self) -> bool {
+        matches!(self, Self::Credentials | Self::HelperMuted)
     }
 
     /// Classify a `kube` error, which is every failure that reached the cluster
@@ -539,6 +678,20 @@ pub fn explain(error: &page::Error, cluster: &str) -> String {
                  Its kubeconfig entry runs `{command}`. Run it yourself: it should print an ExecCredential \
                  whose `status` holds a token or a client certificate. If it prints a prompt instead, \
                  set `interactiveMode: IfAvailable` in that `exec` block so it can ask you."
+            )
+        }
+        // Only the dashboard runs a helper this way, so the advice is the
+        // dashboard's key, not `interactiveMode`: setting that would change
+        // nothing, because the dashboard never lets a helper prompt.
+        Failure::HelperMuted => {
+            let (command, detail) = match helper(error) {
+                Some(exec::Error::Muted { command, detail }) => (command.as_str(), detail.as_str()),
+                _ => ("", "it did not say why"),
+            };
+            format!(
+                "the credential helper for {cluster} failed, and inside the dashboard it may not ask you anything: {detail}.\n\
+                 L runs `{command}` in the foreground, where it can prompt — after an AWS login, \
+                 if the context uses IAM Identity Center."
             )
         }
         // No advice worth inventing, so show the real thing rather than a
@@ -1423,6 +1576,51 @@ users:
     }
 
     #[test]
+    fn a_helper_the_dashboard_would_not_let_prompt_points_at_l_with_what_it_said() {
+        let error = helper_error(exec::Error::Muted {
+            command: "AWS_PROFILE=prod aws eks get-token".to_owned(),
+            detail: "Enter MFA code for arn:aws:iam::1:mfa/me:".to_owned(),
+        });
+
+        assert_eq!(Failure::of(&error), Failure::HelperMuted);
+        let message = explain(&error, "prod (us-east-1)");
+        let (first, second) = message.split_once('\n').unwrap();
+        assert!(
+            first.contains("credential helper for prod (us-east-1) failed"),
+            "{first}"
+        );
+        assert!(
+            first.contains("Enter MFA code for arn:aws:iam::1:mfa/me:"),
+            "{first}"
+        );
+        assert!(
+            second.starts_with("L runs `AWS_PROFILE=prod aws eks get-token` in the foreground"),
+            "{second}"
+        );
+        // The command line's advice for an unreadable helper is to set
+        // `interactiveMode`, which the dashboard would ignore.
+        assert!(!message.contains("interactiveMode"), "{message}");
+    }
+
+    #[test]
+    fn only_a_refusal_or_a_muted_helper_is_something_signing_in_again_could_fix() {
+        for (failure, fixed) in [
+            (Failure::Credentials, true),
+            (Failure::HelperMuted, true),
+            (Failure::HelperMissing, false),
+            (Failure::Forbidden, false),
+            (Failure::Unreachable, false),
+            (Failure::Slow(Duration::from_secs(30)), false),
+            (Failure::PageExpired, false),
+            (Failure::HelperStalled(Duration::from_secs(30)), false),
+            (Failure::HelperUnreadable, false),
+            (Failure::Other, false),
+        ] {
+            assert_eq!(failure.fixed_by_signing_in(), fixed, "{failure:?}");
+        }
+    }
+
+    #[test]
     fn a_service_error_that_is_not_a_helpers_is_still_unreachable() {
         let wrapped = kube::Error::Service(Box::new(io::Error::other("connection refused")));
 
@@ -1443,7 +1641,8 @@ users:
             expires: None,
         };
 
-        assert!(assemble(config, Some(credential), Budget::default()).is_err());
+        let kept = keep(&config, credential, Budget::default(), Prompt::AsConfigured);
+        assert!(assemble(config, Some(kept)).is_err());
     }
 
     #[tokio::test]
@@ -1457,6 +1656,7 @@ users:
             expires: None,
         };
 
-        assert!(assemble(config, Some(credential), Budget::default()).is_ok());
+        let kept = keep(&config, credential, Budget::default(), Prompt::AsConfigured);
+        assert!(assemble(config, Some(kept)).is_ok());
     }
 }

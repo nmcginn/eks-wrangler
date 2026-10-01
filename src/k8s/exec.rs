@@ -26,6 +26,11 @@
 //! shell-out in [`crate::aws::login`], and nothing here reads or writes the AWS
 //! CLI's token cache (decision 74, narrowed by 110).
 //!
+//! Whether a helper may talk to the user is decided by the caller, through
+//! [`Prompt`]. The command line honours the kubeconfig's `interactiveMode`;
+//! the dashboard, which has drawn over the terminal the helper would talk to,
+//! never lets it (decision 120).
+//!
 //! [`parse`], [`due`], [`interactive`] and [`exec_info`] are pure, so every
 //! shape of document a helper might print is a fixture. [`run`] is the only
 //! function with a process in it.
@@ -112,6 +117,19 @@ pub enum Error {
         command: String,
         limit: std::time::Duration,
     },
+
+    /// It failed, or printed something other than a credential, after being
+    /// refused a terminal its own `interactiveMode` would have given it —
+    /// see [`Prompt::Never`]. Kept apart from [`Error::Failed`] and
+    /// [`Error::Unreadable`] because the cure is different: not "fix the
+    /// helper", but "run it somewhere it can ask".
+    #[error("`{command}` failed without a terminal to ask on: {detail}")]
+    Muted {
+        command: String,
+        /// The last thing it said on stderr, or why its output was not a
+        /// credential.
+        detail: String,
+    },
 }
 
 impl Error {
@@ -122,7 +140,8 @@ impl Error {
             Self::Start { command, .. }
             | Self::Failed { command, .. }
             | Self::Unreadable { command, .. }
-            | Self::Stalled { command, .. } => command,
+            | Self::Stalled { command, .. }
+            | Self::Muted { command, .. } => command,
         }
     }
 }
@@ -167,6 +186,41 @@ pub fn due(expires: Option<Timestamp>, now: Timestamp) -> bool {
         Some(at) => at
             .checked_sub(SKEW)
             .map_or(true, |refresh_at| now >= refresh_at),
+    }
+}
+
+/// Who decides whether a helper may talk to the user.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Prompt {
+    /// The kubeconfig does, through `interactiveMode`, read by [`interactive`]
+    /// the way client-go reads it. Every command-line listing, and the
+    /// dashboard's `L`, which hands the helper the real terminal on purpose.
+    AsConfigured,
+    /// Nobody: `/dev/null` stdin, captured stderr, `interactive: false` in the
+    /// exec info, whatever the block says. Every fetch the dashboard starts,
+    /// because the terminal a prompt would go to is in raw mode behind the
+    /// alternate screen, and the keys an answer would come from belong to
+    /// `App::on_key`.
+    Never,
+}
+
+impl Prompt {
+    /// Whether a helper whose block says `mode` may prompt, with stdin a
+    /// terminal or not.
+    #[must_use]
+    pub fn allows(self, mode: Option<&ExecInteractiveMode>, stdin_is_terminal: bool) -> bool {
+        match self {
+            Self::AsConfigured => interactive(mode, stdin_is_terminal),
+            Self::Never => false,
+        }
+    }
+
+    /// Whether this policy took away a terminal the block would have had —
+    /// which is what makes a failure [`Error::Muted`] rather than the helper's
+    /// own fault.
+    #[must_use]
+    pub fn muted(self, mode: Option<&ExecInteractiveMode>, stdin_is_terminal: bool) -> bool {
+        interactive(mode, stdin_is_terminal) && !self.allows(mode, stdin_is_terminal)
     }
 }
 
@@ -289,7 +343,8 @@ pub fn parse(stdout: &[u8]) -> Result<Credential, String> {
 
 /// Run the context's credential helper once, and read what it prints.
 ///
-/// `auth` is the context's `AuthInfo`; callers check [`helper_of`] first. The
+/// `auth` is the context's `AuthInfo`; callers check [`helper_of`] first.
+/// `prompt` says whether it may talk to the user; see [`Prompt`]. The
 /// child is killed if this future is dropped before it exits, which is the
 /// whole reason this exists: every caller races it against a budget, and
 /// losing that race has to stop the helper rather than stop watching it.
@@ -297,7 +352,7 @@ pub fn parse(stdout: &[u8]) -> Result<Credential, String> {
 /// No budget is taken here. The two callers spend theirs differently — see
 /// [`crate::k8s::client::build`] and [`crate::k8s::auth`] — and a timeout is
 /// a thing to put around a future, not to thread through it.
-pub async fn run(auth: &AuthInfo) -> Result<Credential, Error> {
+pub async fn run(auth: &AuthInfo, prompt: Prompt) -> Result<Credential, Error> {
     let command = client::helper_command(auth).unwrap_or_default();
     let start = |source: io::Error| Error::Start {
         command: command.clone(),
@@ -313,10 +368,10 @@ pub async fn run(auth: &AuthInfo) -> Result<Credential, Error> {
         .as_deref()
         .ok_or_else(|| start(io::Error::other("its `exec` block names no command")))?;
 
-    let talks = interactive(
-        exec.interactive_mode.as_ref(),
-        std::io::IsTerminal::is_terminal(&io::stdin()),
-    );
+    let stdin_is_terminal = std::io::IsTerminal::is_terminal(&io::stdin());
+    let mode = exec.interactive_mode.as_ref();
+    let talks = prompt.allows(mode, stdin_is_terminal);
+    let muted = prompt.muted(mode, stdin_is_terminal);
     let info = exec_info(exec, talks).map_err(|error| start(io::Error::other(error)))?;
 
     let mut child = tokio::process::Command::new(program);
@@ -337,6 +392,18 @@ pub async fn run(auth: &AuthInfo) -> Result<Credential, Error> {
         // an immediate end of file rather than a wait on a pipe.
         child.stdin(Stdio::null()).stderr(Stdio::piped());
     }
+    #[cfg(unix)]
+    if prompt == Prompt::Never {
+        // A helper that skips stdin and opens `/dev/tty` itself — Python's
+        // `getpass` does — would still read the dashboard's keystrokes. In a
+        // process group of its own it is a background job to the terminal,
+        // and the terminal refuses its read: `EIO` at once, in practice, so it
+        // fails and is reported as muted. Were it stopped by `SIGTTIN`
+        // instead, the budget would kill it. Not done for `AsConfigured`:
+        // decision 114's reason, an interactive helper in a background group
+        // cannot ask anything.
+        child.process_group(0);
+    }
 
     let output = child
         .spawn()
@@ -345,15 +412,49 @@ pub async fn run(auth: &AuthInfo) -> Result<Credential, Error> {
         .await
         .map_err(start)?;
 
-    if !output.status.success() {
-        return Err(Error::Failed {
-            command,
+    let outcome = if output.status.success() {
+        parse(&output.stdout).map_err(|reason| Error::Unreadable {
+            command: command.clone(),
+            reason,
+        })
+    } else {
+        Err(Error::Failed {
+            command: command.clone(),
             status: output.status,
             stderr: last_line(&output.stderr),
-        });
-    }
+        })
+    };
 
-    parse(&output.stdout).map_err(|reason| Error::Unreadable { command, reason })
+    match outcome {
+        Err(error) if muted => Err(mute(error)),
+        outcome => outcome,
+    }
+}
+
+/// Re-read a helper's failure as one that may only have been for want of a
+/// terminal. Pure, so the mapping is a table in the tests.
+fn mute(error: Error) -> Error {
+    match error {
+        Error::Failed {
+            command,
+            status,
+            stderr,
+        } => Error::Muted {
+            command,
+            detail: if stderr.is_empty() {
+                format!("it exited with {status}")
+            } else {
+                stderr
+            },
+        },
+        Error::Unreadable { command, reason } => Error::Muted {
+            command,
+            detail: reason,
+        },
+        // Neither could have been caused by a missing terminal: one never
+        // started, and the other is about the clock, said in its own words.
+        other @ (Error::Start { .. } | Error::Stalled { .. } | Error::Muted { .. }) => other,
+    }
 }
 
 /// The last non-blank line of what a helper wrote to stderr — where every CLI
@@ -612,7 +713,7 @@ mod tests {
     async fn a_helper_that_prints_a_credential_is_run_and_read() {
         let auth = sh(r#"echo '{"status": {"token": "from-sh"}}'"#);
 
-        let credential = run(&auth).await.unwrap();
+        let credential = run(&auth, Prompt::AsConfigured).await.unwrap();
 
         assert_eq!(credential.secret, Secret::Token("from-sh".to_owned()));
     }
@@ -636,7 +737,7 @@ exec:
 "#
         ));
 
-        run(&auth).await.unwrap();
+        run(&auth, Prompt::AsConfigured).await.unwrap();
 
         let seen = std::fs::read_to_string(seen).unwrap();
         let (profile, info) = seen.split_once('\n').unwrap();
@@ -651,7 +752,9 @@ exec:
     async fn a_helper_that_fails_reports_the_last_thing_it_said() {
         let auth = sh("echo 'working...' >&2; echo 'Error loading SSO Token' >&2; exit 255");
 
-        let error = run(&auth).await.expect_err("it exited 255");
+        let error = run(&auth, Prompt::AsConfigured)
+            .await
+            .expect_err("it exited 255");
 
         let Error::Failed { stderr, .. } = &error else {
             panic!("{error:?}");
@@ -664,7 +767,9 @@ exec:
     async fn a_helper_that_prints_something_else_is_unreadable_and_named() {
         let auth = sh("echo 'hello'");
 
-        let error = run(&auth).await.expect_err("hello is not a credential");
+        let error = run(&auth, Prompt::AsConfigured)
+            .await
+            .expect_err("hello is not a credential");
 
         assert!(matches!(error, Error::Unreadable { .. }), "{error:?}");
         assert!(error.to_string().contains("sh -c"), "{error}");
@@ -676,7 +781,9 @@ exec:
             "exec:\n  command: eks-test-no-such-credential-helper\n  interactiveMode: Never\n",
         );
 
-        let error = run(&auth).await.expect_err("it does not exist");
+        let error = run(&auth, Prompt::AsConfigured)
+            .await
+            .expect_err("it does not exist");
 
         assert!(matches!(error, Error::Start { .. }), "{error:?}");
         assert_eq!(error.command(), "eks-test-no-such-credential-helper");
@@ -686,7 +793,9 @@ exec:
     async fn an_exec_block_with_no_command_cannot_be_started_rather_than_panicking() {
         let auth = exec_auth("exec:\n  args: ['get-token']\n");
 
-        let error = run(&auth).await.expect_err("there is nothing to run");
+        let error = run(&auth, Prompt::AsConfigured)
+            .await
+            .expect_err("there is nothing to run");
 
         assert!(matches!(error, Error::Start { .. }), "{error:?}");
     }
@@ -697,14 +806,220 @@ exec:
         // would wait for somebody to type.
         let auth = sh(r#"read answer || echo '{"status": {"token": "nobody-answered"}}'"#);
 
-        let credential = tokio::time::timeout(std::time::Duration::from_secs(10), run(&auth))
-            .await
-            .expect("a helper with no stdin cannot wait on it")
-            .unwrap();
+        let credential = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            run(&auth, Prompt::AsConfigured),
+        )
+        .await
+        .expect("a helper with no stdin cannot wait on it")
+        .unwrap();
 
         assert_eq!(
             credential.secret,
             Secret::Token("nobody-answered".to_owned())
         );
+    }
+
+    // --- Prompt::Never: the dashboard's helpers ------------------------------
+
+    #[test]
+    fn a_helper_run_for_the_dashboard_may_never_prompt_whatever_its_block_says() {
+        use ExecInteractiveMode::{Always, IfAvailable, Never};
+
+        for mode in [Some(&Always), Some(&IfAvailable), Some(&Never), None] {
+            for terminal in [true, false] {
+                assert!(!Prompt::Never.allows(mode, terminal), "{mode:?} {terminal}");
+                assert_eq!(
+                    Prompt::AsConfigured.allows(mode, terminal),
+                    interactive(mode, terminal),
+                    "{mode:?} {terminal}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_helper_is_muted_only_when_the_policy_took_a_terminal_it_would_have_had() {
+        use ExecInteractiveMode::{Always, IfAvailable, Never};
+
+        // The dashboard, with a terminal in front of it.
+        assert!(Prompt::Never.muted(Some(&Always), true));
+        assert!(Prompt::Never.muted(Some(&IfAvailable), true));
+        assert!(Prompt::Never.muted(None, true));
+        // A block that never prompts lost nothing, so its failures are its own.
+        assert!(!Prompt::Never.muted(Some(&Never), true));
+        // Nor did one with no terminal to lose.
+        assert!(!Prompt::Never.muted(None, false));
+        // The command line takes nothing away.
+        for mode in [Some(&Always), Some(&IfAvailable), Some(&Never), None] {
+            assert!(!Prompt::AsConfigured.muted(mode, true), "{mode:?}");
+        }
+    }
+
+    fn exit(code: i32) -> ExitStatus {
+        // A real status rather than a constructed one, which is not portable.
+        std::process::Command::new("sh")
+            .args(["-c", &format!("exit {code}")])
+            .status()
+            .unwrap()
+    }
+
+    #[test]
+    fn a_muted_failure_keeps_what_the_helper_said_about_it() {
+        let failed = mute(Error::Failed {
+            command: "aws eks get-token".to_owned(),
+            status: exit(255),
+            stderr: "Enter MFA code for arn:aws:iam::1:mfa/me:".to_owned(),
+        });
+        let Error::Muted { command, detail } = &failed else {
+            panic!("{failed:?}");
+        };
+        assert_eq!(command, "aws eks get-token");
+        assert_eq!(detail, "Enter MFA code for arn:aws:iam::1:mfa/me:");
+
+        let silent = mute(Error::Failed {
+            command: "aws".to_owned(),
+            status: exit(1),
+            stderr: String::new(),
+        });
+        let Error::Muted { detail, .. } = &silent else {
+            panic!("{silent:?}");
+        };
+        assert!(detail.starts_with("it exited with"), "{detail}");
+
+        let unreadable = mute(Error::Unreadable {
+            command: "aws".to_owned(),
+            reason: "it printed nothing".to_owned(),
+        });
+        assert!(
+            matches!(&unreadable, Error::Muted { detail, .. } if detail == "it printed nothing"),
+            "{unreadable:?}"
+        );
+    }
+
+    #[test]
+    fn a_helper_that_never_started_or_ran_out_of_time_is_not_called_muted() {
+        let start = mute(Error::Start {
+            command: "aws".to_owned(),
+            source: io::Error::other("not found"),
+        });
+        assert!(matches!(start, Error::Start { .. }), "{start:?}");
+
+        let stalled = mute(Error::Stalled {
+            command: "aws".to_owned(),
+            limit: std::time::Duration::from_secs(30),
+        });
+        assert!(matches!(stalled, Error::Stalled { .. }), "{stalled:?}");
+    }
+
+    #[tokio::test]
+    async fn a_dashboard_helper_gets_no_stdin_no_terminal_and_is_told_it_cannot_prompt() {
+        // `interactiveMode: Always`, the strongest claim a block can make, and
+        // still nothing: `Never` is the policy's to set, not the block's.
+        let dir = tempfile::tempdir().unwrap();
+        let auth = exec_auth(&fixtures::recording_helper(
+            dir.path(),
+            r#"echo '{"status": {"token": "t"}}'"#,
+        ));
+
+        run(&auth, Prompt::Never).await.unwrap();
+
+        let (interactive, stdin, group) = fixtures::recorded(dir.path());
+        assert!(!interactive);
+        assert_eq!(stdin, "null");
+        // A background job to the terminal, so a helper that opens `/dev/tty`
+        // itself cannot read the dashboard's keys either.
+        assert_eq!(group, "own");
+    }
+
+    #[tokio::test]
+    async fn the_command_line_still_hands_an_always_helper_the_terminal_it_asks_for() {
+        let dir = tempfile::tempdir().unwrap();
+        let auth = exec_auth(&fixtures::recording_helper(
+            dir.path(),
+            r#"echo '{"status": {"token": "t"}}'"#,
+        ));
+
+        run(&auth, Prompt::AsConfigured).await.unwrap();
+
+        let (interactive, _, group) = fixtures::recorded(dir.path());
+        assert!(interactive);
+        // In the foreground group, where an answer can be typed.
+        assert_eq!(group, "shared");
+    }
+
+    #[tokio::test]
+    async fn a_dashboard_helper_that_wanted_to_ask_fails_as_muted_with_its_question() {
+        let dir = tempfile::tempdir().unwrap();
+        let auth = exec_auth(&fixtures::recording_helper(dir.path(), "exit 1"));
+
+        let error = run(&auth, Prompt::Never).await.expect_err("it exits 1");
+
+        let Error::Muted { detail, .. } = &error else {
+            panic!("{error:?}");
+        };
+        assert_eq!(detail, "Enter MFA code:");
+    }
+
+    #[tokio::test]
+    async fn a_dashboard_helper_that_never_prompts_fails_in_its_own_words() {
+        // `interactiveMode: Never` lost nothing to the dashboard's policy, so
+        // its failure is the one the command line would report.
+        let auth = sh("echo 'Error loading SSO Token' >&2; exit 255");
+
+        let error = run(&auth, Prompt::Never).await.expect_err("it exits 255");
+
+        assert!(matches!(error, Error::Failed { .. }), "{error:?}");
+    }
+}
+
+/// Credential helpers that report how they were run, for the tests here and
+/// in the modules that run helpers through this one.
+#[cfg(test)]
+pub(crate) mod fixtures {
+    #![allow(clippy::unwrap_used)]
+
+    use std::path::Path;
+
+    /// An `exec` block (as YAML, under `exec:`) that says `interactiveMode:
+    /// Always` and records, in `dir`, what it was given: the exec info,
+    /// whether stdin is `/dev/null`, and whether it leads its own process
+    /// group. It writes `Enter MFA code:` to stderr, then does `then`.
+    pub(crate) fn recording_helper(dir: &Path, then: &str) -> String {
+        let script = format!(
+            r#"printf '%s' "$KUBERNETES_EXEC_INFO" > {info}; if [ /dev/stdin -ef /dev/null ]; then echo null; else echo other; fi > {stdin}; if [ "$(ps -o pgid= -p $$ | tr -d ' ')" = "$$" ]; then echo own; else echo shared; fi > {group}; echo 'Enter MFA code:' >&2; {then}"#,
+            info = dir.join("info").display(),
+            stdin = dir.join("stdin").display(),
+            group = dir.join("group").display(),
+        );
+        format!(
+            "exec:\n  apiVersion: client.authentication.k8s.io/v1beta1\n  command: sh\n  args: ['-c', {script:?}]\n  interactiveMode: Always\n"
+        )
+    }
+
+    /// A whole kubeconfig whose one context, `prod`, points at `server` and
+    /// runs [`recording_helper`].
+    pub(crate) fn recording_kubeconfig(dir: &Path, server: &str, then: &str) -> String {
+        let mut user = String::new();
+        for line in recording_helper(dir, then).lines() {
+            user.push_str("      ");
+            user.push_str(line);
+            user.push('\n');
+        }
+        format!(
+            "apiVersion: v1\nkind: Config\ncurrent-context: prod\nclusters:\n  - name: prod\n    cluster:\n      server: {server}\ncontexts:\n  - name: prod\n    context:\n      cluster: prod\n      user: prod\nusers:\n  - name: prod\n    user:\n{user}"
+        )
+    }
+
+    /// What [`recording_helper`] wrote: its exec info's `interactive`, its
+    /// stdin (`null` or `other`), and its process group (`own` or `shared`).
+    pub(crate) fn recorded(dir: &Path) -> (bool, String, String) {
+        let read = |name: &str| std::fs::read_to_string(dir.join(name)).unwrap();
+        let info: serde_json::Value = serde_json::from_str(&read("info")).unwrap();
+        (
+            info["spec"]["interactive"].as_bool().unwrap_or(true),
+            read("stdin").trim().to_owned(),
+            read("group").trim().to_owned(),
+        )
     }
 }

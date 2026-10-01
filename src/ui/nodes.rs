@@ -681,10 +681,10 @@ mod tests {
             Order::default(),
             Direction::default(),
             "",
-            Some("Press L to log in to AWS and try again."),
+            Some("Press L to sign in again and retry."),
         );
 
-        assert!(rendered.contains("Press L to log in"), "{rendered}");
+        assert!(rendered.contains("Press L to sign in again"), "{rendered}");
     }
 
     #[test]
@@ -704,11 +704,11 @@ mod tests {
             Order::default(),
             Direction::default(),
             "",
-            Some("Press L to log in to AWS and try again."),
+            Some("Press L to sign in again and retry."),
         );
 
         assert!(rendered.contains("Last refresh failed"), "{rendered}");
-        assert!(rendered.contains("Press L to log in"), "{rendered}");
+        assert!(rendered.contains("Press L to sign in again"), "{rendered}");
         assert!(rendered.contains("worker-1"), "{rendered}");
     }
 

@@ -17,6 +17,7 @@ use eks::cli::{Cli, Command, GlobalArgs};
 use eks::commands::{self, completions, contexts, credentials, nodes, pods};
 use eks::config::{self, Config};
 use eks::format::Width;
+use eks::k8s::auth::Store;
 use eks::k8s::nodes::Order as NodeOrder;
 use eks::k8s::order::Direction;
 use eks::k8s::page::Budget;
@@ -296,6 +297,14 @@ fn dashboard(
         commands::block_on(credentials::preflight(paths, &cluster, login))?;
     }
 
+    // The credentials every fetcher below shares, one per context. Building
+    // the fetchers over it is what keeps their credential helpers off the
+    // terminal `ui::run` is about to take: a `Store` only ever runs one
+    // without stdin, stderr, or `interactive` (decision 120). `L` is the one
+    // thing that runs a helper in the foreground, and it hands what that
+    // prints to this same store.
+    let store = Store::new();
+
     // Every fetch after this one — `r`, the refresh interval, a different
     // cluster selected in the sidebar — goes through this closure too, so
     // `ui::run` never has to know how a `NodesFetch` is built, only how to
@@ -303,12 +312,14 @@ fn dashboard(
     let spawn_nodes: ui::NodesFetcher = {
         let config = config.clone();
         let paths = paths.to_vec();
+        let store = store.clone();
         Box::new(move |context: &str| {
             nodes::spawn_gather(
                 config.clone(),
                 paths.clone(),
                 Some(context.to_owned()),
                 budget,
+                store.clone(),
             )
         })
     };
@@ -325,6 +336,7 @@ fn dashboard(
     let spawn_pods: ui::PodsFetcher = {
         let config = config.clone();
         let paths = paths.to_vec();
+        let store = store.clone();
         Box::new(move |context: &str, node: &str, selectors: &Selectors| {
             pods::spawn_gather_for_node(
                 config.clone(),
@@ -333,6 +345,7 @@ fn dashboard(
                 node.to_owned(),
                 selectors.clone(),
                 budget,
+                store.clone(),
             )
         })
     };
@@ -344,6 +357,7 @@ fn dashboard(
     let spawn_containers: ui::ContainersFetcher = {
         let config = config.clone();
         let paths = paths.to_vec();
+        let store = store.clone();
         Box::new(move |context: &str, namespace: &str, pod: &str| {
             pods::spawn_gather_containers(
                 config.clone(),
@@ -352,6 +366,7 @@ fn dashboard(
                 namespace.to_owned(),
                 pod.to_owned(),
                 budget,
+                store.clone(),
             )
         })
     };
@@ -364,6 +379,7 @@ fn dashboard(
     let spawn_logs: ui::LogsFetcher = {
         let config = config.clone();
         let paths = paths.to_vec();
+        let store = store.clone();
         Box::new(
             move |context: &str, namespace: &str, pod: &str, container: &str, previous: bool| {
                 pods::spawn_stream_logs(
@@ -377,6 +393,7 @@ fn dashboard(
                         previous,
                     },
                     budget,
+                    store.clone(),
                 )
             },
         )
@@ -396,31 +413,38 @@ fn dashboard(
         spawn_logs: &spawn_logs,
     };
 
-    // What `L` runs. Unlike the four fetchers above it does not spawn a thread:
-    // it blocks, because it owns the terminal `ui::run` hands back to it, and a
-    // browser login is a thing to wait for rather than to poll.
-    //
-    // `retry_login`, not `preflight`: the key only appears once a background
-    // fetch has already been refused, so the token cache `preflight` would
-    // re-read has already been proven stale — consulting it again would leave
-    // `L` doing nothing whenever the cache still called the dead session
-    // valid. `retry_login` always logs in without asking and reports plainly
-    // when there was nothing an Identity Center login could have fixed,
-    // rather than the two of those reading as the identical "flash and
-    // return" a bare `Ok(())` for both would give the event loop.
-    let login: ui::LoginRunner = {
-        let config = config.clone();
-        let paths = paths.to_vec();
-        Box::new(move |context: &str| {
-            let views = contexts::views(&config);
-            let cluster = contexts::resolve_selector(&views, context)
-                .map_err(|error| format!("{error:#}"))?;
-            commands::block_on(credentials::retry_login(&paths, cluster))
-                .map_err(|error| format!("{error:#}"))
-        })
-    };
+    let login = login_runner(config, paths, budget, store);
 
     ui::run(app, nodes_rx, &spawn_nodes, &drill, refresh, &login)
+}
+
+/// What `L` runs. Unlike the dashboard's four fetchers it does not spawn a
+/// thread: it blocks, because it owns the terminal `ui::run` hands back to it,
+/// and a browser login or a helper's prompt is a thing to wait for rather than
+/// to poll.
+///
+/// `retry_login`, not `preflight`: the key only appears once a background
+/// fetch has already been refused, so the token cache `preflight` would
+/// re-read has already been proven stale. `retry_login` logs in without asking
+/// when there is an Identity Center session to refresh, then runs the
+/// credential helper in the foreground — where, unlike in the fetchers, it may
+/// prompt — and seeds `store` with what it prints, so the refetch that follows
+/// sends it.
+fn login_runner(
+    config: &KubeConfig,
+    paths: &[PathBuf],
+    budget: Budget,
+    store: Store,
+) -> ui::LoginRunner {
+    let config = config.clone();
+    let paths = paths.to_vec();
+    Box::new(move |context: &str| {
+        let views = contexts::views(&config);
+        let cluster =
+            contexts::resolve_selector(&views, context).map_err(|error| format!("{error:#}"))?;
+        commands::block_on(credentials::retry_login(&paths, cluster, budget, &store))
+            .map_err(|error| format!("{error:#}"))
+    })
 }
 
 /// Print a command's output, skipping the newline for empty results so
