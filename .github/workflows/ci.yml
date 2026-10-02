@@ -154,7 +154,7 @@ jobs:
       # falling back to master's, is what makes a pull request's numbers read
       # as "versus master" instead of "versus nothing."
       - name: Restore benchmark history
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v6
         with:
           path: target/criterion
           key: criterion-${{ runner.os }}-${{ github.ref_name }}-${{ github.sha }}
@@ -191,7 +191,7 @@ jobs:
       # which is not a reason to fail a job whose whole purpose is reporting.
       - name: Save benchmark history
         if: always()
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@v6
         continue-on-error: true
         with:
           path: target/criterion

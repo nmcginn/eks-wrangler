@@ -128,7 +128,7 @@ jobs:
       # whose anonymous pull limit is shared across a runner's tenants.
       - name: Register QEMU for foreign-architecture containers
         if: matrix.glibc && matrix.platform != 'linux/amd64'
-        uses: docker/setup-qemu-action@v3
+        uses: docker/setup-qemu-action@v4
         with:
           platforms: ${{ matrix.platform }}
 
