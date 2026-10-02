@@ -1032,8 +1032,8 @@ mod tests {
 
     #[test]
     fn rows_returns_nothing_for_loading_or_error() {
-        assert!(NodesState::Loading.rows().is_empty());
-        assert!(NodesState::Error("nope".to_owned()).rows().is_empty());
+        assert_eq!(NodesState::Loading.rows(), []);
+        assert_eq!(NodesState::Error("nope".to_owned()).rows(), []);
     }
 
     #[test]

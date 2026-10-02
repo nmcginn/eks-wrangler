@@ -874,8 +874,8 @@ mod tests {
 
     #[test]
     fn rows_returns_nothing_for_loading_or_error() {
-        assert!(PodsState::Loading.rows().is_empty());
-        assert!(PodsState::Error("nope".to_owned()).rows().is_empty());
+        assert_eq!(PodsState::Loading.rows(), []);
+        assert_eq!(PodsState::Error("nope".to_owned()).rows(), []);
     }
 
     #[test]
@@ -1103,7 +1103,7 @@ mod tests {
         // `node_facts_lines` returns nothing at all for `None`, rather than
         // five dashes — there is a real difference between "this node has
         // reported none of its wide facts" and "there is no node to ask".
-        assert!(node_facts_lines(None, Theme::dark()).is_empty());
+        assert_eq!(node_facts_lines(None, Theme::dark()), []);
     }
 
     /// A pod reporting one requested device, for the `--sort-resource` tests.
