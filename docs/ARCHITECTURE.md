@@ -10,6 +10,8 @@ src/
   kubeconfig.rs        Reading and safely rewriting kubeconfig files.
   cluster.rs           Turning kubeconfig entries into human-facing views.
   format.rs            Ages and aligned tables — pure string formatting.
+  json.rs              `--json`: the same rows as data — numbers in base
+                       units, RFC 3339 instants, `null` for unknown.
   theme.rs             The entire colour palette, the severity thresholds, and
                        the CLI's colour palette and escape sequences.
   progress.rs          The one line on stderr saying what a command is still

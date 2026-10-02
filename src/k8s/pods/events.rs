@@ -343,7 +343,7 @@ mod tests {
 
     #[test]
     fn an_empty_listing_produces_no_rows() {
-        assert!(from_events(&[], now()).is_empty());
+        assert_eq!(from_events(&[], now()), []);
     }
 
     #[test]

@@ -123,6 +123,10 @@ Nothing is scheduled. Pull the next task up from **Ideas** below.
 - [x] MSRV verification job. (118)
 - [x] Install story: checksum-verifying `install.sh` and a release-rendered `Formula/eks.rb`. (113, 119)
 
+### Milestone 5 — Scripting
+
+- [x] `--json` on every read command: `contexts`, `current`, `nodes`, `pods`. (122)
+
 ---
 
 ## Ideas, not yet scheduled
@@ -136,4 +140,3 @@ Pull these up into a milestone when they become the most valuable next thing.
 - Cost attribution per namespace or workload.
 - CloudWatch and control-plane log integration.
 - Watch-based incremental updates instead of polling.
-- A `--json` output mode across every read command for scripting.
