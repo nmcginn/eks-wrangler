@@ -3,7 +3,7 @@
 use std::path::PathBuf;
 use std::sync::mpsc;
 
-use anyhow::{Result, anyhow};
+use anyhow::{Context as _, Result, anyhow};
 use futures_util::io::AsyncBufReadExt;
 use futures_util::stream::StreamExt;
 use k8s_openapi::api::core::v1::Pod;
@@ -14,6 +14,7 @@ use crate::aws::LoginMode;
 use crate::cluster::ClusterView;
 use crate::commands::{self, StreamHandle, credentials, nodes::target_cluster};
 use crate::format::Width;
+use crate::json::{self, Output};
 use crate::k8s::auth::Store;
 use crate::k8s::metrics::{self as k8s_metrics};
 use crate::k8s::order::Direction;
@@ -67,6 +68,9 @@ pub struct Request<'a> {
     /// Whether the graded cells are written in colour. Decided in `main`,
     /// where stdout is, so nothing below here asks what a terminal is.
     pub palette: Palette,
+    /// `--json`: the same rows, as one document rather than a table. Makes
+    /// `width` and `palette` moot — see [`json`]'s module docs.
+    pub output: Output,
     /// `--timeout`, spent per step rather than per command — a namespace big
     /// enough to be read in several pages should not be cut off for its size.
     /// The first step is the credential helper, which `k8s::connect` runs as a
@@ -319,6 +323,21 @@ pub async fn list(
         SortBy::Resource(resource) => {
             k8s_pods::sort_by_device(&mut rows, resource, request.direction);
         }
+    }
+
+    if request.output == Output::Json {
+        let notes = json::notes(&json::NoteInputs {
+            // A pod listing's own pods failing ended the command above, so
+            // there is no second listing whose absence needs explaining.
+            requests: None,
+            usage: json::failure(&usage),
+            usage_shown: k8s_pods::shows_usage(&rows),
+            samples: &samples,
+            now,
+            label: &label,
+        });
+        return json::pods(&target, &scope, &rows, &notes)
+            .context("could not write the pod listing as JSON");
     }
 
     let notes = notes(&NoteInputs {

@@ -175,6 +175,12 @@ pub enum Command {
         /// Print only context names, one per line, for scripting.
         #[arg(long, short = 'q')]
         quiet: bool,
+
+        /// Print the contexts as one JSON document instead of the table: each
+        /// context's name, short cluster name, region, account, namespace,
+        /// and whether it is the current one.
+        #[arg(long, conflicts_with = "quiet")]
+        json: bool,
     },
 
     /// List the nodes of a cluster.
@@ -203,6 +209,13 @@ pub enum Command {
         /// `kubectl get nodes -o wide` does.
         #[arg(long)]
         wide: bool,
+
+        /// Print one JSON document instead of the table, for scripting:
+        /// quantities as numbers in base units (cores, bytes, counts), times
+        /// as RFC 3339, and `null` wherever the table prints `-`. Every field
+        /// is included, so `--wide` changes nothing here.
+        #[arg(long)]
+        json: bool,
     },
 
     /// List the pods of a namespace, or of every namespace.
@@ -239,6 +252,13 @@ pub enum Command {
         /// `kubectl get pods -o wide` does.
         #[arg(long)]
         wide: bool,
+
+        /// Print one JSON document instead of the table, for scripting:
+        /// quantities as numbers in base units (cores, bytes, counts), times
+        /// as RFC 3339, and `null` wherever the table prints `-`. Every field
+        /// is included, so `--wide` changes nothing here.
+        #[arg(long)]
+        json: bool,
     },
 
     /// Switch the active cluster.
@@ -248,7 +268,12 @@ pub enum Command {
     },
 
     /// Print the active cluster.
-    Current,
+    Current {
+        /// Print the context as a JSON document, in the shape `eks contexts
+        /// --json` lists each one.
+        #[arg(long)]
+        json: bool,
+    },
 
     /// Print a shell completion script to stdout, e.g.
     /// `eks completions zsh > "${fpath[1]}/_eks"`.
@@ -409,6 +434,88 @@ mod tests {
         assert_eq!(sort_resource.as_deref(), Some("nvidia.com/gpu"));
         assert!(sort_reverse);
         assert!(wide);
+    }
+
+    #[test]
+    fn every_read_command_takes_json() {
+        assert!(matches!(
+            parse(&["eks", "contexts", "--json"]).command,
+            Some(Command::Contexts { json: true, .. })
+        ));
+        assert!(matches!(
+            parse(&["eks", "current", "--json"]).command,
+            Some(Command::Current { json: true })
+        ));
+        assert!(matches!(
+            parse(&["eks", "nodes", "--json"]).command,
+            Some(Command::Nodes { json: true, .. })
+        ));
+        assert!(matches!(
+            parse(&["eks", "pods", "--json"]).command,
+            Some(Command::Pods { json: true, .. })
+        ));
+    }
+
+    #[test]
+    fn json_is_off_unless_asked_for() {
+        for args in [
+            vec!["eks", "contexts"],
+            vec!["eks", "current"],
+            vec!["eks", "nodes"],
+            vec!["eks", "pods"],
+        ] {
+            let json = match parse(&args).command {
+                Some(
+                    Command::Contexts { json, .. }
+                    | Command::Current { json }
+                    | Command::Nodes { json, .. }
+                    | Command::Pods { json, .. },
+                ) => json,
+                other => panic!("unexpected {other:?}"),
+            };
+            assert!(!json, "{args:?}");
+        }
+    }
+
+    #[test]
+    fn json_composes_with_the_flags_that_choose_and_order_the_rows() {
+        let cli = parse(&[
+            "eks",
+            "-l",
+            "app=api",
+            "pods",
+            "-A",
+            "--sort",
+            "cpu",
+            "--sort-reverse",
+            "--json",
+            "--wide",
+        ]);
+        let Some(Command::Pods {
+            all_namespaces,
+            sort,
+            sort_reverse,
+            json,
+            ..
+        }) = cli.command
+        else {
+            panic!("expected a Pods command");
+        };
+
+        assert!(all_namespaces && sort_reverse && json);
+        assert_eq!(sort, PodOrder::Cpu);
+        assert_eq!(cli.global.selector.as_deref(), Some("app=api"));
+    }
+
+    #[test]
+    fn contexts_refuses_quiet_and_json_together() {
+        // Two different answers to "what should a script get?" — refusing the
+        // pair beats silently picking one.
+        let error = Cli::try_parse_from(["eks", "contexts", "-q", "--json"])
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("--json"), "{error}");
+        assert!(error.contains("--quiet"), "{error}");
     }
 
     #[test]

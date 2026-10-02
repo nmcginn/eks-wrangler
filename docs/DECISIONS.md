@@ -978,3 +978,27 @@ Carries out decision 120.
   under `--timeout`, then `Store::seed`. It errors only with neither. After it,
   a failed container or log pane is refetched too, and a log stream refused
   for credentials arms `L` (`LogEvent::Refused`).
+
+### 122. `--json` is a per-command flag over the table's own rows, in base units, with `null` for unknown
+
+Pulled up from Ideas when Open was empty; the shape below is the reviewer's to
+change.
+
+- **Surface.** `--json` on `contexts`, `current`, `nodes`, `pods` — the read
+  commands. Not global (it means nothing to the dashboard or `use`), and not
+  `-o json`: one format does not need a format switch yet. Refuses `-q`.
+- **Same rows.** `json.rs` is pure over `NodeRow`/`PodRow`/`ClusterView`, after
+  sorting, so the two outputs cannot disagree. `--wide` and terminal narrowing
+  do not apply; every field is always present.
+- **Spelling.** Quantities are numbers in base units (cores, bytes, counts),
+  integers when whole. Instants are RFC 3339; the human ages are left out.
+  The tables' `-` becomes `null`. `ready` and `readiness_gates` are
+  `{ready, total}`, parsed back from the row's `1/2` text rather than widening
+  `PodRow` for one consumer.
+- **Document shape.** An object, never a bare array, so fields can be added.
+  Listings carry `cluster` and `notes`; pods also the `namespace` read.
+- **Notes.** Only what explains a `null` or dates usage, chosen through the
+  same `metrics::Outcome` as the footnotes and worded for fields. Ordering
+  notes are dropped: the array order is the answer. Prose, not a contract.
+- **Stability.** Field names are not versioned. Until a release says
+  otherwise, the schema may change with the tables.

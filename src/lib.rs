@@ -10,6 +10,7 @@ pub mod commands;
 pub mod config;
 pub mod format;
 pub mod fuzzy;
+pub mod json;
 pub mod k8s;
 pub mod kubeconfig;
 pub mod progress;
