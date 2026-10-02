@@ -182,7 +182,7 @@ mod tests {
     #[test]
     fn ranking_finds_nothing_in_an_empty_list() {
         let names: [&str; 0] = [];
-        assert!(rank("anything", &names, |s| *s).is_empty());
+        assert_eq!(rank("anything", &names, |s| *s), [] as [&&str; 0]);
     }
 
     #[test]
@@ -201,7 +201,7 @@ mod tests {
         let result = rank("wk5", &items, String::as_str);
         let elapsed = started.elapsed();
 
-        assert!(!result.is_empty());
+        assert_ne!(result, [] as [&String; 0]);
         assert!(elapsed < Duration::from_millis(100), "took {elapsed:?}");
     }
 }

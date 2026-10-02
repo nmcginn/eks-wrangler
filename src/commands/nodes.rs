@@ -3,13 +3,14 @@
 use std::path::PathBuf;
 use std::sync::mpsc;
 
-use anyhow::{Result, anyhow};
+use anyhow::{Context as _, Result, anyhow};
 use k8s_openapi::jiff::Timestamp;
 
 use crate::aws::LoginMode;
 use crate::cluster::ClusterView;
 use crate::commands::{self, contexts, credentials};
 use crate::format::Width;
+use crate::json::{self, Output};
 use crate::k8s::auth::Store;
 use crate::k8s::metrics::{self as k8s_metrics};
 use crate::k8s::order::Direction;
@@ -47,6 +48,9 @@ pub struct Request {
     /// Whether the graded cells are written in colour. Decided in `main`,
     /// where stdout is, so nothing below here asks what a terminal is.
     pub palette: Palette,
+    /// `--json`: the same rows, as one document rather than a table. Makes
+    /// `width` and `palette` moot — see [`json`]'s module docs.
+    pub output: Output,
     /// `--timeout`, spent per step rather than per command: each of the three
     /// listings below is read in pages, and a cluster large enough to need
     /// several of them should not be cut off for being large. The step before
@@ -75,6 +79,8 @@ pub struct Request {
 /// stops the CLI table and the pane from quietly answering the same question
 /// two different ways.
 struct Gathered {
+    /// The cluster that was read, for `--json`'s `cluster` object.
+    cluster: ClusterView,
     label: String,
     rows: Vec<k8s_nodes::NodeRow>,
     /// `Err` is already a sentence, via `k8s::explain`/`k8s_metrics::explain`.
@@ -197,6 +203,7 @@ async fn gather(
         .collect();
 
     Ok(Gathered {
+        cluster: target,
         label,
         rows,
         // The map of totals has done its job once it is folded into the rows
@@ -386,6 +393,7 @@ pub async fn list(
         resource,
         width,
         palette,
+        output,
         budget,
         login,
         progress,
@@ -394,6 +402,7 @@ pub async fn list(
     let ordering = ordering_for(order, resource)?;
 
     let Gathered {
+        cluster,
         label,
         mut rows,
         requests,
@@ -418,6 +427,19 @@ pub async fn list(
     match &ordering {
         SortBy::Order(order) => k8s_nodes::sort(&mut rows, *order, direction),
         SortBy::Resource(resource) => k8s_nodes::sort_by_device(&mut rows, resource, direction),
+    }
+
+    if output == Output::Json {
+        let notes = json::notes(&json::NoteInputs {
+            requests: Some(json::failure(&requests)),
+            usage: json::failure(&usage),
+            usage_shown: k8s_nodes::shows_usage(&rows),
+            samples: &samples,
+            now,
+            label: &label,
+        });
+        return json::nodes(&cluster, &rows, &notes)
+            .context("could not write the node listing as JSON");
     }
 
     let footnotes = footnotes(&FootnoteInputs {

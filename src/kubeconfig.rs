@@ -407,7 +407,7 @@ users:
     #[test]
     fn parses_empty_document_as_empty_config() {
         let config = KubeConfig::parse("   \n").unwrap();
-        assert!(config.contexts.is_empty());
+        assert_eq!(config.contexts, []);
         assert!(config.current_context.is_none());
     }
 
@@ -519,6 +519,9 @@ users:
             split_path_list(&joined),
             vec![PathBuf::from("/a"), PathBuf::from("/b")]
         );
-        assert!(split_path_list(&OsString::from("")).is_empty());
+        assert_eq!(
+            split_path_list(&OsString::from("")),
+            [] as [std::path::PathBuf; 0]
+        );
     }
 }

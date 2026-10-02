@@ -505,7 +505,7 @@ mod tests {
 
     #[test]
     fn a_pod_with_no_spec_at_all_has_no_containers() {
-        assert!(ContainerRow::from_pod(&Pod::default()).is_empty());
+        assert_eq!(ContainerRow::from_pod(&Pod::default()), []);
     }
 
     #[test]

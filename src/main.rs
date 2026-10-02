@@ -17,6 +17,7 @@ use eks::cli::{Cli, Command, GlobalArgs};
 use eks::commands::{self, completions, contexts, credentials, nodes, pods};
 use eks::config::{self, Config};
 use eks::format::Width;
+use eks::json::Output;
 use eks::k8s::auth::Store;
 use eks::k8s::nodes::Order as NodeOrder;
 use eks::k8s::order::Direction;
@@ -97,7 +98,11 @@ fn run(cli: Cli) -> Result<ExitCode> {
             )?;
             Ok(ExitCode::SUCCESS)
         }
-        Command::Contexts { quiet } => {
+        Command::Contexts { json: true, .. } => {
+            print_line(&contexts::list_json(&config)?);
+            Ok(ExitCode::SUCCESS)
+        }
+        Command::Contexts { quiet, json: false } => {
             print_line(&contexts::list(
                 &config,
                 quiet,
@@ -113,6 +118,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
             sort_reverse,
             sort_resource,
             wide,
+            json,
         } => run_nodes(
             &config,
             &paths,
@@ -121,7 +127,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
             sort,
             sort_reverse,
             sort_resource,
-            wide,
+            Layout { wide, json },
         ),
         Command::Pods {
             all_namespaces,
@@ -129,6 +135,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
             sort_reverse,
             sort_resource,
             wide,
+            json,
         } => run_pods(
             &config,
             &paths,
@@ -138,19 +145,32 @@ fn run(cli: Cli) -> Result<ExitCode> {
             sort,
             sort_reverse,
             sort_resource.as_deref(),
-            wide,
+            Layout { wide, json },
         ),
         Command::Use { name } => {
             print_line(&contexts::switch(&config, &name)?);
             Ok(ExitCode::SUCCESS)
         }
-        Command::Current => {
-            print_line(&contexts::current(&config)?);
+        Command::Current { json } => {
+            print_line(&if json {
+                contexts::current_json(&config)?
+            } else {
+                contexts::current(&config)?
+            });
             Ok(ExitCode::SUCCESS)
         }
         // Handled above, before a kubeconfig was ever read.
         Command::Completions { .. } | Command::Man => unreachable!("handled above"),
     }
+}
+
+/// `--wide` and `--json`, the two flags that decide how a listing is laid out
+/// rather than what it reads — paired so `run_nodes` and `run_pods` do not
+/// take two adjacent `bool`s that could be passed the wrong way round.
+#[derive(Debug, Clone, Copy)]
+struct Layout {
+    wide: bool,
+    json: bool,
 }
 
 /// `eks nodes`. Split out of [`run`] to keep that function's match arms
@@ -164,7 +184,7 @@ fn run_nodes(
     sort: NodeOrder,
     sort_reverse: bool,
     sort_resource: Option<String>,
-    wide: bool,
+    layout: Layout,
 ) -> Result<ExitCode> {
     let color = global.effective_color(user_config);
     let theme = resolved_theme(global, user_config);
@@ -179,8 +199,9 @@ fn run_nodes(
             order: sort,
             direction: Direction::reversed(sort_reverse),
             resource: sort_resource,
-            width: Width::for_terminal(wide, stdout_terminal_cols()),
+            width: Width::for_terminal(layout.wide, stdout_terminal_cols()),
             palette: stdout_palette(color, theme),
+            output: Output::json(layout.json),
             budget: global.timeout,
             login: global.login,
             progress: stderr_progress(global, color),
@@ -205,7 +226,7 @@ fn run_pods(
     sort: PodOrder,
     sort_reverse: bool,
     sort_resource: Option<&str>,
-    wide: bool,
+    layout: Layout,
 ) -> Result<ExitCode> {
     let color = global.effective_color(user_config);
     let theme = resolved_theme(global, user_config);
@@ -221,8 +242,9 @@ fn run_pods(
             order: sort,
             direction: Direction::reversed(sort_reverse),
             resource: sort_resource,
-            width: Width::for_terminal(wide, stdout_terminal_cols()),
+            width: Width::for_terminal(layout.wide, stdout_terminal_cols()),
             palette: stdout_palette(color, theme),
+            output: Output::json(layout.json),
             budget: global.timeout,
             login: global.login,
             progress: stderr_progress(global, color),

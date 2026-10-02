@@ -1167,7 +1167,7 @@ mod tests {
             for direction in DIRECTIONS {
                 let mut rows: Vec<PodRow> = Vec::new();
                 sort(&mut rows, order, direction);
-                assert!(rows.is_empty());
+                assert_eq!(rows, []);
             }
         }
     }

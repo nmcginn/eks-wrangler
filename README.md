@@ -77,6 +77,7 @@ eks nodes               # list the nodes of the active cluster
 eks pods -A             # list pods across every namespace
 eks use staging         # switch cluster
 eks current             # show the active cluster
+eks nodes --json        # any read command, as JSON for scripts
 ```
 
 Clusters are listed by short name rather than ARN:
@@ -478,6 +479,38 @@ window that ran them looks like — a script's columns must not depend on a
 terminal size it never sees. `--wide` also wins outright: it is a request for
 more columns, not for a table that gets out of the way.
 
+### JSON output
+
+`--json` prints any read command — `eks contexts`, `eks current`, `eks nodes`,
+`eks pods` — as one JSON document instead of a table, for `jq` and scripts:
+
+```sh
+eks nodes --json | jq -r '.nodes[] | select(.severity != "ok") | .name'
+eks pods -A --json | jq '[.pods[] | select(.restarts > 5)] | length'
+eks pods --json | jq '.pods[] | {name, cpu: .cpu.used, asked: .cpu.requested}'
+```
+
+The document is the same rows the table shows, spelled for a program:
+
+- **Numbers in base units.** CPU is cores (`0.25`, not `250m`), memory and
+  storage are bytes, pods and devices are counts. Whole numbers print as
+  integers.
+- **Instants, not ages.** `created_at` and `last_restart_at` are RFC 3339;
+  `3d` was only ever true at the moment it was printed.
+- **`null` where the table prints `-`.** A figure that could not be read is
+  `null`, never `0`: a node running nothing has `"requested": 0`, a node whose
+  pods could not be listed has `"requested": null`.
+- **Every field, every time.** `--wide`'s columns are always there, and nothing
+  is dropped for the terminal's width. `--sort`, `-l`, `-A` and the rest still
+  choose and order the rows.
+
+A listing wraps its rows with the `cluster` it read, and `notes`: the sentences
+that explain a `null` across the board (metrics-server missing, pods not
+listable) and how old the usage figures are. Notes are for a person reading a
+script's log, not for matching on. Errors still go to stderr with a non-zero
+exit, and stdout stays empty. `eks contexts --json` cannot be combined with
+`-q`, which answers the same question a different way.
+
 ### Options
 
 | Flag | Description |
@@ -490,6 +523,7 @@ more columns, not for a table that gets out of the way.
 | `--sort <ORDER>` | Order the listing. Pods: `name` (default), `restarts`, `age`, `cpu`, `memory`, `cpu-share`, `memory-share`. Nodes: `name` (default), `status`, `cpu`, `memory`, `cpu-requested`, `memory-requested`, `pods`, `age` |
 | `--sort-reverse` | Reverse `--sort`; unrankable rows stay at the end. Either flag adds a line under the table naming the order |
 | `--wide` | Add the extra columns `kubectl -o wide` shows. Pods: `IP`, `NOMINATED NODE`, `READINESS GATES`. Nodes: `INTERNAL-IP`, `EXTERNAL-IP`, `OS-IMAGE`, `KERNEL-VERSION`, `CONTAINER-RUNTIME` |
+| `--json` | Print the listing as JSON instead of a table (`eks contexts`, `eks current`, `eks nodes`, `eks pods`). See [JSON output](#json-output) |
 | `--kubeconfig <PATH>` | Override the kubeconfig search path |
 | `--timeout <DURATION>` | How long to wait for any one request to the cluster. Default `30s`; `0` waits for as long as it takes |
 | `--refresh <DURATION>` | How often the dashboard refreshes its panes in the background. Falls back to the config file's `refresh`, then to `15s`; `0` turns automatic refresh off (`r` still refreshes on demand) |

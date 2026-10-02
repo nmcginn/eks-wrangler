@@ -4,6 +4,7 @@ use anyhow::{Context as _, Result, anyhow, bail};
 
 use crate::cluster::ClusterView;
 use crate::format;
+use crate::json;
 use crate::kubeconfig::{self, KubeConfig};
 use crate::theme::Palette;
 
@@ -41,8 +42,34 @@ pub fn list(config: &KubeConfig, quiet: bool, palette: Palette) -> String {
     render_table(&views, palette)
 }
 
+/// `eks contexts --json`: every context, as data rather than a table.
+///
+/// No `quiet` counterpart: a script that wants only the names reads
+/// `.contexts[].context`, and `--json` refuses `-q` at parse time.
+pub fn list_json(config: &KubeConfig) -> Result<String> {
+    json::contexts(&views(config)).context("could not write the contexts as JSON")
+}
+
 /// Render `eks current`.
 pub fn current(config: &KubeConfig) -> Result<String> {
+    let view = current_view(config)?;
+    Ok(format!(
+        "{}\n  context   {}\n  namespace {}",
+        view.label(),
+        view.context_name,
+        view.namespace
+    ))
+}
+
+/// `eks current --json`. Fails exactly when [`current`] does, in the same
+/// words: a missing current context is an error to a script too, and an exit
+/// code says so better than a `null` would.
+pub fn current_json(config: &KubeConfig) -> Result<String> {
+    json::current(&current_view(config)?).context("could not write the context as JSON")
+}
+
+/// The context `current-context` names, or why there is none.
+fn current_view(config: &KubeConfig) -> Result<ClusterView> {
     let current = config
         .current()
         .ok_or_else(|| match &config.current_context {
@@ -52,13 +79,7 @@ pub fn current(config: &KubeConfig) -> Result<String> {
             None => anyhow!("no current context is set; run `eks use <name>` to pick one"),
         })?;
 
-    let view = ClusterView::from_context(&current);
-    Ok(format!(
-        "{}\n  context   {}\n  namespace {}",
-        view.label(),
-        view.context_name,
-        view.namespace
-    ))
+    Ok(ClusterView::from_context(&current))
 }
 
 /// Switch the active cluster, writing `current-context` back to disk.
@@ -380,6 +401,67 @@ contexts:
     fn current_explains_an_unset_context() {
         let err = current(&KubeConfig::default()).unwrap_err().to_string();
         assert!(err.contains("eks use"), "{err}");
+    }
+
+    #[test]
+    fn contexts_as_json_carry_what_the_table_shows_and_what_it_hides() {
+        let document: serde_json::Value =
+            serde_json::from_str(&list_json(&config()).unwrap()).unwrap();
+
+        assert_eq!(
+            document,
+            serde_json::json!({ "contexts": [
+                {
+                    "context": "arn:aws:eks:us-east-1:111122223333:cluster/prod",
+                    "name": "prod",
+                    "region": "us-east-1",
+                    "account_id": "111122223333",
+                    "namespace": "default",
+                    "current": true
+                },
+                {
+                    "context": "staging",
+                    "name": "staging",
+                    "region": "us-west-2",
+                    "account_id": "111122223333",
+                    "namespace": "payments",
+                    "current": false
+                }
+            ]})
+        );
+    }
+
+    #[test]
+    fn an_empty_kubeconfig_as_json_is_an_empty_list() {
+        let output = list_json(&KubeConfig::default()).unwrap();
+        assert!(!output.contains("update-kubeconfig"), "{output}");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&output).unwrap(),
+            serde_json::json!({ "contexts": [] })
+        );
+    }
+
+    #[test]
+    fn current_as_json_is_the_active_context() {
+        let document: serde_json::Value =
+            serde_json::from_str(&current_json(&config()).unwrap()).unwrap();
+
+        assert_eq!(document["name"], "prod");
+        assert_eq!(document["namespace"], "default");
+        assert_eq!(document["current"], true);
+    }
+
+    #[test]
+    fn current_as_json_fails_in_the_same_words_as_the_table() {
+        let unset = current_json(&KubeConfig::default())
+            .unwrap_err()
+            .to_string();
+        assert!(unset.contains("eks use"), "{unset}");
+
+        let dangling = KubeConfig::parse("current-context: gone\n").unwrap();
+        let err = current_json(&dangling).unwrap_err().to_string();
+        assert_eq!(err, current(&dangling).unwrap_err().to_string());
+        assert!(err.contains("\"gone\""), "{err}");
     }
 
     #[test]

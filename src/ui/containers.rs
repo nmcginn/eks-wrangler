@@ -441,8 +441,8 @@ mod tests {
 
     #[test]
     fn rows_returns_nothing_for_loading_or_error() {
-        assert!(ContainersState::Loading.rows().is_empty());
-        assert!(ContainersState::Error("nope".to_owned()).rows().is_empty());
+        assert_eq!(ContainersState::Loading.rows(), []);
+        assert_eq!(ContainersState::Error("nope".to_owned()).rows(), []);
     }
 
     #[test]

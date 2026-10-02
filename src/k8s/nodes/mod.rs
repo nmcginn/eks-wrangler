@@ -2946,7 +2946,10 @@ mod tests {
             now(),
         )];
 
-        assert!(sort_notes(&rows, Order::default(), no_usage()).is_empty());
+        assert_eq!(
+            sort_notes(&rows, Order::default(), no_usage()),
+            [] as [String; 0]
+        );
     }
 
     /// What the command reports when only the metrics read failed.

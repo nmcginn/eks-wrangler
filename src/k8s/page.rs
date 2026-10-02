@@ -525,7 +525,7 @@ mod tests {
     fn an_empty_listing_ends_immediately_with_nothing_in_it() {
         let mut listing: Listing<&str> = Listing::new();
         assert_eq!(listing.absorb([], None), Next::Done);
-        assert!(listing.finish().is_empty());
+        assert_eq!(listing.finish(), [] as [&str; 0]);
     }
 
     #[test]
