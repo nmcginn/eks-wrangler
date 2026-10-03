@@ -40,6 +40,7 @@ pub mod containers;
 pub mod events;
 pub mod logs;
 pub mod order;
+pub mod pick;
 pub mod row;
 
 pub use containers::ContainerRow;

@@ -51,7 +51,7 @@ k8s-openapi = { version = "0.28.0", features = ["latest"] }
 # — see `aws::sso`. A hand-rolled reader for somebody else's format would be
 # worse than the dependency, which the tests already pulled in.
 serde_json = "1.0.145"
-kube = { version = "4.2.0", default-features = false, features = ["client", "config", "http-proxy", "ring", "rustls-tls"] }
+kube = { version = "4.2.0", default-features = false, features = ["client", "config", "http-proxy", "ring", "rustls-tls", "ws"] }
 ratatui = "0.30.2"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_yaml_ng = "0.10.0"
@@ -69,12 +69,17 @@ tower = { version = "0.5.3", default-features = false }
 # `SIGINT` disposition to kill the process mid-draw. `process` is the
 # credential helper: `k8s::exec` spawns it as a child it can kill, where
 # `kube` ran it as a blocking `std::process::Command` nothing could stop.
-tokio = { version = "1.53.1", default-features = false, features = ["rt", "macros", "net", "process", "signal", "sync", "time"] }
+tokio = { version = "1.53.1", default-features = false, features = ["rt", "macros", "net", "process", "signal", "sync", "time", "io-util", "io-std"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 
 [dev-dependencies]
 criterion = { version = "0.8.2", default-features = false, features = ["cargo_bench_support"] }
+# `tests/exec.rs` plays an API server's exec stream to the real binary. Both
+# are already in the tree under `kube`'s `ws` feature, at these versions, so
+# the stand-in speaks exactly the WebSocket library the client does.
+futures-util = { version = "0.3.34", default-features = false, features = ["sink", "std"] }
+tokio-tungstenite = "0.29.0"
 insta = "1.44.2"
 tempfile = "3.24.0"
 

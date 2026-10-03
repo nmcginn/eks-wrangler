@@ -1020,3 +1020,36 @@ The cost is a Python start-up on every call. Paging and `--follow` polling pay
 it once per request, and that is acceptable because no call sits on the render
 path. Live tailing is done by polling, because `start-live-tail` prints output
 meant for a person to read, not for `eks` to parse.
+
+### 124. `eks exec`: prefix matching, `-C` for the container, and a TTY only between two terminals
+
+- **Dependency.** `kube`'s `ws` feature, which brings `tokio-tungstenite`,
+  `tungstenite`, and their `rand`/`sha1`/`data-encoding`. `cargo deny` passes
+  with no new exceptions. `tests/exec.rs` uses the same `tokio-tungstenite` as
+  a dev-dependency to play the API server.
+- **`-C`, not `-c`.** `-c` is the global `--context`, and changing that would
+  break every script using it. A `--context` that does not resolve on `exec`
+  gets a line pointing at `--container`, since that is the likely slip.
+- **Pod names.** A full name or a unique prefix of one; an exact name wins over
+  longer names it starts. Nothing matching in the namespace triggers one
+  best-effort cluster-wide search, so the error can name the namespace with
+  `-n`. A role that may `get` but not `list` pods falls back to the name as
+  typed. `-l`/`--field-selector` narrow the candidates.
+- **TTY when stdin *and* stdout are terminals**, not just stdin as the roadmap
+  and `kubectl` have it: a TTY writes `\r\n` and merges stderr, which would
+  corrupt `eks exec api -- cat f > f.local`.
+- **Shell search.** `/bin/sh -c 'exec bash if present, else sh'`, then
+  `/bin/bash` alone; `cmd.exe` when the pod's `spec.os` or `nodeSelector` says
+  Windows, or when both Linux shells are missing and the node's label says so.
+  A missing executable is read from the runtime's message, the only signal the
+  client gets.
+- **Not running.** Checked before connecting, for the pod's phase and the
+  container's own state. The pod's last five events are printed rather than
+  only pointed at.
+- **Terminal.** Raw mode lives in a guard restored on `Drop`. `SIGTERM` and
+  `SIGHUP` end the session through the same guard (exit 128+n). Without a TTY,
+  Ctrl-C exits 130 via `block_on_interruptible`. A closed stdout pipe exits 141
+  quietly.
+- **Stdin close needs `v5.channel.k8s.io`** (Kubernetes 1.30+). On older
+  clusters `kube` closes the whole stream at end of input, so piped stdin can
+  lose the command's last output, as with `kubectl`.

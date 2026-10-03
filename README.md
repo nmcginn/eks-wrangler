@@ -75,6 +75,7 @@ eks                     # open the dashboard
 eks contexts            # list available clusters
 eks nodes               # list the nodes of the active cluster
 eks pods -A             # list pods across every namespace
+eks exec api            # a shell in the pod whose name starts with api
 eks use staging         # switch cluster
 eks current             # show the active cluster
 eks nodes --json        # any read command, as JSON for scripts
@@ -388,6 +389,32 @@ Unlike the usage columns, the wide ones appear whatever is in them. You asked fo
 them; a column of `-` under `NOMINATED NODE` is the answer "nothing here is being
 preempted", and dropping it would leave you unable to tell that from a flag that
 did nothing.
+
+### A shell in a container
+
+`eks exec` takes the start of a pod's name rather than the whole generated one,
+picks the container, and finds the shell:
+
+```sh
+eks exec api                    # bash if the image has it, else sh
+eks exec api -C sidecar         # a container other than the default
+eks exec api -- env             # one command instead of a shell
+echo hi | eks exec api -- cat   # piped input runs without a terminal
+```
+
+When `api` starts more than one pod's name, `eks` lists them with their
+namespace and status and asks for more of the name; when none in the namespace
+match, it says which namespace does have one. The container is the one the
+pod's `kubectl.kubernetes.io/default-container` annotation names, else its only
+one. The container flag is `-C`, not `kubectl`'s `-c`, which is `--context`
+throughout `eks`.
+
+A pod that is not running gets its phase and its recent events instead of a
+session; an image with no shell at all gets the `kubectl debug` command that
+attaches one. With a terminal at both ends the session is interactive — Ctrl-C
+and window resizes go to the container, and your terminal is put back however
+the session ends. `eks` exits with the remote command's own exit code, so
+`eks exec api -- test -f /ready` works in a script.
 
 Credentials come from the kubeconfig context itself, so whatever works for
 `kubectl` works here. When they have expired, `eks` says so and tells you how to
