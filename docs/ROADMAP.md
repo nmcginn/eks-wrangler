@@ -100,14 +100,10 @@ names of things.
   on. For the audience this tool is for, audit ("who deleted my pod?") and
   authenticator ("why am I unauthorized?") answer the questions `kubectl`
   cannot.
-  *Decide first:* how `eks` calls AWS APIs other than `sso login`. The
-  options are `aws-sdk-cloudwatchlogs` plus `aws-sdk-eks` (a large dependency
-  tree, but real paging, `StartLiveTail` streaming, and no Python start-up
-  per call) or shelling out to the AWS CLI, which every EKS context already
-  needs. Neither touches first paint as long as the client is built lazily.
-  Recommendation: the SDK, because responsiveness ranks above dependency
-  weight in `CLAUDE.md`. This is the reviewer's call, so it is recorded
-  before the task starts.
+  *Decided (2026-10-02):* `eks` calls AWS by running the AWS CLI
+  (`aws eks describe-cluster`, `aws logs filter-log-events`) and reading its
+  JSON output, not through the SDK. This keeps the binary light and matches
+  `aws sso login`. See decision 123.
   *Acceptance:* `--type audit|authenticator|api|controller-manager|scheduler`,
   plus `--since`, `--grep`, and `--follow`. Region, cluster name, and AWS
   profile come from the context, the profile through `aws::profile`, so no
@@ -117,7 +113,13 @@ names of things.
   itself. Audit events print as one line each (time, user, verb, resource,
   response code), not raw JSON, and `--json` prints them whole. Missing
   `logs:FilterLogEvents` or `eks:DescribeCluster` permission names the
-  action. Expired SSO sessions go through the same offer as every other
+  action. A missing or too-old `aws` binary says which version is needed.
+  Each call is a child process `--timeout` can kill, like the credential
+  helper. Paging follows `nextToken` until `--since` is covered, with the
+  progress line showing how far it has got. `--follow` polls
+  `filter-log-events` from the last event's timestamp and drops repeats
+  rather than using `start-live-tail`, whose output is meant for a person to
+  read, not for `eks` to parse. Expired SSO sessions go through the same offer as every other
   command. Log-type selection, the not-enabled advice, and audit
   summarising are pure functions over recorded fixtures.
 
@@ -133,13 +135,17 @@ names of things.
   `kubernetes.pod_name`. Every line from CloudWatch is labelled as such, so a
   reader always knows which source they are looking at. No log group at all
   gets a message saying Container Insights is not set up, with a pointer to
-  how to install it. Record parsing and the source decision are pure
-  functions over fixtures.
+  how to install it. CloudWatch is reached through the AWS CLI, as in the
+  previous task (decision 123). Record parsing and the source decision are
+  pure functions over fixtures.
 
 - [ ] **Control-plane logs in the dashboard.** A cluster-level pane, opened
   from the sidebar, that shows the CLI's control-plane log view with the
   same type switch, `/` search, follow, and not-enabled advice, streamed off
-  the render thread with cancellation, like the container-logs pane.
+  the render thread with cancellation, like the container-logs pane. The
+  `aws` children it starts run non-interactively, under the same rule as the
+  dashboard's credential helpers (decision 120). An expired session sets
+  `credentials_lost` and offers `L`.
 
 ---
 
