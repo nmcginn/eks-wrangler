@@ -1002,3 +1002,21 @@ change.
   notes are dropped: the array order is the answer. Prose, not a contract.
 - **Stability.** Field names are not versioned. Until a release says
   otherwise, the schema may change with the tables.
+
+### 123. AWS APIs beyond login go through the AWS CLI, not the SDK
+
+Decided by the reviewer on 2026-10-02, for the CloudWatch tasks in Milestone 7.
+
+`eks` runs `aws eks describe-cluster`, `aws logs filter-log-events` and the
+like as child processes and parses their `--output json`. It does not depend
+on `aws-sdk-*`. This matches `aws::login`, keeps the binary and the dependency
+tree light, and leaves the profile, the SSO cache and the credential chain to
+the CLI that every EKS context already needs. Each call is a `tokio` child with
+`kill_on_drop`, as in `k8s::exec`, so `--timeout` and Ctrl-C stop it rather
+than abandon it. Inside the dashboard it runs non-interactively, as decision
+120 requires of credential helpers.
+
+The cost is a Python start-up on every call. Paging and `--follow` polling pay
+it once per request, and that is acceptable because no call sits on the render
+path. Live tailing is done by polling, because `start-live-tail` prints output
+meant for a person to read, not for `eks` to parse.

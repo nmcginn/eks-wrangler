@@ -19,7 +19,133 @@ follow-up, and it belongs in the PR that raised it.
 
 ## Open
 
-Nothing is scheduled. Pull the next task up from **Ideas** below.
+The people this is for meet EKS rarely, and usually because something is wrong
+or because they are building something new. Each task below is judged by
+whether it gets that person from "which pod is it?" to an answer without
+reaching for `kubectl` or the AWS console, and without already knowing the
+names of things.
+
+### Milestone 6 — Into the workload
+
+- [ ] **`eks exec`: a shell in a container.** `eks exec <pod> [-c container]
+  [-n namespace] [-- command...]`. Enables `kube`'s `ws` feature, which is a
+  new dependency path (`tokio-tungstenite`), so record it in `DECISIONS.md`.
+  *Acceptance:* `<pod>` matches a full name or a unique prefix, so `api`
+  finds `api-7d9f-xk2`. An ambiguous prefix lists its candidates with their
+  namespace and status and asks for more of the name. The container defaults
+  to the `kubectl.kubernetes.io/default-container` annotation, then to the
+  only container. When a pod has several and neither applies, the error names
+  them. With no command, `eks` looks for a shell: `/bin/bash`, then `/bin/sh`,
+  or `cmd.exe` on a Windows node. An image with no shell (distroless) gets a
+  message saying so that points at an ephemeral debug container
+  (`kubectl debug -it <pod> --image=busybox --target=<container>`), since
+  `eks` cannot create one yet. When stdin is a terminal the session runs with
+  a TTY: raw mode, Ctrl-C delivered to the remote process, and window resizes
+  forwarded. Raw mode is restored on every way out, errors included. Piped
+  stdin runs without a TTY, so `echo hi | eks exec api -- cat` works. The
+  remote command's exit code becomes `eks`'s. A pod that is not `Running`
+  gets its phase and a pointer at its events. A `403` on `pods/exec` names
+  the missing RBAC verb (`create` on `pods/exec`). Pod and container
+  resolution, shell choice, and exit-status decoding are pure functions over
+  fixtures. Stream piping sits behind in-memory readers and writers, so no
+  test needs a cluster.
+
+- [ ] **Exec from the dashboard.** `x` on a container in the pod-containers
+  pane, or on a pod in the pod-drilldown pane (which takes the default
+  container by the CLI's rule), opens the same session. It runs as a new
+  `Flow` variant: `ui::run` gives up the terminal the way `L` does, runs the
+  session, takes the terminal back, and redraws from the state it left.
+  *Acceptance:* the key appears in the pane's hint line. On a pod that is not
+  running, or a container with no shell, the key shows the CLI's reason in
+  the status line and leaves the screen alone. The suspend/resume path is
+  covered by `event_loop` tests over `TestBackend`, as `Flow::Login`'s is.
+
+- [ ] **`eks port-forward`: reach a pod, service, or deployment from
+  localhost.** `eks port-forward <pod | svc/name | deploy/name>
+  [[LOCAL:]REMOTE...]`. People who rarely use a cluster think in services, so
+  `svc/` and `deploy/` are part of this task, not an extension of it.
+  *Acceptance:* a service or deployment resolves through its selector to a
+  ready pod. A service's `port` maps to its `targetPort`, and named ports
+  resolve against the container spec. If REMOTE is omitted and the pod
+  declares exactly one port, that port is used. If it declares several, the
+  command lists them (name, number, protocol, container) and asks which one.
+  LOCAL defaults to REMOTE when that port is free and falls back to an
+  ephemeral port otherwise. Each forward prints a ready-to-click
+  `http://127.0.0.1:<port>` line. Listeners bind loopback only unless
+  `--address` says otherwise. Concurrent connections each get their own
+  stream. When the pod behind a `svc/` or `deploy/` forward goes away, `eks`
+  says so and re-resolves to another ready pod instead of dying, which is the
+  case `kubectl` handles worst. A bare pod target exits with a message
+  naming what happened. Ctrl-C closes every listener cleanly. Spec parsing,
+  target and port resolution, local-port choice, and the re-resolve decision
+  are pure functions over fixtures.
+
+- [ ] **Container ports and forwards in the dashboard.** The pod-containers
+  pane lists each container's declared ports. A key on a port starts a
+  forward that runs in the background for as long as the dashboard is open,
+  and a forwards strip lists each active forward with its local URL, how many
+  connections it has open, and its last error. A second key stops the
+  highlighted one.
+  *Acceptance:* starting a forward never blocks a frame. A forward that fails
+  to bind or loses its pod shows that in the strip and does not raise a modal.
+  The quit hint mentions that forwards end with the dashboard. Rendering is
+  covered by golden snapshots, with and without forwards and on a narrow
+  terminal.
+
+### Milestone 7 — CloudWatch
+
+- [ ] **Control-plane logs: `eks control-plane-logs`.** EKS writes the API
+  server, audit, authenticator, controller-manager, and scheduler logs to
+  `/aws/eks/<cluster>/cluster`, but only for the types someone has switched
+  on. For the audience this tool is for, audit ("who deleted my pod?") and
+  authenticator ("why am I unauthorized?") answer the questions `kubectl`
+  cannot.
+  *Decided (2026-10-02):* `eks` calls AWS by running the AWS CLI
+  (`aws eks describe-cluster`, `aws logs filter-log-events`) and reading its
+  JSON output, not through the SDK. This keeps the binary light and matches
+  `aws sso login`. See decision 123.
+  *Acceptance:* `--type audit|authenticator|api|controller-manager|scheduler`,
+  plus `--since`, `--grep`, and `--follow`. Region, cluster name, and AWS
+  profile come from the context, the profile through `aws::profile`, so no
+  extra flags are needed. A type that is not enabled is reported with the
+  exact `aws eks update-cluster-config` command that would enable it and a
+  note that CloudWatch charges for ingestion. `eks` never turns logging on
+  itself. Audit events print as one line each (time, user, verb, resource,
+  response code), not raw JSON, and `--json` prints them whole. Missing
+  `logs:FilterLogEvents` or `eks:DescribeCluster` permission names the
+  action. A missing or too-old `aws` binary says which version is needed.
+  Each call is a child process `--timeout` can kill, like the credential
+  helper. Paging follows `nextToken` until `--since` is covered, with the
+  progress line showing how far it has got. `--follow` polls
+  `filter-log-events` from the last event's timestamp and drops repeats
+  rather than using `start-live-tail`, whose output is meant for a person to
+  read, not for `eks` to parse. Expired SSO sessions go through the same offer as every other
+  command. Log-type selection, the not-enabled advice, and audit
+  summarising are pure functions over recorded fixtures.
+
+- [ ] **`eks logs`, with a CloudWatch fallback for pods that are gone.**
+  `kubectl logs` cannot show a pod that has been deleted or rescheduled,
+  which is exactly the pod being troubleshot. `eks logs <pod> [-c]
+  [--previous] [--since] [--follow]` reads from the API while the pod exists
+  and falls back to the Container Insights / Fluent Bit group
+  (`/aws/containerinsights/<cluster>/application`, overridable in
+  `config.toml`) when it does not.
+  *Acceptance:* pod and container resolution reuse `eks exec`'s rules. A
+  prefix that matches no live pod is looked up in CloudWatch by
+  `kubernetes.pod_name`. Every line from CloudWatch is labelled as such, so a
+  reader always knows which source they are looking at. No log group at all
+  gets a message saying Container Insights is not set up, with a pointer to
+  how to install it. CloudWatch is reached through the AWS CLI, as in the
+  previous task (decision 123). Record parsing and the source decision are
+  pure functions over fixtures.
+
+- [ ] **Control-plane logs in the dashboard.** A cluster-level pane, opened
+  from the sidebar, that shows the CLI's control-plane log view with the
+  same type switch, `/` search, follow, and not-enabled advice, streamed off
+  the render thread with cancellation, like the container-logs pane. The
+  `aws` children it starts run non-interactively, under the same rule as the
+  dashboard's credential helpers (decision 120). An expired session sets
+  `credentials_lost` and offers `L`.
 
 ---
 
@@ -134,9 +260,8 @@ Nothing is scheduled. Pull the next task up from **Ideas** below.
 Pull these up into a milestone when they become the most valuable next thing.
 
 - Multi-account support (the current design assumes one AWS account).
-- `eks exec` into a container, and port-forwarding.
 - Resource editing: scale a deployment, delete a pod, cordon/drain a node.
   Needs a confirmation-and-undo design first; destructive actions deserve care.
 - Cost attribution per namespace or workload.
-- CloudWatch and control-plane log integration.
+- CloudWatch metrics (Container Insights) beside metrics-server's figures.
 - Watch-based incremental updates instead of polling.
