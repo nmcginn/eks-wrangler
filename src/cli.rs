@@ -350,7 +350,7 @@ mod tests {
         let args = exec_args(&["eks", "exec", "api"]);
         assert_eq!(args.pod, "api");
         assert_eq!(args.container, None);
-        assert!(args.command.is_empty());
+        assert_eq!(args.command, Vec::<String>::new());
     }
 
     #[test]

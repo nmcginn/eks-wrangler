@@ -726,7 +726,7 @@ mod tests {
         assert_eq!(running_containers(&pod), ["sidecar", "proxy"]);
 
         pod.status = None;
-        assert!(running_containers(&pod).is_empty());
+        assert_eq!(running_containers(&pod), Vec::<String>::new());
     }
 
     #[test]
