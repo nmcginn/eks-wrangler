@@ -27,29 +27,6 @@ names of things.
 
 ### Milestone 6 — Into the workload
 
-- [ ] **`eks exec`: a shell in a container.** `eks exec <pod> [-c container]
-  [-n namespace] [-- command...]`. Enables `kube`'s `ws` feature, which is a
-  new dependency path (`tokio-tungstenite`), so record it in `DECISIONS.md`.
-  *Acceptance:* `<pod>` matches a full name or a unique prefix, so `api`
-  finds `api-7d9f-xk2`. An ambiguous prefix lists its candidates with their
-  namespace and status and asks for more of the name. The container defaults
-  to the `kubectl.kubernetes.io/default-container` annotation, then to the
-  only container. When a pod has several and neither applies, the error names
-  them. With no command, `eks` looks for a shell: `/bin/bash`, then `/bin/sh`,
-  or `cmd.exe` on a Windows node. An image with no shell (distroless) gets a
-  message saying so that points at an ephemeral debug container
-  (`kubectl debug -it <pod> --image=busybox --target=<container>`), since
-  `eks` cannot create one yet. When stdin is a terminal the session runs with
-  a TTY: raw mode, Ctrl-C delivered to the remote process, and window resizes
-  forwarded. Raw mode is restored on every way out, errors included. Piped
-  stdin runs without a TTY, so `echo hi | eks exec api -- cat` works. The
-  remote command's exit code becomes `eks`'s. A pod that is not `Running`
-  gets its phase and a pointer at its events. A `403` on `pods/exec` names
-  the missing RBAC verb (`create` on `pods/exec`). Pod and container
-  resolution, shell choice, and exit-status decoding are pure functions over
-  fixtures. Stream piping sits behind in-memory readers and writers, so no
-  test needs a cluster.
-
 - [ ] **Exec from the dashboard.** `x` on a container in the pod-containers
   pane, or on a pod in the pod-drilldown pane (which takes the default
   container by the CLI's rule), opens the same session. It runs as a new
@@ -252,6 +229,10 @@ names of things.
 ### Milestone 5 — Scripting
 
 - [x] `--json` on every read command: `contexts`, `current`, `nodes`, `pods`. (122)
+
+### Milestone 6 — Into the workload
+
+- [x] `eks exec`: a shell or a command in a container, by pod prefix. (124)
 
 ---
 
