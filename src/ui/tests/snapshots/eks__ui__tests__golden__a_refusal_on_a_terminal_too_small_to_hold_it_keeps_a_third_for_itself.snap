@@ -1,0 +1,13 @@
+---
+source: src/ui/tests/golden.rs
+expression: "text(&frame(&shell_refused(), 40, 9))"
+---
+ eks │ beta (us-east-1)
+┌ Clusters ─┐┌ Overview › ip-10-0-1-17.┐
+│  alpha us-││Context   arn:aws:eks:us-│
+│● beta us-e││Namespace default        │
+└───────────┘└─────────────────────────┘
+ container worker in pod
+ worker-5b8c7d9f6-hj4lm is not running
+ (CrashLoopBackOff).
+ tab/→ switch/drill   j/k move   enter o

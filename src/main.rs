@@ -466,15 +466,58 @@ fn dashboard(
         .selected_cluster()
         .map(|cluster| spawn_nodes(&cluster.context_name));
 
+    let (prepare_exec, foreground) = exec_runners(config, paths, budget, store);
+
     let drill = ui::DrillFetchers {
         spawn_pods: &spawn_pods,
         spawn_containers: &spawn_containers,
         spawn_logs: &spawn_logs,
+        prepare_exec: &prepare_exec,
     };
 
-    let login = login_runner(config, paths, budget, store);
+    ui::run(app, nodes_rx, &spawn_nodes, &drill, refresh, &foreground)
+}
 
-    ui::run(app, nodes_rx, &spawn_nodes, &drill, refresh, &login)
+/// What `x` runs, in its two halves, returned beside `L`'s login, which runs
+/// in the foreground as the second half does.
+///
+/// The first runs on a background thread: the checks `eks exec` makes before
+/// its session starts, plus whether the image has a shell at all, so a
+/// refusal can be shown without the dashboard leaving the screen. The second
+/// is the session itself, in the foreground once `ui::run` has handed the
+/// terminal back. Both use `store`, so the session sends the token the checks
+/// just used rather than running the helper again.
+fn exec_runners(
+    config: &KubeConfig,
+    paths: &[PathBuf],
+    budget: Budget,
+    store: Store,
+) -> (ui::ExecPreparer, ui::Foreground) {
+    let prepare: ui::ExecPreparer = {
+        let config = config.clone();
+        let paths = paths.to_vec();
+        let store = store.clone();
+        Box::new(move |context: &str, target: &exec::Target| {
+            exec::spawn_prepare(
+                config.clone(),
+                paths.clone(),
+                context.to_owned(),
+                target.clone(),
+                budget,
+                store.clone(),
+            )
+        })
+    };
+    let session: ui::SessionRunner = {
+        let config = config.clone();
+        let paths = paths.to_vec();
+        let store = store.clone();
+        Box::new(move |context: &str, plan: &exec::Plan| {
+            exec::run_prepared(&config, &paths, context, plan, budget, &store)
+        })
+    };
+    let login = login_runner(config, paths, budget, store);
+    (prepare, ui::Foreground { login, session })
 }
 
 /// What `L` runs. Unlike the dashboard's four fetchers it does not spawn a

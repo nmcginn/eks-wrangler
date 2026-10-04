@@ -1,31 +1,31 @@
 ---
 source: src/ui/tests/golden.rs
-expression: "styled(&frame(&container_logs(), WIDTH, HEIGHT), Theme::dark())"
+expression: "styled(&frame(&shell_refused(), WIDTH, HEIGHT), Theme::dark())"
 ---
  eks │ beta (us-east-1)
-┌ Clusters ────────────────────┐┌ Overview › ip-10-0-1-17.ec2.internal › worker-5b8c7d9f6-hj4lm › w┐
+┌ Clusters ────────────────────┐┌ Overview › ip-10-0-1-17.ec2.internal › worker-5b8c7d9f6-hj4lm ───┐
 │  alpha us-east-1             ││Context   arn:aws:eks:us-east-1:1234:cluster/beta                 │
 │● beta us-east-1              ││Namespace default                                                 │
 │  gamma us-east-1             ││Region    us-east-1                                               │
 │                              ││Account   1234                                                    │
 │                              ││                                                                  │
-│                              ││LOGS  following · wrap off  · stream ended                        │
-│                              ││2026-09-23T02:14:07Z INFO  starting worker v2.4.1                 │
-│                              ││2026-09-23T02:14:07Z INFO  connecting to queue at amqp://queue.pay│
-│                              ││2026-09-23T02:14:12Z ERROR connection refused (os error 111)      │
-│                              ││2026-09-23T02:14:12Z ERROR giving up after 5 attempts             │
+│                              ││IP: 10.0.1.203                                                    │
+│                              ││CONTAINERS                                                        │
+│                              ││migrate (init)  Completed  ready  0  app:1.0                      │
+│                              ││requests: cpu 0, memory 0  limits: cpu unlimited, memory unlimited│
+│                              ││worker  CrashLoopBackOff  not ready  14  app:1.0                  │
+│                              ││requests: cpu 250m, memory 512Mi  limits: cpu unlimited, memory   │
+│                              ││unlimited                                                         │
 │                              ││                                                                  │
-│                              ││                                                                  │
-│                              ││                                                                  │
-│                              ││                                                                  │
-│                              ││                                                                  │
-│                              ││                                                                  │
-│                              ││                                                                  │
-│                              ││                                                                  │
-│                              ││                                                                  │
-│                              ││                                                                  │
+│                              ││EVENTS                                                            │
+│                              ││BackOff  40s ago (×61)                                            │
+│                              ││Back-off restarting failed container worker                       │
 └──────────────────────────────┘└──────────────────────────────────────────────────────────────────┘
- tab/→ switch   j/k scroll   f follow   w wrap   p previous   ←/esc back   q quit   / search   x she
+ container worker in pod worker-5b8c7d9f6-hj4lm is not running (CrashLoopBackOff).
+ Open its log and press p to see how its last run ended.
+ Recent events, newest first:
+    40s ago  Warning  BackOff: Back-off restarting failed container worker (x61)
+ tab/→ switch/drill   j/k move   enter open   ←/esc back   r refresh   x shell   q quit   / filter
 
 --- styles ---
 0:0-4 fg=accent bg=default mod=BOLD
@@ -35,8 +35,8 @@ expression: "styled(&frame(&container_logs(), WIDTH, HEIGHT), Theme::dark())"
 1:1-10 fg=accent bg=default mod=BOLD
 1:11-31 fg=border bg=default mod=NONE
 1:32-32 fg=accent bg=default mod=NONE
-1:33-98 fg=accent bg=default mod=BOLD
-1:99-99 fg=accent bg=default mod=NONE
+1:33-95 fg=accent bg=default mod=BOLD
+1:96-99 fg=accent bg=default mod=NONE
 2:0-0 fg=border bg=default mod=NONE
 2:1-2 fg=success bg=default mod=NONE
 2:3-7 fg=text bg=default mod=NONE
@@ -75,36 +75,48 @@ expression: "styled(&frame(&container_logs(), WIDTH, HEIGHT), Theme::dark())"
 7:0-0 fg=border bg=default mod=NONE
 7:31-31 fg=border bg=default mod=NONE
 7:32-32 fg=accent bg=default mod=NONE
-7:33-36 fg=accent bg=default mod=BOLD
-7:37-74 fg=muted bg=default mod=NONE
+7:33-46 fg=muted bg=default mod=NONE
 7:99-99 fg=accent bg=default mod=NONE
 8:0-0 fg=border bg=default mod=NONE
 8:31-31 fg=border bg=default mod=NONE
 8:32-32 fg=accent bg=default mod=NONE
-8:33-81 fg=text bg=default mod=NONE
+8:33-42 fg=accent bg=default mod=BOLD
 8:99-99 fg=accent bg=default mod=NONE
 9:0-0 fg=border bg=default mod=NONE
 9:31-31 fg=border bg=default mod=NONE
 9:32-32 fg=accent bg=default mod=NONE
-9:33-98 fg=text bg=default mod=NONE
+9:33-46 fg=text bg=default mod=NONE
+9:49-57 fg=success bg=default mod=NONE
+9:60-64 fg=muted bg=default mod=NONE
+9:67-67 fg=muted bg=default mod=NONE
+9:70-76 fg=muted bg=default mod=NONE
 9:99-99 fg=accent bg=default mod=NONE
 10:0-0 fg=border bg=default mod=NONE
 10:31-31 fg=border bg=default mod=NONE
 10:32-32 fg=accent bg=default mod=NONE
-10:33-92 fg=text bg=default mod=NONE
+10:33-98 fg=muted bg=default mod=NONE
 10:99-99 fg=accent bg=default mod=NONE
 11:0-0 fg=border bg=default mod=NONE
 11:31-31 fg=border bg=default mod=NONE
 11:32-32 fg=accent bg=default mod=NONE
-11:33-85 fg=text bg=default mod=NONE
+11:33-40 fg=text bg=selection_bg mod=BOLD
+11:41-56 fg=danger bg=selection_bg mod=BOLD
+11:57-58 fg=text bg=selection_bg mod=BOLD
+11:59-67 fg=muted bg=selection_bg mod=BOLD
+11:68-69 fg=text bg=selection_bg mod=BOLD
+11:70-71 fg=muted bg=selection_bg mod=BOLD
+11:72-73 fg=text bg=selection_bg mod=BOLD
+11:74-80 fg=muted bg=selection_bg mod=BOLD
 11:99-99 fg=accent bg=default mod=NONE
 12:0-0 fg=border bg=default mod=NONE
 12:31-31 fg=border bg=default mod=NONE
 12:32-32 fg=accent bg=default mod=NONE
+12:33-95 fg=muted bg=default mod=NONE
 12:99-99 fg=accent bg=default mod=NONE
 13:0-0 fg=border bg=default mod=NONE
 13:31-31 fg=border bg=default mod=NONE
 13:32-32 fg=accent bg=default mod=NONE
+13:33-41 fg=muted bg=default mod=NONE
 13:99-99 fg=accent bg=default mod=NONE
 14:0-0 fg=border bg=default mod=NONE
 14:31-31 fg=border bg=default mod=NONE
@@ -113,48 +125,38 @@ expression: "styled(&frame(&container_logs(), WIDTH, HEIGHT), Theme::dark())"
 15:0-0 fg=border bg=default mod=NONE
 15:31-31 fg=border bg=default mod=NONE
 15:32-32 fg=accent bg=default mod=NONE
+15:33-38 fg=accent bg=default mod=BOLD
 15:99-99 fg=accent bg=default mod=NONE
 16:0-0 fg=border bg=default mod=NONE
 16:31-31 fg=border bg=default mod=NONE
 16:32-32 fg=accent bg=default mod=NONE
+16:33-39 fg=warning bg=default mod=NONE
+16:42-54 fg=muted bg=default mod=NONE
 16:99-99 fg=accent bg=default mod=NONE
 17:0-0 fg=border bg=default mod=NONE
 17:31-31 fg=border bg=default mod=NONE
 17:32-32 fg=accent bg=default mod=NONE
+17:33-75 fg=muted bg=default mod=NONE
 17:99-99 fg=accent bg=default mod=NONE
-18:0-0 fg=border bg=default mod=NONE
-18:31-31 fg=border bg=default mod=NONE
-18:32-32 fg=accent bg=default mod=NONE
-18:99-99 fg=accent bg=default mod=NONE
-19:0-0 fg=border bg=default mod=NONE
-19:31-31 fg=border bg=default mod=NONE
-19:32-32 fg=accent bg=default mod=NONE
-19:99-99 fg=accent bg=default mod=NONE
-20:0-0 fg=border bg=default mod=NONE
-20:31-31 fg=border bg=default mod=NONE
-20:32-32 fg=accent bg=default mod=NONE
-20:99-99 fg=accent bg=default mod=NONE
-21:0-0 fg=border bg=default mod=NONE
-21:31-31 fg=border bg=default mod=NONE
-21:32-32 fg=accent bg=default mod=NONE
-21:99-99 fg=accent bg=default mod=NONE
-22:0-31 fg=border bg=default mod=NONE
-22:32-99 fg=accent bg=default mod=NONE
+18:0-31 fg=border bg=default mod=NONE
+18:32-99 fg=accent bg=default mod=NONE
+19:1-81 fg=danger bg=default mod=NONE
+20:1-55 fg=danger bg=default mod=NONE
+21:1-28 fg=danger bg=default mod=NONE
+22:1-79 fg=danger bg=default mod=NONE
 23:1-5 fg=accent bg=default mod=BOLD
-23:6-15 fg=muted bg=default mod=NONE
-23:16-18 fg=accent bg=default mod=BOLD
-23:19-28 fg=muted bg=default mod=NONE
-23:29-29 fg=accent bg=default mod=BOLD
-23:30-39 fg=muted bg=default mod=NONE
-23:40-40 fg=accent bg=default mod=BOLD
-23:41-48 fg=muted bg=default mod=NONE
-23:49-49 fg=accent bg=default mod=BOLD
-23:50-61 fg=muted bg=default mod=NONE
-23:62-66 fg=accent bg=default mod=BOLD
-23:67-74 fg=muted bg=default mod=NONE
-23:75-75 fg=accent bg=default mod=BOLD
-23:76-83 fg=muted bg=default mod=NONE
-23:84-84 fg=accent bg=default mod=BOLD
-23:85-94 fg=muted bg=default mod=NONE
-23:95-95 fg=accent bg=default mod=BOLD
-23:96-99 fg=muted bg=default mod=NONE
+23:6-21 fg=muted bg=default mod=NONE
+23:22-24 fg=accent bg=default mod=BOLD
+23:25-32 fg=muted bg=default mod=NONE
+23:33-37 fg=accent bg=default mod=BOLD
+23:38-45 fg=muted bg=default mod=NONE
+23:46-50 fg=accent bg=default mod=BOLD
+23:51-58 fg=muted bg=default mod=NONE
+23:59-59 fg=accent bg=default mod=BOLD
+23:60-70 fg=muted bg=default mod=NONE
+23:71-71 fg=accent bg=default mod=BOLD
+23:72-80 fg=muted bg=default mod=NONE
+23:81-81 fg=accent bg=default mod=BOLD
+23:82-89 fg=muted bg=default mod=NONE
+23:90-90 fg=accent bg=default mod=BOLD
+23:91-99 fg=muted bg=default mod=NONE

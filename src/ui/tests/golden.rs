@@ -455,6 +455,55 @@ fn a_one_by_one_terminal_draws_its_single_cell_without_panicking() {
     insta::assert_snapshot!(text(&frame(&overview(), 1, 1)));
 }
 
+/// [`pod_containers`] with `x` pressed on the crash-looping `worker` and
+/// refused: the reason and its advice on the status line, worded as
+/// `commands::exec` words it for the dashboard.
+fn shell_refused() -> App {
+    let mut app = pod_containers();
+    app.on_key(press(KeyCode::Char('j')));
+    app.on_key(press(KeyCode::Char('x')));
+    app.apply_exec_refusal(FetchError {
+        message: "container worker in pod worker-5b8c7d9f6-hj4lm is not running (CrashLoopBackOff).\n\
+                  Open its log and press p to see how its last run ended.\n\
+                  Recent events, newest first:\n\
+                  \x20  40s ago  Warning  BackOff: Back-off restarting failed container worker (x61)"
+            .to_owned(),
+        credentials: false,
+    });
+    app
+}
+
+#[test]
+fn the_status_line_while_a_shell_is_being_checked_for() {
+    let mut app = pod_containers();
+    app.on_key(press(KeyCode::Char('j')));
+    app.on_key(press(KeyCode::Char('x')));
+    insta::assert_snapshot!(text(&frame(&app, WIDTH, HEIGHT)));
+}
+
+#[test]
+fn the_status_line_when_a_container_cannot_run_a_shell() {
+    insta::assert_snapshot!(text(&frame(&shell_refused(), WIDTH, HEIGHT)));
+}
+
+#[test]
+fn a_refusal_on_an_80_by_24_terminal_wraps_rather_than_running_off_the_edge() {
+    insta::assert_snapshot!(text(&frame(&shell_refused(), 80, 24)));
+}
+
+#[test]
+fn a_refusal_on_a_terminal_too_small_to_hold_it_keeps_a_third_for_itself() {
+    insta::assert_snapshot!(text(&frame(&shell_refused(), 40, 9)));
+}
+
+#[test]
+fn the_status_line_in_colour() {
+    insta::assert_snapshot!(styled(
+        &frame(&shell_refused(), WIDTH, HEIGHT),
+        Theme::dark()
+    ));
+}
+
 /// Every fixture above, for the tests that sweep all of them.
 fn every_view() -> Vec<(&'static str, App)> {
     vec![
@@ -463,6 +512,7 @@ fn every_view() -> Vec<(&'static str, App)> {
         ("node pods", node_pods()),
         ("pod containers", pod_containers()),
         ("container logs", container_logs()),
+        ("shell refused", shell_refused()),
     ]
 }
 

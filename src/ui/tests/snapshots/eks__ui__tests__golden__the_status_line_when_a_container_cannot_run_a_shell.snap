@@ -1,6 +1,6 @@
 ---
 source: src/ui/tests/golden.rs
-expression: "text(&frame(&pod_containers(), WIDTH, HEIGHT))"
+expression: "text(&frame(&shell_refused(), WIDTH, HEIGHT))"
 ---
  eks │ beta (us-east-1)
 ┌ Clusters ────────────────────┐┌ Overview › ip-10-0-1-17.ec2.internal › worker-5b8c7d9f6-hj4lm ───┐
@@ -20,9 +20,9 @@ expression: "text(&frame(&pod_containers(), WIDTH, HEIGHT))"
 │                              ││EVENTS                                                            │
 │                              ││BackOff  40s ago (×61)                                            │
 │                              ││Back-off restarting failed container worker                       │
-│                              ││Pulled  2m ago (×15)                                              │
-│                              ││Container image "app:1.0" already present on machine              │
-│                              ││                                                                  │
-│                              ││                                                                  │
 └──────────────────────────────┘└──────────────────────────────────────────────────────────────────┘
+ container worker in pod worker-5b8c7d9f6-hj4lm is not running (CrashLoopBackOff).
+ Open its log and press p to see how its last run ended.
+ Recent events, newest first:
+    40s ago  Warning  BackOff: Back-off restarting failed container worker (x61)
  tab/→ switch/drill   j/k move   enter open   ←/esc back   r refresh   x shell   q quit   / filter

@@ -13,6 +13,16 @@
 //! Every failure before the session starts is an `Err` that `main` prints the
 //! usual way. Once it has started, the remote command's own exit code is
 //! `eks`'s — so `eks exec api -- test -f /ready` is usable in a script.
+//!
+//! The dashboard's `x` opens the same session in two halves, because the
+//! dashboard must not wait on the network while it holds the terminal.
+//! [`spawn_prepare`] runs on a background thread and finds the pod, the
+//! container, and a shell that is really in the image. Any refusal comes
+//! back as a sentence for the status line, with the dashboard still on
+//! screen. Only a [`Plan`] that will start is handed to [`run_prepared`],
+//! once `ui::run` has given the terminal back. Both halves use the checks and
+//! the wording `eks exec` uses; [`Surface`] changes only the advice, so the
+//! dashboard names keys rather than flags.
 
 use std::io::{self, IsTerminal};
 use std::path::PathBuf;
@@ -22,20 +32,24 @@ use futures_util::stream::{self, BoxStream, StreamExt};
 use k8s_openapi::api::core::v1::{Node, Pod};
 use k8s_openapi::jiff::Timestamp;
 use kube::Client;
-use kube::api::{Api, TerminalSize};
+use kube::api::{Api, AttachParams, TerminalSize};
 use ratatui::crossterm::terminal;
+use tokio::io::AsyncRead;
 
 use crate::aws::LoginMode;
 use crate::cluster::ClusterView;
-use crate::commands::{credentials, nodes::target_cluster, pods::selectors_for};
+use crate::commands::{self, FetchError, credentials, nodes::target_cluster, pods::selectors_for};
+use crate::k8s::auth::Store;
 use crate::k8s::page::{self, Budget};
 use crate::k8s::pods::events::{self, EventRow};
-use crate::k8s::pods::pick::{self, Match, NotRunning};
+use crate::k8s::pods::pick::{self, ContainerError, Match, NotRunning};
 use crate::k8s::pods::{self as k8s_pods, Scope, Selectors};
 use crate::k8s::remote::{self, Ending, Local, Os, Remote};
 use crate::k8s::{self, Failure};
 use crate::kubeconfig::KubeConfig;
 use crate::progress::Progress;
+
+mod keyboard;
 
 /// What a shell's exit status is when a pipe it was writing to has closed:
 /// 128 plus `SIGPIPE`'s number. `eks exec api -- cat big.log | head` ends
@@ -65,6 +79,17 @@ pub struct Request<'a> {
     pub budget: Budget,
     /// `--login`, for the credential check before connecting.
     pub login: LoginMode,
+}
+
+/// Where a message about a session is read, which decides the advice in it:
+/// a flag to pass on the command line, or a key to press in the dashboard.
+/// The diagnosis is the same on both.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Surface {
+    /// `eks exec`.
+    Command,
+    /// `x` in the dashboard.
+    Dashboard,
 }
 
 /// Run `request` and return the exit code `eks` should end with.
@@ -124,6 +149,7 @@ pub async fn run(
             &why,
             events.as_deref(),
             &pick::running_containers(&pod),
+            Surface::Command,
         ));
     }
 
@@ -136,6 +162,8 @@ pub async fn run(
         container: &container,
         tty: request.tty,
         budget: request.budget,
+        watch_signals: true,
+        surface: Surface::Command,
     };
     let mut stdio = Stdio {
         stdin: tokio::io::stdin(),
@@ -229,11 +257,399 @@ async fn node_os(client: &Client, pod: &Pod, budget: Budget) -> Option<Os> {
     remote::os_of_labels(node.metadata.labels.as_ref())
 }
 
+/// What looking for a shell in a container found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Search {
+    /// This shell, one of `os`'s, ran and ended with `code`.
+    Ended {
+        os: Os,
+        shell: Vec<String>,
+        code: u8,
+    },
+    /// None of the shells for this OS is in the image.
+    NoShell(Os),
+    /// This shell could not be run for a reason other than not existing.
+    Broke { shell: Vec<String>, ending: Ending },
+}
+
+/// Try `attempt` on each shell the container might have until one runs.
+///
+/// The pod's own word for its OS first, then Linux's shells, and the node
+/// asked only once neither of those exists — a Windows pod that says
+/// nothing about it is rare, and asking every time would be a request
+/// most sessions never need.
+///
+/// `eks exec` attempts the real session ([`Interactive`]). The dashboard's
+/// [`prepare`] attempts a [`Probe`], which runs the shell without a terminal
+/// and returns as soon as it has started.
+async fn search(
+    client: &Client,
+    pod: &Pod,
+    budget: Budget,
+    attempt: &mut impl Attempt,
+) -> Result<Search> {
+    let mut os = remote::os_of_pod(pod);
+    let mut tried = Vec::new();
+    loop {
+        let current = os.unwrap_or(Os::Linux);
+        tried.push(current);
+        for shell in remote::shells(current) {
+            match attempt.attempt(&shell).await? {
+                Ending::Exited(code) => {
+                    return Ok(Search::Ended {
+                        os: current,
+                        shell,
+                        code,
+                    });
+                }
+                Ending::Missing(detail) => {
+                    tracing::debug!(%detail, shell = ?shell, "no such shell in the image");
+                }
+                ending => return Ok(Search::Broke { shell, ending }),
+            }
+        }
+
+        if os.is_some() {
+            break;
+        }
+        os = node_os(client, pod, budget).await;
+        if os.is_none_or(|os| tried.contains(&os)) {
+            break;
+        }
+    }
+    Ok(Search::NoShell(os.unwrap_or(Os::Linux)))
+}
+
+/// One way of trying a shell, for [`search`].
+///
+/// A trait rather than an async closure: the dashboard's search runs on a
+/// thread [`commands::spawn`] starts, so its future must be `Send`, and the
+/// compiler cannot yet prove that of an async closure borrowing the session.
+trait Attempt {
+    async fn attempt(&mut self, shell: &[String]) -> Result<Ending>;
+}
+
+/// The real session, on this process's terminal.
+struct Interactive<'a, I> {
+    session: &'a Session<'a>,
+    stdio: &'a mut Stdio<I>,
+}
+
+impl<I: AsyncRead + Unpin> Attempt for Interactive<'_, I> {
+    async fn attempt(&mut self, shell: &[String]) -> Result<Ending> {
+        self.session.attempt(shell, self.stdio).await
+    }
+}
+
+/// [`probe`], for each shell in turn.
+struct Probe<'a>(&'a Session<'a>);
+
+impl Attempt for Probe<'_> {
+    async fn attempt(&mut self, shell: &[String]) -> Result<Ending> {
+        probe(self.0, shell).await
+    }
+}
+
+/// The attach parameters for [`probe`]: output only, no input and no TTY.
+///
+/// Without stdin the shell's input is at its end as it starts, so it exits at
+/// once with nothing to run. Stdout is attached only because the API server
+/// refuses a session with no streams at all; whatever reaches it is dropped.
+fn probe_params(container: &str) -> AttachParams {
+    AttachParams {
+        container: Some(container.to_owned()),
+        stdin: false,
+        stdout: true,
+        stderr: false,
+        tty: false,
+        ..AttachParams::default()
+    }
+}
+
+/// Whether `shell` is in the container, by running it with no input.
+///
+/// A shell that is there exits at once and reports its exit code. One that
+/// is not is refused by the runtime as [`Ending::Missing`], exactly as the
+/// real session would be. Any output is thrown away.
+///
+/// A shell still running when the budget runs out has started, so it
+/// counts as there: the session that follows will say if it is not.
+async fn probe(session: &Session<'_>, shell: &[String]) -> Result<Ending> {
+    let mut attached = session
+        .budget
+        .wrap(session.api.exec(
+            session.pod,
+            shell.to_vec(),
+            &probe_params(session.container),
+        ))
+        .await
+        .map_err(|error| {
+            refused(
+                &error,
+                session.label,
+                session.namespace,
+                session.pod,
+                session.surface,
+            )
+        })?;
+    let status = attached.take_status();
+    let (mut input, mut output, mut errors) =
+        (tokio::io::empty(), tokio::io::sink(), tokio::io::sink());
+    let remote = Remote {
+        stdin: None::<tokio::io::Empty>,
+        stdout: attached.stdout(),
+        stderr: attached.stderr(),
+    };
+    let relayed = remote::relay(
+        remote,
+        async move {
+            match status {
+                Some(status) => status.await,
+                None => None,
+            }
+        },
+        Local {
+            stdin: &mut input,
+            stdout: &mut output,
+            stderr: &mut errors,
+        },
+        stream::empty(),
+        |_| {},
+    );
+    let ending = match session.budget.limit() {
+        Some(limit) => tokio::time::timeout(limit, relayed)
+            .await
+            .unwrap_or(Ok(Ending::Exited(0))),
+        None => relayed.await,
+    };
+    drop(attached);
+    ending.context("the probe for a shell failed partway")
+}
+
+/// The container `x` was pressed on, as the dashboard knows it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Target {
+    pub namespace: String,
+    pub pod: String,
+    /// `None` on a pod row, which takes the pod's default container by
+    /// [`pick::container`]'s rule, as `eks exec` without `--container` does.
+    pub container: Option<String>,
+}
+
+/// A session [`spawn_prepare`] has checked will start: a running container, and
+/// a shell its image has.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Plan {
+    pub namespace: String,
+    pub pod: String,
+    pub container: String,
+    pub shell: Vec<String>,
+    /// The OS `shell` is for, so a refusal names the right shells.
+    pub os: Os,
+}
+
+/// Check, on a background thread, that a shell can be opened in `target`.
+///
+/// Everything `eks exec` checks before its session starts, with the same
+/// wording, plus one thing it does not need: that a shell is really in the
+/// image. `eks exec` learns that by starting one. The dashboard has to know
+/// before it gives up the terminal, because a container without a shell
+/// should leave the dashboard on screen with a reason under it. So
+/// `probe` runs each candidate once without a terminal first.
+#[must_use]
+pub fn spawn_prepare(
+    config: KubeConfig,
+    paths: Vec<PathBuf>,
+    cluster: String,
+    target: Target,
+    budget: Budget,
+    store: Store,
+) -> std::sync::mpsc::Receiver<Result<Plan, FetchError>> {
+    commands::spawn(async move {
+        prepare(&config, &paths, &cluster, &target, budget, &store)
+            .await
+            .map_err(|error| FetchError::of(&error))
+    })
+}
+
+async fn prepare(
+    config: &KubeConfig,
+    paths: &[PathBuf],
+    cluster: &str,
+    target: &Target,
+    budget: Budget,
+    store: &Store,
+) -> Result<Plan> {
+    let cluster = target_cluster(config, Some(cluster))?;
+    let client = k8s::client::connect_kept(paths, &cluster, budget, store).await?;
+    plan(&client, &cluster.label(), target, budget).await
+}
+
+/// [`spawn_prepare`]'s checks, over a client that is already connected to
+/// the cluster `label` names.
+pub async fn plan(client: &Client, label: &str, target: &Target, budget: Budget) -> Result<Plan> {
+    let namespace = target.namespace.as_str();
+    let api: Api<Pod> = Api::namespaced(client.clone(), namespace);
+    let pod = match budget.wrap(api.get_opt(&target.pod)).await {
+        Ok(Some(pod)) => pod,
+        Ok(None) => bail!(gone(&target.pod, Surface::Dashboard)),
+        Err(error) => return Err(k8s::client::Error::explained(&error, label).into()),
+    };
+    let container = pick::container(&pod, target.container.as_deref())
+        .map_err(|error| anyhow!(container_choice(&error, Surface::Dashboard)))?;
+
+    let now = Timestamp::now();
+    if let Err(why) = pick::running(&pod, &container, now) {
+        let events = events::fetch(client.clone(), namespace, &target.pod, budget)
+            .await
+            .map(|events| events::from_events(&events, now))
+            .map_err(|error| tracing::debug!(%error, "listing pod events failed"))
+            .ok();
+        bail!(not_running(
+            &target.pod,
+            namespace,
+            &why,
+            events.as_deref(),
+            &pick::running_containers(&pod),
+            Surface::Dashboard,
+        ));
+    }
+
+    let session = Session {
+        api: &api,
+        label,
+        namespace,
+        pod: &target.pod,
+        container: &container,
+        tty: false,
+        budget,
+        watch_signals: false,
+        surface: Surface::Dashboard,
+    };
+    let found = search(client, &pod, budget, &mut Probe(&session)).await?;
+    match found {
+        Search::Ended { os, shell, .. } => Ok(Plan {
+            namespace: namespace.to_owned(),
+            pod: target.pod.clone(),
+            container,
+            shell,
+            os,
+        }),
+        Search::NoShell(os) => bail!(no_shell(
+            &target.pod,
+            namespace,
+            &container,
+            os,
+            Surface::Dashboard
+        )),
+        Search::Broke { shell, ending } => {
+            bail!(session_failed(&ending, &shell, &target.pod, &container))
+        }
+    }
+}
+
+/// Run a session [`spawn_prepare`] planned, on the terminal `ui::run` has just
+/// handed back, until the shell exits.
+///
+/// Blocks, as the login behind `L` does: the terminal is the session's
+/// until then. How the shell exits is the user's business, and nothing is
+/// reported for it. A session that could not start, or broke, comes back as
+/// a sentence for the dashboard's status line.
+pub fn run_prepared(
+    config: &KubeConfig,
+    paths: &[PathBuf],
+    cluster: &str,
+    plan: &Plan,
+    budget: Budget,
+    store: &Store,
+) -> Result<(), FetchError> {
+    commands::block_on(session(config, paths, cluster, plan, budget, store))
+        .map_err(|error| FetchError::of(&error))
+}
+
+async fn session(
+    config: &KubeConfig,
+    paths: &[PathBuf],
+    cluster: &str,
+    plan: &Plan,
+    budget: Budget,
+    store: &Store,
+) -> Result<()> {
+    let cluster = target_cluster(config, Some(cluster))?;
+    let label = cluster.label();
+    // Before connecting, so a slow cluster is not a blank screen.
+    println!("{}", banner(plan, &label));
+
+    let client = k8s::client::connect_kept(paths, &cluster, budget, store).await?;
+    let api: Api<Pod> = Api::namespaced(client, &plan.namespace);
+    let session = Session {
+        api: &api,
+        label: &label,
+        namespace: &plan.namespace,
+        pod: &plan.pod,
+        container: &plan.container,
+        tty: true,
+        budget,
+        watch_signals: false,
+        surface: Surface::Dashboard,
+    };
+    let mut stdio = Stdio {
+        stdin: dashboard_keyboard(),
+        stdout: tokio::io::stdout(),
+        stderr: tokio::io::stderr(),
+    };
+
+    match session.attempt(&plan.shell, &mut stdio).await? {
+        Ending::Exited(_) => Ok(()),
+        // Found by the probe moments ago: the image changed under the pod,
+        // which a restart can do.
+        Ending::Missing(_) => bail!(no_shell(
+            &plan.pod,
+            &plan.namespace,
+            &plan.container,
+            plan.os,
+            Surface::Dashboard
+        )),
+        other => bail!(session_failed(
+            &other,
+            &plan.shell,
+            &plan.pod,
+            &plan.container
+        )),
+    }
+}
+
+/// The line printed above a dashboard session, so the screen says where the
+/// shell is and how to get back.
+fn banner(plan: &Plan, cluster: &str) -> String {
+    format!(
+        "Shell in container {} of pod {} ({}, {cluster}). Exit the shell to return to the dashboard.",
+        plan.container, plan.pod, plan.namespace
+    )
+}
+
+/// The dashboard's keyboard: [`keyboard::Keyboard`] where `poll(2)` exists.
+#[cfg(unix)]
+fn dashboard_keyboard() -> keyboard::Keyboard {
+    keyboard::Keyboard::stdin()
+}
+
+/// Elsewhere, `tokio`'s stdin, whose last read outlives the session: the
+/// first key pressed back in the dashboard is lost to it. No release target
+/// is affected; this keeps the crate building where it is not one.
+#[cfg(not(unix))]
+fn dashboard_keyboard() -> tokio::io::Stdin {
+    tokio::io::stdin()
+}
+
 /// The process's own standard streams, opened once and shared by every
 /// attempt, so input typed while one shell turned out not to exist reaches
 /// the next.
-struct Stdio {
-    stdin: tokio::io::Stdin,
+///
+/// Stdin is a type parameter because the dashboard reads it differently: see
+/// [`keyboard`].
+struct Stdio<I> {
+    stdin: I,
     stdout: tokio::io::Stdout,
     stderr: tokio::io::Stderr,
 }
@@ -247,11 +663,21 @@ struct Session<'a> {
     container: &'a str,
     tty: bool,
     budget: Budget,
+    /// Whether to end the session cleanly on `SIGTERM` and `SIGHUP` (see
+    /// [`terminated`]). Only `eks exec` does. A handler `tokio` installs is
+    /// never removed, so in the dashboard it would outlive the session and
+    /// leave the dashboard unable to be stopped with `kill`.
+    watch_signals: bool,
+    surface: Surface,
 }
 
 impl Session<'_> {
     /// Run the command the user gave, once.
-    async fn command(&self, argv: &[String], stdio: &mut Stdio) -> Result<u8> {
+    async fn command(
+        &self,
+        argv: &[String],
+        stdio: &mut Stdio<impl AsyncRead + Unpin>,
+    ) -> Result<u8> {
         match self.attempt(argv, stdio).await? {
             Ending::Exited(code) => Ok(code),
             Ending::Missing(detail) => {
@@ -268,42 +694,35 @@ impl Session<'_> {
     }
 
     /// Find a shell and run it.
-    ///
-    /// The pod's own word for its OS first, then Linux's shells, and the node
-    /// asked only once neither of those exists — a Windows pod that says
-    /// nothing about it is rare, and asking every time would be a request
-    /// most sessions never need.
-    async fn shell(&self, client: &Client, pod: &Pod, stdio: &mut Stdio) -> Result<u8> {
-        let mut os = remote::os_of_pod(pod);
-        let mut tried = Vec::new();
-        loop {
-            let current = os.unwrap_or(Os::Linux);
-            tried.push(current);
-            for shell in remote::shells(current) {
-                match self.attempt(&shell, stdio).await? {
-                    Ending::Exited(code) => return Ok(code),
-                    Ending::Missing(detail) => {
-                        tracing::debug!(%detail, shell = ?shell, "no such shell in the image");
-                    }
-                    other => bail!(session_failed(&other, &shell, self.pod, self.container)),
-                }
-            }
-
-            if os.is_some() {
-                break;
-            }
-            os = node_os(client, pod, self.budget).await;
-            if os.is_none_or(|os| tried.contains(&os)) {
-                break;
+    async fn shell(
+        &self,
+        client: &Client,
+        pod: &Pod,
+        stdio: &mut Stdio<impl AsyncRead + Unpin>,
+    ) -> Result<u8> {
+        let found = search(
+            client,
+            pod,
+            self.budget,
+            &mut Interactive {
+                session: self,
+                stdio,
+            },
+        )
+        .await?;
+        match found {
+            Search::Ended { code, .. } => Ok(code),
+            Search::NoShell(os) => bail!(no_shell(
+                self.pod,
+                self.namespace,
+                self.container,
+                os,
+                self.surface
+            )),
+            Search::Broke { shell, ending } => {
+                bail!(session_failed(&ending, &shell, self.pod, self.container))
             }
         }
-
-        bail!(no_shell(
-            self.pod,
-            self.namespace,
-            self.container,
-            os.unwrap_or(Os::Linux)
-        ))
     }
 
     /// Start `argv` in the container and carry the session until it ends.
@@ -311,7 +730,11 @@ impl Session<'_> {
     /// The terminal is in raw mode for exactly as long as the session runs,
     /// and back in its own mode before this returns, whichever way it
     /// returns — see [`RawMode`].
-    async fn attempt(&self, argv: &[String], stdio: &mut Stdio) -> Result<Ending> {
+    async fn attempt(
+        &self,
+        argv: &[String],
+        stdio: &mut Stdio<impl AsyncRead + Unpin>,
+    ) -> Result<Ending> {
         let mut attached = self
             .budget
             .wrap(self.api.exec(
@@ -320,7 +743,7 @@ impl Session<'_> {
                 &remote::params(self.container, self.tty),
             ))
             .await
-            .map_err(|error| anyhow!(refused(&error, self.label, self.namespace, self.pod)))?;
+            .map_err(|error| refused(&error, self.label, self.namespace, self.pod, self.surface))?;
 
         let raw = if self.tty {
             Some(
@@ -371,7 +794,7 @@ impl Session<'_> {
 
         let outcome = tokio::select! {
             relayed = relayed => relayed,
-            code = terminated(self.tty) => Ok(Ending::Exited(code)),
+            code = terminated(self.tty && self.watch_signals) => Ok(Ending::Exited(code)),
         };
         drop(raw);
         // `attached` outlives the relay on purpose: dropping it aborts the
@@ -509,20 +932,40 @@ fn with_context_hint(error: &anyhow::Error, context_given: bool) -> anyhow::Erro
 }
 
 /// The cluster refused to start a session, or never answered.
-fn refused(error: &page::Error, cluster: &str, namespace: &str, pod: &str) -> String {
-    match (Failure::of(error), upgrade_status(error)) {
+///
+/// Typed rather than a bare sentence so that a refused credential is still
+/// one when the dashboard receives it, and `L` is offered for it there as
+/// for any other failed request.
+fn refused(
+    error: &page::Error,
+    cluster: &str,
+    namespace: &str,
+    pod: &str,
+    surface: Surface,
+) -> k8s::client::Error {
+    let failure = Failure::of(error);
+    let message = match (failure, upgrade_status(error)) {
         (Failure::Forbidden, _) => format!(
             "{cluster} will not let you run commands in pods in namespace {namespace}: \
              your access is missing the `create` verb on `pods/exec`.\n\
              Ask a cluster admin to grant it (the built-in `edit` and `admin` roles include it). \
              `kubectl auth can-i create pods/exec -n {namespace}` checks whether you have it."
         ),
-        (_, Some(404)) => format!(
-            "pod {pod} was gone by the time eks connected to it — it was probably just replaced.\n\
-             Run the same command again to find its successor."
-        ),
+        (_, Some(404)) => gone(pod, surface),
         _ => k8s::explain(error, cluster),
-    }
+    };
+    k8s::client::Error::Cluster { message, failure }
+}
+
+/// The pod went away between being chosen and being connected to.
+fn gone(pod: &str, surface: Surface) -> String {
+    let next = match surface {
+        Surface::Command => "Run the same command again to find its successor.",
+        Surface::Dashboard => "Press r to refresh the list, then pick its successor.",
+    };
+    format!(
+        "pod {pod} was gone by the time eks connected to it — it was probably just replaced.\n{next}"
+    )
 }
 
 /// The HTTP status a refused WebSocket upgrade came back with, if that is
@@ -560,6 +1003,7 @@ fn not_running(
     why: &NotRunning,
     events: Option<&[EventRow]>,
     running: &[String],
+    surface: Surface,
 ) -> String {
     let head = match why {
         NotRunning::Pod { phase, status } => {
@@ -582,13 +1026,23 @@ fn not_running(
 
     let mut lines = vec![head];
     if let NotRunning::Container { container, .. } = why {
-        lines.push(format!(
-            "`kubectl logs {pod} -n {namespace} -c {container} --previous` shows how its last run ended."
-        ));
+        lines.push(match surface {
+            Surface::Command => format!(
+                "`kubectl logs {pod} -n {namespace} -c {container} --previous` shows how its last run ended."
+            ),
+            Surface::Dashboard => {
+                "Open its log and press p to see how its last run ended.".to_owned()
+            }
+        });
         if let Some(others) = crate::format::list(running, "or") {
-            lines.push(format!(
-                "Its running containers are {others}; pass one to `--container`."
-            ));
+            lines.push(match surface {
+                Surface::Command => {
+                    format!("Its running containers are {others}; pass one to `--container`.")
+                }
+                Surface::Dashboard => format!(
+                    "Its running containers are {others}; press x on one of those in the pod's containers instead."
+                ),
+            });
         }
     }
 
@@ -597,9 +1051,12 @@ fn not_running(
             lines.push("Recent events, newest first:".to_owned());
             lines.extend(events.iter().take(EVENTS_SHOWN).map(event_line));
         }
-        _ => lines.push(format!(
-            "`kubectl describe pod {pod} -n {namespace}` shows its events."
-        )),
+        _ => lines.push(match surface {
+            Surface::Command => {
+                format!("`kubectl describe pod {pod} -n {namespace}` shows its events.")
+            }
+            Surface::Dashboard => "The pod's containers pane lists its events.".to_owned(),
+        }),
     }
     lines.join("\n")
 }
@@ -621,18 +1078,59 @@ fn event_line(event: &EventRow) -> String {
 }
 
 /// No shell in the image.
-fn no_shell(pod: &str, namespace: &str, container: &str, os: Os) -> String {
+///
+/// The dashboard's version spells out the namespace and container in the
+/// `eks exec` line, which the command line already had from whatever the
+/// user typed, so the line can be pasted into a shell as it is.
+fn no_shell(pod: &str, namespace: &str, container: &str, os: Os, surface: Surface) -> String {
+    let instead = match surface {
+        Surface::Command => format!("eks exec {pod} -- <command>"),
+        Surface::Dashboard => format!("eks exec {pod} -n {namespace} -C {container} -- <command>"),
+    };
     match os {
         Os::Linux => format!(
             "container {container} in pod {pod} has no shell: neither /bin/bash nor /bin/sh is in its image, \
              as is usual for a distroless image.\n\
              eks cannot start a debug container yet. kubectl can, with a shell that shares the container's processes:\n\
              \x20 kubectl debug -it {pod} -n {namespace} --image=busybox --target={container}\n\
-             Or run a command the image does have: `eks exec {pod} -- <command>`."
+             Or run a command the image does have: `{instead}`."
         ),
         Os::Windows => format!(
             "container {container} in pod {pod} has no shell: cmd.exe is not in its image.\n\
-             Run a command the image does have: `eks exec {pod} -- <command>`."
+             Run a command the image does have: `{instead}`."
+        ),
+    }
+}
+
+/// Why no container could be chosen, as the dashboard says it.
+///
+/// [`pick::ContainerError`]'s own wording names `--container`, which is
+/// right for `eks exec`. In the dashboard the way to name a container is to
+/// highlight it.
+fn container_choice(error: &ContainerError, surface: Surface) -> String {
+    match (error, surface) {
+        (_, Surface::Command) | (ContainerError::Empty { .. }, _) => error.to_string(),
+        (
+            ContainerError::NotFound {
+                pod,
+                wanted,
+                available,
+            },
+            Surface::Dashboard,
+        ) => format!(
+            "pod {pod} no longer has a container called {wanted}; its containers are {available}.\n\
+             Press r to refresh the list, then pick one of those."
+        ),
+        (
+            ContainerError::Unchosen {
+                pod,
+                count,
+                available,
+            },
+            Surface::Dashboard,
+        ) => format!(
+            "pod {pod} has {count} containers and does not say which is the default: {available}.\n\
+             Press enter to open its containers, then x on the one you want."
         ),
     }
 }
@@ -718,7 +1216,14 @@ mod tests {
 
     #[test]
     fn a_forbidden_session_names_the_missing_verb_and_resource() {
-        let message = refused(&upgrade(403), "prod (us-east-1)", "shop", "api-1");
+        let message = refused(
+            &upgrade(403),
+            "prod (us-east-1)",
+            "shop",
+            "api-1",
+            Surface::Command,
+        )
+        .to_string();
         assert!(message.contains("prod (us-east-1)"), "{message}");
         assert!(
             message.contains("`create` verb on `pods/exec`"),
@@ -733,14 +1238,14 @@ mod tests {
 
     #[test]
     fn a_pod_gone_before_the_session_says_to_run_again() {
-        let message = refused(&upgrade(404), "prod", "shop", "api-1");
+        let message = refused(&upgrade(404), "prod", "shop", "api-1", Surface::Command).to_string();
         assert!(message.starts_with("pod api-1 was gone"), "{message}");
         assert!(message.contains("again"), "{message}");
     }
 
     #[test]
     fn a_refused_credential_gets_the_usual_login_advice() {
-        let message = refused(&upgrade(401), "prod", "shop", "api-1");
+        let message = refused(&upgrade(401), "prod", "shop", "api-1", Surface::Command).to_string();
         assert_eq!(message, k8s::explain(&upgrade(401), "prod"));
         assert!(message.contains("credentials"), "{message}");
     }
@@ -750,7 +1255,7 @@ mod tests {
         let error = page::Error::TimedOut {
             limit: std::time::Duration::from_secs(10),
         };
-        let message = refused(&error, "prod", "shop", "api-1");
+        let message = refused(&error, "prod", "shop", "api-1", Surface::Command).to_string();
         assert!(message.contains("--timeout"), "{message}");
     }
 
@@ -802,7 +1307,7 @@ mod tests {
             ),
         ];
 
-        let message = not_running("api-1", "shop", &why, Some(&events), &[]);
+        let message = not_running("api-1", "shop", &why, Some(&events), &[], Surface::Command);
 
         assert_eq!(
             message,
@@ -823,7 +1328,7 @@ mod tests {
             .map(|n| event("BackOff", &format!("attempt {n}"), true, 1, "1m"))
             .collect();
 
-        let message = not_running("api-1", "shop", &why, Some(&events), &[]);
+        let message = not_running("api-1", "shop", &why, Some(&events), &[], Surface::Command);
 
         assert_eq!(
             message
@@ -842,7 +1347,7 @@ mod tests {
             status: Some("Completed".to_owned()),
         };
         for events in [None, Some(&[][..])] {
-            let message = not_running("job-1", "batch", &why, events, &[]);
+            let message = not_running("job-1", "batch", &why, events, &[], Surface::Command);
             assert!(
                 message.starts_with("pod job-1 is Succeeded (Completed)"),
                 "{message}"
@@ -867,6 +1372,7 @@ mod tests {
             &why,
             None,
             &["sidecar".to_owned(), "proxy".to_owned()],
+            Surface::Command,
         );
 
         assert!(
@@ -891,7 +1397,7 @@ mod tests {
             container: "app".to_owned(),
             reason: None,
         };
-        let message = not_running("api-1", "shop", &why, None, &[]);
+        let message = not_running("api-1", "shop", &why, None, &[], Surface::Command);
         assert!(message.starts_with("container app in pod api-1 is not running."));
         assert!(!message.contains("running containers"), "{message}");
     }
@@ -900,7 +1406,7 @@ mod tests {
 
     #[test]
     fn a_distroless_image_points_at_an_ephemeral_debug_container() {
-        let message = no_shell("api-1", "shop", "app", Os::Linux);
+        let message = no_shell("api-1", "shop", "app", Os::Linux, Surface::Command);
         assert!(
             message.contains("neither /bin/bash nor /bin/sh"),
             "{message}"
@@ -918,7 +1424,7 @@ mod tests {
 
     #[test]
     fn a_windows_image_without_cmd_says_so_without_suggesting_busybox() {
-        let message = no_shell("iis-1", "web", "iis", Os::Windows);
+        let message = no_shell("iis-1", "web", "iis", Os::Windows, Surface::Command);
         assert!(message.contains("cmd.exe is not in its image"), "{message}");
         assert!(!message.contains("busybox"), "{message}");
     }
@@ -948,6 +1454,173 @@ mod tests {
         assert_eq!(
             message,
             "could not run `/bin/sh` in container app of pod api-1: container not running (abc)"
+        );
+    }
+
+    // --- the dashboard's wording ---
+
+    #[test]
+    fn the_probe_attaches_no_input_and_no_terminal() {
+        let params = probe_params("app");
+        assert_eq!(params.container.as_deref(), Some("app"));
+        assert!(!params.stdin, "a shell with input attached waits for it");
+        assert!(!params.tty);
+        // The API server refuses a session with no streams at all.
+        assert!(params.stdout);
+    }
+
+    #[test]
+    fn the_banner_says_where_the_shell_is_and_how_to_get_back() {
+        let plan = Plan {
+            namespace: "shop".to_owned(),
+            pod: "api-1".to_owned(),
+            container: "app".to_owned(),
+            shell: argv(&["/bin/sh"]),
+            os: Os::Linux,
+        };
+        assert_eq!(
+            banner(&plan, "prod (us-east-1)"),
+            "Shell in container app of pod api-1 (shop, prod (us-east-1)). \
+             Exit the shell to return to the dashboard."
+        );
+    }
+
+    #[test]
+    fn in_the_dashboard_a_crashing_container_points_at_keys_not_kubectl() {
+        let why = NotRunning::Container {
+            container: "app".to_owned(),
+            reason: Some("CrashLoopBackOff".to_owned()),
+        };
+
+        let message = not_running(
+            "api-1",
+            "shop",
+            &why,
+            None,
+            &["sidecar".to_owned()],
+            Surface::Dashboard,
+        );
+
+        assert_eq!(
+            message,
+            "container app in pod api-1 is not running (CrashLoopBackOff).\n\
+             Open its log and press p to see how its last run ended.\n\
+             Its running containers are sidecar; press x on one of those in the pod's containers instead.\n\
+             The pod's containers pane lists its events."
+        );
+    }
+
+    #[test]
+    fn in_the_dashboard_a_pending_pod_still_prints_its_events() {
+        let why = NotRunning::Pod {
+            phase: "Pending".to_owned(),
+            status: None,
+        };
+        let events = [event("FailedScheduling", "0/3 nodes", true, 1, "1m")];
+
+        let message = not_running(
+            "api-1",
+            "shop",
+            &why,
+            Some(&events),
+            &[],
+            Surface::Dashboard,
+        );
+
+        assert!(message.contains("FailedScheduling: 0/3 nodes"), "{message}");
+        assert!(!message.contains("kubectl"), "{message}");
+    }
+
+    #[test]
+    fn in_the_dashboard_no_shell_gives_an_eks_exec_line_that_pastes_as_it_is() {
+        let message = no_shell("api-1", "shop", "app", Os::Linux, Surface::Dashboard);
+        assert!(
+            message.contains("`eks exec api-1 -n shop -C app -- <command>`"),
+            "{message}"
+        );
+        assert!(
+            message.contains("kubectl debug -it api-1 -n shop --image=busybox --target=app"),
+            "{message}"
+        );
+
+        let windows = no_shell("iis-1", "web", "iis", Os::Windows, Surface::Dashboard);
+        assert!(
+            windows.contains("`eks exec iis-1 -n web -C iis -- <command>`"),
+            "{windows}"
+        );
+    }
+
+    #[test]
+    fn in_the_dashboard_a_pod_gone_before_the_session_says_to_refresh() {
+        let message =
+            refused(&upgrade(404), "prod", "shop", "api-1", Surface::Dashboard).to_string();
+        assert!(message.starts_with("pod api-1 was gone"), "{message}");
+        assert!(message.contains("Press r to refresh"), "{message}");
+        assert!(!message.contains("command again"), "{message}");
+    }
+
+    #[test]
+    fn a_refused_session_keeps_its_classification_for_the_login_offer() {
+        let refusal = refused(&upgrade(401), "prod", "shop", "api-1", Surface::Dashboard);
+        assert!(
+            matches!(
+                refusal,
+                k8s::client::Error::Cluster {
+                    failure: Failure::Credentials,
+                    ..
+                }
+            ),
+            "{refusal:?}"
+        );
+    }
+
+    #[test]
+    fn in_the_dashboard_a_pod_without_a_default_container_says_to_pick_one() {
+        let error = ContainerError::Unchosen {
+            pod: "api-1".to_owned(),
+            count: 2,
+            available: "app or proxy".to_owned(),
+        };
+
+        let message = container_choice(&error, Surface::Dashboard);
+
+        assert_eq!(
+            message,
+            "pod api-1 has 2 containers and does not say which is the default: app or proxy.\n\
+             Press enter to open its containers, then x on the one you want."
+        );
+        assert_eq!(
+            container_choice(&error, Surface::Command),
+            error.to_string()
+        );
+    }
+
+    #[test]
+    fn in_the_dashboard_a_container_that_has_gone_says_to_refresh() {
+        let error = ContainerError::NotFound {
+            pod: "api-1".to_owned(),
+            wanted: "debugger-x7".to_owned(),
+            available: "app".to_owned(),
+        };
+
+        let message = container_choice(&error, Surface::Dashboard);
+
+        assert!(
+            message.starts_with("pod api-1 no longer has a container called debugger-x7"),
+            "{message}"
+        );
+        assert!(message.contains("Press r to refresh"), "{message}");
+        assert!(!message.contains("--container"), "{message}");
+    }
+
+    #[test]
+    fn a_pod_with_no_containers_reads_the_same_on_both_surfaces() {
+        let error = ContainerError::Empty {
+            pod: "api-1".to_owned(),
+        };
+        assert_eq!(
+            container_choice(&error, Surface::Dashboard),
+            container_choice(&error, Surface::Command)
         );
     }
 }

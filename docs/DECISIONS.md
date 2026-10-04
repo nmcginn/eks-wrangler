@@ -1053,3 +1053,47 @@ meant for a person to read, not for `eks` to parse.
 - **Stdin close needs `v5.channel.k8s.io`** (Kubernetes 1.30+). On older
   clusters `kube` closes the whole stream at end of input, so piped stdin can
   lose the command's last output, as with `kubectl`.
+
+### 125. `x` checks off the render thread, probes for a shell, and refuses on a status line
+
+- **Two halves.** A background check (`exec::spawn_prepare`) runs the pod
+  `get`, `pick::container`, `pick::running`, and the shell search. Only a
+  `Plan` that will start reaches the foreground session. A refusal goes on a
+  status line above the footer, the screen is left alone, and the next key
+  clears it.
+- **Probe.** `eks exec` learns that a shell is missing by trying to start it.
+  The dashboard must know before it gives up the terminal, so it first runs
+  each candidate shell with no stdin and no TTY. A shell that is present
+  exits at once; a missing one is refused exactly as the real session would
+  be. The cost is one extra short-lived process and round trip per `x`. A
+  probe still running when `--timeout` expires counts as found.
+- **Wording.** `exec::Surface` changes the advice, not the diagnosis: `press
+  p` rather than `kubectl logs --previous`, `press r` rather than "run it
+  again", and an `eks exec … -n … -C …` line that pastes as it is.
+- **Targets.** A highlighted container; a highlighted pod's default container
+  by `pick::container`'s rule; the container whose log is open. With the
+  sidebar focused, `x` says to press `tab` rather than guessing a row.
+- **Cancel.** `Esc` while the check runs, or leaving the pane or the cluster.
+  The event loop drops the receiver, so a late answer opens nothing.
+- **Hint.** In the containers pane `x shell` takes the slot of `s/S sort`,
+  which does nothing there. On the pod and log panes it comes after `/`, so a
+  narrow terminal clips it before `q quit`.
+
+### 126. A dashboard session reads the keyboard with `poll(2)`, and installs no signal handlers
+
+- **Keyboard.** `tokio::io::stdin` reads on a blocking thread nothing can
+  cancel. After the session, its pending read takes the dashboard's next
+  input. A manual run against a pseudo-terminal showed that this is the
+  terminal's reply to `ratatui`'s cursor-position query, so the dashboard
+  failed on return. `exec::keyboard::Keyboard` waits with `poll(2)` and a
+  50 ms timeout, reads only when there is input, and its `Drop` stops and
+  joins the thread.
+- **Dependency.** `rustix`'s `event` feature, Unix only. `rustix` is already
+  built for crossterm. Elsewhere the dashboard falls back to `tokio`'s stdin
+  and loses that first key; no release target is affected.
+- **Signals.** `eks exec` catches `SIGTERM`/`SIGHUP` to restore the terminal.
+  A dashboard session does not, because `tokio` never removes a handler it
+  installs, and the dashboard would stop answering `kill`. The dashboard as
+  a whole does not handle those signals yet either.
+- **Terminal.** `leave_terminal` now shows the cursor, which `ratatui` keeps
+  hidden. A banner names the pod and container and says how to get back.
