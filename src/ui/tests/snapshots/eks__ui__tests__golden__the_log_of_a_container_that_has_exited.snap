@@ -25,4 +25,4 @@ expression: "text(&frame(&container_logs(), WIDTH, HEIGHT))"
 │                              ││                                                                  │
 │                              ││                                                                  │
 └──────────────────────────────┘└──────────────────────────────────────────────────────────────────┘
- tab/→ switch   j/k scroll   f follow   w wrap   p previous   ←/esc back   q quit   / search
+ tab/→ switch   j/k scroll   f follow   w wrap   p previous   ←/esc back   q quit   / search   x she

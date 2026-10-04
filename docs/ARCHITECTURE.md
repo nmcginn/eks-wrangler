@@ -507,6 +507,30 @@ sentences printed when a session cannot start. The shell search tries each
 candidate in turn over one shared stdin, so keys typed while a missing shell
 is being refused reach the one that runs.
 
+The dashboard's `x` runs the same session in two halves, because the
+dashboard must not wait on the network while it holds the terminal
+(decisions 125 and 126):
+
+```
+App::on_key ──► Flow::Exec ──► exec::spawn_prepare ──► Plan ──► ui::run hands ──► exec::run_prepared
+  (choose)                     (background: get, pick,          the terminal        (the session)
+                               running, probe for a shell)      back
+                                        │
+                                        └──► refusal ──► the status line
+```
+
+`exec::search` is the shell search for both: `eks exec` passes it the real
+session, and `spawn_prepare` passes a probe that runs each shell with no
+stdin and no TTY, so a shell that is in the image exits at once. The
+messages take an `exec::Surface`, which changes only the advice: a flag on
+the command line, a key in the dashboard. `event_loop` holds the check's
+receiver only while `App` says it is still waiting, so `Esc`, leaving the
+pane, or another cluster cancels it by dropping it. The session runs on this
+thread behind `TerminalIo::session`, the same suspend-and-resume `L` uses,
+and reads the keyboard through `exec::keyboard::Keyboard`, which uses
+`poll(2)` and stops when the session ends. `tokio::io::stdin` cannot be
+stopped, and its last read would take the dashboard's next keystroke.
+
 ## Testing
 
 Run `make test`. The suite needs no cluster, no credentials, and no network, and

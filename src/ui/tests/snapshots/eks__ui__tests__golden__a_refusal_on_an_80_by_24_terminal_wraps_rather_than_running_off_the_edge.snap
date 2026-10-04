@@ -1,0 +1,28 @@
+---
+source: src/ui/tests/golden.rs
+expression: "text(&frame(&shell_refused(), 80, 24))"
+---
+ eks │ beta (us-east-1)
+┌ Clusters ──────────────┐┌ Overview › ip-10-0-1-17.ec2.internal › worker-5b8c7┐
+│  alpha us-east-1       ││Context   arn:aws:eks:us-east-1:1234:cluster/beta   │
+│● beta us-east-1        ││Namespace default                                   │
+│  gamma us-east-1       ││Region    us-east-1                                 │
+│                        ││Account   1234                                      │
+│                        ││                                                    │
+│                        ││IP: 10.0.1.203                                      │
+│                        ││CONTAINERS                                          │
+│                        ││migrate (init)  Completed  ready  0  app:1.0        │
+│                        ││requests: cpu 0, memory 0  limits: cpu unlimited,   │
+│                        ││memory unlimited                                    │
+│                        ││worker  CrashLoopBackOff  not ready  14  app:1.0    │
+│                        ││requests: cpu 250m, memory 512Mi  limits: cpu       │
+│                        ││unlimited, memory unlimited                         │
+│                        ││                                                    │
+│                        ││EVENTS                                              │
+└────────────────────────┘└────────────────────────────────────────────────────┘
+ container worker in pod worker-5b8c7d9f6-hj4lm is not running
+ (CrashLoopBackOff).
+ Open its log and press p to see how its last run ended.
+ Recent events, newest first:
+    40s ago  Warning  BackOff: Back-off restarting failed container worker (x61)
+ tab/→ switch/drill   j/k move   enter open   ←/esc back   r refresh   x shell

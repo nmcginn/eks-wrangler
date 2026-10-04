@@ -27,16 +27,6 @@ names of things.
 
 ### Milestone 6 — Into the workload
 
-- [ ] **Exec from the dashboard.** `x` on a container in the pod-containers
-  pane, or on a pod in the pod-drilldown pane (which takes the default
-  container by the CLI's rule), opens the same session. It runs as a new
-  `Flow` variant: `ui::run` gives up the terminal the way `L` does, runs the
-  session, takes the terminal back, and redraws from the state it left.
-  *Acceptance:* the key appears in the pane's hint line. On a pod that is not
-  running, or a container with no shell, the key shows the CLI's reason in
-  the status line and leaves the screen alone. The suspend/resume path is
-  covered by `event_loop` tests over `TestBackend`, as `Flow::Login`'s is.
-
 - [ ] **`eks port-forward`: reach a pod, service, or deployment from
   localhost.** `eks port-forward <pod | svc/name | deploy/name>
   [[LOCAL:]REMOTE...]`. People who rarely use a cluster think in services, so
@@ -233,6 +223,7 @@ names of things.
 ### Milestone 6 — Into the workload
 
 - [x] `eks exec`: a shell or a command in a container, by pod prefix. (124)
+- [x] Exec from the dashboard: `x` checks, then hands the terminal to the shell. (125, 126)
 
 ---
 
@@ -246,3 +237,6 @@ Pull these up into a milestone when they become the most valuable next thing.
 - Cost attribution per namespace or workload.
 - CloudWatch metrics (Container Insights) beside metrics-server's figures.
 - Watch-based incremental updates instead of polling.
+- A `?` overlay listing every key in the current pane. The footer no longer
+  fits at 100 columns: on the pod list `/ filter` is clipped there, and
+  `x shell` appears only from about 112.

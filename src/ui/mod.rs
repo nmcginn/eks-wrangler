@@ -16,10 +16,11 @@ use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, Ke
 use ratatui::crossterm::{execute, terminal};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, List, ListItem, ListState, Paragraph, Wrap};
+use ratatui::widgets::{Block, List, ListItem, ListState, Padding, Paragraph, Wrap};
 use ratatui::{Frame, Terminal};
 
 use crate::cluster::ClusterView;
+use crate::commands::exec::{Plan, Target as ExecTarget};
 use crate::commands::nodes::NodesFetch;
 use crate::commands::pods::{ContainersFetch, PodsFetch, selectors_for};
 use crate::commands::{FetchError, StreamHandle};
@@ -97,6 +98,22 @@ pub type ContainersFetcher =
 pub type LogsFetcher =
     Box<dyn Fn(&str, &str, &str, &str, bool) -> (mpsc::Receiver<LogEvent>, StreamHandle)>;
 
+/// Checks, on a background thread, that a shell can be opened in a container
+/// of the named context, and plans the session if so — see
+/// [`crate::commands::exec::spawn_prepare`]. A refusal is a sentence for the
+/// status line.
+pub type ExecPreparer = Box<dyn Fn(&str, &ExecTarget) -> mpsc::Receiver<Result<Plan, FetchError>>>;
+
+/// Runs a planned shell session to its end, on this thread and the real
+/// terminal, which [`run`] has handed back before calling it — the same
+/// arrangement as [`LoginRunner`]. The `Err` is a sentence for the status
+/// line: the session could not start, or broke partway.
+pub type SessionRunner = Box<dyn Fn(&str, &Plan) -> Result<(), FetchError>>;
+
+/// [`SessionRunner`] with the terminal handed back around it, as
+/// `event_loop` sees it. Borrowed for the reason [`Suspended`] is.
+type SuspendedSession<'a> = &'a dyn Fn(&str, &Plan) -> Result<(), FetchError>;
+
 /// How often the dashboard automatically starts a new node fetch, on top of
 /// pressing `r` to refresh on demand.
 ///
@@ -153,7 +170,7 @@ impl std::fmt::Display for RefreshInterval {
 }
 
 /// What the event loop should do after handling an input.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Flow {
     /// Stay in the loop.
     Continue,
@@ -163,8 +180,28 @@ pub enum Flow {
     /// reason [`Quit`](Self::Quit) is one: the state machine decides, and the
     /// event loop — the only thing here that owns a terminal — acts.
     Login,
+    /// Check, off the render thread, that a shell can be opened in this
+    /// container. If one can, give the terminal to it until it exits, then
+    /// take the terminal back and redraw. If not, say why in the status line.
+    ///
+    /// A variant for the reason [`Login`](Self::Login) is one: running the
+    /// session means owning the terminal, and only the event loop does.
+    Exec(ExecTarget),
     /// Tear down and exit.
     Quit,
+}
+
+/// What `x` is doing, shown in the status line above the footer.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+enum ExecStatus {
+    /// Nothing; the status line is not drawn.
+    #[default]
+    Idle,
+    /// The checks behind `x` are running for this container. `Esc` cancels.
+    Preparing(ExecTarget),
+    /// Why a shell could not be opened, or why one ended badly. Shown until
+    /// the next key.
+    Refused(String),
 }
 
 /// Which pane `j`/`k`/`Home`/`End` currently move the highlight in.
@@ -424,6 +461,9 @@ pub struct App {
     /// it and the key stops offering something there is no longer a reason to
     /// do.
     credentials_lost: bool,
+    /// What `x` is doing. The pending check lives on the event loop, which
+    /// drops it as soon as this stops being [`ExecStatus::Preparing`].
+    exec: ExecStatus,
 }
 
 impl App {
@@ -455,6 +495,7 @@ impl App {
             pod_selector_edit: SelectorEdit::default(),
             quit_armed_at: None,
             credentials_lost: false,
+            exec: ExecStatus::Idle,
         }
     }
 
@@ -767,6 +808,136 @@ impl App {
             },
             _ => NodesState::Error(message),
         };
+    }
+
+    /// Whether the checks behind `x` are running. The event loop keeps the
+    /// pending answer only while this holds, so anything that clears it —
+    /// `Esc`, leaving the pane, another cluster — is also what cancels it.
+    #[must_use]
+    pub fn exec_preparing(&self) -> bool {
+        matches!(self.exec, ExecStatus::Preparing(_))
+    }
+
+    /// The checks behind `x` came back with a reason no shell can be opened,
+    /// or a session ended without its shell exiting.
+    ///
+    /// It goes on the status line rather than into a pane: the pane is still
+    /// right about everything it shows. A credential refusal also offers `L`,
+    /// as from any pane. Nothing else changes the offer, which belongs to
+    /// whichever pane made it.
+    pub fn apply_exec_refusal(&mut self, error: FetchError) {
+        if error.credentials {
+            self.credentials_lost = true;
+        }
+        self.exec = ExecStatus::Refused(error.message);
+    }
+
+    /// A session the dashboard handed the terminal to has ended — the shell
+    /// exited, however it exited — or could not run. The screen is left as it
+    /// was before `x`.
+    pub fn apply_exec_ending(&mut self, outcome: Result<(), FetchError>) {
+        match outcome {
+            Ok(()) => self.exec = ExecStatus::Idle,
+            Err(error) => self.apply_exec_refusal(error),
+        }
+    }
+
+    /// The container `x` opens a shell in, from wherever the detail pane is:
+    /// the highlighted container, the highlighted pod's default container,
+    /// or the container whose log is open.
+    ///
+    /// `None` where `x` means nothing — the node pane, or a list with nothing
+    /// highlighted yet. `Err` where it would mean something once the
+    /// highlight is visible, which is only while the detail pane has focus.
+    fn exec_target(&self) -> Option<Result<ExecTarget, String>> {
+        let focused = self.focus == Focus::Detail;
+        match &self.view {
+            View::Overview => None,
+            View::NodePods { .. } if !focused => Some(Err(
+                "Press tab to move to the pod list, then x on a pod to open a shell in it."
+                    .to_owned(),
+            )),
+            View::PodContainers { .. } if !focused => Some(Err(
+                "Press tab to move to the container list, then x on a container to open a shell in it."
+                    .to_owned(),
+            )),
+            View::NodePods { .. } => {
+                let pod = self.visible_pods().get(self.detail_selected).copied()?;
+                Some(Ok(ExecTarget {
+                    namespace: pod.namespace.clone(),
+                    pod: pod.name.clone(),
+                    container: None,
+                }))
+            }
+            View::PodContainers { namespace, pod, .. } => {
+                let container = self
+                    .visible_containers()
+                    .get(self.detail_selected)
+                    .copied()?;
+                Some(Ok(ExecTarget {
+                    namespace: namespace.clone(),
+                    pod: pod.clone(),
+                    container: Some(container.name.clone()),
+                }))
+            }
+            View::ContainerLogs {
+                namespace,
+                pod,
+                container,
+                ..
+            } => Some(Ok(ExecTarget {
+                namespace: namespace.clone(),
+                pod: pod.clone(),
+                container: Some(container.clone()),
+            })),
+        }
+    }
+
+    /// `x`: start the checks for a shell, or say why there is nothing to
+    /// check yet.
+    fn start_exec(&mut self) -> Flow {
+        match self.exec_target() {
+            Some(Ok(target)) => {
+                self.exec = ExecStatus::Preparing(target.clone());
+                Flow::Exec(target)
+            }
+            Some(Err(advice)) => {
+                self.exec = ExecStatus::Refused(advice);
+                Flow::Continue
+            }
+            None => Flow::Continue,
+        }
+    }
+
+    /// What the status line says, if anything: the checks in progress, or a
+    /// refusal. Read by the renderer, which only lays it out.
+    fn status_lines(&self) -> Vec<Line<'static>> {
+        let theme = self.theme;
+        match &self.exec {
+            ExecStatus::Idle => Vec::new(),
+            ExecStatus::Preparing(target) => {
+                let what = match &target.container {
+                    Some(container) => format!("container {container} of pod {}", target.pod),
+                    None => format!("pod {}", target.pod),
+                };
+                vec![Line::from(vec![
+                    Span::styled(format!("Opening a shell in {what}…   "), theme.dim()),
+                    Span::styled("esc", theme.heading()),
+                    Span::styled(" cancel", theme.dim()),
+                ])]
+            }
+            // One line per line of the message, for the reason the node
+            // pane splits its errors: the second line is the advice.
+            ExecStatus::Refused(message) => message
+                .lines()
+                .map(|line| {
+                    Line::styled(
+                        line.to_owned(),
+                        theme.severity(crate::theme::Severity::Critical),
+                    )
+                })
+                .collect(),
+        }
     }
 
     /// Reset the node pane to `Loading`.
@@ -1699,6 +1870,27 @@ impl App {
             return Flow::Continue;
         }
 
+        // A refusal on the status line is read once: the next key dismisses
+        // it, and still does whatever it does.
+        if matches!(self.exec, ExecStatus::Refused(_)) {
+            self.exec = ExecStatus::Idle;
+        }
+
+        // A shell checked for in a pane the user has since left, or on a
+        // cluster no longer selected, is not one they want any more.
+        let (selected, view) = (self.selected, std::mem::discriminant(&self.view));
+        let flow = self.handle_key(key);
+        if self.exec_preparing()
+            && (self.selected != selected || std::mem::discriminant(&self.view) != view)
+        {
+            self.exec = ExecStatus::Idle;
+        }
+        flow
+    }
+
+    /// [`Self::on_key`], for a key press, after the status line's own
+    /// bookkeeping.
+    fn handle_key(&mut self, key: KeyEvent) -> Flow {
         if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('c')) {
             return Flow::Quit;
         }
@@ -1718,6 +1910,13 @@ impl App {
 
         if self.pod_selector_edit.is_editing() {
             return self.edit_selector(key);
+        }
+
+        // Ahead of every other meaning `Esc` has: what it cancels is the
+        // newest thing on screen.
+        if key.code == KeyCode::Esc && self.exec_preparing() {
+            self.exec = ExecStatus::Idle;
+            return Flow::Continue;
         }
 
         // Any key other than the quit-family ones clears a pending quit arm,
@@ -1753,6 +1952,7 @@ impl App {
             // does nothing is worse than one that is not offered, so the
             // footer hint appears under exactly this condition too.
             KeyCode::Char('L') if self.credentials_lost => return Flow::Login,
+            KeyCode::Char('x') => return self.start_exec(),
             // The container-logs pane has no rows to move a highlight
             // through — `j`/`k`/`Home`/`End`/`PageUp`/`PageDown` scroll its
             // text instead, the same keys a pager uses.
@@ -1857,6 +2057,11 @@ impl App {
 /// what they start: a fourth drill-down level should not have to grow every
 /// caller's argument list past `clippy::too_many_arguments`' limit again.
 ///
+/// `foreground` holds the two things that need the terminal itself: `L`'s
+/// login and `x`'s shell. This function leaves the alternate screen and raw
+/// mode around each, and takes the terminal back after. `x`'s checks run
+/// before that, on a background thread, through `drill.prepare_exec`.
+///
 /// When [`App::asks_terminal_background`] says so, this also sends
 /// [`crate::theme::BACKGROUND_QUERY`] once, right after the first frame is on
 /// screen, and re-themes if the terminal answers light (decision 111).
@@ -1870,8 +2075,9 @@ pub fn run(
     spawn_nodes: &NodesFetcher,
     drill: &DrillFetchers<'_>,
     refresh: RefreshInterval,
-    login: &LoginRunner,
+    foreground: &Foreground,
 ) -> Result<()> {
+    let Foreground { login, session } = foreground;
     let query_background = app.asks_terminal_background();
     let mut terminal = ratatui::init();
 
@@ -1890,6 +2096,22 @@ pub fn run(
         // a failure to re-enter is reported *after* the login's own.
         let entered = enter_terminal();
         outcome.and(left).and(entered)
+    };
+
+    // The same for `x`, around a shell rather than a login. The line the
+    // session prints first, and the shell itself, land on the screen the
+    // user had before the dashboard opened, as `kubectl exec` would.
+    let in_session = |context: &str, plan: &Plan| -> Result<(), FetchError> {
+        let left = leave_terminal();
+        let outcome = session(context, plan);
+        let entered = enter_terminal();
+        let terminal_error = |message| FetchError {
+            message,
+            credentials: false,
+        };
+        outcome
+            .and(left.map_err(terminal_error))
+            .and(entered.map_err(terminal_error))
     };
 
     let mut next_event = |timeout: Duration| -> std::io::Result<Option<Event>> {
@@ -1917,6 +2139,7 @@ pub fn run(
         refresh,
         TerminalIo {
             suspend: &suspended,
+            session: &in_session,
             next_event: &mut next_event,
             query_background: if query_background {
                 Some(&mut query)
@@ -1929,12 +2152,27 @@ pub fn run(
     result
 }
 
+/// What runs on this thread with the terminal handed back to it: `L`'s login,
+/// and `x`'s shell. Bundled for the reason [`DrillFetchers`] is.
+pub struct Foreground {
+    pub login: LoginRunner,
+    pub session: SessionRunner,
+}
+
+impl std::fmt::Debug for Foreground {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Foreground").finish_non_exhaustive()
+    }
+}
+
 /// What `event_loop` needs from a real terminal beyond drawing on it, taken
 /// as closures so a test can drive the whole loop — keys in, frames out —
 /// against `TestBackend`, the same reason [`Suspended`] is one.
 struct TerminalIo<'a> {
     /// Hand the terminal back around a login; see [`Suspended`].
     suspend: Suspended<'a>,
+    /// Hand the terminal back around a shell; see [`SuspendedSession`].
+    session: SuspendedSession<'a>,
     /// Wait up to the given time for the next terminal event; `None` if
     /// nothing arrived.
     next_event: &'a mut dyn FnMut(Duration) -> std::io::Result<Option<Event>>,
@@ -1950,10 +2188,17 @@ struct TerminalIo<'a> {
 /// along with everything it has cached about the screen — would have to be
 /// replaced mid-loop. These are the two things `init` does that matter to a
 /// suspended session, undone and redone around the handle we already have.
+///
+/// The cursor is shown again too: `ratatui` hides it while it draws, and a
+/// shell or a helper's prompt without one is hard to type into.
 fn leave_terminal() -> Result<(), String> {
     terminal::disable_raw_mode().map_err(|error| format!("could not leave raw mode: {error}"))?;
-    execute!(std::io::stdout(), terminal::LeaveAlternateScreen)
-        .map_err(|error| format!("could not leave the alternate screen: {error}"))
+    execute!(
+        std::io::stdout(),
+        terminal::LeaveAlternateScreen,
+        ratatui::crossterm::cursor::Show
+    )
+    .map_err(|error| format!("could not leave the alternate screen: {error}"))
 }
 
 /// The other half of [`leave_terminal`].
@@ -1964,12 +2209,14 @@ fn enter_terminal() -> Result<(), String> {
 }
 
 /// The fetchers for the detail pane's three drill-down levels, bundled into
-/// one parameter for the reason [`run`]'s doc comment gives.
+/// one parameter for the reason [`run`]'s doc comment gives — and the check
+/// `x` starts from those same levels before a shell is opened.
 #[derive(Clone, Copy)]
 pub struct DrillFetchers<'a> {
     pub spawn_pods: &'a PodsFetcher,
     pub spawn_containers: &'a ContainersFetcher,
     pub spawn_logs: &'a LogsFetcher,
+    pub prepare_exec: &'a ExecPreparer,
 }
 
 // `Box<dyn Fn(..) -> ..>` has no `Debug` impl for `#[derive(Debug)]` to call,
@@ -2099,38 +2346,23 @@ where
     let mut next_refresh = schedule(refresh);
     let mut inflight = Inflight::default();
     let login = io.suspend;
+    let session = io.session;
     let mut input = Input::new(io);
+    // The checks behind `x`, while they run. Kept only while `App` says it
+    // is still waiting for them, so dropping it is how `Esc` cancels.
+    let mut exec_rx: Option<mpsc::Receiver<Result<Plan, FetchError>>> = None;
 
     loop {
-        // Non-blocking: a fetch that has not finished yet leaves the pane
-        // exactly as it was, and one that finished while the user was
-        // pressing keys is picked up on the very next frame rather than
-        // waiting for a quiet moment.
-        if let Some(rx) = &nodes_rx
-            && let Ok(result) = rx.try_recv()
-        {
-            app.apply_nodes(result);
-        }
-        if let Some(rx) = &inflight.pods
-            && let Ok(result) = rx.try_recv()
-        {
-            app.apply_pods(result);
-        }
-        if let Some(rx) = &inflight.containers
-            && let Ok(result) = rx.try_recv()
-        {
-            app.apply_containers(result);
-        }
-        // Drained in a loop rather than one `try_recv` per frame: a log
-        // sends many events, not one, and a burst of them arriving between
-        // two frames must reach the buffer before the next paint rather than
-        // trickling in one line every `TICK` — the whole point of the
-        // acceptance criterion that a burst must not stall the UI is that it
-        // catches up immediately once control comes back here.
-        if let Some(rx) = &inflight.logs {
-            while let Ok(event) = rx.try_recv() {
-                app.apply_log_event(event);
-            }
+        take_arrivals(&mut app, nodes_rx.as_ref(), &inflight);
+        if let Some(checked) = exec_rx.as_ref().and_then(checked_exec) {
+            exec_rx = None;
+            finish_exec(
+                terminal,
+                &mut app,
+                checked,
+                session,
+                selected_context.as_deref(),
+            )?;
         }
 
         terminal.draw(|frame| draw(frame, &app))?;
@@ -2181,7 +2413,15 @@ where
                     Err(message) => app.apply_login_failure(message),
                 }
             }
+            Flow::Exec(target) => {
+                exec_rx = selected_context
+                    .as_deref()
+                    .map(|context| (drill.prepare_exec)(context, &target));
+            }
             Flow::Continue => {}
+        }
+        if !app.exec_preparing() {
+            exec_rx = None;
         }
 
         if is_refresh_key(key) {
@@ -2232,6 +2472,93 @@ where
                 &mut inflight,
             );
         }
+    }
+}
+
+/// Apply every background fetch that has finished since the last frame.
+///
+/// Never waits for one that has not.
+fn take_arrivals(
+    app: &mut App,
+    nodes_rx: Option<&mpsc::Receiver<Result<NodesFetch, FetchError>>>,
+    inflight: &Inflight,
+) {
+    // Non-blocking: a fetch that has not finished yet leaves the pane
+    // exactly as it was, and one that finished while the user was
+    // pressing keys is picked up on the very next frame rather than
+    // waiting for a quiet moment.
+    if let Some(rx) = nodes_rx
+        && let Ok(result) = rx.try_recv()
+    {
+        app.apply_nodes(result);
+    }
+    if let Some(rx) = &inflight.pods
+        && let Ok(result) = rx.try_recv()
+    {
+        app.apply_pods(result);
+    }
+    if let Some(rx) = &inflight.containers
+        && let Ok(result) = rx.try_recv()
+    {
+        app.apply_containers(result);
+    }
+    // Drained in a loop rather than one `try_recv` per frame: a log
+    // sends many events, not one, and a burst of them arriving between
+    // two frames must reach the buffer before the next paint rather than
+    // trickling in one line every `TICK` — the whole point of the
+    // acceptance criterion that a burst must not stall the UI is that it
+    // catches up immediately once control comes back here.
+    if let Some(rx) = &inflight.logs {
+        while let Ok(event) = rx.try_recv() {
+            app.apply_log_event(event);
+        }
+    }
+}
+
+/// Act on the answer to the checks behind `x`: run the shell they planned,
+/// or put their refusal on the status line.
+fn finish_exec<B>(
+    terminal: &mut Terminal<B>,
+    app: &mut App,
+    checked: Result<Plan, FetchError>,
+    session: SuspendedSession<'_>,
+    context: Option<&str>,
+) -> Result<()>
+where
+    B: ratatui::backend::Backend,
+    B::Error: std::error::Error + Send + Sync + 'static,
+{
+    match checked {
+        Ok(plan) => {
+            // Blocks until the shell exits, on purpose: the terminal is the
+            // shell's until then. The background fetches go on meanwhile,
+            // and are picked up on the next pass.
+            let outcome = session(context.unwrap_or_default(), &plan);
+            // The shell had the screen, so `ratatui`'s idea of what is on it
+            // is stale, as after `L`; and `leave_terminal` showed the cursor
+            // `ratatui` keeps hidden.
+            terminal.clear()?;
+            terminal.hide_cursor()?;
+            app.apply_exec_ending(outcome);
+        }
+        Err(error) => app.apply_exec_refusal(error),
+    }
+    Ok(())
+}
+
+/// The answer to the checks behind `x`, if it has arrived.
+///
+/// A check whose thread ended without answering — it could not start a
+/// runtime — is reported as a refusal rather than left as an "Opening a
+/// shell…" that never finishes.
+fn checked_exec(rx: &mpsc::Receiver<Result<Plan, FetchError>>) -> Option<Result<Plan, FetchError>> {
+    match rx.try_recv() {
+        Ok(checked) => Some(checked),
+        Err(mpsc::TryRecvError::Empty) => None,
+        Err(mpsc::TryRecvError::Disconnected) => Some(Err(FetchError {
+            message: "eks could not start the check for a shell. Press x to try again.".to_owned(),
+            credentials: false,
+        })),
     }
 }
 
@@ -2428,18 +2755,51 @@ fn advance_resource_sort(text: &str, key: KeyEvent) -> ResourceSort {
 
 /// Draw one frame.
 pub fn draw(frame: &mut Frame, app: &App) {
+    let status = app.status_lines();
+    let area = frame.area();
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(1), // header
             Constraint::Min(0),    // body
+            Constraint::Length(status_height(&status, area.width, area.height)),
             Constraint::Length(1), // footer
         ])
-        .split(frame.area());
+        .split(area);
 
     draw_header(frame, chunks[0], app);
     draw_body(frame, chunks[1], app);
-    draw_footer(frame, chunks[2], app);
+    // Indented a column, as the footer's hints are, wrapped lines included.
+    frame.render_widget(
+        Paragraph::new(status)
+            .wrap(Wrap { trim: false })
+            .block(Block::new().padding(Padding::left(STATUS_INDENT))),
+        chunks[2],
+    );
+    draw_footer(frame, chunks[3], app);
+}
+
+/// How far the status line is indented from the screen's left edge.
+const STATUS_INDENT: u16 = 1;
+
+/// How many rows the status line takes: each of its lines, wrapped at
+/// `width` less [`STATUS_INDENT`], up to a third of the screen so the panes
+/// stay in sight.
+///
+/// Wrapping is estimated by characters, where `ratatui` wraps by words, so a
+/// long message can run one row short and lose the end of its last line;
+/// the cap would cut it sooner anyway.
+fn status_height(lines: &[Line<'_>], width: u16, height: u16) -> u16 {
+    let width = usize::from(width.saturating_sub(STATUS_INDENT));
+    if lines.is_empty() || width == 0 {
+        return 0;
+    }
+    let rows: usize = lines
+        .iter()
+        .map(|line| line.width().div_ceil(width).max(1))
+        .sum();
+    let cap = usize::from((height / 3).max(1));
+    u16::try_from(rows.min(cap)).unwrap_or(u16::MAX)
 }
 
 fn draw_header(frame: &mut Frame, area: Rect, app: &App) {
@@ -2677,6 +3037,7 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
             ("←/esc", "back"),
             ("q", "quit"),
             ("/", "search"),
+            ("x", "shell"),
         ];
         if app.log_search_active() {
             hints.push(("n/N", "next/prev match"));
@@ -2689,13 +3050,26 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
             ("enter", "open"),
             ("←/esc", "back"),
             ("r", "refresh"),
-            ("s/S", "sort"),
+            // The container list has no ordering for `s`/`S` to change (see
+            // `App::cycle_sort`), so its slot goes to `x`, which is the
+            // thing a container list is most often opened for.
+            if matches!(app.view(), View::PodContainers { .. }) {
+                ("x", "shell")
+            } else {
+                ("s/S", "sort")
+            },
             ("q", "quit"),
             // Last, not because it matters least, but so a narrow terminal
             // clips the newest hint before it clips `q quit` — the one this
             // tool can least afford to hide.
             ("/", "filter"),
         ];
+        // On a pod, `x` opens a shell in its default container. After `/`,
+        // so it is clipped before `q quit`, and ahead of the two narrower
+        // hints below.
+        if matches!(app.view(), View::NodePods { .. }) {
+            hints.push(("x", "shell"));
+        }
         // `R` only does anything against a pane with a `sort_by_device` of
         // its own — the node pane and, now, the pod-drilldown pane (see
         // `App::start_resource_sort`) — so it is offered only there rather
@@ -5652,6 +6026,295 @@ mod tests {
             app.on_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
             Flow::Quit
         );
+    }
+
+    // --- `x`: a shell from the dashboard ---
+
+    fn refused_exec(message: &str) -> FetchError {
+        FetchError {
+            message: message.to_owned(),
+            credentials: false,
+        }
+    }
+
+    fn footer_of(app: &App, width: u16) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(width, 24)).unwrap();
+        terminal.draw(|frame| draw(frame, app)).unwrap();
+        let screen = terminal.backend().to_string();
+        screen.lines().last().unwrap_or_default().to_owned()
+    }
+
+    #[test]
+    fn x_in_the_containers_pane_asks_for_the_highlighted_container() {
+        let mut app = app_with_container();
+
+        assert_eq!(
+            app.on_key(press(KeyCode::Char('x'))),
+            Flow::Exec(ExecTarget {
+                namespace: "default".to_owned(),
+                pod: "api-1".to_owned(),
+                container: Some("app".to_owned()),
+            })
+        );
+        assert!(app.exec_preparing());
+    }
+
+    #[test]
+    fn x_on_a_pod_leaves_the_container_to_the_pods_default() {
+        let mut app = app_with_pod();
+
+        assert_eq!(
+            app.on_key(press(KeyCode::Char('x'))),
+            Flow::Exec(ExecTarget {
+                namespace: "default".to_owned(),
+                pod: "api-1".to_owned(),
+                container: None,
+            })
+        );
+    }
+
+    #[test]
+    fn x_in_a_log_asks_for_the_container_whose_log_it_is() {
+        let mut app = app_with_container();
+        app.on_key(press(KeyCode::Enter));
+        assert!(matches!(app.view(), View::ContainerLogs { .. }));
+
+        let flow = app.on_key(press(KeyCode::Char('x')));
+
+        assert!(
+            matches!(&flow, Flow::Exec(target) if target.container.as_deref() == Some("app")),
+            "{flow:?}"
+        );
+    }
+
+    #[test]
+    fn x_follows_the_filter_to_the_row_actually_highlighted() {
+        let mut app = app_with_pod();
+        app.apply_pods(Ok(PodsFetch {
+            rows: vec![pod_row("api-1"), pod_row("worker-1")],
+            selector_note: None,
+            usage_note: None,
+        }));
+        app.on_key(press(KeyCode::Char('/')));
+        for c in "work".chars() {
+            app.on_key(press(KeyCode::Char(c)));
+        }
+        app.on_key(press(KeyCode::Enter));
+
+        let flow = app.on_key(press(KeyCode::Char('x')));
+
+        assert!(
+            matches!(&flow, Flow::Exec(target) if target.pod == "worker-1"),
+            "{flow:?}"
+        );
+    }
+
+    #[test]
+    fn x_with_the_sidebar_focused_says_how_to_reach_the_list() {
+        let mut app = app_with_container();
+        app.toggle_focus();
+        assert_eq!(app.focus(), Focus::Sidebar);
+
+        assert_eq!(app.on_key(press(KeyCode::Char('x'))), Flow::Continue);
+
+        let lines = app.status_lines();
+        assert_eq!(lines.len(), 1);
+        assert!(
+            lines[0]
+                .to_string()
+                .contains("Press tab to move to the container list"),
+            "{}",
+            lines[0]
+        );
+    }
+
+    #[test]
+    fn x_does_nothing_on_the_node_pane() {
+        let mut app = app_with_node();
+        app.toggle_focus();
+
+        assert_eq!(app.on_key(press(KeyCode::Char('x'))), Flow::Continue);
+        assert!(app.status_lines().is_empty());
+    }
+
+    #[test]
+    fn x_does_nothing_while_the_pod_list_is_still_loading() {
+        let mut app = app_with_node();
+        app.on_key(press(KeyCode::Enter));
+        assert!(matches!(app.view(), View::NodePods { .. }));
+
+        assert_eq!(app.on_key(press(KeyCode::Char('x'))), Flow::Continue);
+        assert!(!app.exec_preparing());
+    }
+
+    #[test]
+    fn x_is_filter_text_while_the_filter_is_capturing() {
+        let mut app = app_with_container();
+        app.on_key(press(KeyCode::Char('/')));
+
+        assert_eq!(app.on_key(press(KeyCode::Char('x'))), Flow::Continue);
+        assert_eq!(app.filter_query(), "x");
+        assert!(!app.exec_preparing());
+    }
+
+    #[test]
+    fn esc_cancels_a_pending_shell_before_it_backs_out_of_anything() {
+        let mut app = app_with_container();
+        app.on_key(press(KeyCode::Char('x')));
+
+        assert_eq!(app.on_key(press(KeyCode::Esc)), Flow::Continue);
+
+        assert!(!app.exec_preparing());
+        assert!(matches!(app.view(), View::PodContainers { .. }));
+    }
+
+    #[test]
+    fn moving_the_highlight_keeps_the_pending_shell() {
+        let mut app = app_with_container();
+        app.on_key(press(KeyCode::Char('x')));
+
+        app.on_key(press(KeyCode::Char('j')));
+
+        assert!(app.exec_preparing());
+    }
+
+    #[test]
+    fn switching_clusters_cancels_a_pending_shell() {
+        let mut app = App::new(vec![cluster("prod", true), cluster("staging", false)]);
+        app.apply_nodes(Ok(NodesFetch {
+            rows: vec![node_row("ip-10-0-1-12")],
+            ..NodesFetch::default()
+        }));
+        app.on_key(press(KeyCode::Tab));
+        app.on_key(press(KeyCode::Enter));
+        app.apply_pods(Ok(PodsFetch {
+            rows: vec![pod_row("api-1")],
+            selector_note: None,
+            usage_note: None,
+        }));
+        app.on_key(press(KeyCode::Char('x')));
+        assert!(app.exec_preparing());
+
+        app.toggle_focus();
+        app.on_key(press(KeyCode::Char('j')));
+
+        assert!(!app.exec_preparing());
+    }
+
+    #[test]
+    fn a_refusal_stays_on_the_status_line_until_the_next_key() {
+        let mut app = app_with_container();
+        app.on_key(press(KeyCode::Char('x')));
+        app.apply_exec_refusal(refused_exec(
+            "container app in pod api-1 is not running (CrashLoopBackOff).\n\
+             Open its log and press p to see how its last run ended.",
+        ));
+
+        let lines: Vec<String> = app.status_lines().iter().map(ToString::to_string).collect();
+        assert_eq!(
+            lines,
+            [
+                "container app in pod api-1 is not running (CrashLoopBackOff).",
+                "Open its log and press p to see how its last run ended.",
+            ]
+        );
+        assert!(!app.exec_preparing());
+
+        app.on_key(press(KeyCode::Char('k')));
+        assert!(app.status_lines().is_empty());
+    }
+
+    #[test]
+    fn a_credential_refusal_offers_l_without_withdrawing_anything() {
+        let mut app = app_with_container();
+        app.apply_exec_refusal(FetchError {
+            message: "prod rejected your credentials.".to_owned(),
+            credentials: true,
+        });
+        assert!(app.credentials_lost());
+
+        // And a refusal for any other reason leaves an offer another pane
+        // made where it was.
+        app.apply_exec_refusal(refused_exec("pod api-1 has no shell."));
+        assert!(app.credentials_lost());
+    }
+
+    #[test]
+    fn a_shell_that_exited_leaves_nothing_on_the_status_line() {
+        let mut app = app_with_container();
+        app.on_key(press(KeyCode::Char('x')));
+
+        app.apply_exec_ending(Ok(()));
+
+        assert!(app.status_lines().is_empty());
+        assert!(!app.exec_preparing());
+    }
+
+    #[test]
+    fn the_footer_offers_x_where_there_is_a_pod_or_container_to_open() {
+        let mut app = app_with_node();
+        assert!(!footer_of(&app, 200).contains("x shell"));
+
+        app = app_with_pod();
+        assert!(footer_of(&app, 200).contains("x shell"));
+
+        app = app_with_container();
+        assert!(footer_of(&app, 200).contains("x shell"));
+
+        app.on_key(press(KeyCode::Enter));
+        assert!(footer_of(&app, 200).contains("x shell"));
+    }
+
+    #[test]
+    fn the_containers_pane_offers_x_in_place_of_a_sort_it_does_not_have() {
+        let footer = footer_of(&app_with_container(), 100);
+        assert!(footer.contains("x shell"), "{footer}");
+        assert!(!footer.contains("s/S"), "{footer}");
+    }
+
+    #[test]
+    fn on_a_pod_x_comes_after_quit_so_a_narrow_footer_clips_it_first() {
+        let footer = footer_of(&app_with_pod(), 200);
+        let quit = footer.find("q quit").unwrap();
+        let shell = footer.find("x shell").unwrap();
+        assert!(quit < shell, "{footer}");
+    }
+
+    #[test]
+    fn the_status_line_takes_no_room_when_there_is_nothing_to_say() {
+        assert_eq!(status_height(&[], 100, 24), 0);
+    }
+
+    #[test]
+    fn the_status_line_grows_with_each_wrapped_line() {
+        // 150 characters in the 99 columns left of a 100-column terminal.
+        let lines = [Line::raw("x".repeat(150)), Line::raw("short")];
+        assert_eq!(status_height(&lines, 100, 24), 3);
+    }
+
+    #[test]
+    fn the_status_line_never_takes_more_than_a_third_of_the_screen() {
+        let lines: Vec<Line> = (0..20).map(|n| Line::raw(format!("line {n}"))).collect();
+        assert_eq!(status_height(&lines, 100, 24), 8);
+        // And always a row, however small the terminal, so a refusal is
+        // never silently invisible.
+        assert_eq!(status_height(&lines, 100, 2), 1);
+    }
+
+    #[test]
+    fn the_status_line_takes_nothing_from_a_terminal_with_no_width() {
+        assert_eq!(status_height(&[Line::raw("x")], 0, 24), 0);
+        assert_eq!(status_height(&[Line::raw("x")], 1, 24), 0);
+    }
+
+    #[test]
+    fn a_refusal_draws_on_a_one_by_one_terminal_without_panicking() {
+        let mut app = app_with_container();
+        app.apply_exec_refusal(refused_exec(
+            "pod api-1 has no shell.\nRun a command instead.",
+        ));
+        let mut terminal = Terminal::new(TestBackend::new(1, 1)).unwrap();
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
     }
 
     mod event_loop;

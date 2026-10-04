@@ -416,6 +416,13 @@ and window resizes go to the container, and your terminal is put back however
 the session ends. `eks` exits with the remote command's own exit code, so
 `eks exec api -- test -f /ready` works in a script.
 
+The dashboard opens the same shell with `x`, on a highlighted container, a
+highlighted pod (its default container), or the container whose log you are
+reading. The dashboard stays on screen while `eks` checks that the pod is
+running and that the image has a shell. If either check fails, the reason
+appears above the footer and nothing else changes. Otherwise the shell takes
+the terminal, and exiting it brings the dashboard back as you left it.
+
 Credentials come from the kubeconfig context itself, so whatever works for
 `kubectl` works here. When they have expired, `eks` says so and tells you how to
 refresh them instead of printing an HTTP status code — and, if the session it
@@ -716,6 +723,7 @@ change, and the next command prints normally underneath it.
 | `Esc` | Back out one level; quits once there is nowhere left to back out to |
 | `r` | Refresh the node pane now |
 | `L` | Log in to AWS again — only offered when the pane is showing a credential failure |
+| `x` | Open a shell in the highlighted pod or container, or the one whose log is open; `Esc` cancels while it is being checked. See [A shell in a container](#a-shell-in-a-container) |
 | `f` | Toggle following a container's log |
 | `w` | Toggle line wrap in a container's log |
 | `p` | Switch a container's log between its current instance and its previous one |

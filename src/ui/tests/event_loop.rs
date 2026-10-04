@@ -30,6 +30,8 @@ enum Step {
     Query,
     /// The loop asked the terminal for its next event.
     Read,
+    /// A shell session ran, with the terminal handed to it.
+    Session,
 }
 
 type Log = Rc<RefCell<Vec<Step>>>;
@@ -92,6 +94,101 @@ struct Run {
     /// How many container fetches and log streams the loop started.
     container_fetches: usize,
     log_streams: usize,
+    /// The containers the checks behind `x` were started for.
+    exec_checks: Vec<ExecTarget>,
+}
+
+/// How the stubs behind `x` answer.
+#[derive(Clone)]
+struct ExecStub {
+    /// What the checks answer with.
+    checked: Result<Plan, FetchError>,
+    /// Hold the answer until the script sends `Event::FocusGained`, rather
+    /// than having it ready at once — a check still running when the next
+    /// key arrives.
+    held: bool,
+    /// How the session ends.
+    session: Result<(), FetchError>,
+}
+
+impl Default for ExecStub {
+    fn default() -> Self {
+        Self {
+            checked: Ok(plan()),
+            held: false,
+            session: Ok(()),
+        }
+    }
+}
+
+fn plan() -> Plan {
+    Plan {
+        namespace: "default".to_owned(),
+        pod: "api-1".to_owned(),
+        container: "app".to_owned(),
+        shell: vec!["/bin/sh".to_owned()],
+        os: crate::k8s::remote::Os::Linux,
+    }
+}
+
+/// The terminal's events, read off `events` one per call. Reading
+/// `Event::FocusGained` also releases a check's answer held back in `held`.
+fn scripted(
+    events: &Rc<RefCell<VecDeque<Event>>>,
+    log: &Log,
+    held: &Rc<RefCell<Held>>,
+) -> impl FnMut(Duration) -> std::io::Result<Option<Event>> {
+    let events = Rc::clone(events);
+    let log = Rc::clone(log);
+    let held = Rc::clone(held);
+    move |_timeout: Duration| {
+        log.borrow_mut().push(Step::Read);
+        // Running dry means the script never quit the loop: fail the test
+        // rather than spin forever.
+        let event = events
+            .borrow_mut()
+            .pop_front()
+            .ok_or_else(|| std::io::Error::other("script ran out before the loop quit"))?;
+        if event == Event::FocusGained
+            && let Some((tx, checked)) = held.borrow_mut().take()
+        {
+            // Nobody may be listening any more; that is the point.
+            let _ = tx.send(checked);
+        }
+        Ok(Some(event))
+    }
+}
+
+/// A check's answer the stub is holding back, and where to send it.
+type Held = Option<(
+    mpsc::Sender<Result<Plan, FetchError>>,
+    Result<Plan, FetchError>,
+)>;
+
+/// The stub behind `x`'s checks: records each target in `checks`, and
+/// answers at once or into `held`, as `exec` says.
+fn exec_preparer(
+    exec: &ExecStub,
+    checks: &Rc<RefCell<Vec<ExecTarget>>>,
+    held: &Rc<RefCell<Held>>,
+) -> ExecPreparer {
+    let checks = Rc::clone(checks);
+    let held = Rc::clone(held);
+    let exec = exec.clone();
+    Box::new(move |_, target| {
+        checks.borrow_mut().push(target.clone());
+        let (tx, rx) = mpsc::channel();
+        if exec.held {
+            *held.borrow_mut() = Some((tx, exec.checked.clone()));
+        } else {
+            tx.send(exec.checked.clone()).unwrap();
+        }
+        rx
+    })
+}
+
+fn ctrl_c() -> Event {
+    Event::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL))
 }
 
 /// Drive `event_loop` over `app` with `script` as everything the terminal
@@ -100,6 +197,16 @@ struct Run {
 /// script is left — which is how a real terminal's reply lands: after the
 /// query, and before any key pressed later.
 fn run_loop(app: App, script: Vec<Event>, terminal_answers: Option<&[u8]>) -> Run {
+    run_loop_with(app, script, terminal_answers, &ExecStub::default())
+}
+
+/// [`run_loop`], with `x`'s checks and session answering as `exec` says.
+fn run_loop_with(
+    app: App,
+    script: Vec<Event>,
+    terminal_answers: Option<&[u8]>,
+    exec: &ExecStub,
+) -> Run {
     let log: Log = Rc::default();
     let events: Rc<RefCell<VecDeque<Event>>> = Rc::new(RefCell::new(script.into()));
     events.borrow_mut().extend([
@@ -138,26 +245,25 @@ fn run_loop(app: App, script: Vec<Event>, terminal_answers: Option<&[u8]>) -> Ru
             crate::commands::spawn_stream(|_tx, _stop| async {})
         })
     };
+    let exec_checks: Rc<RefCell<Vec<ExecTarget>>> = Rc::default();
+    let held: Rc<RefCell<Held>> = Rc::default();
+    let prepare_exec = exec_preparer(exec, &exec_checks, &held);
     let drill = DrillFetchers {
         spawn_pods: &spawn_pods,
         spawn_containers: &spawn_containers,
         spawn_logs: &spawn_logs,
+        prepare_exec: &prepare_exec,
     };
-
-    let mut next_event = {
-        let events = Rc::clone(&events);
+    let session = {
         let log = Rc::clone(&log);
-        move |_timeout: Duration| -> std::io::Result<Option<Event>> {
-            log.borrow_mut().push(Step::Read);
-            // Running dry means the script never quit the loop: fail the test
-            // rather than spin forever.
-            events
-                .borrow_mut()
-                .pop_front()
-                .map(Some)
-                .ok_or_else(|| std::io::Error::other("script ran out before the loop quit"))
+        let outcome = exec.session.clone();
+        move |_: &str, _: &Plan| -> Result<(), FetchError> {
+            log.borrow_mut().push(Step::Session);
+            outcome.clone()
         }
     };
+
+    let mut next_event = scripted(&events, &log, &held);
     let mut query = {
         let events = Rc::clone(&events);
         let log = Rc::clone(&log);
@@ -183,6 +289,7 @@ fn run_loop(app: App, script: Vec<Event>, terminal_answers: Option<&[u8]>) -> Ru
         RefreshInterval::never(),
         TerminalIo {
             suspend: &|_| Ok(()),
+            session: &session,
             next_event: &mut next_event,
             query_background: if asks { Some(&mut query) } else { None },
         },
@@ -197,6 +304,7 @@ fn run_loop(app: App, script: Vec<Event>, terminal_answers: Option<&[u8]>) -> Ru
         node_fetches: node_fetches.get(),
         container_fetches: container_fetches.get(),
         log_streams: log_streams.get(),
+        exec_checks: exec_checks.borrow().clone(),
     }
 }
 
@@ -387,4 +495,242 @@ fn l_leaves_a_container_pane_that_loaded_alone() {
 
     assert_eq!(run.container_fetches, 0);
     assert_eq!(run.node_fetches, 1);
+}
+
+// --- `x`: a shell from the dashboard ---
+
+fn text(screen: &ratatui::buffer::Buffer) -> String {
+    screen
+        .content()
+        .chunks(usize::from(screen.area.width))
+        .map(|row| row.iter().map(Cell::symbol).collect::<String>())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+#[test]
+fn x_on_a_container_checks_it_then_hands_the_terminal_to_the_shell() {
+    let run = run_loop(
+        app_with_container(),
+        vec![Event::Key(press(KeyCode::Char('x'))), ctrl_c()],
+        None,
+    );
+
+    assert_eq!(
+        run.exec_checks,
+        [ExecTarget {
+            namespace: "default".to_owned(),
+            pod: "api-1".to_owned(),
+            container: Some("app".to_owned()),
+        }]
+    );
+    // The key is read, the session runs, and the very next thing is a frame:
+    // the dashboard is back on screen before it waits for another key.
+    let session = run.log.iter().position(|&step| step == Step::Session);
+    let session = session.expect("the session never ran");
+    assert_eq!(run.log[session - 1], Step::Read, "{:?}", run.log);
+    assert_eq!(run.log[session + 1], Step::Frame, "{:?}", run.log);
+}
+
+#[test]
+fn x_on_a_pod_asks_for_its_default_container() {
+    let run = run_loop(
+        app_with_pod(),
+        vec![Event::Key(press(KeyCode::Char('x'))), ctrl_c()],
+        None,
+    );
+
+    assert_eq!(run.exec_checks.len(), 1);
+    assert_eq!(run.exec_checks[0].pod, "api-1");
+    assert_eq!(run.exec_checks[0].container, None);
+}
+
+#[test]
+fn after_the_shell_exits_the_dashboard_is_redrawn_as_it_was_left() {
+    let with_shell = run_loop(
+        app_with_container(),
+        vec![Event::Key(press(KeyCode::Char('x'))), ctrl_c()],
+        None,
+    );
+    let without = run_loop(app_with_container(), vec![ctrl_c()], None);
+
+    assert_eq!(with_shell.screen, without.screen);
+}
+
+#[test]
+fn a_refused_check_says_why_on_the_status_line_and_never_leaves_the_screen() {
+    let exec = ExecStub {
+        checked: Err(FetchError {
+            message: "container app in pod api-1 is not running (CrashLoopBackOff).\n\
+                      Open its log and press p to see how its last run ended."
+                .to_owned(),
+            credentials: false,
+        }),
+        ..ExecStub::default()
+    };
+    let run = run_loop_with(
+        app_with_container(),
+        vec![Event::Key(press(KeyCode::Char('x'))), ctrl_c()],
+        None,
+        &exec,
+    );
+
+    assert!(!run.log.contains(&Step::Session), "{:?}", run.log);
+    let screen = text(&run.screen);
+    assert!(
+        screen.contains("is not running (CrashLoopBackOff)."),
+        "{screen}"
+    );
+    assert!(
+        screen.contains("press p to see how its last run ended"),
+        "{screen}"
+    );
+    // The pane under it is untouched.
+    assert!(screen.contains("› api-1 "), "{screen}");
+}
+
+#[test]
+fn the_next_key_clears_a_refusal_from_the_status_line() {
+    let exec = ExecStub {
+        checked: Err(FetchError {
+            message: "pod api-1 has no shell.".to_owned(),
+            credentials: false,
+        }),
+        ..ExecStub::default()
+    };
+    let run = run_loop_with(
+        app_with_container(),
+        vec![
+            Event::Key(press(KeyCode::Char('x'))),
+            Event::Key(press(KeyCode::Char('j'))),
+            ctrl_c(),
+        ],
+        None,
+        &exec,
+    );
+
+    assert!(!text(&run.screen).contains("has no shell"));
+}
+
+#[test]
+fn esc_cancels_the_check_and_its_late_answer_opens_nothing() {
+    let exec = ExecStub {
+        held: true,
+        ..ExecStub::default()
+    };
+    let run = run_loop_with(
+        app_with_container(),
+        vec![
+            Event::Key(press(KeyCode::Char('x'))),
+            Event::Key(press(KeyCode::Esc)),
+            Event::FocusGained,
+            ctrl_c(),
+        ],
+        None,
+        &exec,
+    );
+
+    assert_eq!(run.exec_checks.len(), 1);
+    assert!(!run.log.contains(&Step::Session), "{:?}", run.log);
+    let screen = text(&run.screen);
+    assert!(!screen.contains("Opening a shell"), "{screen}");
+    // Esc cancelled rather than backing out of the pane.
+    assert!(screen.contains("› api-1 "), "{screen}");
+}
+
+#[test]
+fn a_check_still_running_shows_that_it_is_and_how_to_cancel_it() {
+    let exec = ExecStub {
+        held: true,
+        ..ExecStub::default()
+    };
+    let run = run_loop_with(
+        app_with_container(),
+        vec![Event::Key(press(KeyCode::Char('x'))), ctrl_c()],
+        None,
+        &exec,
+    );
+
+    let screen = text(&run.screen);
+    assert!(
+        screen.contains("Opening a shell in container app of pod api-1…   esc cancel"),
+        "{screen}"
+    );
+}
+
+#[test]
+fn leaving_the_pane_cancels_the_check() {
+    let exec = ExecStub {
+        held: true,
+        ..ExecStub::default()
+    };
+    let run = run_loop_with(
+        app_with_container(),
+        vec![
+            Event::Key(press(KeyCode::Char('x'))),
+            Event::Key(press(KeyCode::Left)),
+            Event::FocusGained,
+            ctrl_c(),
+        ],
+        None,
+        &exec,
+    );
+
+    assert!(!run.log.contains(&Step::Session), "{:?}", run.log);
+}
+
+#[test]
+fn a_session_that_broke_says_why_once_the_dashboard_is_back() {
+    let exec = ExecStub {
+        session: Err(FetchError {
+            message: "the connection to pod api-1 closed before `/bin/sh` reported how it ended."
+                .to_owned(),
+            credentials: false,
+        }),
+        ..ExecStub::default()
+    };
+    let run = run_loop_with(
+        app_with_container(),
+        vec![Event::Key(press(KeyCode::Char('x'))), ctrl_c()],
+        None,
+        &exec,
+    );
+
+    assert!(run.log.contains(&Step::Session));
+    let screen = text(&run.screen);
+    assert!(
+        screen.contains("the connection to pod api-1 closed"),
+        "{screen}"
+    );
+}
+
+#[test]
+fn a_credential_refusal_from_the_check_offers_l() {
+    let exec = ExecStub {
+        checked: Err(FetchError {
+            message: "prod rejected your credentials.".to_owned(),
+            credentials: true,
+        }),
+        ..ExecStub::default()
+    };
+    let run = run_loop_with(
+        app_with_container(),
+        vec![Event::Key(press(KeyCode::Char('x'))), ctrl_c()],
+        None,
+        &exec,
+    );
+
+    assert!(text(&run.screen).contains("L log in"));
+}
+
+#[test]
+fn x_on_the_node_pane_checks_nothing() {
+    let run = run_loop(
+        app(),
+        vec![Event::Key(press(KeyCode::Char('x'))), ctrl_c()],
+        None,
+    );
+
+    assert!(run.exec_checks.is_empty());
+    assert!(!run.log.contains(&Step::Session));
 }

@@ -91,23 +91,32 @@ async fn read_head(socket: &mut TcpStream) -> Option<String> {
     String::from_utf8(head).ok()
 }
 
+/// The pods in namespace `default`.
+fn default_pods() -> Vec<String> {
+    vec![
+        pod("api-7d9f-xk2", "default", "Running"),
+        pod("web-1", "default", "Running"),
+        pod("web-2", "default", "Running"),
+        pod("pending-1", "default", "Pending"),
+        pod("locked-1", "default", "Running"),
+        pod("expired-1", "default", "Running"),
+        pod("shell-1", "default", "Running"),
+        crashing("crash-1", "default"),
+    ]
+}
+
 /// What each plain request is answered with.
 fn route(target: &str) -> (&'static str, String) {
     let path = target.split('?').next().unwrap_or_default();
+    if let Some(name) = path.strip_prefix("/api/v1/namespaces/default/pods/")
+        && let Some(found) = default_pods()
+            .into_iter()
+            .find(|pod| pod.contains(&format!(r#""name":"{name}""#)))
+    {
+        return ("200 OK", found);
+    }
     match path {
-        "/api/v1/namespaces/default/pods" => (
-            "200 OK",
-            list(
-                "PodList",
-                &[
-                    pod("api-7d9f-xk2", "default", "Running"),
-                    pod("web-1", "default", "Running"),
-                    pod("web-2", "default", "Running"),
-                    pod("pending-1", "default", "Pending"),
-                    pod("locked-1", "default", "Running"),
-                ],
-            ),
-        ),
+        "/api/v1/namespaces/default/pods" => ("200 OK", list("PodList", &default_pods())),
         "/api/v1/pods" => (
             "200 OK",
             list(
@@ -159,16 +168,36 @@ fn pod(name: &str, namespace: &str, phase: &str) -> String {
     )
 }
 
+/// A running pod whose one container is crash-looping.
+fn crashing(name: &str, namespace: &str) -> String {
+    format!(
+        r#"{{"metadata":{{"name":"{name}","namespace":"{namespace}","creationTimestamp":"2026-10-03T11:00:00Z"}},
+            "spec":{{"nodeName":"node-1","containers":[{{"name":"app","image":"app:1"}}]}},
+            "status":{{"phase":"Running","containerStatuses":[{{"name":"app","ready":false,"restartCount":7,
+              "image":"app:1","imageID":"","state":{{"waiting":{{"reason":"CrashLoopBackOff"}}}}}}]}}}}"#
+    )
+}
+
 /// An exec stream. The command in the query decides what the "container"
-/// does; a pod whose name starts `locked-` refuses the upgrade the way an
-/// API server does for a role without `create` on `pods/exec`.
+/// does. A pod whose name starts `locked-` refuses the upgrade the way an
+/// API server does for a role without `create` on `pods/exec`, and one
+/// starting `expired-` the way it does for a token that has lapsed. A pod
+/// starting `shell-` has a `/bin/sh`.
 async fn exec(mut socket: TcpStream, head: &str, target: &str) {
-    if target.contains("/pods/locked-") {
-        let body = r#"{"kind":"Status","status":"Failure","reason":"Forbidden","code":403}"#;
+    let refusal = if target.contains("/pods/locked-") {
+        Some(("403 Forbidden", "Forbidden", 403))
+    } else if target.contains("/pods/expired-") {
+        Some(("401 Unauthorized", "Unauthorized", 401))
+    } else {
+        None
+    };
+    if let Some((line, reason, code)) = refusal {
+        let body =
+            format!(r#"{{"kind":"Status","status":"Failure","reason":"{reason}","code":{code}}}"#);
         let _ = socket
             .write_all(
                 format!(
-                    "HTTP/1.1 403 Forbidden\r\ncontent-length: {}\r\n\r\n{body}",
+                    "HTTP/1.1 {line}\r\ncontent-length: {}\r\n\r\n{body}",
                     body.len()
                 )
                 .as_bytes(),
@@ -197,6 +226,7 @@ async fn exec(mut socket: TcpStream, head: &str, target: &str) {
     let command = query_values(target, "command");
     let program = command.first().map(String::as_str).unwrap_or_default();
     match program {
+        "/bin/sh" if target.contains("/pods/shell-") => shell(&mut ws, target).await,
         // Echo stdin back until the client says stdin is closed.
         "cat" => {
             while let Some(Ok(message)) = ws.next().await {
@@ -255,6 +285,23 @@ async fn exec(mut socket: TcpStream, head: &str, target: &str) {
     // makes the kernel answer with a reset, which discards the status the
     // client has not read yet — a failure of this stand-in, not of `eks`.
     while let Some(Ok(_)) = ws.next().await {}
+}
+
+/// A shell in an image that has one, run with no input attached: it reads
+/// the end of its input at once and exits, which is what the dashboard's
+/// probe for a shell relies on. With input attached it would wait for a
+/// person to type, so that is reported as a failure the test will see rather
+/// than a hang.
+async fn shell(ws: &mut WebSocketStream<TcpStream>, target: &str) {
+    if query_values(target, "stdin").iter().any(|v| v == "true") {
+        status(
+            ws,
+            r#"{"status":"Failure","reason":"InternalError","message":"the probe attached stdin"}"#,
+        )
+        .await;
+    } else {
+        status(ws, r#"{"status":"Success"}"#).await;
+    }
 }
 
 async fn status(ws: &mut WebSocketStream<TcpStream>, json: &str) {
@@ -441,4 +488,121 @@ fn a_container_the_pod_does_not_have_is_named_alongside_the_real_ones() {
     assert_eq!(output.status.code(), Some(1));
     assert!(text.contains("no container called \"sidecar\""), "{text}");
     assert!(text.contains("Its containers are app"), "{text}");
+}
+
+// --- The dashboard's `x` ---
+//
+// The dashboard checks a session will start before it gives up the terminal,
+// through `commands::exec::plan`. It is called here in-process, over a client
+// built straight from the stand-in's URL: a kubeconfig would pick up a proxy
+// from this process's environment, which a test cannot clear for itself.
+
+use eks::commands::FetchError;
+use eks::commands::exec::{Plan, Target, plan};
+use eks::k8s::Budget;
+
+fn dashboard_plan(pod: &str, container: Option<&str>) -> anyhow::Result<Plan> {
+    let url = serve();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let client = kube::Client::try_from(kube::Config::new(url.parse().unwrap())).unwrap();
+        let target = Target {
+            namespace: "default".to_owned(),
+            pod: pod.to_owned(),
+            container: container.map(ToOwned::to_owned),
+        };
+        plan(
+            &client,
+            "test",
+            &target,
+            Budget::of(std::time::Duration::from_secs(10)),
+        )
+        .await
+    })
+}
+
+fn refusal(pod: &str) -> String {
+    format!("{:#}", dashboard_plan(pod, None).unwrap_err())
+}
+
+#[test]
+fn the_dashboard_finds_a_shell_without_attaching_input_or_a_terminal() {
+    let plan = dashboard_plan("shell-1", None).unwrap();
+
+    assert_eq!(
+        plan,
+        Plan {
+            namespace: "default".to_owned(),
+            pod: "shell-1".to_owned(),
+            container: "app".to_owned(),
+            shell: eks::k8s::remote::shells(eks::k8s::remote::Os::Linux)[0].clone(),
+            os: eks::k8s::remote::Os::Linux,
+        }
+    );
+}
+
+#[test]
+fn the_dashboard_takes_the_container_it_was_given() {
+    let plan = dashboard_plan("shell-1", Some("app")).unwrap();
+    assert_eq!(plan.container, "app");
+}
+
+#[test]
+fn the_dashboard_refuses_an_image_without_a_shell_with_a_pasteable_command() {
+    let text = refusal("api-7d9f-xk2");
+
+    assert!(text.contains("has no shell"), "{text}");
+    assert!(
+        text.contains("`eks exec api-7d9f-xk2 -n default -C app -- <command>`"),
+        "{text}"
+    );
+}
+
+#[test]
+fn the_dashboard_refuses_a_pending_pod_with_its_events() {
+    let text = refusal("pending-1");
+
+    assert!(text.starts_with("pod pending-1 is Pending"), "{text}");
+    assert!(text.contains("FailedScheduling"), "{text}");
+}
+
+#[test]
+fn the_dashboard_refuses_a_crashing_container_and_says_which_key_shows_why() {
+    let text = refusal("crash-1");
+
+    assert!(
+        text.starts_with("container app in pod crash-1 is not running (CrashLoopBackOff)."),
+        "{text}"
+    );
+    assert!(text.contains("press p"), "{text}");
+    assert!(!text.contains("kubectl logs"), "{text}");
+}
+
+#[test]
+fn the_dashboard_refuses_a_pod_that_has_gone_and_says_to_refresh() {
+    let text = refusal("api-0000-gone");
+
+    assert!(text.starts_with("pod api-0000-gone was gone"), "{text}");
+    assert!(text.contains("Press r"), "{text}");
+}
+
+#[test]
+fn the_dashboard_names_the_missing_rbac_verb_for_a_forbidden_exec() {
+    let error = dashboard_plan("locked-1", None).unwrap_err();
+
+    assert!(
+        format!("{error:#}").contains("`create` verb on `pods/exec`"),
+        "{error:#}"
+    );
+    assert!(!FetchError::of(&error).credentials);
+}
+
+#[test]
+fn a_lapsed_token_refused_at_the_exec_is_still_a_credential_failure() {
+    // What lets the dashboard offer `L` for it, as for any other request.
+    let error = dashboard_plan("expired-1", None).unwrap_err();
+    assert!(FetchError::of(&error).credentials, "{error:#}");
 }
