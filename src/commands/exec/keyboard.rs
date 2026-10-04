@@ -299,6 +299,6 @@ mod tests {
         let mut read = Vec::new();
         runtime().block_on(keyboard.read_to_end(&mut read)).unwrap();
 
-        assert!(read.is_empty());
+        assert_eq!(read, b"");
     }
 }

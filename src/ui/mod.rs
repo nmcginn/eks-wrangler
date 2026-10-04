@@ -6134,7 +6134,7 @@ mod tests {
         app.toggle_focus();
 
         assert_eq!(app.on_key(press(KeyCode::Char('x'))), Flow::Continue);
-        assert!(app.status_lines().is_empty());
+        assert_eq!(app.status_lines(), Vec::<Line>::new());
     }
 
     #[test]
@@ -6221,7 +6221,7 @@ mod tests {
         assert!(!app.exec_preparing());
 
         app.on_key(press(KeyCode::Char('k')));
-        assert!(app.status_lines().is_empty());
+        assert_eq!(app.status_lines(), Vec::<Line>::new());
     }
 
     #[test]
@@ -6246,7 +6246,7 @@ mod tests {
 
         app.apply_exec_ending(Ok(()));
 
-        assert!(app.status_lines().is_empty());
+        assert_eq!(app.status_lines(), Vec::<Line>::new());
         assert!(!app.exec_preparing());
     }
 

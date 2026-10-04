@@ -731,6 +731,6 @@ fn x_on_the_node_pane_checks_nothing() {
         None,
     );
 
-    assert!(run.exec_checks.is_empty());
+    assert_eq!(run.exec_checks, Vec::<ExecTarget>::new());
     assert!(!run.log.contains(&Step::Session));
 }
