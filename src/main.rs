@@ -13,8 +13,8 @@ use ratatui::crossterm::terminal;
 use tracing_subscriber::EnvFilter;
 
 use eks::aws::LoginMode;
-use eks::cli::{Cli, Command, GlobalArgs};
-use eks::commands::{self, completions, contexts, credentials, nodes, pods};
+use eks::cli::{Cli, Command, ExecArgs, GlobalArgs};
+use eks::commands::{self, completions, contexts, credentials, exec, nodes, pods};
 use eks::config::{self, Config};
 use eks::format::Width;
 use eks::json::Output;
@@ -31,7 +31,7 @@ use eks::ui::{self, App, RefreshInterval};
 /// What a listing exits with when the user's own Ctrl-C ended it, rather than
 /// the process finishing on its own — the conventional 128 + `SIGINT`'s number,
 /// the same code a shell reports for a foreground job the terminal itself
-/// killed. Only `eks nodes` and `eks pods` can produce this: see
+/// killed. Only `eks nodes`, `eks pods`, and `eks exec` can produce this: see
 /// [`commands::block_on_interruptible`].
 fn interrupted() -> ExitCode {
     ExitCode::from(130)
@@ -147,6 +147,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
             sort_resource.as_deref(),
             Layout { wide, json },
         ),
+        Command::Exec(args) => run_exec(&config, &paths, &cli.global, &user_config, &args),
         Command::Use { name } => {
             print_line(&contexts::switch(&config, &name)?);
             Ok(ExitCode::SUCCESS)
@@ -254,6 +255,42 @@ fn run_pods(
             print_line(&output);
             Ok(ExitCode::SUCCESS)
         }
+        commands::Interruptible::Interrupted => Ok(interrupted()),
+    }
+}
+
+/// `eks exec`: the remote command's exit code becomes this process's.
+///
+/// `_interruptible` so a Ctrl-C during a session without a TTY — where it is
+/// a signal to this process rather than a key for the remote one — ends with
+/// the conventional 130 rather than the default disposition's kill. With a
+/// TTY, raw mode turns Ctrl-C into a byte for the container, and this race
+/// never fires.
+fn run_exec(
+    config: &KubeConfig,
+    paths: &[PathBuf],
+    global: &GlobalArgs,
+    user_config: &Config,
+    args: &ExecArgs,
+) -> Result<ExitCode> {
+    let request = exec::Request {
+        pod: &args.pod,
+        container: args.container.as_deref(),
+        command: &args.command,
+        namespace: global.effective_namespace(user_config),
+        label_selector: global.selector.as_deref(),
+        field_selector: global.field_selector.as_deref(),
+        tty: exec::wants_tty(),
+        budget: global.timeout,
+        login: global.login,
+    };
+    match commands::block_on_interruptible(exec::run(
+        config,
+        paths,
+        global.context.as_deref(),
+        request,
+    ))? {
+        commands::Interruptible::Finished(code) => Ok(ExitCode::from(code)),
         commands::Interruptible::Interrupted => Ok(interrupted()),
     }
 }

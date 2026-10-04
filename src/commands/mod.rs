@@ -12,6 +12,7 @@ use anyhow::{Context as _, Result};
 pub mod completions;
 pub mod contexts;
 pub mod credentials;
+pub mod exec;
 pub mod nodes;
 pub mod pods;
 
@@ -106,6 +107,11 @@ pub enum Interruptible<T> {
 /// dashboard never needs this: its raw mode disables the terminal's `SIGINT`
 /// delivery entirely (see `ui::run`), so a Ctrl-C there already arrives as a
 /// key rather than a signal, and every other `block_on` caller is unaffected.
+///
+/// `eks exec` calls it for a third reason: a session without a TTY receives
+/// Ctrl-C as a signal, and the exit code it ends with should say so rather
+/// than be whatever the default disposition leaves. Dropping the session's
+/// future closes its connection.
 ///
 /// The erase itself is not written here — `race` just drops the losing
 /// future, and that is enough. A [`crate::progress::Task`] still outstanding

@@ -47,7 +47,8 @@ pub struct GlobalArgs {
 
     /// Select pods by label, e.g. `-l app=api,tier notin (canary)`. Used by
     /// `eks pods` and the dashboard's pod-drilldown pane, so a selector filters
-    /// the same pods whichever surface reads it; other commands accept the flag
+    /// the same pods whichever surface reads it, and by `eks exec` to narrow
+    /// the pods a name is matched against; other commands accept the flag
     /// without acting on it, the same as `--namespace`.
     #[arg(long, short = 'l', global = true, value_name = "SELECTOR")]
     pub selector: Option<String>,
@@ -261,6 +262,17 @@ pub enum Command {
         json: bool,
     },
 
+    /// Open a shell in a container, or run one command there.
+    ///
+    /// `eks exec api` finds the pod whose name starts with `api`, picks its
+    /// default container, and opens `/bin/bash` (or `/bin/sh`) in it. Anything
+    /// after `--` runs instead of a shell: `eks exec api -- env`. With a
+    /// terminal at both ends the session is interactive, with Ctrl-C and window
+    /// resizes going to the container; piped input runs without one, so
+    /// `echo hi | eks exec api -- cat` works. Exits with the command's own
+    /// exit code.
+    Exec(ExecArgs),
+
     /// Switch the active cluster.
     Use {
         /// Context name, as shown by `eks contexts`.
@@ -288,6 +300,26 @@ pub enum Command {
     Man,
 }
 
+/// `eks exec`'s own arguments, kept in a struct of their own so `main` can
+/// hand them over whole.
+#[derive(Debug, Clone, clap::Args)]
+pub struct ExecArgs {
+    /// The pod: its full name, or the start of exactly one pod's name in the
+    /// namespace.
+    pub pod: String,
+
+    /// The container to run in. Defaults to the one the pod's
+    /// `kubectl.kubernetes.io/default-container` annotation names, then to
+    /// its only container. `-C` rather than `kubectl`'s `-c`, which is
+    /// `--context` everywhere in eks.
+    #[arg(long, short = 'C', value_name = "NAME")]
+    pub container: Option<String>,
+
+    /// The command to run, after `--`. Without one, a shell.
+    #[arg(last = true, value_name = "COMMAND")]
+    pub command: Vec<String>,
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
@@ -304,6 +336,47 @@ mod tests {
         // Catches conflicting flags and malformed arg definitions at test time
         // rather than on the user's first run.
         Cli::command().debug_assert();
+    }
+
+    fn exec_args(args: &[&str]) -> ExecArgs {
+        match parse(args).command {
+            Some(Command::Exec(args)) => args,
+            other => panic!("expected exec, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn exec_takes_a_pod_and_runs_a_shell_without_a_command() {
+        let args = exec_args(&["eks", "exec", "api"]);
+        assert_eq!(args.pod, "api");
+        assert_eq!(args.container, None);
+        assert_eq!(args.command, Vec::<String>::new());
+    }
+
+    #[test]
+    fn exec_passes_everything_after_the_double_dash_through_untouched() {
+        // Flags after `--` belong to the remote command, `-n` and `-c`
+        // included, or `eks exec api -- ls -n` would change namespace.
+        let args = exec_args(&["eks", "exec", "api", "--", "ls", "-n", "-c", "--all"]);
+        assert_eq!(args.command, ["ls", "-n", "-c", "--all"]);
+    }
+
+    #[test]
+    fn exec_names_the_container_with_capital_c_and_keeps_lowercase_c_for_the_context() {
+        let cli = parse(&["eks", "exec", "api", "-C", "sidecar", "-c", "prod"]);
+        assert_eq!(cli.global.context.as_deref(), Some("prod"));
+        let Some(Command::Exec(args)) = cli.command else {
+            panic!("expected exec");
+        };
+        assert_eq!(args.container.as_deref(), Some("sidecar"));
+
+        let long = exec_args(&["eks", "exec", "api", "--container", "app"]);
+        assert_eq!(long.container.as_deref(), Some("app"));
+    }
+
+    #[test]
+    fn exec_without_a_pod_is_a_usage_error() {
+        assert!(Cli::try_parse_from(["eks", "exec"]).is_err());
     }
 
     #[test]

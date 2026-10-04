@@ -21,7 +21,8 @@ src/
                        `aws sso login` when it is not.
   k8s/                 The Kubernetes client, the credential helper and the
                        token it keeps fresh, paging and request budgets,
-                       quantities, selectors, nodes, pods, and metrics.
+                       quantities, selectors, nodes, pods, metrics, and
+                       remote command sessions (`eks exec`).
   commands/            One module per user-facing command.
   ui/                  The interactive dashboard.
 ```
@@ -480,6 +481,32 @@ way the paragraph above describes. See decision 69 for why the flag lives on
 `View` rather than beside `App`'s other pane state, and for how a container
 that has never restarted is refused without ever opening a connection.
 
+## Sessions: `eks exec`
+
+`eks exec` is the first command that hands the terminal to the cluster rather
+than printing an answer, and it splits the same three ways everything else
+does:
+
+```
+pods::fetch_scope ──► pick::find ──► pick::container ──► pick::running ──► remote::shells
+     (I/O)             (choose)        (choose)            (check)          (choose)
+                                                                               │
+              exit code ◄── remote::ending ◄── remote::relay ◄── Api::exec ◄───┘
+                               (decode)        (carry bytes)       (I/O)
+```
+
+`k8s::pods::pick` turns typed text into a pod and a container, and is kept
+apart from `exec` because `eks logs` will resolve by the same rules.
+`k8s::remote` is the session: which shell an OS has, whether a TTY is wanted,
+what the kubelet's status means, and `relay`, which carries bytes between
+`kube`'s `AttachedProcess` pipes and local streams. `relay` is generic over its
+readers and writers, so it is tested over `tokio::io::duplex` pipes.
+`commands::exec` owns everything with a side effect: the requests, raw mode
+(behind a guard whose `Drop` restores it, decision 124), `SIGWINCH`, and the
+sentences printed when a session cannot start. The shell search tries each
+candidate in turn over one shared stdin, so keys typed while a missing shell
+is being refused reach the one that runs.
+
 ## Testing
 
 Run `make test`. The suite needs no cluster, no credentials, and no network, and
@@ -503,6 +530,11 @@ being tested is about a *loop* rather than about either end of it —
 over a loopback socket by a plain OS thread, which is still canned bytes with
 no credential, name lookup, or cluster anywhere in it.
 
+- **The whole binary** — `tests/exec.rs` runs the built `eks` against a
+  stand-in API server on a loopback socket that speaks the exec WebSocket
+  protocol, with scripted commands behind it. It is the one test that proves
+  stdin really reaches a session and the exit code really comes back, since
+  `commands::exec` reads the process's own streams.
 - **Terminal side effects** — `progress::Recorder` is a `Write` a test can read
   back, so "the line named the credential helper" and "the line was gone before
   the table was printed" are assertions rather than things somebody has to

@@ -19,6 +19,7 @@ pub mod order;
 pub mod page;
 pub mod pods;
 pub mod quantity;
+pub mod remote;
 pub mod resource;
 pub mod selector;
 

@@ -613,6 +613,17 @@ impl Failure {
             // advice: install the tool, do not go looking for a fresh token.
             kube::Error::Auth(kube::client::AuthError::AuthExecStart(_)) => Self::HelperMissing,
             kube::Error::Auth(_) => Self::Credentials,
+            // A session (`eks exec`) is a WebSocket upgrade, and a refused one
+            // comes back as the status line the upgrade failed with rather than
+            // as a `Status` body — `kube` does not read the body of a response
+            // that was meant to switch protocols. The code still says which.
+            kube::Error::UpgradeConnection(
+                kube::client::UpgradeConnectionError::ProtocolSwitch(code),
+            ) => match code.as_u16() {
+                401 => Self::Credentials,
+                403 => Self::Forbidden,
+                _ => Self::Other,
+            },
             // `Service` also carries middleware failures, but in practice the
             // connector is what fails: DNS, a refused connection, a timeout.
             kube::Error::Service(_) | kube::Error::HyperError(_) => Self::Unreachable,
@@ -936,6 +947,24 @@ users:
         assert!(message.contains("staging (eu-west-1)"), "{message}");
         assert!(message.contains("access entry"), "{message}");
         assert!(!message.contains("aws sso login"), "{message}");
+    }
+
+    /// A WebSocket upgrade the API server answered with `code` instead of
+    /// `101 Switching Protocols` — how `eks exec` hears a refusal.
+    fn upgrade_error(code: u16) -> page::Error {
+        page::Error::from(kube::Error::UpgradeConnection(
+            kube::client::UpgradeConnectionError::ProtocolSwitch(
+                http::StatusCode::from_u16(code).unwrap(),
+            ),
+        ))
+    }
+
+    #[test]
+    fn a_refused_session_is_classified_by_the_status_it_was_refused_with() {
+        assert_eq!(Failure::of(&upgrade_error(401)), Failure::Credentials);
+        assert_eq!(Failure::of(&upgrade_error(403)), Failure::Forbidden);
+        assert_eq!(Failure::of(&upgrade_error(404)), Failure::Other);
+        assert_eq!(Failure::of(&upgrade_error(500)), Failure::Other);
     }
 
     #[test]
