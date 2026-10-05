@@ -120,8 +120,10 @@ pub fn not_found(wanted: &str, namespace: &str, elsewhere: &[&Pod], now: Timesta
 }
 
 /// The candidates as a small table: what a person needs to choose between
-/// them, and no more.
-fn candidate_table(candidates: &[&Pod], now: Timestamp) -> String {
+/// them, and no more. Shared with `eks port-forward`, which shows the pods
+/// behind a service the same way when none of them is ready.
+#[must_use]
+pub fn candidate_table(candidates: &[&Pod], now: Timestamp) -> String {
     let rows: Vec<Vec<Cell>> = candidates
         .iter()
         .map(|pod| {

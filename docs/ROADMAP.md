@@ -27,26 +27,6 @@ names of things.
 
 ### Milestone 6 — Into the workload
 
-- [ ] **`eks port-forward`: reach a pod, service, or deployment from
-  localhost.** `eks port-forward <pod | svc/name | deploy/name>
-  [[LOCAL:]REMOTE...]`. People who rarely use a cluster think in services, so
-  `svc/` and `deploy/` are part of this task, not an extension of it.
-  *Acceptance:* a service or deployment resolves through its selector to a
-  ready pod. A service's `port` maps to its `targetPort`, and named ports
-  resolve against the container spec. If REMOTE is omitted and the pod
-  declares exactly one port, that port is used. If it declares several, the
-  command lists them (name, number, protocol, container) and asks which one.
-  LOCAL defaults to REMOTE when that port is free and falls back to an
-  ephemeral port otherwise. Each forward prints a ready-to-click
-  `http://127.0.0.1:<port>` line. Listeners bind loopback only unless
-  `--address` says otherwise. Concurrent connections each get their own
-  stream. When the pod behind a `svc/` or `deploy/` forward goes away, `eks`
-  says so and re-resolves to another ready pod instead of dying, which is the
-  case `kubectl` handles worst. A bare pod target exits with a message
-  naming what happened. Ctrl-C closes every listener cleanly. Spec parsing,
-  target and port resolution, local-port choice, and the re-resolve decision
-  are pure functions over fixtures.
-
 - [ ] **Container ports and forwards in the dashboard.** The pod-containers
   pane lists each container's declared ports. A key on a port starts a
   forward that runs in the background for as long as the dashboard is open,
@@ -224,6 +204,7 @@ names of things.
 
 - [x] `eks exec`: a shell or a command in a container, by pod prefix. (124)
 - [x] Exec from the dashboard: `x` checks, then hands the terminal to the shell. (125, 126)
+- [x] `eks port-forward`: pods, `svc/`, and `deploy/`, following a service's pods through a rollout. (127)
 
 ---
 

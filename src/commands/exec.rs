@@ -185,7 +185,9 @@ pub async fn run(
 /// instead, which is all `kubectl exec` itself would have needed. When
 /// nothing in the namespace matches, the same prefix is looked for across the
 /// cluster, so the message can name the namespace the pod is actually in.
-async fn locate(
+///
+/// `eks port-forward` finds a pod named directly by this same rule.
+pub(crate) async fn locate(
     client: &Client,
     target: &ClusterView,
     namespace: &str,
@@ -970,7 +972,7 @@ fn gone(pod: &str, surface: Surface) -> String {
 
 /// The HTTP status a refused WebSocket upgrade came back with, if that is
 /// what `error` is.
-fn upgrade_status(error: &page::Error) -> Option<u16> {
+pub(crate) fn upgrade_status(error: &page::Error) -> Option<u16> {
     match error {
         page::Error::Api(kube::Error::UpgradeConnection(
             kube::client::UpgradeConnectionError::ProtocolSwitch(code),

@@ -21,8 +21,9 @@ src/
                        `aws sso login` when it is not.
   k8s/                 The Kubernetes client, the credential helper and the
                        token it keeps fresh, paging and request budgets,
-                       quantities, selectors, nodes, pods, metrics, and
-                       remote command sessions (`eks exec`).
+                       quantities, selectors, nodes, pods, metrics,
+                       remote command sessions (`eks exec`), and what
+                       `eks port-forward` decides (`k8s::forward`).
   commands/            One module per user-facing command.
   ui/                  The interactive dashboard.
 ```
@@ -531,6 +532,35 @@ and reads the keyboard through `exec::keyboard::Keyboard`, which uses
 `poll(2)` and stops when the session ends. `tokio::io::stdin` cannot be
 stopped, and its last read would take the dashboard's next keystroke.
 
+## Forwards: `eks port-forward`
+
+`eks port-forward` is the first command that keeps running and serving. It
+splits the same three ways, with a loop added at the end:
+
+```
+spec::Target/Spec ──► find, choose::find ──► choose::choose ──► ports::{on_pod, service_port, target_on_pod}
+     (parse)              (I/O, choose)        (choose a pod)        (choose a port)
+                                                                          │
+   watch_loop ◄── accept ──► connection ──► Api::portforward ◄── listen ◄─┘
+  (every 3 s,                (one stream     (I/O)               (bind, with forward::bind's
+  or when asked)             per client)                          rule for the local port)
+       │
+       └──► choose::after_set / after_pod ──► Move / Verdict ──► the destination, or exit
+```
+
+`k8s::forward` holds every decision: `spec` reads what was typed, `ports`
+turns a number or name into the port in a pod (a service's `port` through its
+`targetPort`), `choose` picks the pod and later decides whether to stay, move,
+wait, or stop. Each is a pure function over fetched objects, tested with
+fixtures. `commands::forward` is the I/O: it resolves, binds, and prints the
+lines, then runs one accept loop per listener and one watch loop. The current
+pod and its ports sit in a `tokio::sync::watch` channel that connections read
+and only the watch loop writes. A connection that finds its pod gone (a `404`
+on the upgrade, before any byte was sent) wakes the watch loop through a
+`Notify` and tries once more on whatever it settles on. Each accept loop owns
+its connections in a `JoinSet`, so dropping the command's future at Ctrl-C
+aborts them along with the listeners.
+
 ## Testing
 
 Run `make test`. The suite needs no cluster, no credentials, and no network, and
@@ -558,7 +588,12 @@ no credential, name lookup, or cluster anywhere in it.
   stand-in API server on a loopback socket that speaks the exec WebSocket
   protocol, with scripted commands behind it. It is the one test that proves
   stdin really reaches a session and the exit code really comes back, since
-  `commands::exec` reads the process's own streams.
+  `commands::exec` reads the process's own streams. `tests/port_forward.rs`
+  does the same for `eks port-forward` with the port-forward protocol: bytes
+  through the printed URL, two connections as two streams, a rollout behind a
+  service followed mid-connection, and Ctrl-C. Its question for a choice of
+  ports is answered through `script(1)`, which gives the binary a
+  pseudo-terminal.
 - **Terminal side effects** — `progress::Recorder` is a `Write` a test can read
   back, so "the line named the credential helper" and "the line was gone before
   the table was printed" are assertions rather than things somebody has to

@@ -13,6 +13,7 @@
 pub mod auth;
 pub mod client;
 pub mod exec;
+pub mod forward;
 pub mod metrics;
 pub mod nodes;
 pub mod order;

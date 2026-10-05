@@ -76,6 +76,7 @@ eks contexts            # list available clusters
 eks nodes               # list the nodes of the active cluster
 eks pods -A             # list pods across every namespace
 eks exec api            # a shell in the pod whose name starts with api
+eks port-forward svc/api  # the api service on localhost, following its pods
 eks use staging         # switch cluster
 eks current             # show the active cluster
 eks nodes --json        # any read command, as JSON for scripts
@@ -423,6 +424,43 @@ running and that the image has a shell. If either check fails, the reason
 appears above the footer and nothing else changes. Otherwise the shell takes
 the terminal, and exiting it brings the dashboard back as you left it.
 
+### A pod, a service, or a deployment on localhost
+
+`eks port-forward` listens on this machine and carries each connection to a
+pod, printing a URL to click:
+
+```sh
+eks port-forward svc/api          # the service's one port, on the same number here
+eks port-forward deploy/api 8080  # a deployment's pods, on their port 8080
+eks port-forward api 9000:http    # the pod's port named http, on localhost:9000
+eks port-forward svc/db :5432     # any free local port
+```
+
+```
+$ eks port-forward svc/api
+http://127.0.0.1:80 → svc/api port 80 (pod api-7d9f8c6b5-xk2pq port 8080)
+Forwarding until Ctrl-C.
+```
+
+A service is forwarded by its own port numbers, which `eks` maps to each
+pod's `targetPort` — a named one included — the way the service itself does.
+With no port, the one the pod or service declares is used; when there are
+several, `eks` lists them (name, number, protocol, and container or where each
+goes) and asks which, or says how to name one when there is no terminal to ask
+at. The local port is the remote's own number when that is free, any free port
+when it is not — the line says why — and exactly the one you typed when you
+typed one. Listeners are on 127.0.0.1 only unless `--address` says otherwise
+(`--address localhost` adds `::1`; `0.0.0.0` is called out on the line).
+
+Every connection gets its own stream to the pod, so a browser's parallel
+requests do not queue behind one another. When the pod behind a `svc/` or
+`deploy/` forward is deleted, replaced in a rollout, or stops being ready,
+`eks` says so and moves to another ready pod; a connection that arrives in the
+middle of that waits for the new pod rather than being dropped. A pod named
+directly has no successor to move to, so when it goes, `eks` exits naming what
+happened and the `deploy/` forward that would have followed it. Ctrl-C closes
+every listener and exits 0.
+
 Credentials come from the kubeconfig context itself, so whatever works for
 `kubectl` works here. When they have expired, `eks` says so and tells you how to
 refresh them instead of printing an HTTP status code — and, if the session it
@@ -552,8 +590,9 @@ exit, and stdout stays empty. `eks contexts --json` cannot be combined with
 | `-c, --context <NAME>` | Use a specific context for this invocation |
 | `-n, --namespace <NS>` | Scope resources to a namespace. Falls back to the config file's `namespace`, then to the context's own |
 | `-A, --all-namespaces` | List pods across every namespace (`eks pods`) |
-| `-l, --selector <SEL>` | Filter pods by label selector (`eks pods`, and the dashboard's pod-drilldown pane) |
-| `--field-selector <SEL>` | Filter pods by field selector (`eks pods`, and the dashboard's pod-drilldown pane) |
+| `-l, --selector <SEL>` | Filter pods by label selector (`eks pods`, and the dashboard's pod-drilldown pane), or narrow the pods a name is matched against (`eks exec`, `eks port-forward`) |
+| `--field-selector <SEL>` | Filter pods by field selector, with the same reach as `-l` |
+| `--address <ADDR>` | Where `eks port-forward` listens: IPs, comma-separated, or `localhost` for both loopbacks. Default `127.0.0.1` |
 | `--sort <ORDER>` | Order the listing. Pods: `name` (default), `restarts`, `age`, `cpu`, `memory`, `cpu-share`, `memory-share`. Nodes: `name` (default), `status`, `cpu`, `memory`, `cpu-requested`, `memory-requested`, `pods`, `age` |
 | `--sort-reverse` | Reverse `--sort`; unrankable rows stay at the end. Either flag adds a line under the table naming the order |
 | `--wide` | Add the extra columns `kubectl -o wide` shows. Pods: `IP`, `NOMINATED NODE`, `READINESS GATES`. Nodes: `INTERNAL-IP`, `EXTERNAL-IP`, `OS-IMAGE`, `KERNEL-VERSION`, `CONTAINER-RUNTIME` |

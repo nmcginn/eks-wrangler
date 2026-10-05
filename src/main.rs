@@ -13,8 +13,8 @@ use ratatui::crossterm::terminal;
 use tracing_subscriber::EnvFilter;
 
 use eks::aws::LoginMode;
-use eks::cli::{Cli, Command, ExecArgs, GlobalArgs};
-use eks::commands::{self, completions, contexts, credentials, exec, nodes, pods};
+use eks::cli::{Cli, Command, ExecArgs, GlobalArgs, PortForwardArgs};
+use eks::commands::{self, completions, contexts, credentials, exec, forward, nodes, pods};
 use eks::config::{self, Config};
 use eks::format::Width;
 use eks::json::Output;
@@ -148,6 +148,9 @@ fn run(cli: Cli) -> Result<ExitCode> {
             Layout { wide, json },
         ),
         Command::Exec(args) => run_exec(&config, &paths, &cli.global, &user_config, &args),
+        Command::PortForward(args) => {
+            run_port_forward(&config, &paths, &cli.global, &user_config, &args)
+        }
         Command::Use { name } => {
             print_line(&contexts::switch(&config, &name)?);
             Ok(ExitCode::SUCCESS)
@@ -292,6 +295,43 @@ fn run_exec(
     ))? {
         commands::Interruptible::Finished(code) => Ok(ExitCode::from(code)),
         commands::Interruptible::Interrupted => Ok(interrupted()),
+    }
+}
+
+/// `eks port-forward`: forwards until Ctrl-C.
+///
+/// Ctrl-C is how a forward is meant to end, so it ends this one with success
+/// rather than the 130 an interrupted listing gets. Dropping the forward's
+/// future on the way out is what closes its listeners and aborts its
+/// connections — see `commands::forward`.
+fn run_port_forward(
+    config: &KubeConfig,
+    paths: &[PathBuf],
+    global: &GlobalArgs,
+    user_config: &Config,
+    args: &PortForwardArgs,
+) -> Result<ExitCode> {
+    let request = forward::Request {
+        target: &args.target,
+        ports: &args.ports,
+        addresses: &args.address,
+        namespace: global.effective_namespace(user_config),
+        label_selector: global.selector.as_deref(),
+        field_selector: global.field_selector.as_deref(),
+        budget: global.timeout,
+        login: global.login,
+    };
+    match commands::block_on_interruptible(forward::run(
+        config,
+        paths,
+        global.context.as_deref(),
+        request,
+    ))? {
+        commands::Interruptible::Finished(()) => Ok(ExitCode::SUCCESS),
+        commands::Interruptible::Interrupted => {
+            eprintln!("Stopped forwarding.");
+            Ok(ExitCode::SUCCESS)
+        }
     }
 }
 

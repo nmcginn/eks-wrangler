@@ -1097,3 +1097,42 @@ meant for a person to read, not for `eks` to parse.
   a whole does not handle those signals yet either.
 - **Terminal.** `leave_terminal` now shows the cursor, which `ratatui` keeps
   hidden. A banner names the pod and container and says how to get back.
+
+### 127. `eks port-forward`: one stream per connection, a three-second watch, and a pod named directly ends the command
+
+- **Streams.** Each accepted connection opens its own `Api::portforward`
+  WebSocket. `kube`'s `Portforwarder` carries one stream per port per
+  socket, so this is the only way two connections are independent. The cost
+  is one upgrade request per connection.
+- **Following pods.** `svc/` and `deploy/` keep their label selector and
+  look at its pods every 3 seconds, and at once when a connection's upgrade
+  gets a `404`. The current pod is kept while it is ready, and otherwise the
+  oldest ready one is chosen. With nothing ready, an unready or terminating
+  current pod is kept, and connections are refused only once it is gone. A
+  connection that hit the `404` waits up to 10 seconds for the new pod and
+  is retried once, since nothing was sent. The service object is read once:
+  a `targetPort` edited while forwarding is not picked up, but a named one is
+  resolved again against each new pod.
+- **A pod named directly** is looked at on the same schedule. Deleted or
+  finished ends the command (exit 1), naming the `deploy/` that would have
+  followed it. That is found from the owning ReplicaSet's name and the pod's
+  `pod-template-hash`, with no extra request. Terminating is said once and
+  kept.
+- **Local port.** No LOCAL means REMOTE's number if it can be bound, and any
+  port otherwise, with the reason on the line. For a service, REMOTE is the
+  service port. A LOCAL that was typed is used exactly or is an error.
+  `--address` defaults to `127.0.0.1`; `localhost` adds `::1`, which may be
+  missing. Any non-loopback listener is called out on its line.
+- **Permission check first.** A `SelfSubjectAccessReview` for `create` on
+  `pods/portforward` runs before binding, so a missing grant is an error now
+  rather than a message on the first click. Clusters before 1.30 authorised
+  the WebSocket upgrade as `get`; a custom role with only `get` would be
+  refused here though it could forward. A review that fails is not a
+  refusal.
+- **Prompting.** Several candidate ports with stdin and stderr both
+  terminals are a numbered question. Without one, the same table is the
+  error, with a command to paste.
+- **Ctrl-C exits 0**, not 130: it is how a forward is meant to end.
+- **Half-close.** `kube` stops delivering the pod's bytes once the client
+  half-closes its side, as `kubectl` does. Clients that read their answer
+  before closing (browsers, `curl`, database drivers) are unaffected.
