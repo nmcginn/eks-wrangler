@@ -421,16 +421,13 @@ mod tests {
             port_forward_args(&["eks", "port-forward", "svc/api", "8080:80", ":http", "9090"]);
         assert_eq!(args.target, "svc/api");
         assert_eq!(args.ports, ["8080:80", ":http", "9090"]);
-        assert!(args.address.is_empty());
+        assert_eq!(args.address, Vec::<String>::new());
     }
 
     #[test]
     fn port_forward_needs_no_port() {
-        assert!(
-            port_forward_args(&["eks", "port-forward", "api"])
-                .ports
-                .is_empty()
-        );
+        let args = port_forward_args(&["eks", "port-forward", "api"]);
+        assert_eq!(args.ports, Vec::<String>::new());
     }
 
     #[test]
