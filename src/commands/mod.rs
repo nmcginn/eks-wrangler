@@ -13,6 +13,7 @@ pub mod completions;
 pub mod contexts;
 pub mod credentials;
 pub mod exec;
+pub mod forward;
 pub mod nodes;
 pub mod pods;
 
@@ -112,6 +113,10 @@ pub enum Interruptible<T> {
 /// Ctrl-C as a signal, and the exit code it ends with should say so rather
 /// than be whatever the default disposition leaves. Dropping the session's
 /// future closes its connection.
+///
+/// `eks port-forward` calls it because Ctrl-C is how a forward ends. Dropping
+/// its future closes the listeners and aborts every connection's task; `main`
+/// reports that as success rather than as an interruption.
 ///
 /// The erase itself is not written here — `race` just drops the losing
 /// future, and that is enough. A [`crate::progress::Task`] still outstanding

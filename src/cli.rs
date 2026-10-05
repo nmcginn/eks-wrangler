@@ -47,8 +47,9 @@ pub struct GlobalArgs {
 
     /// Select pods by label, e.g. `-l app=api,tier notin (canary)`. Used by
     /// `eks pods` and the dashboard's pod-drilldown pane, so a selector filters
-    /// the same pods whichever surface reads it, and by `eks exec` to narrow
-    /// the pods a name is matched against; other commands accept the flag
+    /// the same pods whichever surface reads it, and by `eks exec` and
+    /// `eks port-forward` to narrow the pods a name is matched against (a
+    /// `svc/` or `deploy/` target brings its own); other commands accept the flag
     /// without acting on it, the same as `--namespace`.
     #[arg(long, short = 'l', global = true, value_name = "SELECTOR")]
     pub selector: Option<String>,
@@ -273,6 +274,19 @@ pub enum Command {
     /// exit code.
     Exec(ExecArgs),
 
+    /// Reach a pod, a service, or a deployment from localhost.
+    ///
+    /// `eks port-forward svc/api` listens on the service's port on
+    /// 127.0.0.1 and carries each connection to a ready pod behind it,
+    /// printing a URL to click. Name ports as `[LOCAL:]REMOTE`: `8080`,
+    /// `9000:80`, `:80` for any free local port, or a port's name such as
+    /// `http`. With no port, the one the pod or service declares is used, or
+    /// you are asked which. When the pod behind a `svc/` or `deploy/`
+    /// forward goes away, eks moves to another ready pod and keeps going.
+    /// Runs until Ctrl-C.
+    #[command(name = "port-forward")]
+    PortForward(PortForwardArgs),
+
     /// Switch the active cluster.
     Use {
         /// Context name, as shown by `eks contexts`.
@@ -318,6 +332,26 @@ pub struct ExecArgs {
     /// The command to run, after `--`. Without one, a shell.
     #[arg(last = true, value_name = "COMMAND")]
     pub command: Vec<String>,
+}
+
+/// `eks port-forward`'s own arguments.
+#[derive(Debug, Clone, clap::Args)]
+pub struct PortForwardArgs {
+    /// What to forward to: a pod's name or the start of one (`api`), a
+    /// service (`svc/api`), or a deployment (`deploy/api`).
+    pub target: String,
+
+    /// `[LOCAL:]REMOTE` for each forward. REMOTE is a number or a port name;
+    /// for a service it is the service's own port. LOCAL defaults to the
+    /// same number where that is free, and to any free port where it is not.
+    #[arg(value_name = "PORT")]
+    pub ports: Vec<String>,
+
+    /// Addresses to listen on, comma-separated: IPs, or `localhost` for
+    /// both loopbacks. Defaults to 127.0.0.1 alone, so nothing outside this
+    /// machine can connect unless you ask for that, e.g. with `0.0.0.0`.
+    #[arg(long, value_name = "ADDRESS", value_delimiter = ',')]
+    pub address: Vec<String>,
 }
 
 #[cfg(test)]
@@ -372,6 +406,65 @@ mod tests {
 
         let long = exec_args(&["eks", "exec", "api", "--container", "app"]);
         assert_eq!(long.container.as_deref(), Some("app"));
+    }
+
+    fn port_forward_args(args: &[&str]) -> PortForwardArgs {
+        match parse(args).command {
+            Some(Command::PortForward(args)) => args,
+            other => panic!("expected port-forward, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn port_forward_takes_a_target_and_any_number_of_ports() {
+        let args =
+            port_forward_args(&["eks", "port-forward", "svc/api", "8080:80", ":http", "9090"]);
+        assert_eq!(args.target, "svc/api");
+        assert_eq!(args.ports, ["8080:80", ":http", "9090"]);
+        assert!(args.address.is_empty());
+    }
+
+    #[test]
+    fn port_forward_needs_no_port() {
+        assert!(
+            port_forward_args(&["eks", "port-forward", "api"])
+                .ports
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn port_forward_addresses_split_on_commas_and_repeat() {
+        let args = port_forward_args(&[
+            "eks",
+            "port-forward",
+            "api",
+            "--address",
+            "localhost,10.0.0.5",
+            "--address",
+            "::1",
+        ]);
+        assert_eq!(args.address, ["localhost", "10.0.0.5", "::1"]);
+    }
+
+    #[test]
+    fn port_forward_keeps_the_global_namespace_and_context_flags() {
+        let cli = parse(&[
+            "eks",
+            "port-forward",
+            "deploy/api",
+            "-n",
+            "shop",
+            "-c",
+            "prod",
+        ]);
+        assert_eq!(cli.global.namespace.as_deref(), Some("shop"));
+        assert_eq!(cli.global.context.as_deref(), Some("prod"));
+    }
+
+    #[test]
+    fn port_forward_without_a_target_is_a_usage_error() {
+        assert!(Cli::try_parse_from(["eks", "port-forward"]).is_err());
     }
 
     #[test]
