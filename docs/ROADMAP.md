@@ -25,20 +25,6 @@ whether it gets that person from "which pod is it?" to an answer without
 reaching for `kubectl` or the AWS console, and without already knowing the
 names of things.
 
-### Milestone 6 — Into the workload
-
-- [ ] **Container ports and forwards in the dashboard.** The pod-containers
-  pane lists each container's declared ports. A key on a port starts a
-  forward that runs in the background for as long as the dashboard is open,
-  and a forwards strip lists each active forward with its local URL, how many
-  connections it has open, and its last error. A second key stops the
-  highlighted one.
-  *Acceptance:* starting a forward never blocks a frame. A forward that fails
-  to bind or loses its pod shows that in the strip and does not raise a modal.
-  The quit hint mentions that forwards end with the dashboard. Rendering is
-  covered by golden snapshots, with and without forwards and on a narrow
-  terminal.
-
 ### Milestone 7 — CloudWatch
 
 - [ ] **Control-plane logs: `eks control-plane-logs`.** EKS writes the API
@@ -205,6 +191,7 @@ names of things.
 - [x] `eks exec`: a shell or a command in a container, by pod prefix. (124)
 - [x] Exec from the dashboard: `x` checks, then hands the terminal to the shell. (125, 126)
 - [x] `eks port-forward`: pods, `svc/`, and `deploy/`, following a service's pods through a rollout. (127)
+- [x] Container ports and forwards in the dashboard: `f`/`F` on a port, and a forwards strip. (128)
 
 ---
 

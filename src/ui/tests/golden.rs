@@ -23,6 +23,7 @@ use ratatui::buffer::{Buffer, Cell};
 use ratatui::style::Color;
 
 use super::*;
+use crate::k8s::forward::ports::Declared;
 use crate::k8s::nodes::{Capacity, NodeRow, Pressure, Share};
 use crate::k8s::pods::{ContainerRow, EventRow, PodRow, Requests};
 use crate::k8s::quantity::Quantity;
@@ -504,6 +505,160 @@ fn the_status_line_in_colour() {
     ));
 }
 
+/// [`node_pods`] drilled into the API pod, whose `api` container serves HTTP
+/// and metrics and whose `envoy` sidecar declares an admin port and a UDP
+/// one — highlighted on the first port, with nothing forwarded yet.
+fn pod_ports() -> App {
+    let mut app = node_pods();
+    app.on_key(press(KeyCode::Enter));
+    let port = |container: &str, number: u16, name: &str, protocol: &str| Declared {
+        container: container.to_owned(),
+        name: Some(name.to_owned()),
+        number,
+        protocol: protocol.to_owned(),
+    };
+    app.apply_containers(Ok(ContainersFetch {
+        rows: vec![
+            ContainerRow {
+                ports: vec![
+                    port("api", 8080, "http", "TCP"),
+                    port("api", 9090, "metrics", "TCP"),
+                ],
+                ..container_row("api")
+            },
+            ContainerRow {
+                init: true,
+                ports: vec![
+                    port("envoy", 15000, "admin", "TCP"),
+                    port("envoy", 8125, "statsd", "UDP"),
+                ],
+                ..container_row("envoy")
+            },
+        ],
+        ip: "10.0.1.88".to_owned(),
+        nominated_node: "-".to_owned(),
+        readiness_gates: None,
+        events: Vec::new(),
+        events_error: None,
+        events_empty_note: "No events in the last hour.".to_owned(),
+    }));
+    app.on_key(press(KeyCode::Char('j')));
+    app
+}
+
+/// [`pod_ports`] with three forwards in three states: `8080` listening with
+/// two connections open and one refused earlier, `9090` still starting, and
+/// one to a pod that was deleted since.
+fn forwarding() -> App {
+    let mut app = pod_ports();
+    let Flow::Forward(ForwardRequest { id: http, .. }) = app.on_key(press(KeyCode::Char('f')))
+    else {
+        return app;
+    };
+    app.apply_forward_event(
+        http,
+        ForwardEvent::Listening {
+            url: "http://127.0.0.1:8080".to_owned(),
+            notes: Vec::new(),
+        },
+    );
+    app.apply_forward_event(http, ForwardEvent::Opened);
+    app.apply_forward_event(http, ForwardEvent::Opened);
+    app.apply_forward_event(
+        http,
+        ForwardEvent::Problem(
+            "pod api-7d9f8b6c4-x2kqp refused a connection on port 8080: nothing in it is listening there."
+                .to_owned(),
+        ),
+    );
+    app.on_key(press(KeyCode::Char('j')));
+    app.on_key(press(KeyCode::Char('f')));
+    app
+}
+
+/// [`forwarding`], then a third forward started on the ledger pod, whose pod
+/// has since been deleted, seen from the overview.
+fn forwarding_with_one_lost() -> App {
+    let mut app = forwarding();
+    // Rows are in name order, so `ledger-0` is second.
+    app.on_key(press(KeyCode::Esc));
+    app.on_key(press(KeyCode::Char('j')));
+    app.on_key(press(KeyCode::Enter));
+    app.apply_containers(Ok(ContainersFetch {
+        rows: vec![ContainerRow {
+            ports: vec![Declared {
+                container: "ledger".to_owned(),
+                name: Some("postgres".to_owned()),
+                number: 5432,
+                protocol: "TCP".to_owned(),
+            }],
+            ..container_row("ledger")
+        }],
+        ..ContainersFetch::default()
+    }));
+    app.on_key(press(KeyCode::Char('j')));
+    let Flow::Forward(ForwardRequest { id, .. }) = app.on_key(press(KeyCode::Char('f'))) else {
+        return app;
+    };
+    app.apply_forward_event(
+        id,
+        ForwardEvent::Ended {
+            message: "pod ledger-0 was deleted, so there is nothing left to forward to.\n\
+                      StatefulSet ledger will recreate it under the same name: press f on its port again once it is Running."
+                .to_owned(),
+            credentials: false,
+        },
+    );
+    // Back out to the overview: the strip outlives the panes its forwards
+    // were started from.
+    app.on_key(press(KeyCode::Esc));
+    app.on_key(press(KeyCode::Esc));
+    app
+}
+
+#[test]
+fn the_ports_of_a_pod_s_containers() {
+    insta::assert_snapshot!(text(&frame(&pod_ports(), WIDTH, HEIGHT)));
+}
+
+#[test]
+fn the_ports_of_a_pod_with_forwards_running() {
+    insta::assert_snapshot!(text(&frame(&forwarding(), WIDTH, HEIGHT)));
+}
+
+#[test]
+fn the_forwards_strip_with_one_forward_lost_to_its_pod() {
+    insta::assert_snapshot!(text(&frame(&forwarding_with_one_lost(), WIDTH, 30)));
+}
+
+#[test]
+fn the_ports_and_forwards_on_an_80_by_24_terminal() {
+    insta::assert_snapshot!(text(&frame(&forwarding(), 80, 24)));
+}
+
+#[test]
+fn the_forwards_strip_on_a_terminal_too_small_to_hold_it() {
+    insta::assert_snapshot!(text(&frame(&forwarding_with_one_lost(), 40, 9)));
+}
+
+#[test]
+fn the_overview_with_forwards_running_and_a_quit_armed() {
+    let mut app = forwarding();
+    app.on_key(press(KeyCode::Esc));
+    app.on_key(press(KeyCode::Esc));
+    app.on_key(press(KeyCode::Esc));
+    app.on_key(press(KeyCode::Char('q')));
+    insta::assert_snapshot!(text(&frame(&app, WIDTH, HEIGHT)));
+}
+
+#[test]
+fn the_ports_and_forwards_in_colour() {
+    insta::assert_snapshot!(styled(
+        &frame(&forwarding_with_one_lost(), WIDTH, 30),
+        Theme::dark()
+    ));
+}
+
 /// Every fixture above, for the tests that sweep all of them.
 fn every_view() -> Vec<(&'static str, App)> {
     vec![
@@ -513,6 +668,8 @@ fn every_view() -> Vec<(&'static str, App)> {
         ("pod containers", pod_containers()),
         ("container logs", container_logs()),
         ("shell refused", shell_refused()),
+        ("pod ports", pod_ports()),
+        ("forwarding", forwarding_with_one_lost()),
     ]
 }
 

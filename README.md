@@ -466,6 +466,18 @@ Credentials come from the kubeconfig context itself, so whatever works for
 refresh them instead of printing an HTTP status code — and, if the session it
 needs is an IAM Identity Center one, offers to refresh it for you.
 
+The dashboard forwards too. A pod's containers pane lists each container's
+declared ports as rows of their own; `f` on one forwards it to localhost, on
+the pod's own port number when that is free, and `F` stops it. Forwards run
+in the background while you move around, listed in a strip above the footer
+with the URL to click, how many connections each has open, and its last
+error. A forward whose pod goes away, or that cannot start, says why in the
+strip rather than interrupting you, and stays there until `c` clears it. They
+all end when the dashboard quits.
+For anything the dashboard does not offer — a chosen local port, another
+address, or following a deployment or service through a rollout — use
+`eks port-forward`.
+
 ### Long listings and long sessions
 
 The token `aws eks get-token` prints is good for fifteen minutes. `eks` runs the
@@ -763,7 +775,9 @@ change, and the next command prints normally underneath it.
 | `r` | Refresh the node pane now |
 | `L` | Log in to AWS again — only offered when the pane is showing a credential failure |
 | `x` | Open a shell in the highlighted pod or container, or the one whose log is open; `Esc` cancels while it is being checked. See [A shell in a container](#a-shell-in-a-container) |
-| `f` | Toggle following a container's log |
+| `f` | Toggle following a container's log — or, on a port in a pod's containers pane, forward it to localhost |
+| `F` | Stop the highlighted port's forward, or dismiss one that stopped by itself |
+| `c` | Clear forwards that stopped by themselves from the strip |
 | `w` | Toggle line wrap in a container's log |
 | `p` | Switch a container's log between its current instance and its previous one |
 | `/` | Search a container's log — jumps to the nearest match, `Esc` clears it |

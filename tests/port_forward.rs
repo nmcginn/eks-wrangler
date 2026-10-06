@@ -874,3 +874,251 @@ fn at_a_terminal_several_ports_are_offered_and_the_answer_is_forwarded() {
     let _ = child.kill();
     let _ = child.wait();
 }
+
+// The dashboard's forwards: the same machinery, started by `f` on a port and
+// reporting through a channel rather than on stderr. Driven in-process
+// through `spawn_dashboard`, the one function `main` hands the dashboard,
+// since the dashboard itself needs a terminal these tests do not have.
+
+use eks::commands::forward::spawn_dashboard;
+use eks::k8s::auth::Store;
+use eks::k8s::forward::{Event, PodPort};
+use eks::k8s::page::Budget;
+use eks::kubeconfig::KubeConfig;
+
+/// A forward the dashboard would have started, and the stand-in behind it.
+struct Dashboard {
+    events: mpsc::Receiver<Event>,
+    /// Dropping it is how the dashboard stops a forward.
+    handle: Option<eks::commands::StreamHandle>,
+    cluster: Arc<Cluster>,
+    _home: tempfile::TempDir,
+}
+
+impl Dashboard {
+    fn start(namespace: &str, pod: &str, port: u16) -> Self {
+        let (url, cluster) = serve();
+        let home = tempfile::tempdir().unwrap();
+        let path = kubeconfig(home.path(), &url);
+        let paths = vec![path];
+        let config = KubeConfig::load_from(&paths).unwrap();
+        let (events, handle) = spawn_dashboard(
+            config,
+            paths,
+            "test".to_owned(),
+            PodPort {
+                namespace: namespace.to_owned(),
+                pod: pod.to_owned(),
+                port,
+            },
+            Budget::of(Duration::from_secs(10)),
+            Store::new(),
+        );
+        Self {
+            events,
+            handle: Some(handle),
+            cluster,
+            _home: home,
+        }
+    }
+
+    /// The next event, or a failure naming what was expected.
+    fn next(&self, expecting: &str) -> Event {
+        self.events
+            .recv_timeout(Duration::from_secs(20))
+            .unwrap_or_else(|_| panic!("no event; expected {expecting}"))
+    }
+
+    /// The URL it says it is listening on.
+    fn listening(&self) -> String {
+        match self.next("Listening") {
+            Event::Listening { url, .. } => url,
+            other => panic!("expected Listening, got {other:?}"),
+        }
+    }
+
+    /// The message it ended with.
+    fn ended(&self) -> String {
+        loop {
+            match self.next("Ended") {
+                Event::Ended { message, .. } => return message,
+                Event::Listening { .. } | Event::Opened | Event::Closed | Event::Problem(_) => {}
+            }
+        }
+    }
+}
+
+fn port_in(url: &str) -> u16 {
+    url.rsplit(':').next().unwrap().parse().unwrap()
+}
+
+/// The proxy variables `kube` reads. It sends every request through
+/// `HTTPS_PROXY` when one is set, whatever `NO_PROXY` says, so a developer
+/// behind a proxy would see the stand-in's requests go to it instead.
+const PROXIES: [&str; 6] = [
+    "HTTPS_PROXY",
+    "https_proxy",
+    "HTTP_PROXY",
+    "http_proxy",
+    "ALL_PROXY",
+    "all_proxy",
+];
+
+/// Run `body`, the test called `name`, in a copy of this test binary with no
+/// proxy in its environment.
+///
+/// The binary tests above remove the variables from the child they start.
+/// These run the library in-process, where removing a variable needs
+/// `unsafe`, so the test starts itself again instead, as the only test in a
+/// clean environment.
+fn without_proxy(name: &str, body: impl FnOnce()) {
+    const MARK: &str = "EKS_TEST_WITHOUT_PROXY";
+    if std::env::var_os(MARK).is_some() || PROXIES.iter().all(|var| std::env::var_os(var).is_none())
+    {
+        body();
+        return;
+    }
+    let mut child = Command::new(std::env::current_exe().unwrap());
+    child
+        .args([name, "--exact", "--test-threads=1"])
+        .env(MARK, "1");
+    for var in PROXIES {
+        child.env_remove(var);
+    }
+    let status = child.status().unwrap();
+    assert!(status.success(), "{name} failed in its proxy-free copy");
+}
+
+#[test]
+fn a_dashboard_forward_reports_its_url_and_counts_each_connection() {
+    without_proxy(
+        "a_dashboard_forward_reports_its_url_and_counts_each_connection",
+        || {
+            let forward = Dashboard::start("default", "multi-1", 9090);
+            let url = forward.listening();
+            assert!(url.starts_with("http://127.0.0.1:"), "{url}");
+
+            let answer = ask(port_in(&url), "ping");
+            assert_eq!(answer, "multi-1:9090 ping");
+            assert_eq!(forward.next("Opened"), Event::Opened);
+
+            // The client is gone once `ask` returns; the stream follows it.
+            assert_eq!(forward.next("Closed"), Event::Closed);
+        },
+    );
+}
+
+#[test]
+fn a_dashboard_forward_whose_pod_is_deleted_ends_with_why_and_closes_its_port() {
+    without_proxy(
+        "a_dashboard_forward_whose_pod_is_deleted_ends_with_why_and_closes_its_port",
+        || {
+            let forward = Dashboard::start("default", POD_A, 8080);
+            let port = port_in(&forward.listening());
+
+            forward.cluster.rolled.store(true, Ordering::SeqCst);
+
+            let message = forward.ended();
+            assert!(
+                message.starts_with(&format!(
+                    "pod {POD_A} was deleted, so there is nothing left to forward to."
+                )),
+                "{message}"
+            );
+            assert!(
+                message.contains("`eks port-forward deploy/api`"),
+                "{message}"
+            );
+            assert!(
+                StdStream::connect(("127.0.0.1", port)).is_err(),
+                "the port outlived its forward"
+            );
+        },
+    );
+}
+
+#[test]
+fn dropping_a_dashboard_forward_s_handle_closes_its_port() {
+    without_proxy(
+        "dropping_a_dashboard_forward_s_handle_closes_its_port",
+        || {
+            let mut forward = Dashboard::start("default", "single-1", 38080);
+            let port = port_in(&forward.listening());
+            assert!(StdStream::connect(("127.0.0.1", port)).is_ok());
+
+            drop(forward.handle.take());
+
+            let deadline = Instant::now() + Duration::from_secs(20);
+            while StdStream::connect(("127.0.0.1", port)).is_ok() {
+                assert!(Instant::now() < deadline, "the port stayed open");
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        },
+    );
+}
+
+#[test]
+fn a_refused_connection_is_the_dashboard_forward_s_last_error_and_it_carries_on() {
+    without_proxy(
+        "a_refused_connection_is_the_dashboard_forward_s_last_error_and_it_carries_on",
+        || {
+            let forward = Dashboard::start("default", "refuse-1", 8080);
+            let port = port_in(&forward.listening());
+
+            assert_eq!(ask(port, "ping"), "");
+            let problem = loop {
+                match forward.next("Problem") {
+                    Event::Problem(problem) => break problem,
+                    Event::Ended { message, .. } => panic!("the forward ended: {message}"),
+                    _ => {}
+                }
+            };
+            assert!(
+            problem.starts_with(
+                "pod refuse-1 refused a connection on port 8080: nothing in it is listening there."
+            ),
+            "{problem}"
+        );
+            assert!(problem.contains("the pane lists"), "{problem}");
+            assert!(StdStream::connect(("127.0.0.1", port)).is_ok());
+        },
+    );
+}
+
+#[test]
+fn a_dashboard_forward_without_permission_ends_before_it_listens() {
+    without_proxy(
+        "a_dashboard_forward_without_permission_ends_before_it_listens",
+        || {
+            let forward = Dashboard::start("locked", "single-1", 38080);
+            match forward.next("Ended") {
+                Event::Ended {
+                    message,
+                    credentials,
+                } => {
+                    assert!(
+                        message.contains("`create` verb on `pods/portforward`"),
+                        "{message}"
+                    );
+                    assert!(!credentials, "a missing grant is not a login problem");
+                }
+                other => panic!("expected Ended before anything listened, got {other:?}"),
+            }
+        },
+    );
+}
+
+#[test]
+fn a_dashboard_forward_to_a_pod_already_gone_says_where_to_look() {
+    without_proxy(
+        "a_dashboard_forward_to_a_pod_already_gone_says_where_to_look",
+        || {
+            let forward = Dashboard::start("default", "vanished-1", 8080);
+            let message = forward.ended();
+            assert!(
+                message.starts_with("pod vanished-1 is no longer in namespace default"),
+                "{message}"
+            );
+        },
+    );
+}

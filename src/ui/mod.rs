@@ -24,6 +24,7 @@ use crate::commands::exec::{Plan, Target as ExecTarget};
 use crate::commands::nodes::NodesFetch;
 use crate::commands::pods::{ContainersFetch, PodsFetch, selectors_for};
 use crate::commands::{FetchError, StreamHandle};
+use crate::k8s::forward::{Event as ForwardEvent, PodPort};
 use crate::k8s::nodes as k8s_nodes;
 use crate::k8s::order::Direction as SortDirection;
 use crate::k8s::page::{Budget, ParseError};
@@ -33,12 +34,14 @@ use crate::theme::{Background, Theme};
 
 mod background;
 mod containers;
+mod forwards;
 mod logs;
 mod nodes;
 mod pods;
 
 use background::ReplyReader;
-use containers::ContainersState;
+use containers::{ContainersState, Entry};
+pub use forwards::{Forward, ForwardRequest, Forwards};
 use logs::LogsState;
 use nodes::NodesState;
 use pods::PodsState;
@@ -109,6 +112,13 @@ pub type ExecPreparer = Box<dyn Fn(&str, &ExecTarget) -> mpsc::Receiver<Result<P
 /// arrangement as [`LoginRunner`]. The `Err` is a sentence for the status
 /// line: the session could not start, or broke partway.
 pub type SessionRunner = Box<dyn Fn(&str, &Plan) -> Result<(), FetchError>>;
+
+/// Starts forwarding one port of one pod of the named context, on a thread of
+/// its own, until the returned [`StreamHandle`] is dropped — see
+/// [`crate::commands::forward::spawn_dashboard`]. Like [`LogsFetcher`]'s, the
+/// handle is the forward: dropping it closes the port.
+pub type ForwardStarter =
+    Box<dyn Fn(&str, &PodPort) -> (mpsc::Receiver<ForwardEvent>, StreamHandle)>;
 
 /// [`SessionRunner`] with the terminal handed back around it, as
 /// `event_loop` sees it. Borrowed for the reason [`Suspended`] is.
@@ -187,13 +197,21 @@ pub enum Flow {
     /// A variant for the reason [`Login`](Self::Login) is one: running the
     /// session means owning the terminal, and only the event loop does.
     Exec(ExecTarget),
+    /// Start this forward.
+    ///
+    /// It runs on a thread the event loop holds the handle of, and is
+    /// stopped by [`App`] no longer wanting it (see [`Forwards::wants`]),
+    /// which the event loop checks before every frame, so stopping needs no
+    /// variant of its own.
+    Forward(ForwardRequest),
     /// Tear down and exit.
     Quit,
 }
 
-/// What `x` is doing, shown in the status line above the footer.
+/// What the status line above the footer says: what `x` is doing, or a note
+/// about the key just pressed.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
-enum ExecStatus {
+enum StatusLine {
     /// Nothing; the status line is not drawn.
     #[default]
     Idle,
@@ -202,6 +220,11 @@ enum ExecStatus {
     /// Why a shell could not be opened, or why one ended badly. Shown until
     /// the next key.
     Refused(String),
+    /// Advice about a key that had nothing to act on as pressed — `f` on a
+    /// container rather than a port, or on a port already forwarded. Not a
+    /// failure, so not drawn as one; shown until the next key, like a
+    /// refusal.
+    Note(String),
 }
 
 /// Which pane `j`/`k`/`Home`/`End` currently move the highlight in.
@@ -461,9 +484,13 @@ pub struct App {
     /// it and the key stops offering something there is no longer a reason to
     /// do.
     credentials_lost: bool,
-    /// What `x` is doing. The pending check lives on the event loop, which
-    /// drops it as soon as this stops being [`ExecStatus::Preparing`].
-    exec: ExecStatus,
+    /// What the status line says. The check behind `x` lives on the event
+    /// loop, which drops it as soon as this stops being
+    /// [`StatusLine::Preparing`].
+    status: StatusLine,
+    /// The port forwards started with `f`. Not reset by anything that resets
+    /// a pane: a forward runs for as long as the dashboard is open.
+    forwards: Forwards,
 }
 
 impl App {
@@ -495,7 +522,8 @@ impl App {
             pod_selector_edit: SelectorEdit::default(),
             quit_armed_at: None,
             credentials_lost: false,
-            exec: ExecStatus::Idle,
+            status: StatusLine::Idle,
+            forwards: Forwards::default(),
         }
     }
 
@@ -545,6 +573,12 @@ impl App {
     #[must_use]
     pub fn logs(&self) -> &LogsState {
         &self.logs
+    }
+
+    /// The port forwards this dashboard has started and not dismissed.
+    #[must_use]
+    pub fn forwards(&self) -> &Forwards {
+        &self.forwards
     }
 
     /// Which pane `j`/`k`/`Home`/`End` currently move the highlight in.
@@ -815,7 +849,7 @@ impl App {
     /// `Esc`, leaving the pane, another cluster — is also what cancels it.
     #[must_use]
     pub fn exec_preparing(&self) -> bool {
-        matches!(self.exec, ExecStatus::Preparing(_))
+        matches!(self.status, StatusLine::Preparing(_))
     }
 
     /// The checks behind `x` came back with a reason no shell can be opened,
@@ -829,7 +863,7 @@ impl App {
         if error.credentials {
             self.credentials_lost = true;
         }
-        self.exec = ExecStatus::Refused(error.message);
+        self.status = StatusLine::Refused(error.message);
     }
 
     /// A session the dashboard handed the terminal to has ended — the shell
@@ -837,7 +871,7 @@ impl App {
     /// was before `x`.
     pub fn apply_exec_ending(&mut self, outcome: Result<(), FetchError>) {
         match outcome {
-            Ok(()) => self.exec = ExecStatus::Idle,
+            Ok(()) => self.status = StatusLine::Idle,
             Err(error) => self.apply_exec_refusal(error),
         }
     }
@@ -870,10 +904,7 @@ impl App {
                 }))
             }
             View::PodContainers { namespace, pod, .. } => {
-                let container = self
-                    .visible_containers()
-                    .get(self.detail_selected)
-                    .copied()?;
+                let container = self.highlighted_entry()?.container();
                 Some(Ok(ExecTarget {
                     namespace: namespace.clone(),
                     pod: pod.clone(),
@@ -898,24 +929,223 @@ impl App {
     fn start_exec(&mut self) -> Flow {
         match self.exec_target() {
             Some(Ok(target)) => {
-                self.exec = ExecStatus::Preparing(target.clone());
+                self.status = StatusLine::Preparing(target.clone());
                 Flow::Exec(target)
             }
             Some(Err(advice)) => {
-                self.exec = ExecStatus::Refused(advice);
+                self.status = StatusLine::Refused(advice);
                 Flow::Continue
             }
             None => Flow::Continue,
         }
     }
 
+    /// `f`/`F`, which mean something different in each pane that has them:
+    /// forward and stop a port among a pod's containers, follow a log, and
+    /// (`F` alone) retype the pod list's field selector.
+    fn f_key(&mut self, key: char) -> Flow {
+        match (key, &self.view) {
+            ('f', View::PodContainers { .. }) => return self.forward_highlighted(),
+            (_, View::PodContainers { .. }) => return self.stop_highlighted(),
+            ('f', _) => self.toggle_log_follow(),
+            _ => self.start_selector_edit(pods::SelectorField::Field),
+        }
+        Flow::Continue
+    }
+
+    /// `f` in the pod-containers pane: forward the highlighted port, or say
+    /// what to do instead.
+    ///
+    /// Only a port can be forwarded, so every other place the highlight can
+    /// be gets a sentence on the status line naming what would work, rather
+    /// than a key that silently does nothing.
+    fn forward_highlighted(&mut self) -> Flow {
+        let View::PodContainers { namespace, pod, .. } = &self.view else {
+            return Flow::Continue;
+        };
+        if self.focus != Focus::Detail {
+            return self
+                .note("Press tab to move to the container list, then f on a port to forward it.");
+        }
+        let (namespace, pod) = (namespace.clone(), pod.clone());
+        let advice = match self.highlighted_entry() {
+            None => return Flow::Continue,
+            Some(Entry::Container(row)) if row.ports.is_empty() => format!(
+                "Container {} declares no ports. If it listens on one anyway, \
+                 `eks port-forward {pod} -n {namespace} PORT` forwards it.",
+                row.name
+            ),
+            Some(Entry::Container(row)) => format!(
+                "Move down to one of {}'s ports, then press f to forward it.",
+                row.name
+            ),
+            Some(Entry::Port(_, port)) if !port.is_tcp() => format!(
+                "Port {} is {}, and a port forward carries TCP only.",
+                port.number, port.protocol
+            ),
+            Some(Entry::Port(_, port)) => {
+                let number = port.number;
+                let Some(cluster) = self.selected_cluster() else {
+                    return Flow::Continue;
+                };
+                let (context, label) = (cluster.context_name.clone(), cluster.display_name.clone());
+                let target = PodPort {
+                    namespace,
+                    pod: pod.clone(),
+                    port: number,
+                };
+                match self.forwards.start(&context, &label, target.clone()) {
+                    forwards::Started::New(id) => {
+                        return Flow::Forward(ForwardRequest {
+                            id,
+                            context,
+                            target,
+                        });
+                    }
+                    forwards::Started::Already(Some(url)) => format!(
+                        "Port {number} of pod {pod} is already forwarded to {url}. Press F to stop it."
+                    ),
+                    forwards::Started::Already(None) => format!(
+                        "Port {number} of pod {pod} is already being forwarded. Press F to stop it."
+                    ),
+                }
+            }
+        };
+        self.note(&advice)
+    }
+
+    /// `F` in the pod-containers pane: stop the highlighted port's forward,
+    /// or dismiss it if it has already stopped by itself.
+    fn stop_highlighted(&mut self) -> Flow {
+        let View::PodContainers { namespace, pod, .. } = &self.view else {
+            return Flow::Continue;
+        };
+        if self.focus != Focus::Detail {
+            return self.note(
+                "Press tab to move to the container list, then F on a forwarded port to stop it.",
+            );
+        }
+        let (namespace, pod) = (namespace.clone(), pod.clone());
+        let number = match self.highlighted_entry() {
+            None => return Flow::Continue,
+            Some(Entry::Container(_)) => {
+                return self
+                    .note("Move down to a forwarded port, then press F to stop its forward.");
+            }
+            Some(Entry::Port(_, port)) => port.number,
+        };
+        let Some(context) = self.selected_cluster().map(|c| c.context_name.clone()) else {
+            return Flow::Continue;
+        };
+        let target = PodPort {
+            namespace,
+            pod,
+            port: number,
+        };
+        if self.forwards.stop(&context, &target) {
+            Flow::Continue
+        } else {
+            self.note(&format!(
+                "Port {number} is not being forwarded. Press f to forward it."
+            ))
+        }
+    }
+
+    /// Put a note on the status line until the next key.
+    fn note(&mut self, text: &str) -> Flow {
+        self.status = StatusLine::Note(text.to_owned());
+        Flow::Continue
+    }
+
+    /// Apply what forward `id` reported about itself.
+    ///
+    /// A forward on the selected cluster that ended for want of credentials
+    /// arms `L`, as a refused fetch does in any pane; a successful login then
+    /// starts it again (see [`Self::retry_forwards_after_login`]). One on
+    /// another cluster does not: `L` logs in to the selected cluster's
+    /// profile without asking, and arming it for another account's failure
+    /// is what decision 76 rules out. Nothing here disarms it: a forward that
+    /// is working says nothing about whichever pane is failing.
+    pub fn apply_forward_event(&mut self, id: forwards::Id, event: ForwardEvent) {
+        let selected = self.selected_cluster().map(|c| c.context_name.as_str());
+        let here = self
+            .forwards
+            .all()
+            .iter()
+            .any(|f| f.id == id && Some(f.context.as_str()) == selected);
+        if here
+            && matches!(
+                event,
+                ForwardEvent::Ended {
+                    credentials: true,
+                    ..
+                }
+            )
+        {
+            self.credentials_lost = true;
+        }
+        self.forwards.apply(id, event);
+    }
+
+    /// A forward's thread is gone without saying why — it could not start a
+    /// runtime. Said on the strip like any other way of stopping, so the port
+    /// does not read as starting for ever.
+    pub fn apply_forward_lost(&mut self, id: forwards::Id) {
+        if self.forwards.wants(id) {
+            self.forwards.apply(
+                id,
+                ForwardEvent::Ended {
+                    message: "eks could not start this forward. Press f on its port to try again."
+                        .to_owned(),
+                    credentials: false,
+                },
+            );
+        }
+    }
+
+    /// Whether forward `id` still wants the thread running it.
+    #[must_use]
+    pub fn wants_forward(&self, id: forwards::Id) -> bool {
+        self.forwards.wants(id)
+    }
+
+    /// After a successful `L`: the selected cluster's forwards that stopped
+    /// for want of credentials, put back to starting, for the event loop to
+    /// start again. Another cluster's were not what was logged in to.
+    pub fn retry_forwards_after_login(&mut self) -> Vec<ForwardRequest> {
+        match self.selected_cluster().map(|c| c.context_name.clone()) {
+            Some(context) => self.forwards.retry_after_login(&context),
+            None => Vec::new(),
+        }
+    }
+
+    /// What each forwarded port of the pod on screen shows on its own row,
+    /// by port number. Empty outside [`View::PodContainers`].
+    fn port_marks(&self) -> containers::Marks {
+        let (View::PodContainers { namespace, pod, .. }, Some(cluster)) =
+            (&self.view, self.selected_cluster())
+        else {
+            return containers::Marks::new();
+        };
+        self.forwards
+            .all()
+            .iter()
+            .filter(|f| {
+                f.context == cluster.context_name
+                    && f.target.namespace == *namespace
+                    && f.target.pod == *pod
+            })
+            .map(|f| (f.target.port, f.mark()))
+            .collect()
+    }
+
     /// What the status line says, if anything: the checks in progress, or a
     /// refusal. Read by the renderer, which only lays it out.
     fn status_lines(&self) -> Vec<Line<'static>> {
         let theme = self.theme;
-        match &self.exec {
-            ExecStatus::Idle => Vec::new(),
-            ExecStatus::Preparing(target) => {
+        match &self.status {
+            StatusLine::Idle => Vec::new(),
+            StatusLine::Preparing(target) => {
                 let what = match &target.container {
                     Some(container) => format!("container {container} of pod {}", target.pod),
                     None => format!("pod {}", target.pod),
@@ -926,9 +1156,13 @@ impl App {
                     Span::styled(" cancel", theme.dim()),
                 ])]
             }
+            StatusLine::Note(message) => message
+                .lines()
+                .map(|line| Line::styled(line.to_owned(), theme.body()))
+                .collect(),
             // One line per line of the message, for the reason the node
             // pane splits its errors: the second line is the advice.
-            ExecStatus::Refused(message) => message
+            StatusLine::Refused(message) => message
                 .lines()
                 .map(|line| {
                     Line::styled(
@@ -1493,10 +1727,7 @@ impl App {
                 namespace,
                 pod,
             } => {
-                let container = self
-                    .visible_containers()
-                    .get(self.detail_selected)
-                    .copied()?;
+                let container = self.highlighted_entry()?.container();
                 Some(View::ContainerLogs {
                     node: node.clone(),
                     namespace: namespace.clone(),
@@ -1532,6 +1763,15 @@ impl App {
         crate::fuzzy::rank(self.filter.query(), self.containers.rows(), |row| {
             row.name.as_str()
         })
+    }
+
+    /// The highlighted row of the pod-containers pane — a container, or one
+    /// of its ports — from the same [`containers::entries`] the pane draws,
+    /// so the row `enter`, `x`, and `f` act on is the one on screen.
+    fn highlighted_entry(&self) -> Option<Entry<'_>> {
+        containers::entries(&self.visible_containers())
+            .get(self.detail_selected)
+            .copied()
     }
 
     /// The [`k8s_nodes::NodeRow`] behind the node currently drilled into, from
@@ -1654,7 +1894,7 @@ impl App {
         match &self.view {
             View::Overview => self.visible_nodes().len(),
             View::NodePods { .. } => self.visible_pods().len(),
-            View::PodContainers { .. } => self.visible_containers().len(),
+            View::PodContainers { .. } => containers::entries(&self.visible_containers()).len(),
             // Not a row list: `j`/`k`/`Home`/`End` scroll the log itself in
             // this view rather than moving a highlight, so there is no count
             // for them to be bounded against.
@@ -1872,8 +2112,8 @@ impl App {
 
         // A refusal on the status line is read once: the next key dismisses
         // it, and still does whatever it does.
-        if matches!(self.exec, ExecStatus::Refused(_)) {
-            self.exec = ExecStatus::Idle;
+        if matches!(self.status, StatusLine::Refused(_) | StatusLine::Note(_)) {
+            self.status = StatusLine::Idle;
         }
 
         // A shell checked for in a pane the user has since left, or on a
@@ -1883,7 +2123,7 @@ impl App {
         if self.exec_preparing()
             && (self.selected != selected || std::mem::discriminant(&self.view) != view)
         {
-            self.exec = ExecStatus::Idle;
+            self.status = StatusLine::Idle;
         }
         flow
     }
@@ -1915,7 +2155,7 @@ impl App {
         // Ahead of every other meaning `Esc` has: what it cancels is the
         // newest thing on screen.
         if key.code == KeyCode::Esc && self.exec_preparing() {
-            self.exec = ExecStatus::Idle;
+            self.status = StatusLine::Idle;
             return Flow::Continue;
         }
 
@@ -1947,7 +2187,8 @@ impl App {
             KeyCode::Char('S') => self.reverse_sort(),
             KeyCode::Char('R') => self.start_resource_sort(),
             KeyCode::Char('l') => self.start_selector_edit(pods::SelectorField::Label),
-            KeyCode::Char('F') => self.start_selector_edit(pods::SelectorField::Field),
+            KeyCode::Char('c') => self.forwards.clear_stopped(),
+            KeyCode::Char(c @ ('f' | 'F')) => return self.f_key(c),
             // Only when there is something for it to fix. A key that silently
             // does nothing is worse than one that is not offered, so the
             // footer hint appears under exactly this condition too.
@@ -1980,7 +2221,6 @@ impl App {
             {
                 self.scroll_logs_up(logs::PAGE);
             }
-            KeyCode::Char('f') => self.toggle_log_follow(),
             KeyCode::Char('w') => self.toggle_log_wrap(),
             KeyCode::Char('p') => self.toggle_log_previous(),
             KeyCode::Char(c @ ('n' | 'N')) => self.search_log(c == 'n'),
@@ -2217,6 +2457,8 @@ pub struct DrillFetchers<'a> {
     pub spawn_containers: &'a ContainersFetcher,
     pub spawn_logs: &'a LogsFetcher,
     pub prepare_exec: &'a ExecPreparer,
+    /// `f`'s forwards, which outlive the pane they were started from.
+    pub start_forward: &'a ForwardStarter,
 }
 
 // `Box<dyn Fn(..) -> ..>` has no `Debug` impl for `#[derive(Debug)]` to call,
@@ -2255,6 +2497,67 @@ impl Inflight {
         self.containers = None;
         self.logs = None;
         drop(self.logs_handle.take());
+    }
+}
+
+/// The threads running the dashboard's port forwards, by the id [`App`]
+/// knows each one as.
+///
+/// [`App`] decides which forwards should exist; this only holds the handles.
+/// After every key the event loop drops the handle of any forward `App` no
+/// longer wants — stopped with `F`, or ended by itself — and dropping it is
+/// what closes the port (see [`crate::commands::spawn_stream`]).
+#[derive(Default)]
+struct Forwarders(Vec<Forwarder>);
+
+struct Forwarder {
+    id: forwards::Id,
+    events: mpsc::Receiver<ForwardEvent>,
+    /// Held, never read: dropping it ends the forward.
+    _handle: StreamHandle,
+}
+
+impl Forwarders {
+    fn start(&mut self, start: &ForwardStarter, request: &ForwardRequest) {
+        let (events, handle) = start(&request.context, &request.target);
+        self.0.push(Forwarder {
+            id: request.id,
+            events,
+            _handle: handle,
+        });
+    }
+
+    /// Hand `app` everything each forward has said since the last frame,
+    /// then drop the ones it no longer wants. Never waits.
+    fn take_arrivals(&mut self, app: &mut App) {
+        for forwarder in &self.0 {
+            loop {
+                match forwarder.events.try_recv() {
+                    Ok(event) => app.apply_forward_event(forwarder.id, event),
+                    Err(mpsc::TryRecvError::Empty) => break,
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        app.apply_forward_lost(forwarder.id);
+                        break;
+                    }
+                }
+            }
+        }
+        self.reconcile(app);
+    }
+
+    /// Drop every forward `app` no longer wants. Called with the arrivals at
+    /// the top of each pass, so a forward `F` stopped has closed its port
+    /// before the frame that no longer lists it is drawn.
+    fn reconcile(&mut self, app: &App) {
+        self.0.retain(|forwarder| app.wants_forward(forwarder.id));
+    }
+
+    /// After a successful `L`: start again every forward that stopped for
+    /// want of credentials (see [`App::retry_forwards_after_login`]).
+    fn retry_after_login(&mut self, app: &mut App, start: &ForwardStarter) {
+        for request in app.retry_forwards_after_login() {
+            self.start(start, &request);
+        }
     }
 }
 
@@ -2351,9 +2654,11 @@ where
     // The checks behind `x`, while they run. Kept only while `App` says it
     // is still waiting for them, so dropping it is how `Esc` cancels.
     let mut exec_rx: Option<mpsc::Receiver<Result<Plan, FetchError>>> = None;
+    let mut forwarders = Forwarders::default();
 
     loop {
         take_arrivals(&mut app, nodes_rx.as_ref(), &inflight);
+        forwarders.take_arrivals(&mut app);
         if let Some(checked) = exec_rx.as_ref().and_then(checked_exec) {
             exec_rx = None;
             finish_exec(
@@ -2408,6 +2713,7 @@ where
                         let context = selected_context.as_deref();
                         refetch(spawn_nodes, &mut nodes_rx, context);
                         refetch_after_login(&mut app, drill, context, &mut inflight);
+                        forwarders.retry_after_login(&mut app, drill.start_forward);
                         next_refresh = schedule(refresh);
                     }
                     Err(message) => app.apply_login_failure(message),
@@ -2418,6 +2724,7 @@ where
                     .as_deref()
                     .map(|context| (drill.prepare_exec)(context, &target));
             }
+            Flow::Forward(request) => forwarders.start(drill.start_forward, &request),
             Flow::Continue => {}
         }
         if !app.exec_preparing() {
@@ -2756,12 +3063,15 @@ fn advance_resource_sort(text: &str, key: KeyEvent) -> ResourceSort {
 /// Draw one frame.
 pub fn draw(frame: &mut Frame, app: &App) {
     let status = app.status_lines();
+    let selected_context = app.selected_cluster().map(|c| c.context_name.as_str());
+    let strip = app.forwards.strip(selected_context, app.theme);
     let area = frame.area();
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(1), // header
             Constraint::Min(0),    // body
+            Constraint::Length(strip_height(&strip, area.width, area.height)),
             Constraint::Length(status_height(&status, area.width, area.height)),
             Constraint::Length(1), // footer
         ])
@@ -2769,14 +3079,74 @@ pub fn draw(frame: &mut Frame, app: &App) {
 
     draw_header(frame, chunks[0], app);
     draw_body(frame, chunks[1], app);
+    draw_forwards(
+        frame,
+        chunks[2],
+        strip,
+        app.forwards.stopped() > 0,
+        app.theme,
+    );
     // Indented a column, as the footer's hints are, wrapped lines included.
     frame.render_widget(
         Paragraph::new(status)
             .wrap(Wrap { trim: false })
             .block(Block::new().padding(Padding::left(STATUS_INDENT))),
-        chunks[2],
+        chunks[3],
     );
-    draw_footer(frame, chunks[3], app);
+    draw_footer(frame, chunks[4], app);
+}
+
+/// How many rows the forwards strip takes: its title rule, and its lines
+/// wrapped as the status line's are, within the same third of the screen.
+/// None at all while nothing has been forwarded.
+fn strip_height(lines: &[Line<'_>], width: u16, height: u16) -> u16 {
+    if lines.is_empty() {
+        return 0;
+    }
+    let cap = (height / 3).max(1);
+    status_height(lines, width, height)
+        .saturating_add(1)
+        .min(cap)
+}
+
+/// The forwards strip: every forward this dashboard has started, under a
+/// rule titled the way the panes are, on every view — a forward outlives the
+/// pane it was started from, so where to click for it must too.
+fn draw_forwards(
+    frame: &mut Frame,
+    area: Rect,
+    lines: Vec<Line<'static>>,
+    any_stopped: bool,
+    theme: Theme,
+) {
+    if area.height == 0 {
+        return;
+    }
+    let block = Block::new()
+        .borders(ratatui::widgets::Borders::TOP)
+        .border_style(theme.pane_border(false))
+        .title(strip_title(any_stopped))
+        .title_style(theme.heading())
+        .padding(Padding::left(STATUS_INDENT));
+    frame.render_widget(
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: false })
+            .block(block),
+        area,
+    );
+}
+
+/// The strip's title. It says that forwards end with the dashboard here,
+/// where it is on screen whenever there is one, rather than by lengthening
+/// `q quit` in a footer that already clips at a hundred columns; the armed
+/// quit says it again. While a stopped forward is listed it also offers `c`,
+/// the one key that clears it from any pane.
+fn strip_title(any_stopped: bool) -> &'static str {
+    if any_stopped {
+        " Forwards · they end when eks quits · c clears stopped "
+    } else {
+        " Forwards · they end when eks quits "
+    }
 }
 
 /// How far the status line is indented from the screen's left edge.
@@ -2957,6 +3327,7 @@ fn draw_detail(frame: &mut Frame, area: Rect, app: &App) {
                 app.containers(),
                 highlighted,
                 app.filter_query(),
+                &app.port_marks(),
                 theme,
             );
         }
@@ -2973,6 +3344,16 @@ fn detail_row<'a>(label: &'a str, value: &'a str, theme: Theme) -> Line<'a> {
     ])
 }
 
+/// What the footer says while a quit waits for its second press: that it
+/// will end the forwards too, while any are running.
+fn quit_warning(running: usize) -> String {
+    match running {
+        0 => "press esc/q again to quit".to_owned(),
+        1 => "press esc/q again to quit and end the port forward".to_owned(),
+        n => format!("press esc/q again to quit and end {n} port forwards"),
+    }
+}
+
 fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
     let theme = app.theme;
 
@@ -2980,7 +3361,7 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
         let warning = Line::from(vec![
             Span::raw(" "),
             Span::styled(
-                "press esc/q again to quit",
+                quit_warning(app.forwards.running()),
                 theme.severity(crate::theme::Severity::Warn),
             ),
         ]);
@@ -3064,6 +3445,19 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
             // tool can least afford to hide.
             ("/", "filter"),
         ];
+        // `f`/`F` only where there is a port to press them on. After `/`
+        // for the reason `x` is on the pod list; the highlighted port names
+        // the key on its own row too, so it is on screen however narrow the
+        // terminal.
+        if matches!(app.view(), View::PodContainers { .. })
+            && app
+                .containers()
+                .rows()
+                .iter()
+                .any(|row| !row.ports.is_empty())
+        {
+            hints.push(("f/F", "forward/stop"));
+        }
         // On a pod, `x` opens a shell in its default container. After `/`,
         // so it is clipped before `q quit`, and ahead of the two narrower
         // hints below.
@@ -3104,6 +3498,7 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
+    use crate::k8s::forward::ports::Declared;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
 
@@ -3318,6 +3713,7 @@ mod tests {
             requests: crate::k8s::pods::Requests::default(),
             cpu_limit: None,
             memory_limit: None,
+            ports: Vec::new(),
         }
     }
 
@@ -3337,6 +3733,69 @@ mod tests {
     /// [`app_with_container`]'s counterpart for the `p` (previous log) tests:
     /// a container that has restarted, so it has a previous instance to
     /// switch to.
+    fn declared(container: &str, number: u16, name: Option<&str>, protocol: &str) -> Declared {
+        Declared {
+            container: container.to_owned(),
+            name: name.map(str::to_owned),
+            number,
+            protocol: protocol.to_owned(),
+        }
+    }
+
+    /// An app drilled into `api-1`'s containers, where `web` declares an
+    /// HTTP port and a UDP one and `worker` declares none — so the rows the
+    /// highlight moves through are `web`, `8080`, `53`, `worker`, focused on
+    /// `web`.
+    fn app_with_ports() -> App {
+        let mut app = app_with_pod();
+        app.on_key(press(KeyCode::Enter));
+        app.apply_containers(Ok(ContainersFetch {
+            rows: vec![
+                crate::k8s::pods::ContainerRow {
+                    ports: vec![
+                        declared("web", 8080, Some("http"), "TCP"),
+                        declared("web", 53, Some("dns"), "UDP"),
+                    ],
+                    ..container_row("web")
+                },
+                container_row("worker"),
+            ],
+            ..ContainersFetch::default()
+        }));
+        app
+    }
+
+    /// The pod port `app_with_ports`' `8080` row forwards.
+    fn web_port() -> PodPort {
+        PodPort {
+            namespace: "default".to_owned(),
+            pod: "api-1".to_owned(),
+            port: 8080,
+        }
+    }
+
+    /// The selected cluster's context, as a forward records it.
+    const BETA: &str = "arn:aws:eks:us-east-1:1234:cluster/beta";
+
+    /// [`app_with_ports`] with `f` pressed on `8080`: the forward's id, and
+    /// the app with it starting.
+    fn app_forwarding() -> (forwards::Id, App) {
+        let mut app = app_with_ports();
+        app.on_key(press(KeyCode::Char('j')));
+        let Flow::Forward(request) = app.on_key(press(KeyCode::Char('f'))) else {
+            return (u64::MAX, app);
+        };
+        (request.id, app)
+    }
+
+    fn status_text(app: &App) -> String {
+        app.status_lines()
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
     fn app_with_crashed_container() -> App {
         let mut app = app_with_pod();
         app.on_key(press(KeyCode::Enter));
@@ -4047,6 +4506,7 @@ mod tests {
                 requests: crate::k8s::pods::Requests::default(),
                 cpu_limit: None,
                 memory_limit: None,
+                ports: Vec::new(),
             }],
             ..ContainersFetch::default()
         }));
@@ -6315,6 +6775,415 @@ mod tests {
         ));
         let mut terminal = Terminal::new(TestBackend::new(1, 1)).unwrap();
         terminal.draw(|frame| draw(frame, &app)).unwrap();
+    }
+
+    #[test]
+    fn a_container_s_ports_are_rows_the_highlight_moves_through() {
+        let mut app = app_with_ports();
+        assert_eq!(app.detail_row_count(), 4);
+        app.on_key(press(KeyCode::End));
+        assert_eq!(app.detail_selected(), 3);
+        app.on_key(press(KeyCode::Char('j')));
+        assert_eq!(app.detail_selected(), 0, "the highlight still wraps");
+    }
+
+    #[test]
+    fn f_on_a_port_starts_a_forward_to_that_port_of_that_pod() {
+        let mut app = app_with_ports();
+        app.on_key(press(KeyCode::Char('j')));
+        let flow = app.on_key(press(KeyCode::Char('f')));
+        assert_eq!(
+            flow,
+            Flow::Forward(ForwardRequest {
+                id: 0,
+                context: BETA.to_owned(),
+                target: web_port(),
+            })
+        );
+        assert_eq!(app.forwards().running(), 1);
+        assert_eq!(app.forwards().all()[0].cluster, "beta");
+    }
+
+    #[test]
+    fn f_on_a_port_already_forwarded_starts_nothing_and_says_where_it_is() {
+        let (id, mut app) = app_forwarding();
+        app.apply_forward_event(
+            id,
+            ForwardEvent::Listening {
+                url: "http://127.0.0.1:8080".to_owned(),
+                notes: Vec::new(),
+            },
+        );
+        assert_eq!(app.on_key(press(KeyCode::Char('f'))), Flow::Continue);
+        assert_eq!(app.forwards().all().len(), 1);
+        assert_eq!(
+            status_text(&app),
+            "Port 8080 of pod api-1 is already forwarded to http://127.0.0.1:8080. Press F to stop it."
+        );
+    }
+
+    #[test]
+    fn f_on_a_container_with_ports_says_to_move_to_one() {
+        let mut app = app_with_ports();
+        assert_eq!(app.on_key(press(KeyCode::Char('f'))), Flow::Continue);
+        assert_eq!(
+            status_text(&app),
+            "Move down to one of web's ports, then press f to forward it."
+        );
+        assert!(app.forwards().all().is_empty());
+    }
+
+    #[test]
+    fn f_on_a_container_without_ports_says_how_to_forward_one_anyway() {
+        let mut app = app_with_ports();
+        app.on_key(press(KeyCode::End));
+        app.on_key(press(KeyCode::Char('f')));
+        let text = status_text(&app);
+        assert!(
+            text.starts_with("Container worker declares no ports."),
+            "{text}"
+        );
+        assert!(
+            text.contains("`eks port-forward api-1 -n default PORT`"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn f_on_a_udp_port_says_a_forward_carries_tcp_only() {
+        let mut app = app_with_ports();
+        app.on_key(press(KeyCode::Char('j')));
+        app.on_key(press(KeyCode::Char('j')));
+        assert_eq!(app.on_key(press(KeyCode::Char('f'))), Flow::Continue);
+        assert_eq!(
+            status_text(&app),
+            "Port 53 is UDP, and a port forward carries TCP only."
+        );
+        assert!(app.forwards().all().is_empty());
+    }
+
+    #[test]
+    fn f_with_the_sidebar_focused_says_to_move_to_the_list_first() {
+        let mut app = app_with_ports();
+        app.toggle_focus();
+        assert_eq!(app.on_key(press(KeyCode::Char('f'))), Flow::Continue);
+        assert!(status_text(&app).starts_with("Press tab to move to the container list"));
+    }
+
+    #[test]
+    fn f_and_capital_f_mean_nothing_on_the_node_pane() {
+        let mut app = app_with_node();
+        assert_eq!(app.on_key(press(KeyCode::Char('f'))), Flow::Continue);
+        assert_eq!(app.on_key(press(KeyCode::Char('F'))), Flow::Continue);
+        assert!(status_text(&app).is_empty());
+        assert!(app.forwards().all().is_empty());
+    }
+
+    #[test]
+    fn capital_f_on_the_pod_list_still_retypes_the_field_selector() {
+        let mut app = app_with_pod();
+        app.on_key(press(KeyCode::Char('F')));
+        assert!(app.is_typing_selector());
+    }
+
+    #[test]
+    fn f_in_the_log_pane_still_toggles_following() {
+        let mut app = app_with_container();
+        app.on_key(press(KeyCode::Enter));
+        app.apply_log_event(LogEvent::Line("one".to_owned()));
+        let before = streaming(app.logs()).follow();
+        app.on_key(press(KeyCode::Char('f')));
+        assert_ne!(streaming(app.logs()).follow(), before);
+        assert!(app.forwards().all().is_empty());
+    }
+
+    #[test]
+    fn capital_f_on_a_forwarded_port_stops_it() {
+        let (id, mut app) = app_forwarding();
+        assert!(app.wants_forward(id));
+        assert_eq!(app.on_key(press(KeyCode::Char('F'))), Flow::Continue);
+        assert!(!app.wants_forward(id));
+        assert!(app.forwards().all().is_empty());
+        assert!(status_text(&app).is_empty());
+    }
+
+    #[test]
+    fn capital_f_dismisses_a_forward_that_stopped_by_itself() {
+        let (id, mut app) = app_forwarding();
+        app.apply_forward_event(
+            id,
+            ForwardEvent::Ended {
+                message: "pod api-1 was deleted.".to_owned(),
+                credentials: false,
+            },
+        );
+        app.on_key(press(KeyCode::Char('F')));
+        assert!(app.forwards().all().is_empty());
+    }
+
+    #[test]
+    fn capital_f_on_a_port_with_no_forward_says_how_to_start_one() {
+        let mut app = app_with_ports();
+        app.on_key(press(KeyCode::Char('j')));
+        app.on_key(press(KeyCode::Char('F')));
+        assert_eq!(
+            status_text(&app),
+            "Port 8080 is not being forwarded. Press f to forward it."
+        );
+    }
+
+    #[test]
+    fn capital_f_on_a_container_says_to_move_to_a_forwarded_port() {
+        let mut app = app_with_ports();
+        app.on_key(press(KeyCode::Char('F')));
+        assert_eq!(
+            status_text(&app),
+            "Move down to a forwarded port, then press F to stop its forward."
+        );
+    }
+
+    #[test]
+    fn the_next_key_clears_a_forwarding_note() {
+        let mut app = app_with_ports();
+        app.on_key(press(KeyCode::Char('f')));
+        assert!(!status_text(&app).is_empty());
+        app.on_key(press(KeyCode::Char('j')));
+        assert!(status_text(&app).is_empty());
+    }
+
+    #[test]
+    fn enter_on_a_port_opens_the_log_of_the_container_it_belongs_to() {
+        let mut app = app_with_ports();
+        app.on_key(press(KeyCode::Char('j')));
+        app.on_key(press(KeyCode::Enter));
+        assert!(matches!(
+            app.view(),
+            View::ContainerLogs { container, .. } if container == "web"
+        ));
+    }
+
+    #[test]
+    fn x_on_a_port_opens_a_shell_in_the_container_it_belongs_to() {
+        let mut app = app_with_ports();
+        app.on_key(press(KeyCode::Char('j')));
+        assert_eq!(
+            app.on_key(press(KeyCode::Char('x'))),
+            Flow::Exec(ExecTarget {
+                namespace: "default".to_owned(),
+                pod: "api-1".to_owned(),
+                container: Some("web".to_owned()),
+            })
+        );
+    }
+
+    #[test]
+    fn a_forward_outlives_the_pane_and_the_cluster_it_was_started_from() {
+        let (id, mut app) = app_forwarding();
+        app.on_key(press(KeyCode::Esc));
+        app.on_key(press(KeyCode::Esc));
+        app.leave_detail_view();
+        app.select_next();
+        assert!(app.wants_forward(id));
+        assert_eq!(app.forwards().running(), 1);
+    }
+
+    #[test]
+    fn the_port_row_marks_only_the_pod_on_screen() {
+        let (id, mut app) = app_forwarding();
+        app.apply_forward_event(
+            id,
+            ForwardEvent::Listening {
+                url: "http://127.0.0.1:8080".to_owned(),
+                notes: Vec::new(),
+            },
+        );
+        assert_eq!(
+            app.port_marks().get(&8080).map(|(text, _)| text.as_str()),
+            Some("→ http://127.0.0.1:8080")
+        );
+        app.on_key(press(KeyCode::Esc));
+        assert!(app.port_marks().is_empty(), "the pod list has no port rows");
+    }
+
+    #[test]
+    fn a_forward_refused_for_credentials_offers_l_and_a_login_retries_it() {
+        let (id, mut app) = app_forwarding();
+        app.apply_forward_event(
+            id,
+            ForwardEvent::Ended {
+                message: "beta rejected your credentials.".to_owned(),
+                credentials: true,
+            },
+        );
+        assert!(app.credentials_lost());
+
+        let retried = app.retry_forwards_after_login();
+        assert_eq!(retried.len(), 1);
+        assert_eq!(retried[0].context, BETA);
+        assert_eq!(retried[0].target, web_port());
+        assert!(app.wants_forward(retried[0].id));
+    }
+
+    #[test]
+    fn a_credential_failure_on_another_cluster_s_forward_neither_offers_l_nor_is_retried() {
+        let (id, mut app) = app_forwarding();
+        app.select_next();
+        app.apply_forward_event(
+            id,
+            ForwardEvent::Ended {
+                message: "beta rejected your credentials.".to_owned(),
+                credentials: true,
+            },
+        );
+        assert!(
+            !app.credentials_lost(),
+            "L would log in to gamma's profile for beta's failure"
+        );
+        assert!(app.retry_forwards_after_login().is_empty());
+    }
+
+    #[test]
+    fn c_clears_a_stopped_forward_from_any_pane() {
+        let (lost, mut app) = app_forwarding();
+        app.apply_forward_event(
+            lost,
+            ForwardEvent::Ended {
+                message: "pod api-1 was deleted.".to_owned(),
+                credentials: false,
+            },
+        );
+        // Backed all the way out, where no port row is on screen to press
+        // `F` on.
+        app.on_key(press(KeyCode::Esc));
+        app.on_key(press(KeyCode::Esc));
+        assert!(render_app(&app, 120, 30).contains("c clears stopped"));
+
+        app.on_key(press(KeyCode::Char('c')));
+        assert!(app.forwards().all().is_empty());
+        assert!(!render_app(&app, 120, 30).contains("Forwards"));
+    }
+
+    #[test]
+    fn c_leaves_a_running_forward_alone() {
+        let (id, mut app) = app_forwarding();
+        app.on_key(press(KeyCode::Char('c')));
+        assert!(app.wants_forward(id));
+        assert!(!render_app(&app, 120, 30).contains("c clears stopped"));
+    }
+
+    #[test]
+    fn a_forward_whose_thread_is_lost_says_so_and_how_to_retry() {
+        let (id, mut app) = app_forwarding();
+        app.apply_forward_lost(id);
+        assert!(!app.wants_forward(id));
+        assert!(matches!(
+            &app.forwards().all()[0].state,
+            forwards::State::Ended { message, .. } if message.contains("Press f on its port")
+        ));
+    }
+
+    fn render_app(app: &App, width: u16, height: u16) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal.draw(|frame| draw(frame, app)).unwrap();
+        terminal.backend().to_string()
+    }
+
+    #[test]
+    fn the_forwards_strip_appears_once_something_is_forwarded_and_stays_on_every_view() {
+        assert!(!render_app(&app_with_ports(), 100, 24).contains("Forwards"));
+
+        let (id, mut app) = app_forwarding();
+        app.apply_forward_event(
+            id,
+            ForwardEvent::Listening {
+                url: "http://127.0.0.1:8080".to_owned(),
+                notes: Vec::new(),
+            },
+        );
+        let screen = render_app(&app, 100, 24);
+        assert!(screen.contains("Forwards"), "{screen}");
+        assert!(
+            screen.contains("http://127.0.0.1:8080 → pod api-1 port 8080  no connections"),
+            "{screen}"
+        );
+
+        app.on_key(press(KeyCode::Esc));
+        app.on_key(press(KeyCode::Esc));
+        assert_eq!(app.view(), &View::Overview);
+        assert!(render_app(&app, 100, 24).contains("http://127.0.0.1:8080 → pod api-1"));
+    }
+
+    #[test]
+    fn the_strip_says_its_forwards_end_when_the_dashboard_does() {
+        let (_, app) = app_forwarding();
+        assert!(render_app(&app, 80, 24).contains("Forwards · they end when eks quits"));
+    }
+
+    #[test]
+    fn an_armed_quit_with_forwards_running_says_it_will_end_them() {
+        let (_, mut app) = app_forwarding();
+        app.on_key(press(KeyCode::Esc));
+        app.on_key(press(KeyCode::Esc));
+        app.on_key(press(KeyCode::Esc));
+        app.on_key(press(KeyCode::Char('q')));
+        assert!(
+            render_app(&app, 80, 24).contains("press esc/q again to quit and end the port forward")
+        );
+    }
+
+    #[test]
+    fn an_armed_quit_does_not_count_a_forward_that_already_stopped() {
+        let (id, mut app) = app_forwarding();
+        app.apply_forward_event(
+            id,
+            ForwardEvent::Ended {
+                message: "gone".to_owned(),
+                credentials: false,
+            },
+        );
+        app.on_key(press(KeyCode::Esc));
+        app.on_key(press(KeyCode::Esc));
+        app.on_key(press(KeyCode::Esc));
+        app.on_key(press(KeyCode::Char('q')));
+        let screen = render_app(&app, 80, 24);
+        assert!(screen.contains("press esc/q again to quit"), "{screen}");
+        assert!(!screen.contains("port forward"), "{screen}");
+    }
+
+    #[test]
+    fn the_armed_quit_counts_the_forwards_it_will_end() {
+        assert_eq!(quit_warning(0), "press esc/q again to quit");
+        assert_eq!(
+            quit_warning(1),
+            "press esc/q again to quit and end the port forward"
+        );
+        assert_eq!(
+            quit_warning(3),
+            "press esc/q again to quit and end 3 port forwards"
+        );
+    }
+
+    #[test]
+    fn the_footer_offers_f_only_where_there_is_a_port() {
+        assert!(render_app(&app_with_ports(), 160, 24).contains("f/F forward/stop"));
+        assert!(!render_app(&app_with_container(), 160, 24).contains("f/F"));
+        assert!(!render_app(&app_with_pod(), 160, 24).contains("f/F"));
+    }
+
+    #[test]
+    fn the_strip_never_takes_more_than_a_third_of_the_screen() {
+        let lines: Vec<Line<'_>> = (0..20).map(|n| Line::raw(n.to_string())).collect();
+        assert_eq!(strip_height(&lines, 80, 24), 8);
+        assert_eq!(strip_height(&[], 80, 24), 0);
+        assert_eq!(strip_height(&lines, 80, 1), 1);
+    }
+
+    #[test]
+    fn a_one_by_one_terminal_with_forwards_draws_without_panicking() {
+        let (_, app) = app_forwarding();
+        render_app(&app, 1, 1);
+        // Too short for the strip to have a row of its own beside the body.
+        render_app(&app, 30, 3);
     }
 
     mod event_loop;

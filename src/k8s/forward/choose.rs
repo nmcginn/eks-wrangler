@@ -17,6 +17,7 @@ use k8s_openapi::jiff::Timestamp;
 use kube::ResourceExt;
 
 use crate::format;
+use crate::k8s::forward::Surface;
 use crate::k8s::forward::spec::{Kind, Target};
 use crate::k8s::pods::PodRow;
 use crate::k8s::pods::pick;
@@ -181,9 +182,9 @@ pub enum Verdict {
 /// following one is what `svc/` and `deploy/` are for. So the message on the
 /// way out says which of those would have followed it, when the pod says.
 #[must_use]
-pub fn after_pod(seen: Option<&Pod>, last: &Pod, now: Timestamp) -> Verdict {
+pub fn after_pod(seen: Option<&Pod>, last: &Pod, now: Timestamp, surface: Surface) -> Verdict {
     let name = last.name_any();
-    let follow = follow_hint(last);
+    let follow = follow_hint(last, surface);
     match seen.map(|pod| health(pod, now)) {
         None => Verdict::Stop(format!(
             "pod {name} was deleted, so there is nothing left to forward to.\n{follow}"
@@ -200,8 +201,13 @@ pub fn after_pod(seen: Option<&Pod>, last: &Pod, now: Timestamp) -> Verdict {
 
 /// What to do instead of forwarding to `pod` by name, so the next forward
 /// survives its replacement.
+///
+/// Following a deployment or a service is something only `eks
+/// port-forward` does, so that advice names the command on either surface;
+/// starting again on a pod that comes back under its own name is `f` in the
+/// dashboard.
 #[must_use]
-pub fn follow_hint(pod: &Pod) -> String {
+pub fn follow_hint(pod: &Pod, surface: Surface) -> String {
     let owner = pod
         .metadata
         .owner_references
@@ -232,10 +238,16 @@ pub fn follow_hint(pod: &Pod) -> String {
                 ),
             }
         }
-        "StatefulSet" => format!(
-            "StatefulSet {} will recreate it under the same name: run the same command again once it is Running.",
-            owner.name
-        ),
+        "StatefulSet" => {
+            let again = match surface {
+                Surface::Command => "run the same command again",
+                Surface::Dashboard => "press f on its port again",
+            };
+            format!(
+                "StatefulSet {} will recreate it under the same name: {again} once it is Running.",
+                owner.name
+            )
+        }
         kind => format!(
             "{kind} {} may replace it under a new name; a service in front of its pods \
              (`eks port-forward svc/<name>`) follows them.",
@@ -246,17 +258,27 @@ pub fn follow_hint(pod: &Pod) -> String {
 
 /// Why a bare pod cannot be forwarded to at all.
 #[must_use]
-pub fn unusable(pod: &Pod, now: Timestamp) -> Option<String> {
+pub fn unusable(pod: &Pod, now: Timestamp, surface: Surface) -> Option<String> {
     let name = pod.name_any();
     match health(pod, now) {
         Health::Finished(phase) => Some(format!(
             "pod {name} has finished ({phase}), so nothing in it is listening.\n{}",
-            follow_hint(pod)
+            follow_hint(pod, surface)
         )),
-        Health::NotStarted(status) => Some(format!(
-            "pod {name} is {status}, so nothing in it is listening yet.\n\
-             `eks pods` shows when it is Running; `kubectl describe pod {name}` shows its events."
-        )),
+        Health::NotStarted(status) => {
+            let next = match surface {
+                Surface::Command => format!(
+                    "`eks pods` shows when it is Running; `kubectl describe pod {name}` shows its events."
+                ),
+                Surface::Dashboard => {
+                    "Its events, under its containers, say why; press f again once it is Running."
+                        .to_owned()
+                }
+            };
+            Some(format!(
+                "pod {name} is {status}, so nothing in it is listening yet.\n{next}"
+            ))
+        }
         Health::Ready | Health::Unready | Health::Terminating => None,
     }
 }
@@ -706,9 +728,15 @@ mod tests {
     #[test]
     fn a_running_pod_named_directly_is_kept() {
         let last = ready("api-a", EARLY);
-        assert_eq!(after_pod(Some(&last), &last, now()), Verdict::Keep);
+        assert_eq!(
+            after_pod(Some(&last), &last, now(), Surface::Command),
+            Verdict::Keep
+        );
         let unready = pod("api-a", "Running", false, EARLY);
-        assert_eq!(after_pod(Some(&unready), &last, now()), Verdict::Keep);
+        assert_eq!(
+            after_pod(Some(&unready), &last, now(), Surface::Command),
+            Verdict::Keep
+        );
     }
 
     #[test]
@@ -719,7 +747,7 @@ mod tests {
             "api-7d9f8c6b5",
             Some("7d9f8c6b5"),
         );
-        let Verdict::Stop(text) = after_pod(None, &last, now()) else {
+        let Verdict::Stop(text) = after_pod(None, &last, now(), Surface::Command) else {
             panic!("expected to stop");
         };
         assert!(
@@ -733,7 +761,8 @@ mod tests {
     fn a_finished_pod_named_directly_stops() {
         let last = ready("job-1", EARLY);
         let now_finished = pod("job-1", "Succeeded", false, EARLY);
-        let Verdict::Stop(text) = after_pod(Some(&now_finished), &last, now()) else {
+        let Verdict::Stop(text) = after_pod(Some(&now_finished), &last, now(), Surface::Command)
+        else {
             panic!("expected to stop");
         };
         assert!(text.contains("has finished (Succeeded)"), "{text}");
@@ -745,7 +774,7 @@ mod tests {
         let last = ready("api-a", EARLY);
         let going = terminating(ready("api-a", EARLY));
         assert!(matches!(
-            after_pod(Some(&going), &last, now()),
+            after_pod(Some(&going), &last, now(), Surface::Command),
             Verdict::Warn(text) if text.contains("shutting down")
         ));
     }
@@ -753,22 +782,73 @@ mod tests {
     #[test]
     fn a_statefulset_pod_is_said_to_come_back_under_its_own_name() {
         let pod = owned(ready("db-0", EARLY), "StatefulSet", "db", None);
-        assert!(follow_hint(&pod).contains("same name"));
+        assert!(follow_hint(&pod, Surface::Command).contains("same name"));
+    }
+
+    #[test]
+    fn in_the_dashboard_a_statefulset_pod_is_started_again_with_f() {
+        let pod = owned(ready("db-0", EARLY), "StatefulSet", "db", None);
+        let text = follow_hint(&pod, Surface::Dashboard);
+        assert!(text.contains("press f on its port again"), "{text}");
+        assert!(!text.contains("command"), "{text}");
+    }
+
+    #[test]
+    fn following_a_deployment_names_the_command_on_either_surface() {
+        let pod = owned(
+            ready("api-7d9f8c6b5-xk2pq", EARLY),
+            "ReplicaSet",
+            "api-7d9f8c6b5",
+            Some("7d9f8c6b5"),
+        );
+        assert_eq!(
+            follow_hint(&pod, Surface::Dashboard),
+            follow_hint(&pod, Surface::Command)
+        );
+    }
+
+    #[test]
+    fn in_the_dashboard_a_pod_not_yet_running_points_at_its_events_on_screen() {
+        let text = unusable(
+            &pod("api-a", "Pending", false, EARLY),
+            now(),
+            Surface::Dashboard,
+        )
+        .unwrap();
+        assert!(text.starts_with("pod api-a is Pending"), "{text}");
+        assert!(text.contains("press f again"), "{text}");
+        assert!(!text.contains("kubectl"), "{text}");
     }
 
     #[test]
     fn a_replicaset_without_the_hash_label_points_at_a_service() {
         let pod = owned(ready("x-1", EARLY), "ReplicaSet", "x-abc", None);
-        assert!(follow_hint(&pod).contains("ReplicaSet x-abc"));
+        assert!(follow_hint(&pod, Surface::Command).contains("ReplicaSet x-abc"));
     }
 
     #[test]
     fn a_pending_or_finished_pod_cannot_be_forwarded_to_at_all() {
-        let text = unusable(&pod("api-a", "Pending", false, EARLY), now()).unwrap();
+        let text = unusable(
+            &pod("api-a", "Pending", false, EARLY),
+            now(),
+            Surface::Command,
+        )
+        .unwrap();
         assert!(text.starts_with("pod api-a is Pending"), "{text}");
-        assert!(unusable(&pod("api-a", "Failed", false, EARLY), now()).is_some());
+        assert!(
+            unusable(
+                &pod("api-a", "Failed", false, EARLY),
+                now(),
+                Surface::Command
+            )
+            .is_some()
+        );
         assert_eq!(
-            unusable(&pod("api-a", "Running", false, EARLY), now()),
+            unusable(
+                &pod("api-a", "Running", false, EARLY),
+                now(),
+                Surface::Command
+            ),
             None
         );
     }

@@ -19,11 +19,16 @@
 //!
 //! Ctrl-C drops the whole future (see `main`), which closes every listener
 //! and aborts every connection's task.
+//!
+//! The dashboard's `f` runs steps 2 to 4 for one port of one pod through
+//! [`spawn_dashboard`]. Everything the command would print on stderr while it
+//! runs goes through a `Report` instead, which for the dashboard is a
+//! channel its forwards strip reads.
 
 use std::fmt::Debug;
 use std::io::IsTerminal as _;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, mpsc};
 use std::time::Duration;
 
 use anyhow::{Result, anyhow, bail};
@@ -44,11 +49,14 @@ use tokio::task::JoinSet;
 
 use crate::aws::LoginMode;
 use crate::cluster::ClusterView;
-use crate::commands::{credentials, exec, nodes::target_cluster, pods::selectors_for};
+use crate::commands::{
+    FetchError, StreamHandle, credentials, exec, nodes::target_cluster, pods::selectors_for,
+};
+use crate::k8s::auth::Store;
 use crate::k8s::forward::choose::{self, Found, Move, Verdict};
 use crate::k8s::forward::ports::{self, Default as DefaultPort};
 use crate::k8s::forward::spec::{self, Kind, Listen, Local, Remote, Spec, Target};
-use crate::k8s::forward::{self, Bind, Landing};
+use crate::k8s::forward::{self, Bind, Event, Landing, PodPort, Surface};
 use crate::k8s::page::{self, Budget};
 use crate::k8s::pods::{self as k8s_pods, Scope, Selectors};
 use crate::k8s::{self, Failure};
@@ -171,6 +179,7 @@ pub async fn run(
         budget,
         destination,
         recheck: Notify::new(),
+        report: Report::Stderr,
     });
 
     let watching = match resolved.selector {
@@ -256,7 +265,7 @@ async fn resolve(
         Kind::Pod => {
             let pod =
                 exec::locate(client, cluster, namespace, &target.name, selectors, budget).await?;
-            if let Some(why) = choose::unusable(&pod, now) {
+            if let Some(why) = choose::unusable(&pod, now, Surface::Command) {
                 bail!(why);
             }
             Ok(Resolved {
@@ -553,6 +562,49 @@ struct Shared {
     /// Woken by a connection that found its pod gone, so the watch loop looks
     /// now rather than at its next tick.
     recheck: Notify,
+    /// Where the lines about connections and the pod go.
+    report: Report,
+}
+
+/// Where a running forward's commentary goes.
+///
+/// `eks port-forward` owns its terminal and writes a line to stderr for each
+/// thing worth knowing. A forward the dashboard started must never write to
+/// the terminal — it would land on top of the frame — so the same moments go
+/// down a channel as [`Event`]s, with the connection count the strip shows
+/// beside them.
+#[derive(Debug, Clone)]
+enum Report {
+    Stderr,
+    Dashboard(mpsc::Sender<Event>),
+}
+
+impl Report {
+    /// One line about something that went wrong and did not end the forward.
+    fn say(&self, line: &str) {
+        match self {
+            Self::Stderr => eprintln!("{line}"),
+            Self::Dashboard(events) => {
+                // A dashboard that has stopped listening has also dropped the
+                // handle that ends this forward; nothing is lost.
+                let _ = events.send(Event::Problem(line.to_owned()));
+            }
+        }
+    }
+
+    /// Something only the dashboard counts: a connection opening or closing.
+    fn count(&self, event: Event) {
+        if let Self::Dashboard(events) = self {
+            let _ = events.send(event);
+        }
+    }
+
+    fn surface(&self) -> Surface {
+        match self {
+            Self::Stderr => Surface::Command,
+            Self::Dashboard(_) => Surface::Dashboard,
+        }
+    }
 }
 
 /// Accept connections on one listener until the command ends.
@@ -566,7 +618,12 @@ async fn accept(shared: Arc<Shared>, listener: TcpListener, index: usize) {
         while connections.try_join_next().is_some() {}
         match listener.accept().await {
             Ok((socket, _)) => {
-                connections.spawn(connection(Arc::clone(&shared), socket, index));
+                let shared = Arc::clone(&shared);
+                connections.spawn(async move {
+                    shared.report.count(Event::Opened);
+                    connection(&shared, socket, index).await;
+                    shared.report.count(Event::Closed);
+                });
             }
             Err(error) => {
                 // Out of file descriptors, usually. Pausing lets some close.
@@ -591,18 +648,20 @@ enum Broke {
 /// A connection that finds its pod gone wakes the watch loop and waits for it
 /// to settle on another pod, then tries once more. During a rollout that
 /// turns what would be a dropped request into a slightly slow one.
-async fn connection(shared: Arc<Shared>, mut socket: TcpStream, index: usize) {
+async fn connection(shared: &Shared, mut socket: TcpStream, index: usize) {
     let mut tried_again = false;
     loop {
         let current = shared.destination.borrow().clone();
         let Some(destination) = current else {
-            eprintln!("{}", forward::refused_while_waiting(&shared.target));
+            shared
+                .report
+                .say(&forward::refused_while_waiting(&shared.target));
             return;
         };
         let Some(&port) = destination.ports.get(index) else {
             return;
         };
-        match carry(&shared, &destination.pod, port, &mut socket).await {
+        match carry(shared, &destination.pod, port, &mut socket).await {
             Ok(()) => return,
             Err(Broke::Gone) if !tried_again => {
                 tried_again = true;
@@ -612,14 +671,14 @@ async fn connection(shared: Arc<Shared>, mut socket: TcpStream, index: usize) {
                 let _ = tokio::time::timeout(RESETTLE, changes.changed()).await;
             }
             Err(Broke::Gone) => {
-                eprintln!(
+                shared.report.say(&format!(
                     "a connection was dropped: pod {} was gone and no other pod was ready in time.",
                     destination.pod
-                );
+                ));
                 return;
             }
             Err(Broke::Said(message)) => {
-                eprintln!("{message}");
+                shared.report.say(&message);
                 return;
             }
         }
@@ -678,6 +737,7 @@ async fn carry(shared: &Shared, pod: &str, port: u16, socket: &mut TcpStream) ->
             pod,
             port,
             &message,
+            shared.report.surface(),
         ))
     })
 }
@@ -713,7 +773,7 @@ enum Watching {
 /// Look at the pod every [`CHECK_EVERY`], and whenever a connection asks,
 /// until a pod named directly is gone.
 async fn watch_loop(shared: &Shared, mut watching: Watching) -> Result<()> {
-    let mut said = Said::default();
+    let mut said = Said::new(&shared.report);
 
     loop {
         tokio::select! {
@@ -726,7 +786,7 @@ async fn watch_loop(shared: &Shared, mut watching: Watching) -> Result<()> {
                 let name = last.name_any();
                 match shared.budget.wrap(shared.api.get_opt(&name)).await {
                     Ok(seen) => {
-                        match choose::after_pod(seen.as_ref(), last, now) {
+                        match choose::after_pod(seen.as_ref(), last, now, shared.report.surface()) {
                             Verdict::Keep => {}
                             Verdict::Warn(line) => said.once(line),
                             Verdict::Stop(why) => bail!(why),
@@ -805,26 +865,30 @@ async fn watch_loop(shared: &Shared, mut watching: Watching) -> Result<()> {
     }
 }
 
-/// The watch loop's lines on stderr, each state reported once however many
-/// looks find it unchanged.
-#[derive(Default)]
-struct Said {
+/// The watch loop's lines, each state reported once however many looks find
+/// it unchanged.
+struct Said<'a> {
+    report: &'a Report,
     last: Option<String>,
 }
 
-impl Said {
-    /// Print `line` unless it is what was printed last.
+impl<'a> Said<'a> {
+    fn new(report: &'a Report) -> Self {
+        Self { report, last: None }
+    }
+
+    /// Report `line` unless it is what was reported last.
     fn once(&mut self, line: String) {
         if self.last.as_ref() != Some(&line) {
-            eprintln!("{line}");
+            self.report.say(&line);
             self.last = Some(line);
         }
     }
 
-    /// Print `line`, an event rather than a state, and forget what was
-    /// printed before it, so the state that follows is reported afresh.
+    /// Report `line`, an event rather than a state, and forget what was
+    /// reported before it, so the state that follows is reported afresh.
     fn always(&mut self, line: &str) {
-        eprintln!("{line}");
+        self.report.say(line);
         self.last = None;
     }
 }
@@ -836,4 +900,123 @@ fn unchecked(pod: &str, error: &page::Error, label: &str) -> String {
         "could not check on pod {pod}: {}\nForwarding carries on.",
         k8s::explain(error, label)
     )
+}
+
+/// Forward one port of one pod for the dashboard, until the returned handle
+/// is dropped.
+///
+/// The same steps as [`run`] after it has resolved a pod by name: the
+/// permission check, a listener on loopback that prefers the pod's own port
+/// number, one stream per connection, and the watch loop. What differs is
+/// where it all goes. Nothing is printed; every line `run` would write on
+/// stderr arrives as an [`Event`], and the reason the forward stopped —
+/// whether it never started or its pod went away — is its last one,
+/// [`Event::Ended`]. Credentials come from the dashboard's shared `store`,
+/// so the helper never prompts on the dashboard's terminal (decision 120).
+///
+/// Dropping the handle drops the whole future: the listener closes and every
+/// connection's task is aborted with it, as Ctrl-C does for the command.
+#[must_use]
+pub fn spawn_dashboard(
+    config: KubeConfig,
+    paths: Vec<PathBuf>,
+    context: String,
+    target: PodPort,
+    budget: Budget,
+    store: Store,
+) -> (mpsc::Receiver<Event>, StreamHandle) {
+    super::spawn_stream(move |events, stop| async move {
+        let report = Report::Dashboard(events.clone());
+        let served = tokio::select! {
+            _ = stop => return,
+            served = serve(&config, &paths, &context, &target, budget, &store, report) => served,
+        };
+        let error = served.err().unwrap_or_else(|| {
+            // The accept loop never returns while its listener is open, so
+            // this is the same "for completeness" arm `run` has.
+            anyhow!(
+                "the forward to pod {} stopped accepting connections.",
+                target.pod
+            )
+        });
+        let FetchError {
+            message,
+            credentials,
+        } = FetchError::of(&error);
+        let _ = events.send(Event::Ended {
+            message,
+            credentials,
+        });
+    })
+}
+
+/// [`spawn_dashboard`]'s future, apart so its early returns can use `?`.
+async fn serve(
+    config: &KubeConfig,
+    paths: &[PathBuf],
+    context: &str,
+    target: &PodPort,
+    budget: Budget,
+    store: &Store,
+    report: Report,
+) -> Result<()> {
+    let PodPort {
+        namespace,
+        pod: pod_name,
+        port,
+    } = target;
+    let cluster = target_cluster(config, Some(context))?;
+    let label = cluster.label();
+    let client = k8s::client::connect_kept(paths, &cluster, budget, store).await?;
+
+    if allowed(&client, namespace, budget).await == Some(false) {
+        bail!(forward::forbidden(&label, namespace));
+    }
+
+    let api: Api<Pod> = Api::namespaced(client, namespace);
+    let pod = budget
+        .wrap(api.get_opt(pod_name))
+        .await
+        .map_err(|error| anyhow!(k8s::explain(&error, &label)))?
+        .ok_or_else(|| anyhow!(forward::pod_gone(pod_name, namespace)))?;
+    if let Some(why) = choose::unusable(&pod, Timestamp::now(), Surface::Dashboard) {
+        bail!(why);
+    }
+    let remote = Remote::Number(*port);
+    let pod_port = ports::on_pod(&pod, &remote)?;
+    let spec = Spec {
+        local: Local::Same,
+        remote,
+    };
+    let listening = listen(&spec::addresses(&[])?, &spec, pod_port).await?;
+    let Some(listener) = listening.listeners.into_iter().next() else {
+        bail!("eks could not listen on any local address for pod {pod_name} port {port}.");
+    };
+    let address = listener.local_addr()?;
+    report.count(Event::Listening {
+        url: spec::url(address.ip(), address.port()),
+        notes: listening.fallback.into_iter().collect(),
+    });
+
+    let (destination, _) = watch::channel(Some(Destination {
+        pod: pod_name.clone(),
+        ports: vec![pod_port],
+    }));
+    let shared = Arc::new(Shared {
+        api,
+        target: Target {
+            kind: Kind::Pod,
+            name: pod_name.clone(),
+        },
+        label,
+        namespace: namespace.clone(),
+        budget,
+        destination,
+        recheck: Notify::new(),
+        report,
+    });
+    tokio::select! {
+        outcome = watch_loop(&shared, Watching::Pod { last: Box::new(pod) }) => outcome,
+        () = accept(Arc::clone(&shared), listener, 0) => Ok(()),
+    }
 }

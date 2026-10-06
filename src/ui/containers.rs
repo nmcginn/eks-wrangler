@@ -5,11 +5,15 @@
 //! same split [`super::pods`] and [`super::nodes`] keep between computation
 //! and rendering.
 
+use std::collections::BTreeMap;
+use std::fmt::Write as _;
+
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Wrap};
 
+use crate::k8s::forward::ports::Declared;
 use crate::k8s::pods::ContainerRow;
 use crate::k8s::pods::containers::resources_summary;
 use crate::k8s::pods::events::EventRow;
@@ -65,6 +69,47 @@ impl ContainersState {
     }
 }
 
+/// One row the pane's highlight can rest on: a container, or one of the
+/// ports it declares, listed under it.
+///
+/// Ports are rows of their own, rather than something `f` cycles through on
+/// a container's row, because a forward belongs to one port: the highlight
+/// is what says which, and the same row is where its URL appears once it is
+/// running. Everything a container's row does — `enter` for its log, `x` for
+/// a shell — a port's row does for the container it sits under.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Entry<'a> {
+    Container(&'a ContainerRow),
+    Port(&'a ContainerRow, &'a Declared),
+}
+
+impl<'a> Entry<'a> {
+    /// The container this row is, or sits under.
+    pub(super) fn container(self) -> &'a ContainerRow {
+        match self {
+            Self::Container(row) | Self::Port(row, _) => row,
+        }
+    }
+}
+
+/// The rows the highlight moves through, in the order they are drawn: each
+/// container, then its ports. Taken over the containers the `/` filter left,
+/// so a port follows its container in and out of a filtered list.
+pub(super) fn entries<'a>(containers: &[&'a ContainerRow]) -> Vec<Entry<'a>> {
+    containers
+        .iter()
+        .flat_map(|row| {
+            std::iter::once(Entry::Container(row))
+                .chain(row.ports.iter().map(|port| Entry::Port(row, port)))
+        })
+        .collect()
+}
+
+/// What a port's row says about its forward, by port number: the URL, or
+/// that it is starting or has stopped. Ports are per pod, so the number is
+/// enough to say which.
+pub(super) type Marks = BTreeMap<u16, (String, Severity)>;
+
 /// Draw whatever the pod-containers pane currently knows.
 ///
 /// `selected` highlights a row — `None` when the pane does not currently
@@ -77,12 +122,16 @@ impl ContainersState {
 /// narrows. It narrows the `EVENTS` section below the container list too, via
 /// [`events_lines`]: one query for the whole pane rather than a second `/`
 /// for a section nothing here ever highlights or drills into.
+///
+/// `selected` counts [`entries`], ports included, and `marks` is what each
+/// forwarded port's row says about its forward.
 pub(super) fn draw(
     frame: &mut Frame,
     area: Rect,
     state: &ContainersState,
     selected: Option<usize>,
     filter: &str,
+    marks: &Marks,
     theme: Theme,
 ) {
     let lines: Vec<Line> = match state {
@@ -115,11 +164,17 @@ pub(super) fn draw(
                     theme.dim(),
                 ));
             } else {
-                lines.extend(
-                    visible.into_iter().enumerate().flat_map(|(index, row)| {
-                        container_lines(row, Some(index) == selected, theme)
-                    }),
-                );
+                lines.extend(entries(&visible).into_iter().enumerate().flat_map(
+                    |(index, entry)| {
+                        let selected = Some(index) == selected;
+                        match entry {
+                            Entry::Container(row) => container_lines(row, selected, theme),
+                            Entry::Port(_, port) => {
+                                vec![port_line(port, marks.get(&port.number), selected, theme)]
+                            }
+                        }
+                    },
+                ));
             }
 
             lines.push(Line::raw(""));
@@ -205,6 +260,52 @@ fn container_lines(row: &ContainerRow, selected: bool, theme: Theme) -> Vec<Line
     let resources = Line::styled(format!("  {requests}  {limits}"), theme.dim());
 
     vec![identity, resources]
+}
+
+/// One declared port's row: its number, its name, and its forward if it has
+/// one.
+///
+/// The highlighted port also names the key that acts on it — `f` to forward,
+/// `F` to stop — so the one key this row exists for is on screen where the
+/// eye already is, whatever the footer had room for. A port that is not TCP
+/// says so instead, since a forward carries TCP alone.
+fn port_line(
+    port: &Declared,
+    mark: Option<&(String, Severity)>,
+    selected: bool,
+    theme: Theme,
+) -> Line<'static> {
+    // A mark rather than an indent: the pane's paragraph trims leading
+    // spaces, and without one a port would read as a container of its own.
+    let mut label = format!("· port {}", port.number);
+    // Writing to a `String` cannot fail.
+    if !port.is_tcp() {
+        let _ = write!(label, "/{}", port.protocol);
+    }
+    if let Some(name) = &port.name {
+        let _ = write!(label, " ({name})");
+    }
+    let mut spans = vec![Span::styled(label, theme.body())];
+    if let Some((text, severity)) = mark {
+        spans.push(Span::raw("  "));
+        spans.push(Span::styled(text.clone(), theme.severity(*severity)));
+    }
+    let hint = match (port.is_tcp(), mark) {
+        (false, _) => Some("TCP only: cannot be forwarded"),
+        (true, None) if selected => Some("f forward"),
+        (true, Some(_)) if selected => Some("F stop"),
+        (true, _) => None,
+    };
+    if let Some(hint) = hint {
+        spans.push(Span::raw("  "));
+        spans.push(Span::styled(hint, theme.dim()));
+    }
+    let line = Line::from(spans);
+    if selected {
+        line.style(theme.selected())
+    } else {
+        line
+    }
 }
 
 /// The `EVENTS` section under the container list: whatever
@@ -316,6 +417,7 @@ mod tests {
             requests: Requests::default(),
             cpu_limit: None,
             memory_limit: None,
+            ports: Vec::new(),
         }
     }
 
@@ -386,14 +488,139 @@ mod tests {
     }
 
     fn render_filtered(state: &ContainersState, selected: Option<usize>, filter: &str) -> String {
+        render_marked(state, selected, filter, &Marks::new())
+    }
+
+    fn render_marked(
+        state: &ContainersState,
+        selected: Option<usize>,
+        filter: &str,
+        marks: &Marks,
+    ) -> String {
         let mut terminal = Terminal::new(TestBackend::new(90, 20)).unwrap();
         terminal
             .draw(|frame| {
                 let area = frame.area();
-                draw(frame, area, state, selected, filter, Theme::dark());
+                draw(frame, area, state, selected, filter, marks, Theme::dark());
             })
             .unwrap();
         terminal.backend().to_string()
+    }
+
+    fn port(container: &str, number: u16, name: Option<&str>, protocol: &str) -> Declared {
+        Declared {
+            container: container.to_owned(),
+            name: name.map(str::to_owned),
+            number,
+            protocol: protocol.to_owned(),
+        }
+    }
+
+    fn with_ports(name: &str, ports: Vec<Declared>) -> ContainerRow {
+        ContainerRow {
+            ports,
+            ..container(name)
+        }
+    }
+
+    #[test]
+    fn a_container_s_ports_are_rows_under_it_in_spec_order() {
+        let web = with_ports(
+            "web",
+            vec![
+                port("web", 8080, Some("http"), "TCP"),
+                port("web", 9090, None, "TCP"),
+            ],
+        );
+        let sidecar = container("sidecar");
+        let rows = [&web, &sidecar];
+        let listed: Vec<String> = entries(&rows)
+            .into_iter()
+            .map(|entry| match entry {
+                Entry::Container(row) => row.name.clone(),
+                Entry::Port(row, port) => format!("{}:{}", row.name, port.number),
+            })
+            .collect();
+        assert_eq!(listed, ["web", "web:8080", "web:9090", "sidecar"]);
+    }
+
+    #[test]
+    fn a_port_row_belongs_to_the_container_above_it() {
+        let web = with_ports("web", vec![port("web", 8080, None, "TCP")]);
+        let rows = [&web];
+        let all = entries(&rows);
+        assert_eq!(all[1].container().name, "web");
+    }
+
+    #[test]
+    fn no_containers_means_no_rows() {
+        assert!(entries(&[]).is_empty());
+    }
+
+    #[test]
+    fn a_port_shows_its_number_and_name_under_its_container() {
+        let state = loaded(vec![with_ports(
+            "web",
+            vec![port("web", 8080, Some("http"), "TCP")],
+        )]);
+        let output = render(&state, None);
+        assert!(output.contains("port 8080 (http)"), "{output}");
+        assert!(
+            !output.contains("8080/TCP"),
+            "TCP is the default and goes unsaid: {output}"
+        );
+    }
+
+    #[test]
+    fn the_highlighted_port_names_the_key_that_forwards_it() {
+        let state = loaded(vec![with_ports(
+            "web",
+            vec![port("web", 8080, None, "TCP")],
+        )]);
+        assert!(render(&state, Some(1)).contains("f forward"));
+        assert!(
+            !render(&state, Some(0)).contains("f forward"),
+            "only the highlighted port offers the key"
+        );
+    }
+
+    #[test]
+    fn a_forwarded_port_shows_its_url_and_the_key_that_stops_it() {
+        let state = loaded(vec![with_ports(
+            "web",
+            vec![port("web", 8080, None, "TCP")],
+        )]);
+        let marks = Marks::from([(8080, ("→ http://127.0.0.1:8080".to_owned(), Severity::Ok))]);
+        let output = render_marked(&state, Some(1), "", &marks);
+        assert!(
+            output.contains("port 8080  → http://127.0.0.1:8080"),
+            "{output}"
+        );
+        assert!(output.contains("F stop"), "{output}");
+        assert!(!output.contains("f forward"), "{output}");
+    }
+
+    #[test]
+    fn a_udp_port_says_it_cannot_be_forwarded() {
+        let state = loaded(vec![with_ports(
+            "dns",
+            vec![port("dns", 53, Some("dns"), "UDP")],
+        )]);
+        let output = render(&state, Some(1));
+        assert!(output.contains("port 53/UDP (dns)"), "{output}");
+        assert!(output.contains("TCP only: cannot be forwarded"), "{output}");
+        assert!(!output.contains("f forward"), "{output}");
+    }
+
+    #[test]
+    fn a_filtered_out_container_takes_its_ports_with_it() {
+        let state = loaded(vec![
+            with_ports("web", vec![port("web", 8080, None, "TCP")]),
+            with_ports("metrics", vec![port("metrics", 9100, None, "TCP")]),
+        ]);
+        let output = render_filtered(&state, None, "metr");
+        assert!(output.contains("port 9100"), "{output}");
+        assert!(!output.contains("port 8080"), "{output}");
     }
 
     #[test]
@@ -459,7 +686,15 @@ mod tests {
             terminal
                 .draw(|frame| {
                     let area = frame.area();
-                    draw(frame, area, &state, Some(0), "", Theme::dark());
+                    draw(
+                        frame,
+                        area,
+                        &state,
+                        Some(0),
+                        "",
+                        &Marks::new(),
+                        Theme::dark(),
+                    );
                 })
                 .unwrap();
         }
@@ -513,7 +748,7 @@ mod tests {
         terminal
             .draw(|frame| {
                 let area = frame.area();
-                draw(frame, area, &state, None, "", Theme::dark());
+                draw(frame, area, &state, None, "", &Marks::new(), Theme::dark());
             })
             .unwrap();
         let rendered = terminal.backend().to_string();
@@ -812,7 +1047,7 @@ mod tests {
             terminal
                 .draw(|frame| {
                     let area = frame.area();
-                    draw(frame, area, &state, None, "", Theme::dark());
+                    draw(frame, area, &state, None, "", &Marks::new(), Theme::dark());
                 })
                 .unwrap();
         }
