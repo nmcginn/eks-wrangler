@@ -561,6 +561,29 @@ on the upgrade, before any byte was sent) wakes the watch loop through a
 its connections in a `JoinSet`, so dropping the command's future at Ctrl-C
 aborts them along with the listeners.
 
+The dashboard's `f` reuses everything after resolving: the permission
+check, `listen`, `accept`, `connection`, and `watch_loop`, through
+`commands::forward::spawn_dashboard` (decision 128). What the command writes
+to stderr goes through a `Report`, which for the dashboard is a channel of
+`k8s::forward::Event`s — listening, a connection opened or closed, a
+problem, ended — and the advice in those lines takes a `forward::Surface`.
+State is split the usual way:
+
+```
+App::on_key ──► Forwards::start ──► Flow::Forward ──► Forwarders::start ──► spawn_dashboard
+ (f on a port)    (pure: one per                         (event loop holds    (its own thread)
+                  context, pod, port)                    each handle)               │
+                         ▲                                                          │
+                         └──── App::apply_forward_event ◄──── Event channel ◄───────┘
+```
+
+`ui::forwards::Forwards` is pure: which forwards exist, what each last said,
+and the strip's lines. The event loop holds only the threads' handles, and
+before each frame drops every one `App` no longer wants. `F` and a forward
+ending by itself both stop it that way, with no message of their own. The
+containers pane's highlight moves over `containers::entries`, a container
+then its ports, so the row `enter`, `x`, and `f` act on is the one drawn.
+
 ## Testing
 
 Run `make test`. The suite needs no cluster, no credentials, and no network, and

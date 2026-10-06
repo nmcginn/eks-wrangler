@@ -1136,3 +1136,37 @@ meant for a person to read, not for `eks` to parse.
 - **Half-close.** `kube` stops delivering the pod's bytes once the client
   half-closes its side, as `kubectl` does. Clients that read their answer
   before closing (browsers, `curl`, database drivers) are unaffected.
+
+### 128. Dashboard forwards: ports are rows, `f`/`F` act on the highlighted one, and a forward outlives its pane
+
+- **Ports are rows.** Each declared port is a row under its container, so
+  the highlight says which port `f` forwards and the row shows its URL.
+  `Enter` and `x` on a port act on its container. Ordinary init containers
+  show no ports, by `ports::declared`'s rule.
+- **Keys.** `f` forwards the highlighted port; `F` stops it, or dismisses a
+  forward that stopped by itself. `f` on anything else (a container, a UDP
+  port, a port already forwarded) puts a sentence on the status line. Outside
+  this pane `f` still follows a log and `F` still retypes the field selector.
+- **Always to the pod, on loopback, preferring the pod's port number.**
+  The dashboard has no way to type `LOCAL:REMOTE` or `--address`; the CLI
+  remains the tool for those and for following a `deploy/` or `svc/`.
+- **Same machinery as the CLI.** `commands::forward::spawn_dashboard` runs
+  the command's permission check, listener, per-connection streams, and
+  watch loop. Their stderr lines go through a `Report` that, for the
+  dashboard, is a channel of `k8s::forward::Event`s. Advice in those lines
+  takes a `forward::Surface`, as `exec` messages do.
+- **One thread per forward**, held by the event loop and stopped by
+  dropping its handle. `App` decides which forwards should exist; the loop
+  drops any handle `App` no longer wants before each frame.
+- **A stopped forward stays on the strip** with its reason, since it may
+  have stopped while nobody was looking. `f` on its port restarts it and
+  `F` dismisses it. `c` clears every stopped forward from any pane, because
+  a deleted pod's port row is gone with it; the strip's title offers `c`
+  while there is one to clear.
+- **Credentials.** A forward on the selected cluster that ends for want of
+  credentials arms `L`, and a successful `L` restarts it. A forward on
+  another cluster does neither, for decision 76's reason.
+- **Quit hint.** The strip's title says forwards end when `eks` quits, and
+  the armed quit counts them. `q quit` in the footer is unchanged, because
+  a longer hint clips at 100 columns.
+

@@ -137,6 +137,17 @@ pub fn exposure(address: IpAddr) -> Option<String> {
 /// Printed once every forward is listening.
 pub const STOP_HINT: &str = "Forwarding until Ctrl-C.";
 
+/// Where a line about a forward is read, which decides the advice in it —
+/// a command to run, or the pane already on screen. The diagnosis is the
+/// same on both, as for `eks exec`'s own `Surface`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Surface {
+    /// `eks port-forward`.
+    Command,
+    /// `f` in the dashboard's pod-containers pane.
+    Dashboard,
+}
+
 /// A connection the pod's end of the forward refused or dropped, from the
 /// error the kubelet sent back.
 ///
@@ -144,14 +155,23 @@ pub const STOP_HINT: &str = "Forwarding until Ctrl-C.";
 /// to see. "Connection refused" in it is by far the commonest case, and the
 /// one with clear advice: nothing is listening on that port.
 #[must_use]
-pub fn connection_failed(target: &Target, pod: &str, port: u16, message: &str) -> String {
+pub fn connection_failed(
+    target: &Target,
+    pod: &str,
+    port: u16,
+    message: &str,
+    surface: Surface,
+) -> String {
     if message.contains("connection refused") {
-        let check = match target.kind {
-            Kind::Service => format!(
+        let check = match (surface, target.kind) {
+            (Surface::Dashboard, _) => "Check which port the app listens on; the pane lists \
+                 the ports each container declares, and an app may listen on one it does not."
+                .to_owned(),
+            (Surface::Command, Kind::Service) => format!(
                 "Check that the service's targetPort is the port the app listens on; \
                  `eks port-forward {target}` with no port shows where each of its ports goes."
             ),
-            _ => format!(
+            (Surface::Command, _) => format!(
                 "Check which port the app listens on; `eks port-forward {target}` with no port lists the ones it declares."
             ),
         };
@@ -163,10 +183,55 @@ pub fn connection_failed(target: &Target, pod: &str, port: u16, message: &str) -
     format!("a connection to pod {pod} port {port} failed: {message}")
 }
 
+/// The pod a dashboard forward was started on is not there any more.
+///
+/// Reached between the pane listing the pod and `f`: a rollout or an
+/// eviction in the moment between. Its replacement, if it has one, has a new
+/// name, so the advice is where to find it.
+#[must_use]
+pub fn pod_gone(pod: &str, namespace: &str) -> String {
+    format!(
+        "pod {pod} is no longer in namespace {namespace}, so there is nothing to forward to.\n\
+         Go back to the node's pods and press r to see what replaced it."
+    )
+}
+
 /// A connection arrived while no pod was ready to take it.
 #[must_use]
 pub fn refused_while_waiting(target: &Target) -> String {
     format!("refused a connection: no pod behind {target} is ready yet.")
+}
+
+/// One port of one pod, as the dashboard forwards it: always to that pod by
+/// name, on loopback, with the pod's own port number preferred locally.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct PodPort {
+    pub namespace: String,
+    pub pod: String,
+    pub port: u16,
+}
+
+/// What a forward the dashboard started reports about itself while it runs.
+///
+/// The command line prints these as lines on stderr; the dashboard has no
+/// stderr it can write to without tearing the screen, so the same moments
+/// arrive here instead, for its forwards strip.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Event {
+    /// The local end is listening. `notes` are [`forwarding`]'s: why the
+    /// port is not the pod's own number, when it is not.
+    Listening { url: String, notes: Vec<String> },
+    /// A local connection was accepted.
+    Opened,
+    /// A local connection finished, however it finished.
+    Closed,
+    /// Something went wrong that did not end the forward: a connection the
+    /// pod refused, a look at the pod that failed, a pod shutting down.
+    Problem(String),
+    /// The forward has stopped and its port is closed: it could not start,
+    /// or its pod is gone. `credentials` is set when a fresh login could fix
+    /// it, as for every other dashboard fetch.
+    Ended { message: String, credentials: bool },
 }
 
 /// Port-forwarding is not allowed for this person in `namespace`.
@@ -352,7 +417,7 @@ mod tests {
                        in network namespace \"/var/run/netns/cni-1\": failed to connect to \
                        localhost:8080 inside namespace \"1f2e\", IPv4: dial tcp4 127.0.0.1:8080: \
                        connect: connection refused";
-        let text = connection_failed(&target("api"), "api-1", 8080, message);
+        let text = connection_failed(&target("api"), "api-1", 8080, message, Surface::Command);
         assert!(
             text.starts_with(
                 "pod api-1 refused a connection on port 8080: nothing in it is listening there."
@@ -368,14 +433,47 @@ mod tests {
 
     #[test]
     fn a_refused_connection_through_a_service_points_at_its_target_port() {
-        let text = connection_failed(&target("svc/api"), "api-1", 8080, "connection refused");
+        let text = connection_failed(
+            &target("svc/api"),
+            "api-1",
+            8080,
+            "connection refused",
+            Surface::Command,
+        );
         assert!(text.contains("targetPort"), "{text}");
     }
 
     #[test]
+    fn a_refused_connection_in_the_dashboard_points_at_the_pane_not_a_command() {
+        let text = connection_failed(
+            &target("api-1"),
+            "api-1",
+            8080,
+            "connect: connection refused",
+            Surface::Dashboard,
+        );
+        assert!(
+            text.starts_with("pod api-1 refused a connection on port 8080"),
+            "{text}"
+        );
+        assert!(text.contains("the pane lists"), "{text}");
+        assert!(!text.contains("eks port-forward"), "{text}");
+    }
+
+    #[test]
     fn any_other_failure_is_passed_on_as_the_kubelet_said_it() {
-        let text = connection_failed(&target("api"), "api-1", 8080, "timeout\n");
+        let text = connection_failed(&target("api"), "api-1", 8080, "timeout\n", Surface::Command);
         assert_eq!(text, "a connection to pod api-1 port 8080 failed: timeout");
+    }
+
+    #[test]
+    fn a_pod_gone_before_its_forward_started_says_where_to_look() {
+        let text = pod_gone("api-1", "payments");
+        assert!(
+            text.starts_with("pod api-1 is no longer in namespace payments"),
+            "{text}"
+        );
+        assert!(text.contains("press r"), "{text}");
     }
 
     #[test]

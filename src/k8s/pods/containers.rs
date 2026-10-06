@@ -9,6 +9,7 @@
 
 use k8s_openapi::api::core::v1::{Container, ContainerStatus, Pod};
 
+use crate::k8s::forward::ports::{self, Declared};
 use crate::k8s::quantity::{self, Quantity};
 use crate::theme::Severity;
 
@@ -55,6 +56,12 @@ pub struct ContainerRow {
     pub cpu_limit: Option<Quantity>,
     /// This container's memory limit, on the same terms as [`Self::cpu_limit`].
     pub memory_limit: Option<Quantity>,
+    /// The ports this container declares, in spec order — what the
+    /// dashboard offers to forward. Empty for an ordinary init container even
+    /// when its spec lists some: it has finished before anything could
+    /// connect, the same rule `eks port-forward` reads ports by
+    /// ([`ports::declared`]).
+    pub ports: Vec<Declared>,
 }
 
 impl ContainerRow {
@@ -88,7 +95,19 @@ impl ContainerRow {
             .iter()
             .map(|container| Self::build(container, find(app_statuses, &container.name), false));
 
-        init.chain(app).collect()
+        let declared = ports::declared(pod);
+        init.chain(app)
+            .map(|mut row| {
+                // Container names are unique across a pod's init and app
+                // containers, so the name alone says whose port it is.
+                row.ports = declared
+                    .iter()
+                    .filter(|port| port.container == row.name)
+                    .cloned()
+                    .collect();
+                row
+            })
+            .collect()
     }
 
     fn build(spec: &Container, status: Option<&ContainerStatus>, init: bool) -> Self {
@@ -119,6 +138,7 @@ impl ContainerRow {
                 requests,
                 cpu_limit,
                 memory_limit,
+                ports: Vec::new(),
             };
         };
 
@@ -134,6 +154,7 @@ impl ContainerRow {
             requests,
             cpu_limit,
             memory_limit,
+            ports: Vec::new(),
         }
     }
 }
@@ -257,8 +278,8 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use k8s_openapi::api::core::v1::{
-        ContainerState, ContainerStateRunning, ContainerStateTerminated, ContainerStateWaiting,
-        PodSpec, PodStatus, ResourceRequirements,
+        ContainerPort, ContainerState, ContainerStateRunning, ContainerStateTerminated,
+        ContainerStateWaiting, PodSpec, PodStatus, ResourceRequirements,
     };
     use k8s_openapi::apimachinery::pkg::api::resource::Quantity as ApiQuantity;
 
@@ -703,6 +724,91 @@ mod tests {
         assert!(!limits.contains("unlimited, memory unlimited"), "{limits}");
     }
 
+    fn with_ports(
+        mut container: Container,
+        ports: &[(Option<&str>, i32, Option<&str>)],
+    ) -> Container {
+        container.ports = Some(
+            ports
+                .iter()
+                .map(|(name, number, protocol)| ContainerPort {
+                    name: name.map(str::to_owned),
+                    container_port: *number,
+                    protocol: protocol.map(str::to_owned),
+                    ..Default::default()
+                })
+                .collect(),
+        );
+        container
+    }
+
+    #[test]
+    fn each_container_carries_the_ports_it_declares_and_no_one_else_s() {
+        let pod = pod(
+            PodSpec {
+                containers: vec![
+                    with_ports(
+                        spec_container("web", "web:1"),
+                        &[(Some("http"), 8080, None), (Some("dns"), 53, Some("UDP"))],
+                    ),
+                    with_ports(spec_container("metrics", "m:1"), &[(None, 9100, None)]),
+                    spec_container("worker", "w:1"),
+                ],
+                ..Default::default()
+            },
+            None,
+        );
+        let rows = ContainerRow::from_pod(&pod);
+        let ports: Vec<Vec<(u16, Option<&str>, &str)>> = rows
+            .iter()
+            .map(|row| {
+                row.ports
+                    .iter()
+                    .map(|port| (port.number, port.name.as_deref(), port.protocol.as_str()))
+                    .collect()
+            })
+            .collect();
+        assert_eq!(
+            ports,
+            [
+                vec![(8080, Some("http"), "TCP"), (53, Some("dns"), "UDP")],
+                vec![(9100, None, "TCP")],
+                vec![],
+            ]
+        );
+    }
+
+    #[test]
+    fn a_sidecar_s_ports_are_offered_and_an_ordinary_init_container_s_are_not() {
+        let mut sidecar = with_ports(spec_container("proxy", "envoy:1"), &[(None, 15000, None)]);
+        sidecar.restart_policy = Some("Always".to_owned());
+        let pod = pod(
+            PodSpec {
+                init_containers: Some(vec![
+                    with_ports(spec_container("migrate", "m:1"), &[(None, 5432, None)]),
+                    sidecar,
+                ]),
+                containers: vec![spec_container("app", "app:1")],
+                ..Default::default()
+            },
+            None,
+        );
+        let rows = ContainerRow::from_pod(&pod);
+        let offered: Vec<(&str, Vec<u16>)> = rows
+            .iter()
+            .map(|row| {
+                (
+                    row.name.as_str(),
+                    row.ports.iter().map(|port| port.number).collect(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            offered,
+            [("migrate", vec![]), ("proxy", vec![15000]), ("app", vec![])]
+        );
+    }
+
     fn base_row() -> ContainerRow {
         ContainerRow {
             name: "app".to_owned(),
@@ -715,6 +821,7 @@ mod tests {
             requests: Requests::default(),
             cpu_limit: None,
             memory_limit: None,
+            ports: Vec::new(),
         }
     }
 }

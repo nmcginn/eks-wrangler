@@ -13,6 +13,8 @@
 use std::cell::{Cell as Counter, RefCell};
 use std::collections::VecDeque;
 use std::rc::Rc;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use ratatui::backend::{Backend, ClearType, TestBackend, WindowSize};
 use ratatui::buffer::Cell;
@@ -96,11 +98,16 @@ struct Run {
     log_streams: usize,
     /// The containers the checks behind `x` were started for.
     exec_checks: Vec<ExecTarget>,
+    /// The ports `f` started forwards for, in order.
+    forwards_started: Vec<PodPort>,
+    /// How many of those forwards' handles the loop had dropped — each one
+    /// a port closed — by the time it quit, or shortly after.
+    forwards_stopped: Arc<AtomicUsize>,
 }
 
-/// How the stubs behind `x` answer.
+/// How the stubs behind `x` and `f` answer.
 #[derive(Clone)]
-struct ExecStub {
+struct Stubs {
     /// What the checks answer with.
     checked: Result<Plan, FetchError>,
     /// Hold the answer until the script sends `Event::FocusGained`, rather
@@ -109,14 +116,18 @@ struct ExecStub {
     held: bool,
     /// How the session ends.
     session: Result<(), FetchError>,
+    /// What every forward started with `f` reports, at once, before it
+    /// waits to be stopped.
+    forward_events: Vec<ForwardEvent>,
 }
 
-impl Default for ExecStub {
+impl Default for Stubs {
     fn default() -> Self {
         Self {
             checked: Ok(plan()),
             held: false,
             session: Ok(()),
+            forward_events: Vec::new(),
         }
     }
 }
@@ -168,7 +179,7 @@ type Held = Option<(
 /// The stub behind `x`'s checks: records each target in `checks`, and
 /// answers at once or into `held`, as `exec` says.
 fn exec_preparer(
-    exec: &ExecStub,
+    exec: &Stubs,
     checks: &Rc<RefCell<Vec<ExecTarget>>>,
     held: &Rc<RefCell<Held>>,
 ) -> ExecPreparer {
@@ -187,6 +198,41 @@ fn exec_preparer(
     })
 }
 
+/// The stub behind `f`: records each port in `started`, hands back
+/// `stubs.forward_events` already queued, and counts in `stopped` each
+/// forward whose handle the loop drops.
+fn forward_starter(
+    stubs: &Stubs,
+    started: &Rc<RefCell<Vec<PodPort>>>,
+    stopped: &Arc<AtomicUsize>,
+) -> ForwardStarter {
+    let started = Rc::clone(started);
+    let stopped = Arc::clone(stopped);
+    let events = stubs.forward_events.clone();
+    Box::new(move |_, target| {
+        started.borrow_mut().push(target.clone());
+        // Queued before the receiver is handed back, so they are there for
+        // the loop's very next pass rather than whenever a thread gets round
+        // to them.
+        let (tx, rx) = mpsc::channel();
+        for event in events.clone() {
+            tx.send(event).unwrap();
+        }
+        let stopped = Arc::clone(&stopped);
+        let (_, handle) =
+            crate::commands::spawn_stream(move |_: mpsc::Sender<()>, stop| async move {
+                // The sender lives as long as the forward, as a real one's
+                // does: a channel that closes early is a thread that died,
+                // and the loop says so.
+                let _events = tx;
+                if stop.await.is_ok() {
+                    stopped.fetch_add(1, Ordering::SeqCst);
+                }
+            });
+        (rx, handle)
+    })
+}
+
 fn ctrl_c() -> Event {
     Event::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL))
 }
@@ -197,7 +243,7 @@ fn ctrl_c() -> Event {
 /// script is left — which is how a real terminal's reply lands: after the
 /// query, and before any key pressed later.
 fn run_loop(app: App, script: Vec<Event>, terminal_answers: Option<&[u8]>) -> Run {
-    run_loop_with(app, script, terminal_answers, &ExecStub::default())
+    run_loop_with(app, script, terminal_answers, &Stubs::default())
 }
 
 /// [`run_loop`], with `x`'s checks and session answering as `exec` says.
@@ -205,7 +251,7 @@ fn run_loop_with(
     app: App,
     script: Vec<Event>,
     terminal_answers: Option<&[u8]>,
-    exec: &ExecStub,
+    exec: &Stubs,
 ) -> Run {
     let log: Log = Rc::default();
     let events: Rc<RefCell<VecDeque<Event>>> = Rc::new(RefCell::new(script.into()));
@@ -248,11 +294,15 @@ fn run_loop_with(
     let exec_checks: Rc<RefCell<Vec<ExecTarget>>> = Rc::default();
     let held: Rc<RefCell<Held>> = Rc::default();
     let prepare_exec = exec_preparer(exec, &exec_checks, &held);
+    let forwards_started: Rc<RefCell<Vec<PodPort>>> = Rc::default();
+    let forwards_stopped = Arc::new(AtomicUsize::new(0));
+    let start_forward = forward_starter(exec, &forwards_started, &forwards_stopped);
     let drill = DrillFetchers {
         spawn_pods: &spawn_pods,
         spawn_containers: &spawn_containers,
         spawn_logs: &spawn_logs,
         prepare_exec: &prepare_exec,
+        start_forward: &start_forward,
     };
     let session = {
         let log = Rc::clone(&log);
@@ -305,6 +355,8 @@ fn run_loop_with(
         container_fetches: container_fetches.get(),
         log_streams: log_streams.get(),
         exec_checks: exec_checks.borrow().clone(),
+        forwards_started: forwards_started.borrow().clone(),
+        forwards_stopped,
     }
 }
 
@@ -559,14 +611,14 @@ fn after_the_shell_exits_the_dashboard_is_redrawn_as_it_was_left() {
 
 #[test]
 fn a_refused_check_says_why_on_the_status_line_and_never_leaves_the_screen() {
-    let exec = ExecStub {
+    let exec = Stubs {
         checked: Err(FetchError {
             message: "container app in pod api-1 is not running (CrashLoopBackOff).\n\
                       Open its log and press p to see how its last run ended."
                 .to_owned(),
             credentials: false,
         }),
-        ..ExecStub::default()
+        ..Stubs::default()
     };
     let run = run_loop_with(
         app_with_container(),
@@ -591,12 +643,12 @@ fn a_refused_check_says_why_on_the_status_line_and_never_leaves_the_screen() {
 
 #[test]
 fn the_next_key_clears_a_refusal_from_the_status_line() {
-    let exec = ExecStub {
+    let exec = Stubs {
         checked: Err(FetchError {
             message: "pod api-1 has no shell.".to_owned(),
             credentials: false,
         }),
-        ..ExecStub::default()
+        ..Stubs::default()
     };
     let run = run_loop_with(
         app_with_container(),
@@ -614,9 +666,9 @@ fn the_next_key_clears_a_refusal_from_the_status_line() {
 
 #[test]
 fn esc_cancels_the_check_and_its_late_answer_opens_nothing() {
-    let exec = ExecStub {
+    let exec = Stubs {
         held: true,
-        ..ExecStub::default()
+        ..Stubs::default()
     };
     let run = run_loop_with(
         app_with_container(),
@@ -640,9 +692,9 @@ fn esc_cancels_the_check_and_its_late_answer_opens_nothing() {
 
 #[test]
 fn a_check_still_running_shows_that_it_is_and_how_to_cancel_it() {
-    let exec = ExecStub {
+    let exec = Stubs {
         held: true,
-        ..ExecStub::default()
+        ..Stubs::default()
     };
     let run = run_loop_with(
         app_with_container(),
@@ -660,9 +712,9 @@ fn a_check_still_running_shows_that_it_is_and_how_to_cancel_it() {
 
 #[test]
 fn leaving_the_pane_cancels_the_check() {
-    let exec = ExecStub {
+    let exec = Stubs {
         held: true,
-        ..ExecStub::default()
+        ..Stubs::default()
     };
     let run = run_loop_with(
         app_with_container(),
@@ -681,13 +733,13 @@ fn leaving_the_pane_cancels_the_check() {
 
 #[test]
 fn a_session_that_broke_says_why_once_the_dashboard_is_back() {
-    let exec = ExecStub {
+    let exec = Stubs {
         session: Err(FetchError {
             message: "the connection to pod api-1 closed before `/bin/sh` reported how it ended."
                 .to_owned(),
             credentials: false,
         }),
-        ..ExecStub::default()
+        ..Stubs::default()
     };
     let run = run_loop_with(
         app_with_container(),
@@ -706,12 +758,12 @@ fn a_session_that_broke_says_why_once_the_dashboard_is_back() {
 
 #[test]
 fn a_credential_refusal_from_the_check_offers_l() {
-    let exec = ExecStub {
+    let exec = Stubs {
         checked: Err(FetchError {
             message: "prod rejected your credentials.".to_owned(),
             credentials: true,
         }),
-        ..ExecStub::default()
+        ..Stubs::default()
     };
     let run = run_loop_with(
         app_with_container(),
@@ -733,4 +785,143 @@ fn x_on_the_node_pane_checks_nothing() {
 
     assert_eq!(run.exec_checks, Vec::<ExecTarget>::new());
     assert!(!run.log.contains(&Step::Session));
+}
+
+/// [`Stubs`] whose every forward reports `events` at once.
+fn forwarding(events: Vec<ForwardEvent>) -> Stubs {
+    Stubs {
+        forward_events: events,
+        ..Stubs::default()
+    }
+}
+
+fn listening_on_8080() -> ForwardEvent {
+    ForwardEvent::Listening {
+        url: "http://127.0.0.1:8080".to_owned(),
+        notes: Vec::new(),
+    }
+}
+
+/// `j` onto `web`'s port 8080 in [`app_with_ports`], then `f`.
+fn forward_8080() -> Vec<Event> {
+    vec![
+        Event::Key(press(KeyCode::Char('j'))),
+        Event::Key(press(KeyCode::Char('f'))),
+    ]
+}
+
+/// Wait up to two seconds for `count` forwards' threads to have been told
+/// to stop — their handles dropped, their ports closed.
+fn stopped(run: &Run, count: usize) -> bool {
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while run.forwards_stopped.load(Ordering::SeqCst) < count {
+        if std::time::Instant::now() > deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    true
+}
+
+#[test]
+fn f_on_a_port_starts_a_forward_whose_url_is_on_the_next_frame() {
+    let mut script = forward_8080();
+    script.push(ctrl_c());
+    let run = run_loop_with(
+        app_with_ports(),
+        script,
+        None,
+        &forwarding(vec![listening_on_8080(), ForwardEvent::Opened]),
+    );
+
+    assert_eq!(
+        run.forwards_started,
+        [PodPort {
+            namespace: "default".to_owned(),
+            pod: "api-1".to_owned(),
+            port: 8080,
+        }]
+    );
+    let screen = text(&run.screen);
+    assert!(
+        screen.contains("http://127.0.0.1:8080 → pod api-1 port 8080  1 connection"),
+        "{screen}"
+    );
+    assert!(
+        screen.contains("port 8080 (http)  → http://127.0.0.1:8080"),
+        "{screen}"
+    );
+}
+
+#[test]
+fn capital_f_closes_the_port_and_takes_it_off_the_strip() {
+    let mut script = forward_8080();
+    script.extend([Event::Key(press(KeyCode::Char('F'))), ctrl_c()]);
+    let run = run_loop_with(
+        app_with_ports(),
+        script,
+        None,
+        &forwarding(vec![listening_on_8080()]),
+    );
+
+    assert!(stopped(&run, 1), "the forward was never told to stop");
+    assert!(!text(&run.screen).contains("Forwards"));
+}
+
+#[test]
+fn quitting_ends_every_forward_the_dashboard_started() {
+    let mut script = forward_8080();
+    script.push(ctrl_c());
+    let run = run_loop_with(
+        app_with_ports(),
+        script,
+        None,
+        &forwarding(vec![listening_on_8080()]),
+    );
+
+    assert!(stopped(&run, 1), "a forward outlived the dashboard");
+}
+
+#[test]
+fn a_forward_that_stops_by_itself_says_why_on_the_strip_and_raises_nothing() {
+    let mut script = forward_8080();
+    script.push(ctrl_c());
+    let run = run_loop_with(
+        app_with_ports(),
+        script,
+        None,
+        &forwarding(vec![ForwardEvent::Ended {
+            message:
+                "could not listen on 127.0.0.1:8080: something else is already listening there."
+                    .to_owned(),
+            credentials: false,
+        }]),
+    );
+
+    let screen = text(&run.screen);
+    assert!(screen.contains("pod api-1 port 8080  stopped"), "{screen}");
+    assert!(
+        screen.contains("could not listen on 127.0.0.1:8080"),
+        "{screen}"
+    );
+    // The pane is as it was: the container list, still under its title.
+    assert!(screen.contains("Overview › worker-1 › api-1"), "{screen}");
+    assert!(screen.contains("CONTAINERS"), "{screen}");
+}
+
+#[test]
+fn a_successful_l_starts_again_a_forward_refused_for_credentials() {
+    let mut script = forward_8080();
+    script.extend([Event::Key(press(KeyCode::Char('L'))), ctrl_c()]);
+    let run = run_loop_with(
+        app_with_ports(),
+        script,
+        None,
+        &forwarding(vec![ForwardEvent::Ended {
+            message: "beta rejected your credentials.".to_owned(),
+            credentials: true,
+        }]),
+    );
+
+    assert_eq!(run.forwards_started.len(), 2, "the forward was not retried");
 }

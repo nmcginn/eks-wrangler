@@ -1,0 +1,13 @@
+---
+source: src/ui/tests/golden.rs
+expression: "text(&frame(&forwarding_with_one_lost(), 40, 9))"
+---
+ eks │ beta (us-east-1)
+┌ Clusters ─┐┌ Overview ───────────────┐
+│  alpha us-││Context   arn:aws:eks:us-│
+│● beta us-e││Namespace default        │
+└───────────┘└─────────────────────────┘
+ Forwards · they end when eks quits · c
+ http://127.0.0.1:8080 → pod
+ api-7d9f8b6c4-x2kqp port 8080  2
+ tab/→ switch/drill   j/k move   enter o

@@ -19,6 +19,7 @@ use eks::config::{self, Config};
 use eks::format::Width;
 use eks::json::Output;
 use eks::k8s::auth::Store;
+use eks::k8s::forward::PodPort;
 use eks::k8s::nodes::Order as NodeOrder;
 use eks::k8s::order::Direction;
 use eks::k8s::page::Budget;
@@ -506,6 +507,8 @@ fn dashboard(
         .selected_cluster()
         .map(|cluster| spawn_nodes(&cluster.context_name));
 
+    let start_forward = forward_starter(config, paths, budget, store.clone());
+
     let (prepare_exec, foreground) = exec_runners(config, paths, budget, store);
 
     let drill = ui::DrillFetchers {
@@ -513,9 +516,35 @@ fn dashboard(
         spawn_containers: &spawn_containers,
         spawn_logs: &spawn_logs,
         prepare_exec: &prepare_exec,
+        start_forward: &start_forward,
     };
 
     ui::run(app, nodes_rx, &spawn_nodes, &drill, refresh, &foreground)
+}
+
+/// What `f` on a port runs: a forward on a thread of its own, for as long
+/// as the dashboard holds its handle. `budget` bounds each request it makes —
+/// connecting, the checks, each connection's upgrade — never the forward.
+/// Built over `store`, so its credential helper never prompts on the
+/// dashboard's terminal (decision 120).
+fn forward_starter(
+    config: &KubeConfig,
+    paths: &[PathBuf],
+    budget: Budget,
+    store: Store,
+) -> ui::ForwardStarter {
+    let config = config.clone();
+    let paths = paths.to_vec();
+    Box::new(move |context: &str, target: &PodPort| {
+        forward::spawn_dashboard(
+            config.clone(),
+            paths.clone(),
+            context.to_owned(),
+            target.clone(),
+            budget,
+            store.clone(),
+        )
+    })
 }
 
 /// What `x` runs, in its two halves, returned beside `L`'s login, which runs

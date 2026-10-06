@@ -30,7 +30,8 @@ pub struct Declared {
 }
 
 impl Declared {
-    fn is_tcp(&self) -> bool {
+    #[must_use]
+    pub fn is_tcp(&self) -> bool {
         self.protocol == "TCP"
     }
 }

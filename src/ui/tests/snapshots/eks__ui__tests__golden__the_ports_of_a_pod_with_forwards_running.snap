@@ -1,0 +1,28 @@
+---
+source: src/ui/tests/golden.rs
+expression: "text(&frame(&forwarding(), WIDTH, HEIGHT))"
+---
+ eks │ beta (us-east-1)
+┌ Clusters ────────────────────┐┌ Overview › ip-10-0-1-17.ec2.internal › api-7d9f8b6c4-x2kqp ──────┐
+│  alpha us-east-1             ││Context   arn:aws:eks:us-east-1:1234:cluster/beta                 │
+│● beta us-east-1              ││Namespace default                                                 │
+│  gamma us-east-1             ││Region    us-east-1                                               │
+│                              ││Account   1234                                                    │
+│                              ││                                                                  │
+│                              ││IP: 10.0.1.88                                                     │
+│                              ││CONTAINERS                                                        │
+│                              ││api  Running  ready  0  app:1.0                                   │
+│                              ││requests: cpu 0, memory 0  limits: cpu unlimited, memory unlimited│
+│                              ││· port 8080 (http)  → http://127.0.0.1:8080                       │
+│                              ││· port 9090 (metrics)  starting forward…  F stop                  │
+│                              ││envoy (init)  Running  ready  0  app:1.0                          │
+│                              ││requests: cpu 0, memory 0  limits: cpu unlimited, memory unlimited│
+│                              ││· port 15000 (admin)                                              │
+│                              ││· port 8125/UDP (statsd)  TCP only: cannot be forwarded           │
+│                              ││                                                                  │
+└──────────────────────────────┘└──────────────────────────────────────────────────────────────────┘
+ Forwards · they end when eks quits ────────────────────────────────────────────────────────────────
+ http://127.0.0.1:8080 → pod api-7d9f8b6c4-x2kqp port 8080  2 connections
+   pod api-7d9f8b6c4-x2kqp refused a connection on port 8080: nothing in it is listening there.
+ pod api-7d9f8b6c4-x2kqp port 9090  starting…
+ tab/→ switch/drill   j/k move   enter open   ←/esc back   r refresh   x shell   q quit   / filter
