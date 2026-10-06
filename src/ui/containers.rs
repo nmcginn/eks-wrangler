@@ -554,7 +554,7 @@ mod tests {
 
     #[test]
     fn no_containers_means_no_rows() {
-        assert!(entries(&[]).is_empty());
+        assert_eq!(entries(&[]), Vec::new());
     }
 
     #[test]

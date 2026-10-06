@@ -430,7 +430,7 @@ mod tests {
         let mut forwards = Forwards::default();
         let id = started(&mut forwards, "api-1", 8080);
         assert!(forwards.stop(PROD, &target("api-1", 8080)));
-        assert!(forwards.all().is_empty());
+        assert_eq!(forwards.all(), []);
         assert!(!forwards.wants(id));
         assert!(!forwards.stop(PROD, &target("api-1", 8080)));
     }
@@ -496,7 +496,7 @@ mod tests {
         let mut forwards = Forwards::default();
         let refused = started(&mut forwards, "api-1", 8080);
         forwards.apply(refused, ended("your session expired", true));
-        assert!(forwards.retry_after_login("staging").is_empty());
+        assert_eq!(forwards.retry_after_login("staging"), Vec::new());
         assert!(!forwards.wants(refused));
     }
 
@@ -516,10 +516,9 @@ mod tests {
 
     #[test]
     fn an_empty_strip_has_no_lines() {
-        assert!(
-            Forwards::default()
-                .strip(Some(PROD), Theme::dark())
-                .is_empty()
+        assert_eq!(
+            Forwards::default().strip(Some(PROD), Theme::dark()),
+            Vec::<Line<'_>>::new()
         );
     }
 

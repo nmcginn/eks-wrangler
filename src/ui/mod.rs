@@ -6830,7 +6830,7 @@ mod tests {
             status_text(&app),
             "Move down to one of web's ports, then press f to forward it."
         );
-        assert!(app.forwards().all().is_empty());
+        assert_eq!(app.forwards().all(), []);
     }
 
     #[test]
@@ -6859,7 +6859,7 @@ mod tests {
             status_text(&app),
             "Port 53 is UDP, and a port forward carries TCP only."
         );
-        assert!(app.forwards().all().is_empty());
+        assert_eq!(app.forwards().all(), []);
     }
 
     #[test]
@@ -6875,8 +6875,8 @@ mod tests {
         let mut app = app_with_node();
         assert_eq!(app.on_key(press(KeyCode::Char('f'))), Flow::Continue);
         assert_eq!(app.on_key(press(KeyCode::Char('F'))), Flow::Continue);
-        assert!(status_text(&app).is_empty());
-        assert!(app.forwards().all().is_empty());
+        assert_eq!(status_text(&app), "");
+        assert_eq!(app.forwards().all(), []);
     }
 
     #[test]
@@ -6894,7 +6894,7 @@ mod tests {
         let before = streaming(app.logs()).follow();
         app.on_key(press(KeyCode::Char('f')));
         assert_ne!(streaming(app.logs()).follow(), before);
-        assert!(app.forwards().all().is_empty());
+        assert_eq!(app.forwards().all(), []);
     }
 
     #[test]
@@ -6903,8 +6903,8 @@ mod tests {
         assert!(app.wants_forward(id));
         assert_eq!(app.on_key(press(KeyCode::Char('F'))), Flow::Continue);
         assert!(!app.wants_forward(id));
-        assert!(app.forwards().all().is_empty());
-        assert!(status_text(&app).is_empty());
+        assert_eq!(app.forwards().all(), []);
+        assert_eq!(status_text(&app), "");
     }
 
     #[test]
@@ -6918,7 +6918,7 @@ mod tests {
             },
         );
         app.on_key(press(KeyCode::Char('F')));
-        assert!(app.forwards().all().is_empty());
+        assert_eq!(app.forwards().all(), []);
     }
 
     #[test]
@@ -6946,9 +6946,9 @@ mod tests {
     fn the_next_key_clears_a_forwarding_note() {
         let mut app = app_with_ports();
         app.on_key(press(KeyCode::Char('f')));
-        assert!(!status_text(&app).is_empty());
+        assert_ne!(status_text(&app), "");
         app.on_key(press(KeyCode::Char('j')));
-        assert!(status_text(&app).is_empty());
+        assert_eq!(status_text(&app), "");
     }
 
     #[test]
@@ -7039,7 +7039,7 @@ mod tests {
             !app.credentials_lost(),
             "L would log in to gamma's profile for beta's failure"
         );
-        assert!(app.retry_forwards_after_login().is_empty());
+        assert_eq!(app.retry_forwards_after_login(), Vec::new());
     }
 
     #[test]
@@ -7059,7 +7059,7 @@ mod tests {
         assert!(render_app(&app, 120, 30).contains("c clears stopped"));
 
         app.on_key(press(KeyCode::Char('c')));
-        assert!(app.forwards().all().is_empty());
+        assert_eq!(app.forwards().all(), []);
         assert!(!render_app(&app, 120, 30).contains("Forwards"));
     }
 
