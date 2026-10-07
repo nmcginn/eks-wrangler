@@ -306,7 +306,7 @@ fn a_type_that_is_off_is_reported_with_the_command_that_would_switch_it_on() {
     );
     // Nothing was read, and nothing was switched on.
     assert_eq!(world.calls().len(), 1, "{:#?}", world.calls());
-    assert!(stdout(&output).is_empty());
+    assert_eq!(stdout(&output), "");
 }
 
 #[test]
@@ -410,7 +410,7 @@ fn an_empty_window_says_so_on_stderr_and_leaves_stdout_empty() {
     let output = world.eks(&["control-plane-logs", "--since", "15m", "--grep", "nope"]);
 
     assert!(output.status.success(), "{}", stderr(&output));
-    assert!(stdout(&output).is_empty());
+    assert_eq!(stdout(&output), "");
     let note = stderr(&output);
     assert!(
         note.contains("No audit events from prod (us-east-1) in the last 15m containing \"nope\"."),
