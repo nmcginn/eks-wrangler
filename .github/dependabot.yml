@@ -20,3 +20,12 @@ updates:
     groups:
       actions:
         patterns: ["*"]
+
+  # rust-toolchain.toml pins the compiler (decision 130), so a new Rust
+  # release arrives as its own PR, with whatever its clippy newly flags
+  # fixed there, rather than inside an unrelated nightly PR's CI run.
+  - package-ecosystem: rust-toolchain
+    directory: /
+    schedule:
+      interval: weekly
+      day: saturday

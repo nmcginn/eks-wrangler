@@ -1,0 +1,10 @@
+# The one toolchain every build here uses: CI, `make check`, and every
+# session that opens a pull request. A floating `stable` let CI move to a
+# release whose clippy had new lints before anyone's local toolchain did, so
+# a PR that passed `make check` failed CI (decision 130). Raising this is a
+# pull request of its own, carrying whatever the new clippy asks for.
+# The MSRV job is unaffected: scripts/msrv.sh runs `cargo +<rust-version>`.
+[toolchain]
+channel = "1.99.0"
+components = ["clippy", "rustfmt"]
+profile = "minimal"

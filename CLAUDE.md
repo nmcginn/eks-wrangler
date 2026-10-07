@@ -55,7 +55,8 @@ The rule that matters most: **separate computation from I/O and from rendering.*
 
 ## Conventions
 
-- **Rust 2024**, stable toolchain. MSRV is declared in `Cargo.toml`.
+- **Rust 2024**, on the stable release pinned in `rust-toolchain.toml` — CI
+  and `make check` lint with the same clippy. MSRV is declared in `Cargo.toml`.
 - **No panics in library code.** `unwrap`, `expect`, and `panic!` are denied by
   lint. A panic in a TUI leaves the user's terminal wedged. Return `Result`.
   Tests may opt out locally with `#![allow(clippy::unwrap_used)]`.
