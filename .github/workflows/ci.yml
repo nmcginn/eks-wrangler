@@ -23,10 +23,11 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      # rust-toolchain.toml names the version and its components, so this
+      # job lints with exactly the clippy `make check` ran locally
+      # (decision 130). rustup on the runner reads the file.
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
+        run: rustup toolchain install
 
       - uses: Swatinem/rust-cache@v2
 
@@ -56,7 +57,7 @@ jobs:
       - uses: actions/checkout@v7
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        run: rustup toolchain install
 
       - uses: Swatinem/rust-cache@v2
 
@@ -93,9 +94,20 @@ jobs:
       # Read from the manifest, by the runner's preinstalled cargo, rather
       # than written down again here: raising rust-version is then a
       # one-line change this job follows by itself.
+      #
+      # On the runner's own stable: only cargo's reading of the manifest is
+      # needed here, not the toolchain rust-toolchain.toml pins. Every step
+      # after this one runs on the MSRV instead of that pin, rust-cache's
+      # `rustc -vV` included, so the pin is never downloaded in this job
+      # and the cache is keyed on the toolchain that actually builds.
       - name: Read the declared MSRV
         id: msrv
-        run: echo "version=$(scripts/msrv.sh --print)" >> "$GITHUB_OUTPUT"
+        env:
+          RUSTUP_TOOLCHAIN: stable
+        run: |
+          version="$(scripts/msrv.sh --print)"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "RUSTUP_TOOLCHAIN=$version" >> "$GITHUB_ENV"
 
       - name: Install Rust ${{ steps.msrv.outputs.version }}
         uses: dtolnay/rust-toolchain@master
@@ -118,7 +130,7 @@ jobs:
       - uses: actions/checkout@v7
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        run: rustup toolchain install
 
       - uses: Swatinem/rust-cache@v2
 
@@ -141,7 +153,7 @@ jobs:
       - uses: actions/checkout@v7
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        run: rustup toolchain install
 
       - uses: Swatinem/rust-cache@v2
 

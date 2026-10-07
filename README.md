@@ -861,6 +861,9 @@ make deny       # audit dependencies against deny.toml (needs cargo-deny)
 make msrv       # build and test on the oldest supported Rust (needs rustup)
 ```
 
+The toolchain is pinned in `rust-toolchain.toml`; rustup installs it the first
+time you build here, so `make check` lints with exactly the clippy CI does.
+
 `make check` is every CI job but two. The first, `make deny`, runs
 [`cargo-deny`](https://github.com/EmbarkStudios/cargo-deny) over the dependency
 tree — known vulnerabilities, licences, duplicate versions, and where crates come

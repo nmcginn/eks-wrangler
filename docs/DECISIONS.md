@@ -1203,3 +1203,18 @@ meant for a person to read, not for `eks` to parse.
   hangs.
 - **Version.** AWS CLI v2. Only a usage error asks `aws --version`, so a
   version 1 that works keeps working.
+
+### 130. The toolchain is pinned in `rust-toolchain.toml`, and CI installs it from there
+
+CI used `dtolnay/rust-toolchain@stable`, so it moved to each Rust release the
+day it shipped, while a session running `make check` had whatever stable was
+installed locally. When 1.99 added clippy's `assert_is_empty`, PRs #97–#100
+passed `make check` on 1.97 and failed CI, and each needed a follow-up commit.
+`rust-toolchain.toml` now names one release (1.99.0, with clippy and
+rustfmt). rustup reads it for every `cargo` here, and CI and the release build
+install it with `rustup toolchain install`, not `@stable`. Dependabot's
+`rust-toolchain` ecosystem proposes the next release as its own weekly PR, so
+new lints are fixed in that PR and not in an unrelated nightly PR. The MSRV job
+is unaffected because `scripts/msrv.sh` runs `cargo +<rust-version>`. That job
+also exports the MSRV as `RUSTUP_TOOLCHAIN`, so rust-cache keys on the
+toolchain that builds and the pin is never downloaded there.

@@ -643,8 +643,16 @@ fn follow_prints_new_events_and_drops_the_ones_it_has_already_printed() {
         ),
     );
 
+    // `--since` is an instant, not the default hour: a window counted back
+    // from the clock would pass `T0` an hour after it, and from then on the
+    // repeat would be dropped by the window rather than by the tail.
     let mut child = world
-        .command(&["control-plane-logs", "--follow"])
+        .command(&[
+            "control-plane-logs",
+            "--follow",
+            "--since",
+            "2026-10-07T06:00:00Z",
+        ])
         .spawn()
         .unwrap();
     let mut lines = BufReader::new(child.stdout.take().unwrap()).lines();
@@ -667,10 +675,11 @@ fn follow_prints_new_events_and_drops_the_ones_it_has_already_printed() {
         .filter(|call| call.starts_with("logs filter-log-events"))
         .map(|call| arg(call, "--start-time").unwrap().parse().unwrap())
         .collect();
-    // The poll starts thirty seconds before the newest event printed — but
-    // never before `--since`, which here is later than that.
+    // The first read starts at `--since`; the poll after it, thirty seconds
+    // before the newest event printed.
     assert!(polls.len() >= 2, "{calls:#?}");
-    assert_eq!(polls[1], polls[0].max(T0 - 30_000));
+    assert_eq!(polls[0], 1_791_352_800_000, "2026-10-07T06:00:00Z");
+    assert_eq!(polls[1], T0 - 30_000);
 }
 
 #[test]

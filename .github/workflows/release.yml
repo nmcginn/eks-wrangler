@@ -79,10 +79,13 @@ jobs:
           sudo apt-get update
           sudo apt-get install --yes --no-install-recommends ${{ matrix.apt }}
 
+      # The version rust-toolchain.toml pins, as CI tests with (decision
+      # 130); the target is added to that toolchain, not to `stable`.
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.target }}
+        shell: bash
+        run: |
+          rustup toolchain install
+          rustup target add ${{ matrix.target }}
 
       - uses: Swatinem/rust-cache@v2
         with:
