@@ -1170,3 +1170,36 @@ meant for a person to read, not for `eks` to parse.
   the armed quit counts them. `q quit` in the footer is unchanged, because
   a longer hint clips at 100 columns.
 
+### 129. `eks control-plane-logs`: the AWS CLI's own paging, streams named for two types, JSON Lines, and a thirty-second follow window
+
+- **Defaults.** `--type audit`, `--since 1h`. Audit is the question this
+  command exists for; an hour keeps a busy cluster's audit log to a few pages.
+  `--since` also takes an RFC 3339 instant.
+- **Paging** uses the AWS CLI's `--max-items 5000` and `--starting-token`,
+  following its `NextToken`. Each page is a CLI start-up and one step on the
+  progress line. Events are collected, then printed in time order.
+- **Streams.** `audit`, `authenticator`, and `scheduler` are read by stream
+  prefix. `api` cannot be (every audit stream also starts `kube-apiserver-`)
+  and `controller-manager` has two prefixes, so for those the group's streams
+  are listed alongside `describe-cluster` and named, at most 100, newest
+  first, with an hour's grace on CloudWatch's lazy `lastEventTimestamp`.
+  `--follow` lists them again every minute.
+- **`--grep`** is sent as one quoted filter-pattern term and then checked as
+  a case-sensitive substring here, so the flag means one thing whatever the
+  pattern language does with punctuation.
+- **`--follow`** polls every 5 s from 30 s before the newest event printed,
+  dropping repeats by event ID: control-plane instances deliver late, and
+  starting at the newest timestamp exactly would skip an event stamped before
+  it. Ctrl-C exits 0, as for port-forward; a closed stdout ends it quietly.
+  A poll that is throttled, cannot reach AWS, or outlives `--timeout` is
+  reported once and retried on the next tick; any other failure ends it.
+- **`--json` is JSON Lines**, not one document: a follow never ends. Each
+  line is `time`, `type`, `stream`, `id`, and `message`, an audit event's as
+  an object.
+- **Not enabled** is an error naming the types that are on and the exact
+  `update-cluster-config` command; eks never runs it.
+- **The AWS CLI never prompts:** `/dev/null` stdin, its own process group,
+  `AWS_PAGER=""`. A profile that needs an MFA code typed fails rather than
+  hangs.
+- **Version.** AWS CLI v2. Only a usage error asks `aws --version`, so a
+  version 1 that works keeps working.

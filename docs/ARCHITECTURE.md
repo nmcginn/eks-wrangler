@@ -18,7 +18,10 @@ src/
                        waiting for, and the rules for when to draw it at all.
   aws/                 Which AWS profile a context uses, whether its IAM
                        Identity Center session is still alive, and running
-                       `aws sso login` when it is not.
+                       `aws sso login` when it is not; running the AWS CLI
+                       and reading its failures (`aws::cli`), and the EKS
+                       and CloudWatch calls `eks control-plane-logs` makes
+                       (`aws::eks`, `aws::logs`, `aws::audit`).
   k8s/                 The Kubernetes client, the credential helper and the
                        token it keeps fresh, paging and request budgets,
                        quantities, selectors, nodes, pods, metrics,
@@ -583,6 +586,45 @@ before each frame drops every one `App` no longer wants. `F` and a forward
 ending by itself both stop it that way, with no message of their own. The
 containers pane's highlight moves over `containers::entries`, a container
 then its ports, so the row `enter`, `x`, and `f` act on is the one drawn.
+
+## Control-plane logs: `eks control-plane-logs`
+
+The first command that talks to AWS rather than to the cluster, and it does
+so through the AWS CLI (decision 123), the same program the credential helper
+already runs:
+
+```
+ClusterView + exec block ──► aws::eks::Target ──► describe-cluster ─┬─► aws::eks::logging ──► not_enabled?
+      (kubeconfig)              (pure)            (+ describe-log-   │       (pure)               (stop)
+                                                   streams, at once) └─► logs::pick_streams ──► Scope
+                                                                              (pure)
+filter-log-events ──► logs::page ──► logs::matches ──► Tail::admit ──► audit::line / json_line
+ (one CLI run per     (pure)          (--grep)         (order, drop     (pure)
+  page, NextToken)                                      repeats)
+```
+
+`aws::cli::run` is the only process handling: a `tokio` child with
+`kill_on_drop`, `/dev/null` stdin, its own process group, no pager, raced
+against `--timeout` per run. Everything it can fail with is read by
+`Failure::classify`, a pure function over the CLI's stderr, and worded by
+`Failure::explain`. A usage error is the one failure that runs a second
+process, `aws --version`, so a working CLI never pays for it.
+
+`Target::of` reads the cluster name, region, and profile from what the
+kubeconfig already holds, in the order an ARN, the endpoint's hostname, then
+the helper's own `--cluster-name`/`--region`/`--profile`. The profile is passed
+on only when the context names one: `--profile default` would override keys in
+the environment that the helper itself would use. The login offer is
+`credentials::AwsLogin`, the same `Context` every cluster command decides
+with, split so the command can take the retry itself when the CLI reports
+expired credentials.
+
+`Tail` is what makes paging and `--follow` the same loop. The first read
+starts at `--since`; each poll starts thirty seconds before the newest event
+printed, and `Tail` drops the events it has already printed, keeping only that
+window's IDs. The window exists because several control-plane instances
+deliver late, and starting exactly at the newest timestamp would lose an
+event stamped just before it for good.
 
 ## Testing
 

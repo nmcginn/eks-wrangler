@@ -474,7 +474,7 @@ pub fn exec_env(auth: &AuthInfo) -> impl Iterator<Item = (&str, &str)> {
 /// themselves, and an EKS `exec` block routinely carries an argument with a
 /// space in it — a role ARN with a path, a profile named after a team. A line
 /// they have to repair before it runs is worse than no line.
-fn shell_word(word: &str) -> String {
+pub(crate) fn shell_word(word: &str) -> String {
     // The conservative set: anything a POSIX shell leaves alone unquoted.
     let plain = !word.is_empty()
         && word.chars().all(|c| {

@@ -27,35 +27,6 @@ names of things.
 
 ### Milestone 7 — CloudWatch
 
-- [ ] **Control-plane logs: `eks control-plane-logs`.** EKS writes the API
-  server, audit, authenticator, controller-manager, and scheduler logs to
-  `/aws/eks/<cluster>/cluster`, but only for the types someone has switched
-  on. For the audience this tool is for, audit ("who deleted my pod?") and
-  authenticator ("why am I unauthorized?") answer the questions `kubectl`
-  cannot.
-  *Decided (2026-10-02):* `eks` calls AWS by running the AWS CLI
-  (`aws eks describe-cluster`, `aws logs filter-log-events`) and reading its
-  JSON output, not through the SDK. This keeps the binary light and matches
-  `aws sso login`. See decision 123.
-  *Acceptance:* `--type audit|authenticator|api|controller-manager|scheduler`,
-  plus `--since`, `--grep`, and `--follow`. Region, cluster name, and AWS
-  profile come from the context, the profile through `aws::profile`, so no
-  extra flags are needed. A type that is not enabled is reported with the
-  exact `aws eks update-cluster-config` command that would enable it and a
-  note that CloudWatch charges for ingestion. `eks` never turns logging on
-  itself. Audit events print as one line each (time, user, verb, resource,
-  response code), not raw JSON, and `--json` prints them whole. Missing
-  `logs:FilterLogEvents` or `eks:DescribeCluster` permission names the
-  action. A missing or too-old `aws` binary says which version is needed.
-  Each call is a child process `--timeout` can kill, like the credential
-  helper. Paging follows `nextToken` until `--since` is covered, with the
-  progress line showing how far it has got. `--follow` polls
-  `filter-log-events` from the last event's timestamp and drops repeats
-  rather than using `start-live-tail`, whose output is meant for a person to
-  read, not for `eks` to parse. Expired SSO sessions go through the same offer as every other
-  command. Log-type selection, the not-enabled advice, and audit
-  summarising are pure functions over recorded fixtures.
-
 - [ ] **`eks logs`, with a CloudWatch fallback for pods that are gone.**
   `kubectl logs` cannot show a pod that has been deleted or rescheduled,
   which is exactly the pod being troubleshot. `eks logs <pod> [-c]
@@ -192,6 +163,10 @@ names of things.
 - [x] Exec from the dashboard: `x` checks, then hands the terminal to the shell. (125, 126)
 - [x] `eks port-forward`: pods, `svc/`, and `deploy/`, following a service's pods through a rollout. (127)
 - [x] Container ports and forwards in the dashboard: `f`/`F` on a port, and a forwards strip. (128)
+
+### Milestone 7 — CloudWatch
+
+- [x] `eks control-plane-logs`: five types, `--since`, `--grep`, `--follow`, `--json`, audit as one line per request. (123, 129)
 
 ---
 

@@ -1,0 +1,3 @@
+# A product name, not an identifier: prose about CloudWatch should not need
+# backticks to pass `doc_markdown`. `..` keeps clippy's own list.
+doc-valid-idents = ["CloudWatch", ".."]

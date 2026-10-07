@@ -13,8 +13,10 @@ use ratatui::crossterm::terminal;
 use tracing_subscriber::EnvFilter;
 
 use eks::aws::LoginMode;
-use eks::cli::{Cli, Command, ExecArgs, GlobalArgs, PortForwardArgs};
-use eks::commands::{self, completions, contexts, credentials, exec, forward, nodes, pods};
+use eks::cli::{Cli, Command, ControlPlaneLogsArgs, ExecArgs, GlobalArgs, PortForwardArgs};
+use eks::commands::{
+    self, completions, contexts, control_plane_logs, credentials, exec, forward, nodes, pods,
+};
 use eks::config::{self, Config};
 use eks::format::Width;
 use eks::json::Output;
@@ -77,28 +79,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
     let user_config = user_config();
 
     match cli.command.unwrap_or(Command::Dashboard) {
-        Command::Dashboard => {
-            // Validated here, before the terminal takes over, exactly as
-            // `pods::list` validates the same flags: a malformed `-l` should be
-            // a sentence naming the bad text, not a dashboard that opens and
-            // then can never load a node's pods.
-            let selectors = pods::selectors_for(
-                cli.global.selector.as_deref(),
-                cli.global.field_selector.as_deref(),
-            )?;
-            dashboard(
-                &config,
-                &paths,
-                cli.global.context.as_deref(),
-                cli.global.timeout,
-                cli.global.effective_refresh(&user_config),
-                &selectors,
-                cli.global.login,
-                resolved_theme(&cli.global, &user_config),
-                query_background(&cli.global, &user_config),
-            )?;
-            Ok(ExitCode::SUCCESS)
-        }
+        Command::Dashboard => run_dashboard(&config, &paths, &cli.global, &user_config),
         Command::Contexts { json: true, .. } => {
             print_line(&contexts::list_json(&config)?);
             Ok(ExitCode::SUCCESS)
@@ -152,6 +133,9 @@ fn run(cli: Cli) -> Result<ExitCode> {
         Command::PortForward(args) => {
             run_port_forward(&config, &paths, &cli.global, &user_config, &args)
         }
+        Command::ControlPlaneLogs(args) => {
+            run_control_plane_logs(&config, &paths, &cli.global, &user_config, &args)
+        }
         Command::Use { name } => {
             print_line(&contexts::switch(&config, &name)?);
             Ok(ExitCode::SUCCESS)
@@ -167,6 +151,34 @@ fn run(cli: Cli) -> Result<ExitCode> {
         // Handled above, before a kubeconfig was ever read.
         Command::Completions { .. } | Command::Man => unreachable!("handled above"),
     }
+}
+
+/// The dashboard, `eks` with no subcommand. Split out of [`run`] to keep its
+/// match arms short.
+fn run_dashboard(
+    config: &KubeConfig,
+    paths: &[PathBuf],
+    global: &GlobalArgs,
+    user_config: &Config,
+) -> Result<ExitCode> {
+    // Validated here, before the terminal takes over, exactly as
+    // `pods::list` validates the same flags: a malformed `-l` should be
+    // a sentence naming the bad text, not a dashboard that opens and
+    // then can never load a node's pods.
+    let selectors =
+        pods::selectors_for(global.selector.as_deref(), global.field_selector.as_deref())?;
+    dashboard(
+        config,
+        paths,
+        global.context.as_deref(),
+        global.timeout,
+        global.effective_refresh(user_config),
+        &selectors,
+        global.login,
+        resolved_theme(global, user_config),
+        query_background(global, user_config),
+    )?;
+    Ok(ExitCode::SUCCESS)
 }
 
 /// `--wide` and `--json`, the two flags that decide how a listing is laid out
@@ -333,6 +345,48 @@ fn run_port_forward(
             eprintln!("Stopped forwarding.");
             Ok(ExitCode::SUCCESS)
         }
+    }
+}
+
+/// `eks control-plane-logs`. Ctrl-C ends `--follow` with success, as it ends
+/// a forward: it is how a follow is meant to stop. Without `--follow` it is
+/// an interruption like any listing's, and exits 130.
+fn run_control_plane_logs(
+    config: &KubeConfig,
+    paths: &[PathBuf],
+    global: &GlobalArgs,
+    user_config: &Config,
+    args: &ControlPlaneLogsArgs,
+) -> Result<ExitCode> {
+    let color = global.effective_color(user_config);
+    let request = control_plane_logs::Request {
+        kind: args.kind,
+        since: args.since,
+        grep: args.grep.as_deref(),
+        follow: args.follow,
+        output: Output::json(args.json),
+        palette: stdout_palette(color, resolved_theme(global, user_config)),
+        budget: global.timeout,
+        login: global.login,
+        progress: stderr_progress(global, color),
+    };
+    let stdout = std::io::stdout();
+    let mut out = stdout.lock();
+    let mut notes = std::io::stderr();
+    let sinks = control_plane_logs::Sinks {
+        out: &mut out,
+        notes: &mut notes,
+    };
+    match commands::block_on_interruptible(control_plane_logs::run(
+        config,
+        paths,
+        global.context.as_deref(),
+        request,
+        sinks,
+    ))? {
+        commands::Interruptible::Finished(()) => Ok(ExitCode::SUCCESS),
+        commands::Interruptible::Interrupted if args.follow => Ok(ExitCode::SUCCESS),
+        commands::Interruptible::Interrupted => Ok(interrupted()),
     }
 }
 
