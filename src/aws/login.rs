@@ -15,15 +15,22 @@
 use std::io::IsTerminal;
 use std::process::{Command, Stdio};
 
+use crate::launch;
+
 /// Failures from running the login.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
+    /// `why` is worked out when the start fails; see [`crate::launch`].
     #[error(
-        "could not start `{line}`: {message}\n\
-         The AWS CLI is what logs you in to IAM Identity Center, and it is not on your PATH. \
-         Install it, or pass `--login never` to be told to log in by hand instead."
+        "could not start `{line}`: {why}.\n\
+         The AWS CLI is what logs you in to IAM Identity Center. {} \
+         Or pass `--login never` to be told to log in by hand instead.",
+        .why.remedy(launch::Origin::Eks)
     )]
-    CouldNotStart { line: String, message: String },
+    CouldNotStart {
+        line: String,
+        why: launch::NotStarted,
+    },
 
     #[error(
         "`{line}` exited without logging you in{status}.\n\
@@ -75,7 +82,10 @@ pub fn run(argv: &[String], env: &[(String, String)]) -> Result<(), Error> {
         // worded rather than `unwrap`ped, as everything in this crate is.
         return Err(Error::CouldNotStart {
             line,
-            message: "there is no command to run".to_owned(),
+            why: launch::NotStarted::Other {
+                program: String::new(),
+                reason: "there is no command to run".to_owned(),
+            },
         });
     };
 
@@ -103,7 +113,7 @@ pub fn run(argv: &[String], env: &[(String, String)]) -> Result<(), Error> {
 
     let mut spawned = child.spawn().map_err(|error| Error::CouldNotStart {
         line: line.clone(),
-        message: error.to_string(),
+        why: launch::explain(program, &error),
     })?;
 
     // Copied on this thread rather than after the wait, so the URL appears
@@ -114,7 +124,11 @@ pub fn run(argv: &[String], env: &[(String, String)]) -> Result<(), Error> {
 
     let status = spawned.wait().map_err(|error| Error::CouldNotStart {
         line: line.clone(),
-        message: error.to_string(),
+        // It started, so there is nothing to look up: the system's words.
+        why: launch::NotStarted::Other {
+            program: program.clone(),
+            reason: error.to_string(),
+        },
     })?;
 
     if status.success() {
@@ -166,7 +180,14 @@ mod tests {
         let message = error.to_string();
 
         assert!(message.contains("eks-test-no-such-aws-cli"), "{message}");
-        assert!(message.contains("not on your PATH"), "{message}");
+        assert!(
+            message.contains("on the PATH eks was started with"),
+            "{message}"
+        );
+        assert!(
+            message.contains("`type eks-test-no-such-aws-cli`"),
+            "{message}"
+        );
         assert!(message.contains("--login never"), "{message}");
     }
 

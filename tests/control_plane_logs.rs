@@ -469,8 +469,34 @@ fn no_aws_cli_on_the_path_says_what_to_install() {
 
     assert_eq!(output.status.code(), Some(1));
     let message = stderr(&output);
-    assert!(message.contains("`aws` is not on your PATH"), "{message}");
+    assert!(
+        message.contains("`aws` is not in any of the 3 directories on the PATH"),
+        "{message}"
+    );
+    assert!(message.contains("`type aws`"), "{message}");
     assert!(message.contains("version 2"), "{message}");
+}
+
+#[test]
+fn an_aws_cli_behind_a_tilde_in_path_is_found_and_the_spelling_blamed() {
+    // `export PATH="~/bin:$PATH"`: bash runs `aws` from there at its prompt,
+    // and no program bash starts can.
+    let world = World::new();
+
+    let output = world
+        .command(&["control-plane-logs"])
+        .env("PATH", "~/bin:/usr/bin:/bin")
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(1));
+    let message = stderr(&output);
+    assert!(message.contains("`aws` is in `~/bin`"), "{message}");
+    assert!(
+        message.contains("write `$HOME/bin` instead of `~/bin`"),
+        "{message}"
+    );
+    assert!(world.calls().is_empty(), "{:?}", world.calls());
 }
 
 #[test]

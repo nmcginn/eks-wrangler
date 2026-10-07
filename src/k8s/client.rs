@@ -43,6 +43,7 @@ use crate::format;
 use crate::k8s::auth::{Authorise, Keeper, Kept, Store};
 use crate::k8s::exec::{self, Credential, Prompt, Secret};
 use crate::k8s::page::{self, Budget};
+use crate::launch;
 use crate::progress::Progress;
 
 /// Failures from building a client, before any resource is requested.
@@ -526,8 +527,9 @@ fn read_merged(paths: &[PathBuf]) -> Result<Kubeconfig, Error> {
 pub enum Failure {
     /// Credentials are absent, expired, or were refused by the API server.
     Credentials,
-    /// The kubeconfig's credential helper could not even be started — usually
-    /// the AWS CLI is not installed or not on `PATH`.
+    /// The kubeconfig's credential helper could not even be started: not
+    /// installed, not on the `PATH` this process has, or not runnable —
+    /// [`crate::launch`] says which.
     HelperMissing,
     /// Authentication worked; authorisation did not.
     Forbidden,
@@ -643,11 +645,26 @@ pub fn explain(error: &page::Error, cluster: &str) -> String {
             "{cluster} rejected your credentials — they are missing or expired.\n\
              Refresh them and try again: `aws sso login`, or renew whichever AWS profile that context uses."
         ),
-        Failure::HelperMissing => format!(
-            "the credential helper for {cluster} could not be started.\n\
-             Its kubeconfig entry runs a command — for EKS that is usually `aws` — which is not on your PATH. \
-             Install the AWS CLI, or fix the `exec` block for that context."
-        ),
+        // Names the command and what was wrong with it. "Not on your PATH",
+        // said to somebody whose `aws` answers at their prompt, is advice they
+        // already know to be wrong — and the context may not run `aws` at all.
+        Failure::HelperMissing => match helper(error) {
+            Some(exec::Error::Start { command, why }) if command.is_empty() => format!(
+                "the credential helper for {cluster} could not be started: {why}.\n{}",
+                why.remedy(launch::Origin::Kubeconfig)
+            ),
+            Some(exec::Error::Start { command, why }) => format!(
+                "the credential helper for {cluster} could not be started: {why}.\n\
+                 Its kubeconfig entry runs `{command}`. {}",
+                why.remedy(launch::Origin::Kubeconfig)
+            ),
+            // `kube`'s own running of a helper, which no request makes now.
+            _ => format!(
+                "the credential helper for {cluster} could not be started: {error}.\n\
+                 Its kubeconfig entry runs a command — for EKS that is usually `aws`, from the AWS CLI. \
+                 Run it yourself to see why, or fix the `exec` block for that context."
+            ),
+        },
         Failure::Forbidden => format!(
             "{cluster} knows who you are but will not let you list this resource.\n\
              Ask a cluster admin for an EKS access entry, or a role mapping in the aws-auth ConfigMap."
@@ -1090,9 +1107,14 @@ users:
             panic!("a helper that does not exist cannot be run");
         };
 
+        // Names the helper the kubeconfig actually runs, rather than assuming
+        // it is `aws`: this one is not, and is not installed.
         let message = error.to_string();
         assert!(message.contains("prod (us-east-1)"), "{message}");
-        assert!(message.contains("AWS CLI"), "{message}");
+        assert!(
+            message.contains("`eks-test-no-such-credential-helper` is not in any of the"),
+            "{message}"
+        );
         assert!(
             !message.contains("os error"),
             "raw io error leaked: {message}"
@@ -1104,7 +1126,7 @@ users:
         // The other side of the timeout, and the one a wrong `match` arm would
         // break silently: this helper fails immediately — it does not exist —
         // so the budget has nothing to expire on, and the message must be the
-        // one about the AWS CLI rather than the one about waiting.
+        // one about starting it rather than the one about waiting.
         let dir = tempfile::tempdir().unwrap();
         let paths = vec![write_kubeconfig(dir.path(), MISSING_HELPER)];
 
@@ -1120,7 +1142,7 @@ users:
         };
 
         let message = error.to_string();
-        assert!(message.contains("AWS CLI"), "{message}");
+        assert!(message.contains("could not be started"), "{message}");
         assert!(
             !message.contains("took longer than"),
             "a helper that failed at once was reported as slow: {message}"
@@ -1530,11 +1552,101 @@ users:
     fn a_helper_that_is_not_installed_still_suggests_installing_it() {
         let error = helper_error(exec::Error::Start {
             command: "aws eks get-token --cluster-name prod".to_owned(),
-            source: io::Error::from(io::ErrorKind::NotFound),
+            why: launch::NotStarted::NotOnPath {
+                program: "aws".to_owned(),
+                directories: 5,
+            },
         });
 
         assert_eq!(Failure::of(&error), Failure::HelperMissing);
-        assert!(explain(&error, "prod (us-east-1)").contains("AWS CLI"));
+        let message = explain(&error, "prod (us-east-1)");
+        assert!(message.contains("AWS CLI"), "{message}");
+        assert!(!message.contains("aws sso login"), "{message}");
+    }
+
+    #[test]
+    fn a_helper_that_works_at_the_prompt_but_not_here_is_sent_to_find_out_why() {
+        // The report this was written for: `aws` answered in the user's zsh,
+        // and the dashboard said it was not on their PATH.
+        let error = helper_error(exec::Error::Start {
+            command: "AWS_PROFILE=prod aws eks get-token --cluster-name prod".to_owned(),
+            why: launch::NotStarted::NotOnPath {
+                program: "aws".to_owned(),
+                directories: 5,
+            },
+        });
+
+        let message = explain(&error, "prod (us-east-1)");
+
+        assert!(
+            message.contains(
+                "could not be started: `aws` is not in any of the 5 directories on the PATH eks was started with"
+            ),
+            "{message}"
+        );
+        assert!(
+            message.contains("runs `AWS_PROFILE=prod aws eks get-token --cluster-name prod`"),
+            "{message}"
+        );
+        assert!(
+            message.contains("If `aws` works in your shell"),
+            "{message}"
+        );
+        assert!(message.contains("`type aws`"), "{message}");
+    }
+
+    #[test]
+    fn an_exec_block_with_no_command_says_so_rather_than_naming_an_empty_one() {
+        let error = helper_error(exec::Error::Start {
+            command: String::new(),
+            why: launch::NotStarted::Other {
+                program: String::new(),
+                reason: "its `exec` block names no command".to_owned(),
+            },
+        });
+
+        let message = explain(&error, "prod (us-east-1)");
+
+        assert!(
+            message.contains("could not be started: its `exec` block names no command."),
+            "{message}"
+        );
+        assert!(!message.contains("``"), "{message}");
+    }
+
+    #[test]
+    fn a_helper_behind_a_tilde_in_path_names_the_entry_and_its_spelling() {
+        let error = helper_error(exec::Error::Start {
+            command: "aws eks get-token".to_owned(),
+            why: launch::NotStarted::Tilde {
+                program: "aws".to_owned(),
+                entry: "~/.local/bin".to_owned(),
+            },
+        });
+
+        let message = explain(&error, "prod (us-east-1)");
+
+        assert!(message.contains("`aws` is in `~/.local/bin`"), "{message}");
+        assert!(message.contains("write `$HOME/.local/bin`"), "{message}");
+        assert!(!message.contains("install"), "{message}");
+    }
+
+    #[test]
+    fn a_helper_named_by_a_full_path_that_is_gone_says_to_name_it_again() {
+        let error = helper_error(exec::Error::Start {
+            command: "/usr/local/bin/aws eks get-token".to_owned(),
+            why: launch::NotStarted::NoFile {
+                path: "/usr/local/bin/aws".to_owned(),
+            },
+        });
+
+        let message = explain(&error, "prod (us-east-1)");
+
+        assert!(
+            message.contains("there is no file at `/usr/local/bin/aws`"),
+            "{message}"
+        );
+        assert!(message.contains("`command -v aws`"), "{message}");
     }
 
     #[test]
