@@ -24,9 +24,23 @@
 //! over the session, the flag, and whether there is a human at the terminal, so
 //! "never open a browser at somebody who is piping this into a file" is a test
 //! rather than a hope.
+//!
+//! Beyond login, `eks control-plane-logs` reads CloudWatch, and does it the
+//! same way: by running the AWS CLI rather than linking an SDK (decision 123).
+//!
+//! - [`cli`] runs one AWS CLI call under `--timeout` and reads its failures.
+//! - [`eks`] works out which cluster, region, and profile a context means, and
+//!   reads `describe-cluster`'s logging switches.
+//! - [`logs`] knows which CloudWatch streams hold which control-plane log, and
+//!   how to page and follow them.
+//! - [`audit`] turns an event into the line that is printed.
 
+pub mod audit;
+pub mod cli;
 pub mod config;
+pub mod eks;
 pub mod login;
+pub mod logs;
 pub mod profile;
 pub mod sso;
 

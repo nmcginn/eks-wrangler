@@ -77,6 +77,7 @@ eks nodes               # list the nodes of the active cluster
 eks pods -A             # list pods across every namespace
 eks exec api            # a shell in the pod whose name starts with api
 eks port-forward svc/api  # the api service on localhost, following its pods
+eks control-plane-logs    # who did what in the last hour, from the audit log
 eks use staging         # switch cluster
 eks current             # show the active cluster
 eks nodes --json        # any read command, as JSON for scripts
@@ -478,6 +479,42 @@ For anything the dashboard does not offer — a chosen local port, another
 address, or following a deployment or service through a rollout — use
 `eks port-forward`.
 
+### The control plane's own logs
+
+`eks control-plane-logs` reads the logs EKS writes to CloudWatch for the
+control plane: who did what (`audit`), why someone was refused
+(`authenticator`), and the API server, controller manager, and scheduler.
+The cluster, region, and AWS profile come from the context, and the reading
+is done by the AWS CLI (version 2), which every EKS context already needs.
+
+```sh
+eks control-plane-logs                                  # the audit log, last hour
+eks control-plane-logs --grep api-7f9c --since 1d       # everything done to one pod
+eks control-plane-logs -t authenticator --grep denied   # why was I unauthorized?
+eks control-plane-logs -t api -f                        # follow the API server's log
+```
+
+```
+$ eks control-plane-logs --grep api-7f9c
+2026-10-07T06:21:02Z  ci-deployer/github-actions  patch  deployments.apps shop/api  200
+2026-10-07T06:21:04Z  Admin/alice  delete  pods shop/api-7f9c  200
+```
+
+Each audit event is one line: when, who (an IAM role and session rather than
+its ARN), the verb, the object, and the response code — refusals and server
+errors in colour. Other types print as the component wrote them, behind the
+time. `--since` takes `30s`, `15m`, `2h`, `3d`, or an RFC 3339 time (default
+`1h`); `--grep` keeps events containing the text exactly as written; `-f`
+keeps printing new events until Ctrl-C; `--json` prints each event whole, one
+JSON object per line.
+
+EKS only writes the types someone has switched on. Asking for one that is off
+says which are on and prints the `aws eks update-cluster-config` command that
+would switch it on; `eks` never runs it, because CloudWatch charges for what it
+ingests and stores. A missing `logs:FilterLogEvents` or `eks:DescribeCluster`
+permission is named, and an expired Identity Center session gets the same
+login offer as every other command.
+
 ### Long listings and long sessions
 
 The token `aws eks get-token` prints is good for fifteen minutes. `eks` runs the
@@ -608,9 +645,9 @@ exit, and stdout stays empty. `eks contexts --json` cannot be combined with
 | `--sort <ORDER>` | Order the listing. Pods: `name` (default), `restarts`, `age`, `cpu`, `memory`, `cpu-share`, `memory-share`. Nodes: `name` (default), `status`, `cpu`, `memory`, `cpu-requested`, `memory-requested`, `pods`, `age` |
 | `--sort-reverse` | Reverse `--sort`; unrankable rows stay at the end. Either flag adds a line under the table naming the order |
 | `--wide` | Add the extra columns `kubectl -o wide` shows. Pods: `IP`, `NOMINATED NODE`, `READINESS GATES`. Nodes: `INTERNAL-IP`, `EXTERNAL-IP`, `OS-IMAGE`, `KERNEL-VERSION`, `CONTAINER-RUNTIME` |
-| `--json` | Print the listing as JSON instead of a table (`eks contexts`, `eks current`, `eks nodes`, `eks pods`). See [JSON output](#json-output) |
+| `--json` | Print the listing as JSON instead of a table (`eks contexts`, `eks current`, `eks nodes`, `eks pods`). See [JSON output](#json-output). `eks control-plane-logs --json` prints one object per event, per line |
 | `--kubeconfig <PATH>` | Override the kubeconfig search path |
-| `--timeout <DURATION>` | How long to wait for any one request to the cluster. Default `30s`; `0` waits for as long as it takes |
+| `--timeout <DURATION>` | How long to wait for any one request to the cluster, or any one AWS CLI run. Default `30s`; `0` waits for as long as it takes |
 | `--refresh <DURATION>` | How often the dashboard refreshes its panes in the background. Falls back to the config file's `refresh`, then to `15s`; `0` turns automatic refresh off (`r` still refreshes on demand) |
 | `--color <WHEN>` | `auto`, `always`, or `never`. Spelled `--colour` too. Falls back to the config file's `color`, then to `auto` |
 | `--theme <THEME>` | `auto`, `dark`, or `light`. Falls back to the config file's `theme`, then to `auto` |

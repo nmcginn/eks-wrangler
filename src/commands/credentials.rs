@@ -125,6 +125,52 @@ pub async fn open(
     }
 }
 
+/// The login offer for a command that reaches AWS through the AWS CLI
+/// rather than through a cluster: `eks control-plane-logs`.
+///
+/// The same two chances [`connect`] takes, split so the command can take the
+/// second one itself. [`AwsLogin::before`] is the pre-flight, over the same
+/// token cache; [`AwsLogin::after_refusal`] is the retry, taken when the AWS
+/// CLI says the credentials it was given have expired — the CLI's refusal
+/// standing in for the cluster's `401`. Same wording, same `--login` rules,
+/// and at most once per command, for the reason `connect` gives.
+#[derive(Debug)]
+pub struct AwsLogin {
+    context: Context,
+    before: Outcome,
+    spent: bool,
+}
+
+impl AwsLogin {
+    /// Read the context's AWS configuration and make the pre-flight offer.
+    pub fn before(config: &Config, label: &str, login: LoginMode) -> Result<Self> {
+        let context = Context::of(config, login);
+        let before = context.act(&context.before(label))?;
+        Ok(Self {
+            context,
+            before,
+            spent: false,
+        })
+    }
+
+    /// The AWS CLI refused the credentials: offer a login, once. `true` when
+    /// one ran, so the call is worth making again.
+    pub fn after_refusal(&mut self) -> Result<bool> {
+        if std::mem::replace(&mut self.spent, true) || self.before != Outcome::NothingToDo {
+            return Ok(false);
+        }
+        // "AWS refused the credentials…": it was the AWS CLI's call that was
+        // refused, not the cluster, which this command never talks to.
+        Ok(self.context.act(&self.context.after_refusal("AWS"))? == Outcome::LoggedIn)
+    }
+
+    /// The profile the context authenticates as, for advice that names it.
+    #[must_use]
+    pub fn profile(&self) -> &str {
+        &self.context.profile
+    }
+}
+
 /// What [`Context::act`] did about an [`Action`].
 ///
 /// Three outcomes rather than a `bool`, because the two that did not log
@@ -316,6 +362,7 @@ pub fn refused_credentials(error: &anyhow::Error) -> bool {
 /// pre-flight did, and re-reading `~/.aws/config` between two attempts a second
 /// apart would be work for nothing — and could give two different answers to
 /// one command.
+#[derive(Debug)]
 struct Context {
     mode: LoginMode,
     profile: String,
@@ -479,6 +526,28 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
     use super::*;
+
+    #[test]
+    fn login_never_offers_the_aws_cli_nothing_before_or_after_a_refusal() {
+        // The promise `--login never` makes everywhere: the same message the
+        // tool always gave, and no login run.
+        let config = Config::new("https://example.invalid".parse().unwrap());
+        let mut login = AwsLogin::before(&config, "prod", LoginMode::Never).unwrap();
+
+        assert!(!login.after_refusal().unwrap());
+    }
+
+    #[test]
+    fn the_aws_cli_is_offered_a_login_after_a_refusal_at_most_once() {
+        let config = Config::new("https://example.invalid".parse().unwrap());
+        let mut login = AwsLogin::before(&config, "prod", LoginMode::Never).unwrap();
+        login.after_refusal().unwrap();
+
+        // Spent, whatever the first answer was: a second refusal in the same
+        // command is an error, not a loop.
+        assert!(login.spent);
+        assert!(!login.after_refusal().unwrap());
+    }
 
     #[test]
     fn pressing_enter_at_the_prompt_is_a_yes() {

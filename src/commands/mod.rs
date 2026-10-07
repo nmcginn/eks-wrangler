@@ -11,6 +11,7 @@ use anyhow::{Context as _, Result};
 
 pub mod completions;
 pub mod contexts;
+pub mod control_plane_logs;
 pub mod credentials;
 pub mod exec;
 pub mod forward;

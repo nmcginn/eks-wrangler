@@ -8,6 +8,7 @@ use std::path::PathBuf;
 use clap::{Parser, Subcommand};
 
 use crate::aws::LoginMode;
+use crate::aws::logs::{LogType, Since};
 use crate::config::Config;
 use crate::k8s::nodes::Order as NodeOrder;
 use crate::k8s::page::Budget;
@@ -63,8 +64,9 @@ pub struct GlobalArgs {
     pub kubeconfig: Option<PathBuf>,
 
     /// How long to wait for any one step of talking to the cluster: the
-    /// kubeconfig's credential helper, and then each request. `0` waits for as
-    /// long as it takes. A listing too large for one response is read in
+    /// kubeconfig's credential helper, and then each request — and for each
+    /// run of the AWS CLI that `eks control-plane-logs` makes. `0` waits for
+    /// as long as it takes. A listing too large for one response is read in
     /// pages, and this is the limit on each page rather than on the command.
     #[arg(long, global = true, value_name = "DURATION", default_value_t = Budget::default())]
     pub timeout: Budget,
@@ -287,6 +289,18 @@ pub enum Command {
     #[command(name = "port-forward")]
     PortForward(PortForwardArgs),
 
+    /// Read the control plane's own logs from CloudWatch: who did what
+    /// (`audit`), why someone was refused (`authenticator`), and the API
+    /// server, controller manager, and scheduler.
+    ///
+    /// The cluster, region, and AWS profile come from the context; the
+    /// reading is done by the AWS CLI, which must be installed. EKS only
+    /// writes the log types someone has switched on, and a type that is off
+    /// is reported with the command that would switch it on — eks never
+    /// does, since CloudWatch charges for what it stores.
+    #[command(name = "control-plane-logs", visible_alias = "cpl")]
+    ControlPlaneLogs(ControlPlaneLogsArgs),
+
     /// Switch the active cluster.
     Use {
         /// Context name, as shown by `eks contexts`.
@@ -352,6 +366,39 @@ pub struct PortForwardArgs {
     /// machine can connect unless you ask for that, e.g. with `0.0.0.0`.
     #[arg(long, value_name = "ADDRESS", value_delimiter = ',')]
     pub address: Vec<String>,
+}
+
+/// `eks control-plane-logs`' own arguments.
+#[derive(Debug, Clone, clap::Args)]
+pub struct ControlPlaneLogsArgs {
+    /// Which log to read. `audit` prints one line per request: the time,
+    /// who made it, the verb, the object, and the response code.
+    #[arg(
+        long = "type",
+        short = 't',
+        value_name = "TYPE",
+        default_value = "audit"
+    )]
+    pub kind: LogType,
+
+    /// How far back to read: a length of time (`30s`, `15m`, `2h`, `3d`) or
+    /// an RFC 3339 instant (`2026-10-07T05:00:00Z`).
+    #[arg(long, value_name = "WHEN", default_value_t = Since::default())]
+    pub since: Since,
+
+    /// Only events containing this text, exactly as written (case matters).
+    #[arg(long, value_name = "TEXT")]
+    pub grep: Option<String>,
+
+    /// Keep printing new events as they arrive, until Ctrl-C.
+    #[arg(long, short = 'f')]
+    pub follow: bool,
+
+    /// Print each event whole, as one line of JSON: `time`, `type`,
+    /// `stream`, `id`, and `message` — an audit event's as an object, any
+    /// other type's as text.
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[cfg(test)]
@@ -462,6 +509,62 @@ mod tests {
     #[test]
     fn port_forward_without_a_target_is_a_usage_error() {
         assert!(Cli::try_parse_from(["eks", "port-forward"]).is_err());
+    }
+
+    fn control_plane_logs_args(args: &[&str]) -> ControlPlaneLogsArgs {
+        match parse(args).command {
+            Some(Command::ControlPlaneLogs(args)) => args,
+            other => panic!("expected control-plane-logs, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn control_plane_logs_reads_the_audit_log_of_the_last_hour_by_default() {
+        let args = control_plane_logs_args(&["eks", "control-plane-logs"]);
+        assert_eq!(args.kind, LogType::Audit);
+        assert_eq!(args.since, Since::default());
+        assert_eq!(args.grep, None);
+        assert!(!args.follow);
+        assert!(!args.json);
+    }
+
+    #[test]
+    fn control_plane_logs_takes_every_type_by_its_flag_spelling() {
+        for kind in LogType::ALL {
+            let args = control_plane_logs_args(&["eks", "cpl", "--type", kind.flag()]);
+            assert_eq!(args.kind, kind);
+        }
+        assert!(Cli::try_parse_from(["eks", "cpl", "--type", "controllerManager"]).is_err());
+        assert!(Cli::try_parse_from(["eks", "cpl", "--type", "kubelet"]).is_err());
+    }
+
+    #[test]
+    fn control_plane_logs_takes_since_grep_follow_and_json() {
+        let args = control_plane_logs_args(&[
+            "eks",
+            "control-plane-logs",
+            "-t",
+            "authenticator",
+            "--since",
+            "2026-10-07T05:00:00Z",
+            "--grep",
+            "AccessDenied",
+            "-f",
+            "--json",
+            "-c",
+            "prod",
+        ]);
+        assert_eq!(args.kind, LogType::Authenticator);
+        assert_eq!(args.since, "2026-10-07T05:00:00Z".parse().unwrap());
+        assert_eq!(args.grep.as_deref(), Some("AccessDenied"));
+        assert!(args.follow);
+        assert!(args.json);
+    }
+
+    #[test]
+    fn control_plane_logs_refuses_a_since_it_cannot_read_before_running_anything() {
+        let error = Cli::try_parse_from(["eks", "cpl", "--since", "yesterday"]).unwrap_err();
+        assert!(error.to_string().contains("`15m`"), "{error}");
     }
 
     #[test]
