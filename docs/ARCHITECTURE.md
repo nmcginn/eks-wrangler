@@ -8,6 +8,9 @@ src/
   lib.rs               Library root — everything testable lives below here.
   cli.rs               clap definitions and argument-derived settings.
   kubeconfig.rs        Reading and safely rewriting kubeconfig files.
+  launch.rs            Why a program would not start — a full path with
+                       nothing at it, a `~` in PATH, a dead `#!`
+                       interpreter — and what to do about it.
   cluster.rs           Turning kubeconfig entries into human-facing views.
   format.rs            Ages and aligned tables — pure string formatting.
   json.rs              `--json`: the same rows as data — numbers in base

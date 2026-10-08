@@ -28,11 +28,11 @@ use std::time::Duration;
 use crate::format;
 use crate::k8s::client;
 use crate::k8s::page::Budget;
+use crate::launch;
 
 /// Where to get the AWS CLI, for the message that says it is missing or too
 /// old.
-pub const INSTALL_URL: &str =
-    "https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html";
+pub const INSTALL_URL: &str = launch::AWS_INSTALL_URL;
 
 /// The oldest AWS CLI major version `eks` is written against.
 pub const REQUIRED_MAJOR: u32 = 2;
@@ -89,13 +89,14 @@ impl Call {
 /// Why a call produced no answer.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
-    /// The program could not be started at all, nearly always because it is
-    /// not installed.
-    #[error("could not start `{program}`: {source}")]
+    /// The program could not be started at all. `why` is worked out at the
+    /// moment it failed — see [`crate::launch`] — and boxed because it is the
+    /// rare case, and every `Result` carrying this error would otherwise be
+    /// sized for it.
+    #[error("could not start `{program}`: {why}")]
     Start {
         program: String,
-        #[source]
-        source: io::Error,
+        why: Box<launch::NotStarted>,
     },
 
     /// `--timeout` ran out first, and the child was killed.
@@ -121,7 +122,10 @@ pub async fn run(call: &Call, budget: Budget) -> Result<Vec<u8>, Error> {
     let Some((program, rest)) = call.argv.split_first() else {
         return Err(Error::Start {
             program: String::new(),
-            source: io::Error::other("there is no command to run"),
+            why: Box::new(launch::NotStarted::Other {
+                program: String::new(),
+                reason: "there is no command to run".to_owned(),
+            }),
         });
     };
 
@@ -148,7 +152,7 @@ pub async fn run(call: &Call, budget: Budget) -> Result<Vec<u8>, Error> {
 
     let start = |source: io::Error| Error::Start {
         program: program.clone(),
-        source,
+        why: Box::new(launch::explain(program, &source)),
     };
     let waiting = async {
         child
@@ -207,8 +211,9 @@ pub async fn version(program: &str, budget: Budget) -> Option<String> {
 /// What a failed call means for the person running `eks`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Failure {
-    /// `aws` is not installed, or not on `PATH`.
-    Missing,
+    /// `aws` could not be started: not installed, not on the `PATH` this
+    /// process has, or not runnable — [`crate::launch`] says which.
+    Missing { why: launch::NotStarted },
     /// The CLI did not understand its own arguments: nearly always a CLI too
     /// old for them.
     Usage { detail: String },
@@ -246,11 +251,8 @@ impl Failure {
     #[must_use]
     pub fn of(error: &Error, action: &str) -> Self {
         match error {
-            Error::Start { source, .. } if source.kind() == io::ErrorKind::NotFound => {
-                Self::Missing
-            }
-            Error::Start { source, .. } => Self::Other {
-                detail: source.to_string(),
+            Error::Start { why, .. } => Self::Missing {
+                why: why.as_ref().clone(),
             },
             Error::TimedOut { limit, .. } => Self::TimedOut { limit: *limit },
             Error::Failed { stderr, .. } => Self::classify(stderr, action),
@@ -359,9 +361,9 @@ impl Failure {
     pub fn explain(&self, call: &Call, profile: &str, found: Option<&str>) -> String {
         let command = call.short();
         match self {
-            Self::Missing => format!(
-                "eks reads CloudWatch through the AWS CLI, and `aws` is not on your PATH.\n\
-                 Install AWS CLI version {REQUIRED_MAJOR}: {INSTALL_URL}"
+            Self::Missing { why } => format!(
+                "eks reads CloudWatch through the AWS CLI, and could not start it: {why}.\n{}",
+                why.remedy(launch::Origin::Eks)
             ),
             Self::Usage { detail } => match found.and_then(major_version) {
                 Some(major) if major < REQUIRED_MAJOR => format!(
@@ -708,7 +710,7 @@ mod tests {
             assert!(failure.passes(), "{failure:?}");
         }
         let lasting = [
-            Failure::Missing,
+            Failure::Missing { why: not_on_path() },
             Failure::Denied {
                 action: "logs:FilterLogEvents".to_owned(),
                 principal: None,
@@ -730,12 +732,34 @@ mod tests {
 
     // --- explain ---------------------------------------------------------
 
+    fn not_on_path() -> launch::NotStarted {
+        launch::NotStarted::NotOnPath {
+            program: "aws".to_owned(),
+            directories: 4,
+        }
+    }
+
     #[test]
     fn a_missing_cli_says_which_version_to_install_and_where() {
-        let message = Failure::Missing.explain(&filter_call(), "prod", None);
-        assert!(message.contains("not on your PATH"), "{message}");
+        let message = Failure::Missing { why: not_on_path() }.explain(&filter_call(), "prod", None);
+        assert!(
+            message.contains(
+                "`aws` is not in any of the 4 directories on the PATH eks was started with"
+            ),
+            "{message}"
+        );
         assert!(message.contains("version 2"), "{message}");
         assert!(message.contains(INSTALL_URL), "{message}");
+    }
+
+    #[test]
+    fn a_cli_the_shell_finds_and_eks_does_not_is_fixed_on_path_not_in_a_kubeconfig() {
+        // eks chose to run `aws` here, not the kubeconfig, so the advice is
+        // about the environment eks starts in.
+        let message = Failure::Missing { why: not_on_path() }.explain(&filter_call(), "prod", None);
+        assert!(message.contains("`type aws`"), "{message}");
+        assert!(message.contains("on the PATH eks starts with"), "{message}");
+        assert!(!message.contains("command:"), "{message}");
     }
 
     #[test]
@@ -869,7 +893,15 @@ mod tests {
         )
         .await
         .unwrap_err();
-        assert_eq!(Failure::of(&error, "x:Y"), Failure::Missing);
+        assert!(
+            matches!(
+                Failure::of(&error, "x:Y"),
+                Failure::Missing {
+                    why: launch::NotStarted::NotOnPath { .. }
+                }
+            ),
+            "{error:?}"
+        );
     }
 
     #[tokio::test]

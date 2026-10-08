@@ -1260,3 +1260,23 @@ toolchain that builds and the pin is never downloaded there.
   retry, and paging for both CloudWatch commands.
 - **No `--json` yet.** Whether an API line gets a time (it has none unless
   `timestamps=true` is asked for) is the reviewer's call.
+
+### 132. A program that will not start is diagnosed, not guessed at
+
+A credential helper that failed to start was reported as "not on your PATH",
+without the command or the system's reason. In the report that prompted this,
+`aws` was on PATH but was an x86_64 build on an Apple Silicon Mac that no
+longer had Rosetta. macOS refused it with "Bad CPU type in executable", and
+eks told the user that `aws` was missing. The same guess was made by `aws sso
+login` and by the CloudWatch calls. All three now pass the failed start to
+`launch::explain`. It repeats `execvp`'s lookup and names the real cause: a
+bare name on no `PATH` directory (counted), no `PATH` at all, a `PATH` entry
+with a literal `~` (bash expands it at its own prompt and nothing else does),
+a full path with nothing there, a dangling link, a script whose `#!`
+interpreter is gone (the kernel says `ENOENT` for that too), or a file that is
+not executable. Anything else is the system's own words. The advice depends on
+who named the program: a kubeconfig's `command:` can be changed, but `aws` run
+by eks can only be fixed in `PATH`. The lookup is a few `stat` calls and runs
+only after a start has failed. eks does not expand `~` or ask the user's shell
+for its aliases itself, because that would let it run what kubectl will not,
+and the user would see a different failure the next time they used kubectl.

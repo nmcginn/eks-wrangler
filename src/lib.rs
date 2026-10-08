@@ -13,6 +13,7 @@ pub mod fuzzy;
 pub mod json;
 pub mod k8s;
 pub mod kubeconfig;
+pub mod launch;
 pub mod progress;
 pub mod theme;
 pub mod ui;

@@ -44,6 +44,7 @@ use kube::config::{AuthInfo, ExecConfig, ExecInteractiveMode};
 use serde::Deserialize;
 
 use crate::k8s::client;
+use crate::launch;
 
 /// How long before its stated expiry a credential is treated as already gone.
 ///
@@ -92,10 +93,15 @@ pub struct Credential {
 /// `Display` is for logs.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
-    /// The command could not be started at all: not installed, not on `PATH`,
-    /// or an `exec` block with no command in it.
-    #[error("could not start `{command}`: {source}")]
-    Start { command: String, source: io::Error },
+    /// The command could not be started at all: not installed, not on the
+    /// `PATH` this process has, or an `exec` block with no command in it.
+    /// `why` is worked out when the start fails, while the `PATH` it failed
+    /// against is still the one to hand.
+    #[error("could not start `{command}`: {why}")]
+    Start {
+        command: String,
+        why: launch::NotStarted,
+    },
 
     /// It ran and exited with a failure.
     #[error("`{command}` exited with {status}{}", stderr_suffix(.stderr))]
@@ -354,25 +360,32 @@ pub fn parse(stdout: &[u8]) -> Result<Credential, String> {
 /// a thing to put around a future, not to thread through it.
 pub async fn run(auth: &AuthInfo, prompt: Prompt) -> Result<Credential, Error> {
     let command = client::helper_command(auth).unwrap_or_default();
-    let start = |source: io::Error| Error::Start {
+    let refuse = |reason: &str| Error::Start {
         command: command.clone(),
-        source,
+        why: launch::NotStarted::Other {
+            program: String::new(),
+            reason: reason.to_owned(),
+        },
     };
 
     let exec = auth
         .exec
         .as_ref()
-        .ok_or_else(|| start(io::Error::other("the context has no `exec` block")))?;
+        .ok_or_else(|| refuse("the context has no `exec` block"))?;
     let program = exec
         .command
         .as_deref()
-        .ok_or_else(|| start(io::Error::other("its `exec` block names no command")))?;
+        .ok_or_else(|| refuse("its `exec` block names no command"))?;
+    let start = |source: io::Error| Error::Start {
+        command: command.clone(),
+        why: launch::explain(program, &source),
+    };
 
     let stdin_is_terminal = std::io::IsTerminal::is_terminal(&io::stdin());
     let mode = exec.interactive_mode.as_ref();
     let talks = prompt.allows(mode, stdin_is_terminal);
     let muted = prompt.muted(mode, stdin_is_terminal);
-    let info = exec_info(exec, talks).map_err(|error| start(io::Error::other(error)))?;
+    let info = exec_info(exec, talks).map_err(|error| refuse(&error.to_string()))?;
 
     let mut child = tokio::process::Command::new(program);
     child
@@ -785,8 +798,39 @@ exec:
             .await
             .expect_err("it does not exist");
 
-        assert!(matches!(error, Error::Start { .. }), "{error:?}");
+        assert!(
+            matches!(
+                error,
+                Error::Start {
+                    why: launch::NotStarted::NotOnPath { .. },
+                    ..
+                }
+            ),
+            "{error:?}"
+        );
         assert_eq!(error.command(), "eks-test-no-such-credential-helper");
+    }
+
+    #[tokio::test]
+    async fn a_helper_named_by_a_path_that_is_not_there_says_which_path() {
+        // A kubeconfig written on another machine, where the AWS CLI lived
+        // somewhere this one does not have.
+        let auth =
+            exec_auth("exec:\n  command: /eks-test/no/such/bin/aws\n  args: [eks, get-token]\n");
+
+        let error = run(&auth, Prompt::AsConfigured)
+            .await
+            .expect_err("it does not exist");
+
+        let Error::Start { why, .. } = &error else {
+            panic!("{error:?}");
+        };
+        assert_eq!(
+            why,
+            &launch::NotStarted::NoFile {
+                path: "/eks-test/no/such/bin/aws".to_owned()
+            }
+        );
     }
 
     #[tokio::test]
@@ -901,7 +945,9 @@ exec:
     fn a_helper_that_never_started_or_ran_out_of_time_is_not_called_muted() {
         let start = mute(Error::Start {
             command: "aws".to_owned(),
-            source: io::Error::other("not found"),
+            why: launch::NotStarted::NoPath {
+                program: "aws".to_owned(),
+            },
         });
         assert!(matches!(start, Error::Start { .. }), "{start:?}");
 
