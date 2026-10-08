@@ -76,6 +76,7 @@ eks contexts            # list available clusters
 eks nodes               # list the nodes of the active cluster
 eks pods -A             # list pods across every namespace
 eks exec api            # a shell in the pod whose name starts with api
+eks logs api            # its log, from CloudWatch once the pod is gone
 eks port-forward svc/api  # the api service on localhost, following its pods
 eks control-plane-logs    # who did what in the last hour, from the audit log
 eks use staging         # switch cluster
@@ -425,6 +426,44 @@ running and that the image has a shell. If either check fails, the reason
 appears above the footer and nothing else changes. Otherwise the shell takes
 the terminal, and exiting it brings the dashboard back as you left it.
 
+### A container's log, even after its pod is gone
+
+`eks logs` finds the pod by the same rules as `eks exec` (the start of its
+name, `-C` for a container other than the default) and prints its log:
+
+```sh
+eks logs api                  # every line the kubelet kept
+eks logs api -f               # and keep printing, until Ctrl-C
+eks logs api -p               # the instance before the last restart
+eks logs api --since 15m      # only the last 15 minutes
+```
+
+While the pod is running, this is `kubectl logs`. When no running pod's name
+starts with what you typed, because the pod was deleted, evicted, or
+rescheduled under a new name, `eks` looks for its lines in the CloudWatch group
+Container Insights writes to, `/aws/containerinsights/<cluster>/application`,
+through the AWS CLI:
+
+```
+$ eks logs api-7d9f
+No pod starting "api-7d9f" is running in namespace shop; api-7d9f8c6b5-xk2pq was. Reading app's lines in the last 1h from CloudWatch, /aws/containerinsights/prod/application. Older lines need `--since`, e.g. `--since 1d`.
+[cloudwatch 2026-10-07T06:21:02Z] listening on :8080
+[cloudwatch 2026-10-07T06:21:04Z stderr] panic: out of memory
+```
+
+Every line from CloudWatch carries the `[cloudwatch …]` label, so it is never
+mistaken for the cluster's own; the note above them goes to stderr, so a pipe
+gets the lines alone. CloudWatch is read for the last hour unless `--since`
+says otherwise. A prefix that several gone pods started with lists them, with
+when each was last heard from. CloudWatch keeps no pod spec, so a pod with
+several containers needs `-C`. `-p` reads the instance before the last one
+CloudWatch holds. `-f` keeps polling for lines still on their way.
+
+A cluster without Container Insights gets the `aws eks create-addon` command
+that sets it up; lines are only kept from then on. A cluster that ships
+container logs to another group can name it in the config file, as
+`log_group`.
+
 ### A pod, a service, or a deployment on localhost
 
 `eks port-forward` listens on this machine and carries each connection to a
@@ -639,7 +678,7 @@ exit, and stdout stays empty. `eks contexts --json` cannot be combined with
 | `-c, --context <NAME>` | Use a specific context for this invocation |
 | `-n, --namespace <NS>` | Scope resources to a namespace. Falls back to the config file's `namespace`, then to the context's own |
 | `-A, --all-namespaces` | List pods across every namespace (`eks pods`) |
-| `-l, --selector <SEL>` | Filter pods by label selector (`eks pods`, and the dashboard's pod-drilldown pane), or narrow the pods a name is matched against (`eks exec`, `eks port-forward`) |
+| `-l, --selector <SEL>` | Filter pods by label selector (`eks pods`, and the dashboard's pod-drilldown pane), or narrow the pods a name is matched against (`eks exec`, `eks logs`, `eks port-forward`) |
 | `--field-selector <SEL>` | Filter pods by field selector, with the same reach as `-l` |
 | `--address <ADDR>` | Where `eks port-forward` listens: IPs, comma-separated, or `localhost` for both loopbacks. Default `127.0.0.1` |
 | `--sort <ORDER>` | Order the listing. Pods: `name` (default), `restarts`, `age`, `cpu`, `memory`, `cpu-share`, `memory-share`. Nodes: `name` (default), `status`, `cpu`, `memory`, `cpu-requested`, `memory-requested`, `pods`, `age` |
@@ -663,13 +702,15 @@ All of these are global, and they parse on either side of the subcommand:
 ### Config file
 
 `~/.config/eks/config.toml` sets defaults for four of the flags above, for
-whoever is tired of typing `--color always` or `--refresh 5s` every time:
+whoever is tired of typing `--color always` or `--refresh 5s` every time, and
+names the CloudWatch group `eks logs` reads a gone pod's lines from:
 
 ```toml
 color = "always"      # or "colour" — same as --color/--colour
 theme = "light"        # same as --theme
 refresh = "5s"         # same grammar as --refresh and --timeout
 namespace = "payments" # same as --namespace/-n
+log_group = "/aws/containerinsights/{cluster}/application" # the default; {cluster} is the cluster's name
 ```
 
 Every key is optional, and so is the file itself — nothing changes if it does

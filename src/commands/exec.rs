@@ -195,6 +195,46 @@ pub(crate) async fn locate(
     selectors: &Selectors,
     budget: Budget,
 ) -> Result<Pod> {
+    match find(client, target, namespace, wanted, selectors, budget).await? {
+        Located::Live(pod) => Ok(*pod),
+        Located::Gone { unlisted: true, .. } => Err(anyhow!(unlistable(wanted, namespace))),
+        Located::Gone { elsewhere, .. } => {
+            let elsewhere: Vec<&Pod> = elsewhere.iter().collect();
+            Err(anyhow!(pick::not_found(
+                wanted,
+                namespace,
+                &elsewhere,
+                Timestamp::now()
+            )))
+        }
+    }
+}
+
+/// What [`find`] found.
+#[derive(Debug)]
+pub(crate) enum Located {
+    /// One running pod, by [`pick::find`]'s rule.
+    Live(Box<Pod>),
+    /// No pod in the namespace is called `wanted` or starts with it.
+    Gone {
+        /// Pods in other namespaces that start with it, best effort.
+        elsewhere: Vec<Pod>,
+        /// Pods could not be listed, so only the exact name was tried.
+        unlisted: bool,
+    },
+}
+
+/// [`locate`]'s search, with "no such pod" as an answer rather than an error:
+/// `eks logs` goes on to look in CloudWatch for it. A prefix that matches
+/// several pods is still an error, by [`pick::ambiguous`]'s wording.
+pub(crate) async fn find(
+    client: &Client,
+    target: &ClusterView,
+    namespace: &str,
+    wanted: &str,
+    selectors: &Selectors,
+    budget: Budget,
+) -> Result<Located> {
     let label = target.label();
     let scope = Scope::Namespace(namespace.to_owned());
     let listed =
@@ -206,8 +246,11 @@ pub(crate) async fn locate(
             tracing::debug!(%error, "listing pods was refused; trying the name as given");
             let api: Api<Pod> = Api::namespaced(client.clone(), namespace);
             return match budget.wrap(api.get_opt(wanted)).await {
-                Ok(Some(pod)) => Ok(pod),
-                Ok(None) => Err(anyhow!(unlistable(wanted, namespace))),
+                Ok(Some(pod)) => Ok(Located::Live(Box::new(pod))),
+                Ok(None) => Ok(Located::Gone {
+                    elsewhere: Vec::new(),
+                    unlisted: true,
+                }),
                 Err(error) => Err(anyhow!(k8s::explain(&error, &label))),
             };
         }
@@ -216,7 +259,7 @@ pub(crate) async fn locate(
 
     let now = Timestamp::now();
     match pick::find(&pods, wanted) {
-        Match::One(pod) => Ok(pod.clone()),
+        Match::One(pod) => Ok(Located::Live(Box::new(pod.clone()))),
         Match::Several(candidates) => Err(anyhow!(pick::ambiguous(wanted, &candidates, now))),
         Match::None => {
             // Best effort: a role scoped to one namespace cannot list the
@@ -231,8 +274,8 @@ pub(crate) async fn locate(
             .await
             .map_err(|error| tracing::debug!(%error, "searching every namespace failed"))
             .unwrap_or_default();
-            let elsewhere: Vec<&Pod> = everywhere
-                .iter()
+            let elsewhere: Vec<Pod> = everywhere
+                .into_iter()
                 .filter(|pod| pod.metadata.namespace.as_deref() != Some(namespace))
                 .filter(|pod| {
                     pod.metadata
@@ -241,7 +284,10 @@ pub(crate) async fn locate(
                         .is_some_and(|name| !wanted.is_empty() && name.starts_with(wanted))
                 })
                 .collect();
-            Err(anyhow!(pick::not_found(wanted, namespace, &elsewhere, now)))
+            Ok(Located::Gone {
+                elsewhere,
+                unlisted: false,
+            })
         }
     }
 }
@@ -920,10 +966,10 @@ pub fn wants_tty() -> bool {
 
 // --- What is printed when a session cannot start ---------------------------
 
-/// `-c` is `--context` in `eks`, where `kubectl exec` reads it as the
-/// container. A context that does not resolve, typed on this command, was
+/// `-c` is `--context` in `eks`, where `kubectl exec` and `kubectl logs` read
+/// it as the container. A context that does not resolve, typed on this command, was
 /// most likely meant as one.
-fn with_context_hint(error: &anyhow::Error, context_given: bool) -> anyhow::Error {
+pub(crate) fn with_context_hint(error: &anyhow::Error, context_given: bool) -> anyhow::Error {
     if !context_given {
         return anyhow!("{error:#}");
     }

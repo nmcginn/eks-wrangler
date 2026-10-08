@@ -21,7 +21,9 @@ src/
                        `aws sso login` when it is not; running the AWS CLI
                        and reading its failures (`aws::cli`), and the EKS
                        and CloudWatch calls `eks control-plane-logs` makes
-                       (`aws::eks`, `aws::logs`, `aws::audit`).
+                       (`aws::eks`, `aws::logs`, `aws::audit`), and the
+                       Container Insights records `eks logs` falls back to
+                       for a pod that is gone (`aws::insights`).
   k8s/                 The Kubernetes client, the credential helper and the
                        token it keeps fresh, paging and request budgets,
                        quantities, selectors, nodes, pods, metrics,
@@ -625,6 +627,33 @@ printed, and `Tail` drops the events it has already printed, keeping only that
 window's IDs. The window exists because several control-plane instances
 deliver late, and starting exactly at the newest timestamp would lose an
 event stamped just before it for good.
+
+The AWS CLI handling both CloudWatch commands share (`Aws`, the login retry,
+`read_pages`, and what counts as a failure that passes) lives in
+`commands::cloudwatch`, so the two cannot drift apart in how they treat a
+refusal.
+
+## Container logs: `eks logs`
+
+Two sources, decided by whether the cluster still has the pod:
+
+```
+exec::find ──┬─► Located::Live ──► pick::container ──► k8s_logs::command_params ──► log_stream ──► stdout
+ (list, then │                     (+ pick::restarts      (pure)                       (API server)   (as is)
+  -A for     │                      for --previous)
+  the hint)  └─► Located::Gone ──► insights::pattern ──► filter-log-events ──► insights::record ──► insights::resolve ──► insights::line
+                                    (pure; refuses        (Container Insights   (pure)              (pure: pod,         ("[cloudwatch …]")
+                                     non-names)            group, paged)                             container, instance)
+```
+
+`exec::find` is `exec::locate` with "no such pod" as an answer rather than
+an error, so `eks exec` and `eks port-forward` keep their messages and
+`eks logs` goes on to CloudWatch. The pattern matches the namespace and the
+start of the pod's name on the server, and every container, so `resolve` can
+apply `eks exec`'s rules (an exact name wins, a prefix must mean one pod) and
+name the containers that are there when the one asked for is not. Fluent
+Bit's stream names start with the node, so they cannot narrow the read.
+`--follow` on a gone pod reuses `Tail` to poll for lines still in transit.
 
 ## Testing
 

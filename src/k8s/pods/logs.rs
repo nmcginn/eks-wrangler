@@ -12,6 +12,8 @@
 
 use kube::api::LogParams;
 
+use crate::aws::logs::Since;
+
 /// How many lines of history to open a log with, before following whatever
 /// is printed after.
 ///
@@ -38,6 +40,37 @@ pub fn params(container: &str, previous: bool) -> LogParams {
         follow: !previous,
         previous,
         tail_lines: Some(TAIL_LINES),
+        ..LogParams::default()
+    }
+}
+
+/// The parameters `eks logs` opens a running container's log with.
+///
+/// Unlike the dashboard's [`params`], no tail: `kubectl logs` prints every
+/// line the kubelet kept, and a command whose output is piped into `grep` or
+/// a file should too. `--since` narrows it instead. `--previous` turns
+/// `follow` off for [`params`]' reason: that instance has stopped.
+#[must_use]
+pub fn command_params(
+    container: &str,
+    previous: bool,
+    follow: bool,
+    since: Option<Since>,
+) -> LogParams {
+    let (since_seconds, since_time) = match since {
+        None => (None, None),
+        Some(Since::Ago(span)) => (
+            Some(i64::try_from(span.as_secs()).unwrap_or(i64::MAX)),
+            None,
+        ),
+        Some(Since::At(at)) => (None, Some(at)),
+    };
+    LogParams {
+        container: Some(container.to_owned()),
+        follow: follow && !previous,
+        previous,
+        since_seconds,
+        since_time,
         ..LogParams::default()
     }
 }
@@ -84,6 +117,43 @@ mod tests {
         assert_eq!(lp.since_seconds, None);
         assert_eq!(lp.limit_bytes, None);
         assert!(!lp.timestamps);
+    }
+
+    #[test]
+    fn the_command_reads_every_line_kept_unless_since_narrows_it() {
+        let lp = command_params("app", false, false, None);
+
+        assert_eq!(lp.container.as_deref(), Some("app"));
+        assert_eq!(lp.tail_lines, None);
+        assert_eq!(lp.since_seconds, None);
+        assert_eq!(lp.since_time, None);
+        assert!(!lp.follow);
+        assert!(!lp.previous);
+    }
+
+    #[test]
+    fn the_command_s_since_is_seconds_or_an_instant() {
+        let ago = command_params(
+            "app",
+            false,
+            true,
+            Some(Since::Ago(std::time::Duration::from_secs(900))),
+        );
+        assert_eq!(ago.since_seconds, Some(900));
+        assert!(ago.follow);
+
+        let at = "2026-10-07T05:00:00Z".parse().unwrap();
+        let instant = command_params("app", false, false, Some(Since::At(at)));
+        assert_eq!(instant.since_time, Some(at));
+        assert_eq!(instant.since_seconds, None);
+    }
+
+    #[test]
+    fn the_command_never_follows_a_previous_instance() {
+        let lp = command_params("app", true, true, None);
+
+        assert!(lp.previous);
+        assert!(!lp.follow);
     }
 
     #[test]

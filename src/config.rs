@@ -1,4 +1,5 @@
-//! The user's config file: colour, refresh interval, and default namespace,
+//! The user's config file: colour, refresh interval, default namespace, and
+//! the CloudWatch group `eks logs` falls back to,
 //! read once at startup and overridden by anything the command line sets.
 //!
 //! Precedence is CLI flag, then config file, then built-in default — the same
@@ -26,6 +27,10 @@ pub struct Config {
     pub theme: Option<ThemeChoice>,
     pub refresh: Option<RefreshInterval>,
     pub namespace: Option<String>,
+    /// The CloudWatch group `eks logs` reads a gone pod's lines from, with
+    /// `{cluster}` for the cluster's name. Unset is Container Insights' own,
+    /// [`crate::aws::insights::DEFAULT_GROUP`].
+    pub log_group: Option<String>,
 }
 
 /// Where the config file lives: `~/.config/eks/config.toml`, following
@@ -123,6 +128,7 @@ struct RawConfig {
     theme: Option<String>,
     refresh: Option<String>,
     namespace: Option<String>,
+    log_group: Option<String>,
 }
 
 impl RawConfig {
@@ -149,12 +155,25 @@ impl RawConfig {
                     .map_err(|error: DurationParseError| format!("refresh {value:?}: {error}"))
             })
             .transpose()?;
+        // CloudWatch group names are 1–512 characters; an empty one is a
+        // mistake to point at, not a group to read.
+        let log_group = match self.log_group {
+            Some(group) if group.trim().is_empty() => {
+                return Err(
+                    "log_group is empty; remove it to read Container Insights' own \
+                            group, or name a CloudWatch log group"
+                        .to_owned(),
+                );
+            }
+            other => other,
+        };
 
         Ok(Config {
             color,
             theme,
             refresh,
             namespace: self.namespace,
+            log_group,
         })
     }
 }
@@ -189,7 +208,8 @@ mod tests {
     #[test]
     fn every_key_parses_through_the_same_grammar_the_flags_use() {
         let (config, warning) = parse(
-            "color = \"always\"\ntheme = \"light\"\nrefresh = \"5s\"\nnamespace = \"payments\"\n",
+            "color = \"always\"\ntheme = \"light\"\nrefresh = \"5s\"\nnamespace = \"payments\"\n\
+             log_group = \"/eks/{cluster}/pods\"\n",
             Path::new("config.toml"),
         );
 
@@ -201,6 +221,16 @@ mod tests {
             Some(RefreshInterval::every(Duration::from_secs(5)))
         );
         assert_eq!(config.namespace.as_deref(), Some("payments"));
+        assert_eq!(config.log_group.as_deref(), Some("/eks/{cluster}/pods"));
+    }
+
+    #[test]
+    fn an_empty_log_group_falls_back_to_defaults_with_a_warning_naming_it() {
+        let (config, warning) = parse("log_group = \" \"\n", Path::new("config.toml"));
+
+        assert_eq!(config, Config::default());
+        let warning = warning.expect("an empty log_group should warn");
+        assert!(warning.to_string().contains("log_group is empty"));
     }
 
     #[test]
@@ -232,6 +262,7 @@ mod tests {
             Some(RefreshInterval::every(Duration::from_secs(60)))
         );
         assert_eq!(config.namespace, None);
+        assert_eq!(config.log_group, None);
     }
 
     #[test]

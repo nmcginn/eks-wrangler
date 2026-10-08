@@ -9,12 +9,14 @@ use std::sync::mpsc;
 
 use anyhow::{Context as _, Result};
 
+pub(crate) mod cloudwatch;
 pub mod completions;
 pub mod contexts;
 pub mod control_plane_logs;
 pub mod credentials;
 pub mod exec;
 pub mod forward;
+pub mod logs;
 pub mod nodes;
 pub mod pods;
 

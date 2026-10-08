@@ -25,8 +25,9 @@
 //! "never open a browser at somebody who is piping this into a file" is a test
 //! rather than a hope.
 //!
-//! Beyond login, `eks control-plane-logs` reads CloudWatch, and does it the
-//! same way: by running the AWS CLI rather than linking an SDK (decision 123).
+//! Beyond login, `eks control-plane-logs` and `eks logs` read CloudWatch, and
+//! do it the same way: by running the AWS CLI rather than linking an SDK
+//! (decision 123).
 //!
 //! - [`cli`] runs one AWS CLI call under `--timeout` and reads its failures.
 //! - [`eks`] works out which cluster, region, and profile a context means, and
@@ -34,11 +35,14 @@
 //! - [`logs`] knows which CloudWatch streams hold which control-plane log, and
 //!   how to page and follow them.
 //! - [`audit`] turns an event into the line that is printed.
+//! - [`insights`] reads Container Insights' application group, where
+//!   `eks logs` finds the lines of a pod that is gone.
 
 pub mod audit;
 pub mod cli;
 pub mod config;
 pub mod eks;
+pub mod insights;
 pub mod login;
 pub mod logs;
 pub mod profile;

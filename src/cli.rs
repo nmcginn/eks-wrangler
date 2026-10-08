@@ -276,6 +276,15 @@ pub enum Command {
     /// exit code.
     Exec(ExecArgs),
 
+    /// Print a container's log, even after its pod is gone.
+    ///
+    /// `eks logs api` finds the pod whose name starts with `api` and prints
+    /// its default container's log, as `kubectl logs` would. When no running
+    /// pod matches (it was deleted, or rescheduled under a new name), eks
+    /// reads the lines Container Insights kept in CloudWatch instead, through
+    /// the AWS CLI, and labels every one of them `[cloudwatch …]`.
+    Logs(LogsArgs),
+
     /// Reach a pod, a service, or a deployment from localhost.
     ///
     /// `eks port-forward svc/api` listens on the service's port on
@@ -346,6 +355,37 @@ pub struct ExecArgs {
     /// The command to run, after `--`. Without one, a shell.
     #[arg(last = true, value_name = "COMMAND")]
     pub command: Vec<String>,
+}
+
+/// `eks logs`' own arguments.
+#[derive(Debug, Clone, clap::Args)]
+pub struct LogsArgs {
+    /// The pod: its full name, or the start of exactly one pod's name in the
+    /// namespace. A pod that is gone is looked for in CloudWatch by the same
+    /// rule.
+    pub pod: String,
+
+    /// The container. Defaults to the one the pod's
+    /// `kubectl.kubernetes.io/default-container` annotation names, then to
+    /// its only container. `-C` rather than `kubectl`'s `-c`, which is
+    /// `--context` everywhere in eks.
+    #[arg(long, short = 'C', value_name = "NAME")]
+    pub container: Option<String>,
+
+    /// The log of the container's previous instance: the one that crashed
+    /// before the restart.
+    #[arg(long, short = 'p')]
+    pub previous: bool,
+
+    /// Only lines from this far back: a length of time (`30s`, `15m`, `2h`,
+    /// `3d`) or an RFC 3339 instant. A running pod's log is read whole
+    /// without it; CloudWatch is read for the last hour.
+    #[arg(long, value_name = "WHEN")]
+    pub since: Option<Since>,
+
+    /// Keep printing new lines as they are written, until Ctrl-C.
+    #[arg(long, short = 'f')]
+    pub follow: bool,
 }
 
 /// `eks port-forward`'s own arguments.
@@ -453,6 +493,47 @@ mod tests {
 
         let long = exec_args(&["eks", "exec", "api", "--container", "app"]);
         assert_eq!(long.container.as_deref(), Some("app"));
+    }
+
+    fn logs_args(args: &[&str]) -> LogsArgs {
+        match parse(args).command {
+            Some(Command::Logs(args)) => args,
+            other => panic!("expected logs, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn logs_takes_a_pod_and_reads_everything_by_default() {
+        let args = logs_args(&["eks", "logs", "api"]);
+        assert_eq!(args.pod, "api");
+        assert_eq!(args.container, None);
+        assert!(!args.previous);
+        assert_eq!(args.since, None);
+        assert!(!args.follow);
+    }
+
+    #[test]
+    fn logs_takes_kubectl_s_short_flags_but_capital_c_for_the_container() {
+        let cli = parse(&[
+            "eks", "logs", "api", "-C", "app", "-p", "-f", "--since", "15m", "-c", "prod",
+        ]);
+        assert_eq!(cli.global.context.as_deref(), Some("prod"));
+        let Some(Command::Logs(args)) = cli.command else {
+            panic!("expected logs");
+        };
+        assert_eq!(args.container.as_deref(), Some("app"));
+        assert!(args.previous);
+        assert!(args.follow);
+        assert_eq!(
+            args.since,
+            Some(Since::Ago(std::time::Duration::from_secs(900)))
+        );
+    }
+
+    #[test]
+    fn logs_refuses_a_since_it_cannot_read_and_a_missing_pod() {
+        assert!(Cli::try_parse_from(["eks", "logs", "api", "--since", "soon"]).is_err());
+        assert!(Cli::try_parse_from(["eks", "logs"]).is_err());
     }
 
     fn port_forward_args(args: &[&str]) -> PortForwardArgs {
