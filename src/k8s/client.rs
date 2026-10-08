@@ -1566,8 +1566,8 @@ users:
 
     #[test]
     fn a_helper_that_works_at_the_prompt_but_not_here_is_sent_to_find_out_why() {
-        // The report this was written for: `aws` answered in the user's zsh,
-        // and the dashboard said it was not on their PATH.
+        // `aws` is on no directory of the PATH eks has, and may still be
+        // something the user's shell can run: an alias, a function.
         let error = helper_error(exec::Error::Start {
             command: "AWS_PROFILE=prod aws eks get-token --cluster-name prod".to_owned(),
             why: launch::NotStarted::NotOnPath {
@@ -1612,6 +1612,30 @@ users:
             "{message}"
         );
         assert!(!message.contains("``"), "{message}");
+    }
+
+    #[test]
+    fn a_helper_the_system_refuses_to_run_is_reported_in_the_systems_words() {
+        // The report this was written for: `aws` was on PATH, built for a CPU
+        // the Mac could no longer run, and the dashboard said it was not on
+        // the PATH. Only a start that found nothing may say that.
+        let error = helper_error(exec::Error::Start {
+            command: "aws eks get-token --cluster-name prod".to_owned(),
+            why: launch::NotStarted::Other {
+                program: "aws".to_owned(),
+                reason: "Bad CPU type in executable (os error 86)".to_owned(),
+            },
+        });
+
+        let message = explain(&error, "prod (us-east-1)");
+
+        assert!(
+            message
+                .contains("could not be started: `aws`: Bad CPU type in executable (os error 86)."),
+            "{message}"
+        );
+        assert!(!message.contains("PATH"), "{message}");
+        assert!(message.contains("Run `aws` yourself"), "{message}");
     }
 
     #[test]

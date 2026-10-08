@@ -663,6 +663,24 @@ mod tests {
         assert_eq!(why.to_string(), "`aws`: Exec format error (os error 8)");
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn a_binary_built_for_another_cpu_is_not_looked_up_on_path() {
+        // `ENOEXEC`, which is what Linux says for the wrong architecture. macOS
+        // says `EBADARCH` instead. Either way the program was found, so the
+        // lookup is not repeated and nothing blames PATH.
+        let why = diagnose(
+            "aws",
+            &io::Error::from_raw_os_error(8),
+            Some(OsStr::new("/usr/bin")),
+            None,
+            |_: &Path| panic!("a start that found its program needs no lookup"),
+        );
+
+        assert!(matches!(why, NotStarted::Other { .. }), "{why:?}");
+        assert!(why.to_string().contains("Exec format error"), "{why}");
+    }
+
     #[test]
     fn a_failure_with_no_program_to_name_is_just_the_reason() {
         let why = NotStarted::Other {

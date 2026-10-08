@@ -1264,8 +1264,10 @@ toolchain that builds and the pin is never downloaded there.
 ### 132. A program that will not start is diagnosed, not guessed at
 
 A credential helper that failed to start was reported as "not on your PATH",
-without the command or the system's reason, so a user whose `aws` worked at
-their prompt was told to install it. The same guess was made by `aws sso
+without the command or the system's reason. In the report that prompted this,
+`aws` was on PATH but was an x86_64 build on an Apple Silicon Mac that no
+longer had Rosetta. macOS refused it with "Bad CPU type in executable", and
+eks told the user that `aws` was missing. The same guess was made by `aws sso
 login` and by the CloudWatch calls. All three now pass the failed start to
 `launch::explain`. It repeats `execvp`'s lookup and names the real cause: a
 bare name on no `PATH` directory (counted), no `PATH` at all, a `PATH` entry
