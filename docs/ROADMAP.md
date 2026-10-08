@@ -27,21 +27,13 @@ names of things.
 
 ### Milestone 7 — CloudWatch
 
-- [ ] **`eks logs`, with a CloudWatch fallback for pods that are gone.**
-  `kubectl logs` cannot show a pod that has been deleted or rescheduled,
-  which is exactly the pod being troubleshot. `eks logs <pod> [-c]
-  [--previous] [--since] [--follow]` reads from the API while the pod exists
-  and falls back to the Container Insights / Fluent Bit group
-  (`/aws/containerinsights/<cluster>/application`, overridable in
-  `config.toml`) when it does not.
-  *Acceptance:* pod and container resolution reuse `eks exec`'s rules. A
-  prefix that matches no live pod is looked up in CloudWatch by
-  `kubernetes.pod_name`. Every line from CloudWatch is labelled as such, so a
-  reader always knows which source they are looking at. No log group at all
-  gets a message saying Container Insights is not set up, with a pointer to
-  how to install it. CloudWatch is reached through the AWS CLI, as in the
-  previous task (decision 123). Record parsing and the source decision are
-  pure functions over fixtures.
+- [ ] **`--json` for `eks logs`.** JSON Lines as `control-plane-logs --json`
+  prints them: `source` (`api` or `cloudwatch`), `namespace`, `pod`,
+  `container`, `stream`, and `log`. *Open question for the reviewer:* an API
+  line has no time unless the log is opened with `timestamps=true`, which
+  makes the kubelet prefix each line; either every JSON line carries a time
+  (and the API path asks for timestamps and strips them) or API lines carry
+  `null`. Decided, it is one PR.
 
 - [ ] **Control-plane logs in the dashboard.** A cluster-level pane, opened
   from the sidebar, that shows the CLI's control-plane log view with the
@@ -167,6 +159,7 @@ names of things.
 ### Milestone 7 — CloudWatch
 
 - [x] `eks control-plane-logs`: five types, `--since`, `--grep`, `--follow`, `--json`, audit as one line per request. (123, 129)
+- [x] `eks logs`: the API server while the pod runs, Container Insights once it is gone, every CloudWatch line labelled. (131)
 
 ---
 

@@ -19,22 +19,22 @@
 //! Every `aws` run is a child `--timeout` kills, and a refusal for expired
 //! credentials is offered a login once and tried again.
 
-use std::io::{self, Write};
+use std::io::Write;
 use std::path::PathBuf;
 use std::time::Instant;
 
 use anyhow::{Context as _, Result, bail};
 use k8s_openapi::jiff::Timestamp;
 
-use crate::aws::cli::{self, Call, Failure};
 use crate::aws::eks::{self, Target};
 use crate::aws::logs::{self, Event, LogType, Query, Scope, Selection, Since, Tail};
 use crate::aws::{LoginMode, audit};
+use crate::commands::cloudwatch::{self, Aws, passing, quiet_on_closed_pipe};
 use crate::commands::credentials::AwsLogin;
 use crate::commands::nodes::target_cluster;
 use crate::json::Output;
 use crate::k8s::client;
-use crate::k8s::page::{self, Budget};
+use crate::k8s::page::Budget;
 use crate::kubeconfig::KubeConfig;
 use crate::progress::Progress;
 use crate::theme::Palette;
@@ -242,13 +242,6 @@ async fn follow(
     }
 }
 
-/// Whether a failed poll is worth trying again.
-fn passing(error: &anyhow::Error) -> bool {
-    error
-        .downcast_ref::<Explained>()
-        .is_some_and(|explained| explained.failure.passes())
-}
-
 fn read_streams(reply: &[u8]) -> Result<Vec<logs::Stream>> {
     logs::streams(reply).context("could not read `aws logs describe-log-streams`' reply")
 }
@@ -272,129 +265,19 @@ async fn read_window(
         start,
         grep: reader.grep,
     };
-    let mut events = Vec::new();
-    let mut read = 0;
-    let mut token: Option<String> = None;
-    let mut step = progress.reading(reader.kind.noun());
-    loop {
-        let call = logs::filter_events(aws.target, &query, token.as_deref());
-        let reply = match step.tick(aws.attempt(&[&call])).await {
-            Ok(mut replies) => replies.pop().unwrap_or_default(),
-            Err(refusal) => {
-                // As in `open`: the line comes off before a login is offered,
-                // and goes back up with the count it had.
-                drop(step);
-                aws.recover(refusal).await?;
-                step = progress.reading(reader.kind.noun());
-                step.advance(read);
-                continue;
-            }
-        };
-        let page =
-            logs::page(&reply).context("could not read `aws logs filter-log-events`' reply")?;
-        read += page.events.len();
-        step.advance(page.events.len());
-        events.extend(
-            page.events
-                .into_iter()
-                .filter(|event| logs::matches(&event.message, reader.grep)),
-        );
-        match page::next(token.as_deref(), page.next.as_deref()) {
-            page::Next::Page(next) => token = Some(next),
-            page::Next::Done => return Ok(events),
-            page::Next::Stalled => {
-                reader.note(
-                    "CloudWatch handed back the paging token it was given, so eks stopped \
-                     reading there; the events above may be incomplete.",
-                );
-                return Ok(events);
-            }
-        }
+    let target = aws.target;
+    let pages = cloudwatch::read_pages(
+        aws,
+        progress,
+        reader.kind.noun(),
+        |token| logs::filter_events(target, &query, token),
+        |event| logs::matches(&event.message, reader.grep),
+    )
+    .await?;
+    if pages.stalled {
+        reader.note(cloudwatch::STALLED);
     }
-}
-
-/// The AWS CLI, as this command runs it: under the budget, and with one
-/// login offered when the credentials turn out to have expired.
-///
-/// Split in two so the offer is made with nothing else on the screen:
-/// [`Aws::attempt`] runs calls and hands back a [`Refusal`] untouched, and
-/// [`Aws::recover`] — called once the caller has taken its progress line down
-/// — offers the login or explains. A loop around the pair ends, because the
-/// login is offered at most once per command.
-struct Aws<'a> {
-    target: &'a Target,
-    login: AwsLogin,
-    budget: Budget,
-}
-
-/// A call that failed, not yet explained.
-struct Refusal {
-    call: Call,
-    error: cli::Error,
-}
-
-/// A failed call, explained: the sentence, and what it was, so `--follow` can
-/// tell a failure that passes from one that does not.
-#[derive(Debug, thiserror::Error)]
-#[error("{message}")]
-struct Explained {
-    message: String,
-    failure: Failure,
-}
-
-impl Aws<'_> {
-    /// One call, with the login offer taken if it is needed. For a call with
-    /// no progress line to take down.
-    async fn run(&mut self, call: &Call) -> Result<Vec<u8>> {
-        loop {
-            match self.attempt(&[call]).await {
-                Ok(mut replies) => return Ok(replies.pop().unwrap_or_default()),
-                Err(refusal) => self.recover(refusal).await?,
-            }
-        }
-    }
-
-    /// Several calls at once, replies in order. Any one failing fails all.
-    async fn attempt(&self, calls: &[&Call]) -> Result<Vec<Vec<u8>>, Refusal> {
-        let outcomes =
-            futures_util::future::join_all(calls.iter().map(|call| cli::run(call, self.budget)))
-                .await;
-        let mut replies = Vec::with_capacity(calls.len());
-        for (call, outcome) in calls.iter().zip(outcomes) {
-            match outcome {
-                Ok(reply) => replies.push(reply),
-                Err(error) => {
-                    return Err(Refusal {
-                        call: (*call).clone(),
-                        error,
-                    });
-                }
-            }
-        }
-        Ok(replies)
-    }
-
-    /// After a refusal: `Ok` when a login ran and the calls are worth making
-    /// again, the explanation otherwise.
-    async fn recover(&mut self, refusal: Refusal) -> Result<()> {
-        let Refusal { call, error } = refusal;
-        let failure = Failure::of(&error, call.action);
-        if failure.fixed_by_signing_in() && self.login.after_refusal()? {
-            return Ok(());
-        }
-        // A usage error is the one failure worth a second process: the
-        // CLI's version says whether it is simply too old.
-        let found = match failure {
-            Failure::Usage { .. } => cli::version(&self.target.program, self.budget).await,
-            _ => None,
-        };
-        tracing::debug!(%error, "AWS CLI call failed");
-        Err(Explained {
-            message: failure.explain(&call, self.login.profile(), found.as_deref()),
-            failure,
-        }
-        .into())
-    }
+    Ok(pages.events)
 }
 
 /// Printing, and what is printed.
@@ -448,13 +331,5 @@ impl Reader<'_, '_> {
             ));
         }
         Scope::Named(names)
-    }
-}
-
-fn quiet_on_closed_pipe(error: io::Error) -> Result<bool> {
-    if error.kind() == io::ErrorKind::BrokenPipe {
-        Ok(false)
-    } else {
-        Err(anyhow::Error::new(error).context("could not write the events"))
     }
 }

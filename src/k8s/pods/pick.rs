@@ -10,8 +10,8 @@
 //! one, a prefix shared by two pods, a pod with three containers and no
 //! default. The wording lives beside the rules for the same reason the table
 //! renderers live beside their rows — the sentence and the decision change
-//! together. `eks logs` will resolve its pod and container by these same
-//! rules, so they are kept apart from `eks exec`'s own session handling.
+//! together. `eks logs` resolves its pod and container by these same rules,
+//! so they are kept apart from `eks exec`'s own session handling.
 
 use k8s_openapi::api::core::v1::{ContainerStatus, Pod};
 use k8s_openapi::jiff::Timestamp;
@@ -331,6 +331,16 @@ fn container_status<'a>(pod: &'a Pod, container: &str) -> Option<&'a ContainerSt
         .flatten()
         .chain(status.ephemeral_container_statuses.iter().flatten())
         .find(|status| status.name == container)
+}
+
+/// How many times `container` has restarted, when the pod's status says.
+///
+/// `eks logs --previous` asks before reading: a container that has never
+/// restarted has no previous log, and the kubelet's own answer to that is a
+/// bare `previous terminated container not found`.
+#[must_use]
+pub fn restarts(pod: &Pod, container: &str) -> Option<i32> {
+    container_status(pod, container).map(|status| status.restart_count)
 }
 
 /// A pod's name, or nothing for the nameless pod a fixture might build.
@@ -760,5 +770,21 @@ mod tests {
             status.container_statuses = None;
         }
         assert_eq!(running(&pod, "app", now()), Ok(()));
+    }
+
+    #[test]
+    fn restarts_are_read_from_the_container_s_status_and_absent_without_one() {
+        let mut pod = pod("p", &["app", "sidecar"]);
+        if let Some(status) = pod.status.as_mut()
+            && let Some(statuses) = status.container_statuses.as_mut()
+        {
+            statuses[1].restart_count = 3;
+        }
+        assert_eq!(restarts(&pod, "app"), Some(0));
+        assert_eq!(restarts(&pod, "sidecar"), Some(3));
+        assert_eq!(restarts(&pod, "missing"), None);
+
+        pod.status = None;
+        assert_eq!(restarts(&pod, "sidecar"), None);
     }
 }

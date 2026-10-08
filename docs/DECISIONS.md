@@ -1218,3 +1218,45 @@ new lints are fixed in that PR and not in an unrelated nightly PR. The MSRV job
 is unaffected because `scripts/msrv.sh` runs `cargo +<rust-version>`. That job
 also exports the MSRV as `RUSTUP_TOOLCHAIN`, so rust-cache keys on the
 toolchain that builds and the pin is never downloaded there.
+
+### 131. `eks logs`: the cluster while the pod runs, Container Insights once it is gone, every CloudWatch line labelled
+
+- **Two sources, chosen by the cluster.** `exec::find` (`locate`'s search,
+  with "no such pod" as an answer) decides. A running pod is read from the
+  API server only, as `kubectl logs` reads it; CloudWatch is asked only when
+  no running pod in the namespace starts with the name. A prefix that matches
+  several running pods is still `pick::ambiguous`'s error.
+- **`-C` for the container**, not the roadmap's `-c`, for decision 124's
+  reason; `-c` that does not resolve as a context gets the same hint.
+- **The read.** `filter-log-events` on `/aws/containerinsights/<cluster>/application`
+  (`log_group` in `config.toml`, `{cluster}` filled in), with a JSON pattern
+  on `kubernetes.namespace_name` and `kubernetes.pod_name = "<prefix>*"`.
+  Every container is read, so a wrong `-C` can be answered with the right
+  ones. Text that is not `[a-z0-9.-]` is refused before any call, so nothing
+  typed is ever escaped into a pattern. Stream names cannot narrow it: Fluent
+  Bit puts the node first.
+- **Resolution** is `exec`'s where CloudWatch can follow it: an exact name
+  wins, a prefix of several gone pods lists them with when each last spoke.
+  CloudWatch keeps no pod spec, so the default-container annotation is
+  unreadable; several containers and no `-C` is a question, not a guess.
+- **`--previous`.** On a running pod, a container whose `restartCount` is 0
+  is refused before asking. In CloudWatch it is the instance (`docker_id`)
+  before the last one the window holds. With `--follow` it is noted on stderr
+  and the follow dropped, on both paths: that instance has stopped.
+- **`--since`.** Unset reads every line the kubelet kept (no tail, unlike the
+  dashboard's 200) and the last hour of CloudWatch, which the note on stderr
+  says, with the `--since` that reaches further.
+- **Labels.** Each CloudWatch line is `[cloudwatch <time>] <line>`, with
+  `stderr` in the label for that stream, the label in the muted ink. API lines
+  are printed as they are, so a pipe gets what `kubectl logs` would give it.
+- **No group** (`ResourceNotFoundException`) says Container Insights is not
+  set up and prints the `aws eks create-addon … amazon-cloudwatch-observability`
+  command; eks never runs it. A missing group named by `log_group` points at
+  the config instead.
+- **Selectors** narrow the running pods only: Container Insights' default
+  Fluent Bit config drops labels. A search that found nothing says so when
+  `-l` or `--field-selector` was given.
+- **Shared AWS handling.** `commands::cloudwatch` holds `Aws`, the login
+  retry, and paging for both CloudWatch commands.
+- **No `--json` yet.** Whether an API line gets a time (it has none unless
+  `timestamps=true` is asked for) is the reviewer's call.

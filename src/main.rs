@@ -13,9 +13,11 @@ use ratatui::crossterm::terminal;
 use tracing_subscriber::EnvFilter;
 
 use eks::aws::LoginMode;
-use eks::cli::{Cli, Command, ControlPlaneLogsArgs, ExecArgs, GlobalArgs, PortForwardArgs};
+use eks::cli::{
+    Cli, Command, ControlPlaneLogsArgs, ExecArgs, GlobalArgs, LogsArgs, PortForwardArgs,
+};
 use eks::commands::{
-    self, completions, contexts, control_plane_logs, credentials, exec, forward, nodes, pods,
+    self, completions, contexts, control_plane_logs, credentials, exec, forward, logs, nodes, pods,
 };
 use eks::config::{self, Config};
 use eks::format::Width;
@@ -34,7 +36,8 @@ use eks::ui::{self, App, RefreshInterval};
 /// What a listing exits with when the user's own Ctrl-C ended it, rather than
 /// the process finishing on its own — the conventional 128 + `SIGINT`'s number,
 /// the same code a shell reports for a foreground job the terminal itself
-/// killed. Only `eks nodes`, `eks pods`, and `eks exec` can produce this: see
+/// killed. Only the listings, `eks exec`, and the log commands without
+/// `--follow` can produce this: see
 /// [`commands::block_on_interruptible`].
 fn interrupted() -> ExitCode {
     ExitCode::from(130)
@@ -130,6 +133,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
             Layout { wide, json },
         ),
         Command::Exec(args) => run_exec(&config, &paths, &cli.global, &user_config, &args),
+        Command::Logs(args) => run_logs(&config, &paths, &cli.global, &user_config, &args),
         Command::PortForward(args) => {
             run_port_forward(&config, &paths, &cli.global, &user_config, &args)
         }
@@ -378,6 +382,51 @@ fn run_control_plane_logs(
         notes: &mut notes,
     };
     match commands::block_on_interruptible(control_plane_logs::run(
+        config,
+        paths,
+        global.context.as_deref(),
+        request,
+        sinks,
+    ))? {
+        commands::Interruptible::Finished(()) => Ok(ExitCode::SUCCESS),
+        commands::Interruptible::Interrupted if args.follow => Ok(ExitCode::SUCCESS),
+        commands::Interruptible::Interrupted => Ok(interrupted()),
+    }
+}
+
+/// `eks logs`. Ctrl-C ends `--follow` with success, as it ends
+/// `control-plane-logs --follow`; without it, it exits 130.
+fn run_logs(
+    config: &KubeConfig,
+    paths: &[PathBuf],
+    global: &GlobalArgs,
+    user_config: &Config,
+    args: &LogsArgs,
+) -> Result<ExitCode> {
+    let color = global.effective_color(user_config);
+    let request = logs::Request {
+        pod: &args.pod,
+        container: args.container.as_deref(),
+        previous: args.previous,
+        since: args.since,
+        follow: args.follow,
+        namespace: global.effective_namespace(user_config),
+        label_selector: global.selector.as_deref(),
+        field_selector: global.field_selector.as_deref(),
+        log_group: user_config.log_group.as_deref(),
+        palette: stdout_palette(color, resolved_theme(global, user_config)),
+        budget: global.timeout,
+        login: global.login,
+        progress: stderr_progress(global, color),
+    };
+    let stdout = std::io::stdout();
+    let mut out = stdout.lock();
+    let mut notes = std::io::stderr();
+    let sinks = logs::Sinks {
+        out: &mut out,
+        notes: &mut notes,
+    };
+    match commands::block_on_interruptible(logs::run(
         config,
         paths,
         global.context.as_deref(),
