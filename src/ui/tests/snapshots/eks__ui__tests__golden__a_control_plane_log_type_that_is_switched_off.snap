@@ -1,0 +1,28 @@
+---
+source: src/ui/tests/golden.rs
+expression: "text(&frame(&control_plane_off(), WIDTH, HEIGHT))"
+---
+ eks │ beta (us-east-1)
+┌ Clusters ────────────────────┐┌ Control plane › scheduler ───────────────────────────────────────┐
+│  alpha us-east-1             ││Context   arn:aws:eks:us-east-1:1234:cluster/beta                 │
+│● beta us-east-1              ││Namespace default                                                 │
+│  gamma us-east-1             ││Region    us-east-1                                               │
+│                              ││Account   1234                                                    │
+│                              ││                                                                  │
+│                              ││api │ audit │ authenticator │ controller-manager │ scheduler      │
+│                              ││beta (us-east-1) does not send its scheduler log to CloudWatch.   │
+│                              ││Switched on now: api and audit (press t to change type).          │
+│                              ││EKS only writes the types someone has switched on, and eks never  │
+│                              ││switches one on for you: CloudWatch charges for every gigabyte it │
+│                              ││ingests and stores.                                               │
+│                              ││To switch it on (only events from then on are recorded):          │
+│                              ││  aws eks update-cluster-config --name beta --region us-east-1    │
+│                              ││--logging                                                         │
+│                              ││'{"clusterLogging":[{"types":["scheduler"],"enabled":true}]}'     │
+│                              ││Once it is on, press r to look again.                             │
+│                              ││                                                                  │
+│                              ││                                                                  │
+│                              ││                                                                  │
+│                              ││                                                                  │
+└──────────────────────────────┘└──────────────────────────────────────────────────────────────────┘
+ j/k scroll   r read again   t/T type   f follow   w wrap   ←/esc back   q quit   / search

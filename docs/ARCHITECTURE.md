@@ -636,6 +636,22 @@ The AWS CLI handling both CloudWatch commands share (`Aws`, the login retry,
 `commands::cloudwatch`, so the two cannot drift apart in how they treat a
 refusal.
 
+The dashboard's `C` reads through the same steps (decision 133):
+
+```
+App::on_key ──► View::ControlPlaneLogs ──► control_plane_logs::spawn_dashboard ──► Update ──► LogsState::apply_update
+ (C, t/T, r)      (event loop sees the       (describe, read_events, Tail;         (Read, Retrying,    (the container log's
+                   view change)               then a poll every 5 s)                Off, Failed)        buffer, drawn by logs::draw)
+```
+
+`describe` and `read_events` are shared with the command. Only what happens
+around them differs: the login offer is `LoginMode::Never`, a failure that
+passes is waited out from the first call, and each read is sent to the pane
+instead of printed. `aws::cli::Surface` changes only the wording of advice:
+a key in the pane, a flag on the command line. The event loop holds the
+read's `StreamHandle` in the slot a container log uses, because the two
+never share a screen, and dropping it is what stops the read.
+
 ## Container logs: `eks logs`
 
 Two sources, decided by whether the cluster still has the pod:

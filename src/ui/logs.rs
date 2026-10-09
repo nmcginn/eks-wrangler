@@ -1,11 +1,14 @@
-//! The container-logs pane: one container's log, followed live.
+//! The two log panes: one container's log, followed live, and one of the
+//! cluster's control-plane logs, read from CloudWatch and polled.
 //!
-//! Fetching streams over [`crate::commands::pods::spawn_stream_logs`]; this
-//! module only reduces the [`LogEvent`]s it delivers into what to draw, the
-//! same split [`super::containers`] and its siblings keep between delivery
-//! and rendering. Unlike those panes, there is no listing to hold — a log
-//! has no natural end, so what accumulates here is a bounded scrollback
-//! buffer rather than a `Vec` of finished rows.
+//! Fetching streams over [`crate::commands::pods::spawn_stream_logs`] and
+//! [`crate::commands::control_plane_logs::spawn_dashboard`]; this module only
+//! reduces the [`LogEvent`]s and [`Update`]s they deliver into what to draw,
+//! the same split [`super::containers`] and its siblings keep between
+//! delivery and rendering. Unlike those panes, there is no listing to hold —
+//! a log has no natural end, so what accumulates here is a bounded scrollback
+//! buffer rather than a `Vec` of finished rows. Both panes share it, and with
+//! it scrolling, follow, wrap, and `/` (decision 133).
 
 use std::collections::VecDeque;
 
@@ -15,6 +18,9 @@ use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Wrap};
 
+use crate::aws::audit;
+use crate::aws::logs::{LogType, Since};
+use crate::commands::control_plane_logs::Update;
 use crate::k8s::pods::LogEvent;
 use crate::theme::{Severity, Theme};
 
@@ -49,8 +55,13 @@ pub enum LogsState {
     /// before starting a fetch that could only ever answer "not found."
     /// Distinct from [`Self::Error`], which is a connection that was
     /// attempted and failed: this is not a failure, so it is worded and
-    /// coloured as information rather than as one.
+    /// coloured as information rather than as one. The control-plane pane
+    /// uses it for a log type the cluster does not send to CloudWatch.
     Unavailable(String),
+    /// Still loading, and the last attempt failed for a reason that passes
+    /// (throttling, the network, a timeout); the stream tries again by
+    /// itself. Only the control-plane pane reaches this.
+    Retrying(String),
 }
 
 impl LogsState {
@@ -70,7 +81,7 @@ impl LogsState {
         };
         match event {
             LogEvent::Line(line) => {
-                if matches!(self, Self::Loading) {
+                if matches!(self, Self::Loading | Self::Retrying(_)) {
                     *self = Self::Streaming(Log::default());
                 }
                 if let Self::Streaming(log) = self {
@@ -81,8 +92,10 @@ impl LogsState {
                 (Self::Streaming(log), reason) => {
                     log.status = reason.map_or(Status::Finished, Status::Failed);
                 }
-                (Self::Loading, Some(message)) => *self = Self::Error(message),
-                (Self::Loading, None) => {
+                (Self::Loading | Self::Retrying(_), Some(message)) => {
+                    *self = Self::Error(message);
+                }
+                (Self::Loading | Self::Retrying(_), None) => {
                     *self = Self::Streaming(Log {
                         status: Status::Finished,
                         ..Log::default()
@@ -100,6 +113,52 @@ impl LogsState {
                 (Self::Error(_) | Self::Unavailable(_), _) => {}
             },
             LogEvent::Refused(_) => {}
+        }
+    }
+
+    /// Feed one update from the control-plane stream into what this pane
+    /// already knows. [`Self::apply`]'s counterpart: a read, even an empty
+    /// one, ends the loading; a failure keeps any lines already shown.
+    pub fn apply_update(&mut self, update: Update) {
+        match update {
+            Update::Read { lines, note } => {
+                if matches!(self, Self::Loading | Self::Retrying(_)) {
+                    *self = Self::Streaming(Log::default());
+                }
+                if let Self::Streaming(log) = self {
+                    for line in lines {
+                        log.push(line);
+                    }
+                    log.note = note;
+                    log.retrying = None;
+                }
+            }
+            Update::Retrying(message) => match self {
+                Self::Loading | Self::Retrying(_) => *self = Self::Retrying(message),
+                Self::Streaming(log) => log.retrying = Some(message),
+                Self::Error(_) | Self::Unavailable(_) => {}
+            },
+            Update::Off(advice) => *self = Self::Unavailable(advice),
+            Update::Failed(error) => match self {
+                Self::Streaming(log) => {
+                    log.retrying = None;
+                    log.status = Status::Failed(error.message);
+                }
+                Self::Loading | Self::Retrying(_) => *self = Self::Error(error.message),
+                Self::Error(_) | Self::Unavailable(_) => {}
+            },
+        }
+    }
+
+    /// Whether the stream has stopped without the log it was asked for:
+    /// it never opened, it broke partway, or there was nothing to open.
+    /// What `r` in the control-plane pane, and a login, start again.
+    #[must_use]
+    pub(super) fn has_stopped_short(&self) -> bool {
+        match self {
+            Self::Error(_) | Self::Unavailable(_) => true,
+            Self::Streaming(log) => matches!(log.status, Status::Failed(_)),
+            Self::Loading | Self::Retrying(_) => false,
         }
     }
 
@@ -248,6 +307,12 @@ pub struct Log {
     wrap: bool,
     status: Status,
     search: LogSearch,
+    /// What the stream says about the lines as a whole, such as streams it
+    /// left out of the read. Replaced by every read.
+    note: Option<String>,
+    /// Why the last read failed, while the stream waits to try again.
+    /// Cleared by the next read that works.
+    retrying: Option<String>,
 }
 
 impl Default for Log {
@@ -259,6 +324,8 @@ impl Default for Log {
             wrap: false,
             status: Status::Live,
             search: LogSearch::Inactive,
+            note: None,
+            retrying: None,
         }
     }
 }
@@ -480,39 +547,115 @@ impl Log {
     }
 }
 
-/// Draw whatever the container-logs pane currently knows. `previous` is
-/// [`super::View::ContainerLogs`]'s own flag, threaded down here rather than
-/// read off `state` — a loading connection and an unavailable one both need
-/// to say which log they are (or were) asking for, and neither carries a
-/// [`Log`] of its own to hold it.
-pub(super) fn draw(frame: &mut Frame, area: Rect, state: &LogsState, previous: bool, theme: Theme) {
-    let lines = match state {
-        LogsState::Loading if previous => {
-            vec![Line::styled("Loading previous logs…", theme.dim())]
-        }
-        LogsState::Loading => vec![Line::styled("Loading logs…", theme.dim())],
-        LogsState::Unavailable(message) => vec![Line::styled(message.clone(), theme.dim())],
-        LogsState::Error(message) => vec![Line::styled(
-            message.clone(),
-            theme.severity(Severity::Critical),
-        )],
-        LogsState::Streaming(log) => log_lines(log, previous, area, theme),
+/// Which log a pane is showing: what its heading and its empty and loading
+/// lines say.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Pane {
+    /// A container's log. `previous` is [`super::View::ContainerLogs`]'s own
+    /// flag: a loading connection and an unavailable one both need to say
+    /// which log they are (or were) asking for, and neither carries a
+    /// [`Log`] of its own to hold it.
+    Container { previous: bool },
+    /// One of the cluster's control-plane logs, read from the last
+    /// [`Since::default`] on.
+    ControlPlane(LogType),
+}
+
+/// Draw whatever a log pane currently knows.
+pub(super) fn draw(frame: &mut Frame, area: Rect, state: &LogsState, pane: Pane, theme: Theme) {
+    let mut lines = match pane {
+        Pane::ControlPlane(kind) => types(kind, usize::from(area.width), theme),
+        Pane::Container { .. } => Vec::new(),
     };
+    let rows = usize::from(area.height).saturating_sub(lines.len());
+    match state {
+        LogsState::Loading => lines.push(Line::styled(loading(pane), theme.dim())),
+        LogsState::Retrying(message) => {
+            lines.push(Line::styled(loading(pane), theme.dim()));
+            lines.extend(sentences(message, theme.severity(Severity::Warn)));
+        }
+        LogsState::Unavailable(message) => lines.extend(sentences(message, theme.dim())),
+        LogsState::Error(message) => {
+            lines.extend(sentences(message, theme.severity(Severity::Critical)));
+        }
+        LogsState::Streaming(log) => lines.extend(log_lines(log, pane, rows, theme)),
+    }
 
     let mut paragraph = Paragraph::new(lines);
-    if matches!(state, LogsState::Streaming(log) if log.wrap()) {
+    // A message wraps whatever `w` says: unlike a log line, it is no use
+    // read only up to the pane's edge.
+    if !matches!(state, LogsState::Streaming(log) if !log.wrap()) {
         paragraph = paragraph.wrap(Wrap { trim: false });
     }
     frame.render_widget(paragraph, area);
 }
 
-fn log_lines(log: &Log, previous: bool, area: Rect, theme: Theme) -> Vec<Line<'_>> {
-    let mut lines = vec![heading(log, previous, theme)];
+/// The control-plane pane's type bar: every type, the one showing marked,
+/// so `t` says where it goes before it is pressed. Wrapped between types
+/// onto as many lines as `width` needs, so a narrow pane never clips the
+/// marked one off its edge.
+fn types(current: LogType, width: usize, theme: Theme) -> Vec<Line<'static>> {
+    const GAP: &str = " │ ";
+    let mut lines = Vec::new();
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut used = 0;
+    for kind in LogType::ALL {
+        let name = kind.flag();
+        if !spans.is_empty() && used + GAP.chars().count() + name.len() > width {
+            lines.push(Line::from(std::mem::take(&mut spans)));
+            used = 0;
+        }
+        if !spans.is_empty() {
+            spans.push(Span::styled(GAP, theme.dim()));
+            used += GAP.chars().count();
+        }
+        let style = if kind == current {
+            theme.selected()
+        } else {
+            theme.dim()
+        };
+        spans.push(Span::styled(name, style));
+        used += name.len();
+    }
+    lines.push(Line::from(spans));
+    lines
+}
+
+/// What a pane says before its first line arrives.
+fn loading(pane: Pane) -> String {
+    match pane {
+        Pane::Container { previous: true } => "Loading previous logs…".to_owned(),
+        Pane::Container { previous: false } => "Loading logs…".to_owned(),
+        Pane::ControlPlane(kind) => format!(
+            "Reading {} {} from CloudWatch…",
+            kind.noun(),
+            Since::default().phrase()
+        ),
+    }
+}
+
+/// A message of several sentences as screen lines, one per line of it.
+fn sentences(message: &str, style: ratatui::style::Style) -> Vec<Line<'static>> {
+    message
+        .lines()
+        .map(|line| Line::styled(line.to_owned(), style))
+        .collect()
+}
+
+/// The pane's lines for a log that has started, in `height` screen rows.
+fn log_lines(log: &Log, pane: Pane, height: usize, theme: Theme) -> Vec<Line<'_>> {
+    let mut lines = vec![heading(log, pane, theme)];
     if let Status::Failed(message) = log.status() {
-        lines.push(Line::styled(
-            format!("Stream ended: {message}"),
+        lines.extend(sentences(
+            &format!("Stream ended: {message}"),
             theme.severity(Severity::Warn),
         ));
+    }
+    if let Some(message) = &log.retrying {
+        lines.extend(sentences(message, theme.severity(Severity::Warn)));
+    }
+    if let Some(note) = &log.note {
+        lines.extend(sentences(note, theme.dim()));
     }
 
     // Shown under the heading rather than folded into it, the same
@@ -532,27 +675,66 @@ fn log_lines(log: &Log, previous: bool, area: Rect, theme: Theme) -> Vec<Line<'_
     }
 
     if log.is_empty() {
-        let text = match log.status() {
-            Status::Live => "No log output yet.",
-            Status::Finished | Status::Failed(_) => "This container has no log output.",
-        };
-        lines.push(Line::styled(text, theme.dim()));
+        lines.push(Line::styled(empty(log.status(), pane), theme.dim()));
         return lines;
     }
 
-    let rows = usize::from(area.height).saturating_sub(lines.len());
+    let rows = height.saturating_sub(lines.len());
     lines.extend(log.visible(rows).map(|line| {
-        let style = if !query.is_empty() && contains_ci(line, query) {
-            theme.match_highlight()
-        } else {
-            theme.body()
-        };
-        Line::styled(line, style)
+        if !query.is_empty() && contains_ci(line, query) {
+            return Line::styled(line, theme.match_highlight());
+        }
+        match (pane, audit_code(line)) {
+            (Pane::ControlPlane(LogType::Audit), Some((rest, code, severity))) => Line::from(vec![
+                Span::styled(rest, theme.body()),
+                Span::styled(code, theme.severity(severity)),
+            ]),
+            _ => Line::styled(line, theme.body()),
+        }
     }));
     lines
 }
 
-fn heading(log: &Log, previous: bool, theme: Theme) -> Line<'static> {
+/// An audit line split before its response code, and how alarming the code
+/// is, so the pane inks it as `eks control-plane-logs` does. `None` for a
+/// line that does not end in one: an event the summary could not read is
+/// printed whole.
+fn audit_code(line: &str) -> Option<(&str, &str, Severity)> {
+    let at = line.rfind("  ")? + 2;
+    let (rest, code) = line.split_at(at);
+    let severity = match code {
+        "-" => audit::severity(None),
+        digits => {
+            let code: u16 = digits.parse().ok()?;
+            if !(100..600).contains(&code) {
+                return None;
+            }
+            audit::severity(Some(code))
+        }
+    };
+    Some((rest, code, severity))
+}
+
+/// What a pane with no lines says.
+fn empty(status: &Status, pane: Pane) -> String {
+    match (pane, status) {
+        (Pane::Container { .. }, Status::Live) => "No log output yet.".to_owned(),
+        (Pane::Container { .. }, Status::Finished | Status::Failed(_)) => {
+            "This container has no log output.".to_owned()
+        }
+        (Pane::ControlPlane(kind), Status::Live) => format!(
+            "No {} {} yet. New ones appear here as CloudWatch receives them, which can take a \
+             minute or two.",
+            kind.noun(),
+            Since::default().phrase()
+        ),
+        (Pane::ControlPlane(kind), Status::Finished | Status::Failed(_)) => {
+            format!("No {} {}.", kind.noun(), Since::default().phrase())
+        }
+    }
+}
+
+fn heading(log: &Log, pane: Pane, theme: Theme) -> Line<'static> {
     let follow = if log.follow() {
         "following"
     } else {
@@ -567,7 +749,11 @@ fn heading(log: &Log, previous: bool, theme: Theme) -> Line<'static> {
     // Silent for the common case — the current log — the same rule
     // `k8s::order::note` follows for the default ordering: only the
     // unusual reading says anything about itself.
-    let title = if previous { "LOGS · previous" } else { "LOGS" };
+    let title = match pane {
+        Pane::Container { previous: false } => "LOGS".to_owned(),
+        Pane::Container { previous: true } => "LOGS · previous".to_owned(),
+        Pane::ControlPlane(_) => "CONTROL PLANE".to_owned(),
+    };
 
     Line::from(vec![
         Span::styled(title, theme.heading()),
@@ -597,7 +783,15 @@ mod tests {
     fn render_with(state: &LogsState, previous: bool) -> String {
         let mut terminal = Terminal::new(TestBackend::new(90, 20)).unwrap();
         terminal
-            .draw(|frame| draw(frame, frame.area(), state, previous, Theme::dark()))
+            .draw(|frame| {
+                draw(
+                    frame,
+                    frame.area(),
+                    state,
+                    Pane::Container { previous },
+                    Theme::dark(),
+                );
+            })
             .unwrap();
         terminal.backend().to_string()
     }
@@ -608,7 +802,10 @@ mod tests {
     fn streaming(state: &LogsState) -> &Log {
         match state {
             LogsState::Streaming(log) => Some(log),
-            LogsState::Loading | LogsState::Error(_) | LogsState::Unavailable(_) => None,
+            LogsState::Loading
+            | LogsState::Retrying(_)
+            | LogsState::Error(_)
+            | LogsState::Unavailable(_) => None,
         }
         .expect("expected Streaming")
     }
@@ -1189,7 +1386,15 @@ mod tests {
         for (width, height) in [(1, 1), (8, 3), (20, 2), (200, 60)] {
             let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
             terminal
-                .draw(|frame| draw(frame, frame.area(), &state, false, Theme::dark()))
+                .draw(|frame| {
+                    draw(
+                        frame,
+                        frame.area(),
+                        &state,
+                        Pane::Container { previous: false },
+                        Theme::dark(),
+                    );
+                })
                 .unwrap();
         }
     }
@@ -1245,8 +1450,7 @@ mod tests {
         log.push("connection error: refused".to_owned());
         log.search = LogSearch::Applied("error".to_owned());
 
-        let area = Rect::new(0, 0, 90, 20);
-        let lines = log_lines(&log, false, area, theme);
+        let lines = log_lines(&log, Pane::Container { previous: false }, 20, theme);
 
         let matching = lines
             .iter()
@@ -1287,11 +1491,394 @@ mod tests {
                         frame,
                         frame.area(),
                         &LogsState::Streaming(log.clone()),
-                        false,
+                        Pane::Container { previous: false },
                         Theme::dark(),
                     );
                 })
                 .unwrap();
+        }
+    }
+
+    // --- the control-plane pane ------------------------------------------
+
+    fn read(lines: &[&str], note: Option<&str>) -> Update {
+        Update::Read {
+            lines: lines.iter().map(|line| (*line).to_owned()).collect(),
+            note: note.map(ToOwned::to_owned),
+        }
+    }
+
+    fn failed(message: &str, credentials: bool) -> Update {
+        Update::Failed(crate::commands::FetchError {
+            message: message.to_owned(),
+            credentials,
+        })
+    }
+
+    fn render_control_plane(state: &LogsState, kind: LogType, width: u16, height: u16) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal
+            .draw(|frame| {
+                draw(
+                    frame,
+                    frame.area(),
+                    state,
+                    Pane::ControlPlane(kind),
+                    Theme::dark(),
+                );
+            })
+            .unwrap();
+        terminal.backend().to_string()
+    }
+
+    #[test]
+    fn the_first_read_ends_the_loading_and_shows_its_lines_in_order() {
+        let mut state = LogsState::Loading;
+
+        state.apply_update(read(&["one", "two"], None));
+
+        let log = streaming(&state);
+        assert_eq!(log.visible(10).collect::<Vec<_>>(), ["one", "two"]);
+        assert_eq!(log.status(), &Status::Live);
+    }
+
+    #[test]
+    fn an_empty_first_read_still_ends_the_loading() {
+        let mut state = LogsState::Loading;
+
+        state.apply_update(read(&[], None));
+
+        assert!(streaming(&state).is_empty());
+    }
+
+    #[test]
+    fn later_reads_add_to_the_lines_already_shown() {
+        let mut state = LogsState::Loading;
+        state.apply_update(read(&["one"], None));
+
+        state.apply_update(read(&["two"], None));
+        state.apply_update(read(&[], None));
+
+        assert_eq!(
+            streaming(&state).visible(10).collect::<Vec<_>>(),
+            ["one", "two"]
+        );
+    }
+
+    #[test]
+    fn each_read_s_note_replaces_the_last() {
+        let mut state = LogsState::Loading;
+        state.apply_update(read(&[], Some("left out")));
+        assert_eq!(streaming(&state).note.as_deref(), Some("left out"));
+
+        state.apply_update(read(&[], None));
+
+        assert_eq!(streaming(&state).note, None);
+    }
+
+    #[test]
+    fn a_failure_that_passes_before_any_read_keeps_loading_and_says_why() {
+        let mut state = LogsState::Loading;
+
+        state.apply_update(Update::Retrying("throttled".to_owned()));
+
+        assert_eq!(state, LogsState::Retrying("throttled".to_owned()));
+        assert!(!state.has_stopped_short());
+    }
+
+    #[test]
+    fn a_read_after_waiting_out_a_failure_ends_the_wait() {
+        let mut state = LogsState::Retrying("throttled".to_owned());
+
+        state.apply_update(read(&["one"], None));
+
+        assert_eq!(streaming(&state).retrying, None);
+        assert_eq!(streaming(&state).visible(10).collect::<Vec<_>>(), ["one"]);
+    }
+
+    #[test]
+    fn a_failure_that_passes_mid_follow_keeps_the_lines_until_the_next_read_clears_it() {
+        let mut state = LogsState::Loading;
+        state.apply_update(read(&["one"], None));
+
+        state.apply_update(Update::Retrying("throttled".to_owned()));
+        assert_eq!(streaming(&state).retrying.as_deref(), Some("throttled"));
+        assert_eq!(streaming(&state).visible(10).collect::<Vec<_>>(), ["one"]);
+
+        state.apply_update(read(&[], None));
+        assert_eq!(streaming(&state).retrying, None);
+    }
+
+    #[test]
+    fn a_type_that_is_off_is_unavailable_not_an_error() {
+        let mut state = LogsState::Loading;
+
+        state.apply_update(Update::Off("switch it on".to_owned()));
+
+        assert_eq!(state, LogsState::Unavailable("switch it on".to_owned()));
+        assert!(state.has_stopped_short());
+    }
+
+    #[test]
+    fn a_failure_before_any_read_is_an_error() {
+        for mut state in [LogsState::Loading, LogsState::Retrying("x".to_owned())] {
+            state.apply_update(failed("denied", false));
+
+            assert_eq!(state, LogsState::Error("denied".to_owned()));
+            assert!(state.has_stopped_short());
+        }
+    }
+
+    #[test]
+    fn a_failure_after_lines_keeps_them_and_marks_the_stream_failed() {
+        let mut state = LogsState::Loading;
+        state.apply_update(read(&["one"], None));
+        state.apply_update(Update::Retrying("throttled".to_owned()));
+
+        state.apply_update(failed("expired", true));
+
+        let log = streaming(&state);
+        assert_eq!(log.status(), &Status::Failed("expired".to_owned()));
+        assert_eq!(log.retrying, None);
+        assert_eq!(log.visible(10).collect::<Vec<_>>(), ["one"]);
+        assert!(state.has_stopped_short());
+    }
+
+    #[test]
+    fn nothing_after_an_error_or_an_unavailable_type_changes_it() {
+        for stopped in [
+            LogsState::Error("denied".to_owned()),
+            LogsState::Unavailable("off".to_owned()),
+        ] {
+            for update in [
+                read(&["late"], None),
+                Update::Retrying("x".to_owned()),
+                failed("again", false),
+            ] {
+                let mut state = stopped.clone();
+                state.apply_update(update);
+                assert_eq!(state, stopped);
+            }
+        }
+    }
+
+    #[test]
+    fn a_loading_live_or_finished_log_has_not_stopped_short() {
+        let mut live = LogsState::Loading;
+        assert!(!live.has_stopped_short());
+        live.apply_update(read(&["one"], None));
+        assert!(!live.has_stopped_short());
+
+        let mut finished = LogsState::Loading;
+        finished.apply(LogEvent::Ended(None));
+        assert!(!finished.has_stopped_short());
+    }
+
+    #[test]
+    fn loading_the_control_plane_names_the_log_and_the_window() {
+        let rendered = render_control_plane(&LogsState::Loading, LogType::Audit, 90, 10);
+
+        assert!(
+            rendered.contains("Reading audit events in the last 1h from CloudWatch…"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn the_type_bar_names_every_type_in_every_state() {
+        for state in [
+            LogsState::Loading,
+            LogsState::Retrying("throttled".to_owned()),
+            LogsState::Unavailable("off".to_owned()),
+            LogsState::Error("denied".to_owned()),
+            LogsState::Streaming(Log::default()),
+        ] {
+            let rendered = render_control_plane(&state, LogType::Api, 90, 10);
+            assert!(
+                rendered.contains("api │ audit │ authenticator │ controller-manager │ scheduler"),
+                "{rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_type_bar_marks_the_type_showing_and_only_that_one() {
+        let theme = Theme::dark();
+        let bar = types(LogType::ControllerManager, 200, theme);
+
+        assert_eq!(bar.len(), 1);
+        let marked: Vec<&str> = bar[0]
+            .spans
+            .iter()
+            .filter(|span| span.style == theme.selected())
+            .map(|span| span.content.as_ref())
+            .collect();
+        assert_eq!(marked, ["controller-manager"]);
+    }
+
+    #[test]
+    fn the_type_bar_wraps_between_types_rather_than_clipping_one() {
+        let bar = types(LogType::Scheduler, 52, Theme::dark());
+
+        let text: Vec<String> = bar.iter().map(ToString::to_string).collect();
+        assert_eq!(
+            text,
+            [
+                "api │ audit │ authenticator │ controller-manager",
+                "scheduler"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_type_bar_narrower_than_any_name_puts_one_name_on_each_line() {
+        let bar = types(LogType::Audit, 1, Theme::dark());
+
+        assert_eq!(bar.len(), LogType::ALL.len());
+    }
+
+    #[test]
+    fn an_empty_control_plane_read_says_nothing_has_arrived_in_the_window_yet() {
+        let mut state = LogsState::Loading;
+        state.apply_update(read(&[], None));
+
+        let rendered = render_control_plane(&state, LogType::Audit, 140, 10);
+
+        assert!(
+            rendered.contains("No audit events in the last 1h yet."),
+            "{rendered}"
+        );
+        assert!(rendered.contains("CONTROL PLANE"), "{rendered}");
+    }
+
+    #[test]
+    fn a_retrying_pane_says_why_under_the_loading_line() {
+        let state = LogsState::Retrying("AWS is throttling.\nTrying again every 5s.".to_owned());
+
+        let rendered = render_control_plane(&state, LogType::Api, 90, 10);
+
+        assert!(
+            rendered.contains("Reading API server log lines"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("AWS is throttling."), "{rendered}");
+        assert!(rendered.contains("Trying again every 5s."), "{rendered}");
+    }
+
+    #[test]
+    fn a_note_and_a_wait_are_shown_above_the_lines() {
+        let mut state = LogsState::Loading;
+        state.apply_update(read(&["the line"], Some("left out")));
+        state.apply_update(Update::Retrying("throttled".to_owned()));
+
+        let rendered = render_control_plane(&state, LogType::Api, 90, 10);
+
+        let at = |text: &str| rendered.find(text).expect("on screen");
+        assert!(at("throttled") < at("the line"), "{rendered}");
+        assert!(at("left out") < at("the line"), "{rendered}");
+    }
+
+    #[test]
+    fn a_message_of_several_lines_is_drawn_one_line_each() {
+        let state = LogsState::Unavailable("first sentence.\nsecond sentence.".to_owned());
+
+        let rendered = render_control_plane(&state, LogType::Audit, 90, 10);
+
+        let rows: Vec<&str> = rendered.lines().collect();
+        assert!(
+            rows.iter()
+                .any(|row| row.trim_matches('"').trim_end() == "first sentence."),
+            "{rendered}"
+        );
+        assert!(
+            rows.iter()
+                .any(|row| row.trim_matches('"').trim_end() == "second sentence."),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn an_audit_line_s_code_is_split_off_and_graded_as_the_command_grades_it() {
+        let line = "2026-10-09T06:12:40Z  Admin/alice  delete  pods shop/api  403";
+
+        assert_eq!(
+            audit_code(line),
+            Some((
+                "2026-10-09T06:12:40Z  Admin/alice  delete  pods shop/api  ",
+                "403",
+                Severity::Warn
+            ))
+        );
+        assert_eq!(
+            audit_code("t  u  get  pods  200").map(|(_, _, s)| s),
+            Some(Severity::Ok)
+        );
+        assert_eq!(
+            audit_code("t  u  get  pods  503").map(|(_, _, s)| s),
+            Some(Severity::Critical)
+        );
+        assert_eq!(
+            audit_code("t  u  watch  pods  -").map(|(_, _, s)| s),
+            Some(Severity::Unknown)
+        );
+    }
+
+    #[test]
+    fn a_line_that_does_not_end_in_a_code_is_not_split() {
+        assert_eq!(
+            audit_code(r#"2026-10-09T06:12:40Z  {"kind":"Event"}"#),
+            None
+        );
+        assert_eq!(audit_code("2026-10-09T06:12:40Z  took  12345"), None);
+        assert_eq!(audit_code("no double space 200"), None);
+        assert_eq!(audit_code(""), None);
+    }
+
+    #[test]
+    fn the_audit_pane_inks_a_refused_request_s_code_and_nothing_else_differently() {
+        let theme = Theme::dark();
+        let mut log = Log::default();
+        log.push("t  u  delete  pods shop/api  403".to_owned());
+
+        let lines = log_lines(&log, Pane::ControlPlane(LogType::Audit), 10, theme);
+        let row = lines.last().expect("the line is drawn");
+
+        assert_eq!(row.spans.len(), 2, "{row:?}");
+        assert_eq!(row.spans[0].style, theme.body());
+        assert_eq!(row.spans[1].content, "403");
+        assert_eq!(row.spans[1].style, theme.severity(Severity::Warn));
+    }
+
+    #[test]
+    fn other_types_and_container_logs_are_never_split_on_a_trailing_number() {
+        let theme = Theme::dark();
+        let mut log = Log::default();
+        log.push("I1009 06:12:40 retrying in  500".to_owned());
+
+        for pane in [
+            Pane::ControlPlane(LogType::Api),
+            Pane::Container { previous: false },
+        ] {
+            let lines = log_lines(&log, pane, 10, theme);
+            let row = lines.last().expect("the line is drawn");
+            assert_eq!(row.style, theme.body(), "{pane:?}");
+            assert_eq!(row.spans.len(), 1, "{pane:?}");
+        }
+    }
+
+    #[test]
+    fn rendering_the_control_plane_pane_survives_a_tiny_terminal() {
+        let mut streaming = LogsState::Loading;
+        streaming.apply_update(read(&["a line"], Some("note")));
+        for state in [
+            LogsState::Loading,
+            LogsState::Retrying("x".to_owned()),
+            LogsState::Unavailable("off\nand more".to_owned()),
+            streaming,
+        ] {
+            for (width, height) in [(1, 1), (8, 3), (20, 2), (200, 60)] {
+                render_control_plane(&state, LogType::ControllerManager, width, height);
+            }
         }
     }
 }

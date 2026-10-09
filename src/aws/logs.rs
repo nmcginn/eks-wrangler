@@ -31,7 +31,7 @@ use std::time::Duration;
 use k8s_openapi::jiff::{SignedDuration, Timestamp};
 use serde::Deserialize;
 
-use crate::aws::cli::Call;
+use crate::aws::cli::{Call, Surface};
 use crate::aws::eks::Target;
 use crate::format;
 
@@ -158,21 +158,35 @@ pub fn group(cluster: &str) -> String {
 /// Says which types *are* on, so somebody who asked for `api` while `audit`
 /// is enabled sees the one they can read today. Names the cost, because
 /// switching a log type on is a standing charge somebody else may be paying,
-/// and says eks will not do it for them.
+/// and says eks will not do it for them. `surface` decides how the reader
+/// gets to another type and back: `--type`, or the pane's `t` and `r`.
 #[must_use]
-pub fn not_enabled(kind: LogType, enabled: &[LogType], target: &Target, label: &str) -> String {
+pub fn not_enabled(
+    kind: LogType,
+    enabled: &[LogType],
+    target: &Target,
+    label: &str,
+    surface: Surface,
+) -> String {
     let on: Vec<String> = enabled.iter().map(|kind| kind.flag().to_owned()).collect();
-    let now = match (format::list(&on, "and"), enabled.first()) {
-        (Some(list), Some(first)) => {
+    let now = match (format::list(&on, "and"), enabled.first(), surface) {
+        (Some(list), Some(first), Surface::Command) => {
             format!("Switched on now: {list} (read it with `--type {first}`).")
         }
+        (Some(list), Some(_), Surface::Dashboard) => {
+            format!("Switched on now: {list} (press t to change type).")
+        }
         _ => "No control-plane log type is switched on.".to_owned(),
+    };
+    let then = match surface {
+        Surface::Command => "",
+        Surface::Dashboard => "\nOnce it is on, press r to look again.",
     };
     format!(
         "{label} does not send its {flag} log to CloudWatch. {now}\n\
          EKS only writes the types someone has switched on, and eks never switches one on \
          for you: CloudWatch charges for every gigabyte it ingests and stores{audit}.\n\
-         To switch it on (only events from then on are recorded):\n  {command}",
+         To switch it on (only events from then on are recorded):\n  {command}{then}",
         flag = kind.flag(),
         audit = if kind == LogType::Audit {
             ", and the audit log is usually the largest of the five"
@@ -367,6 +381,28 @@ pub fn pick_streams(kind: LogType, streams: &[Stream], start: i64) -> (Vec<Strin
         .map(|(_, name)| name.to_owned())
         .collect();
     (names, dropped)
+}
+
+/// What to say when [`pick_streams`] left `dropped` streams out of a read of
+/// `read` streams, or `None` when it left none out.
+///
+/// Only the command line can be told to read less: `--since` is how, and the
+/// dashboard's window is fixed.
+#[must_use]
+pub fn left_out(kind: LogType, read: usize, dropped: usize, surface: Surface) -> Option<String> {
+    if dropped == 0 {
+        return None;
+    }
+    let advice = match surface {
+        Surface::Command => " A shorter --since needs fewer streams.",
+        Surface::Dashboard => "",
+    };
+    Some(format!(
+        "Reading the {read} most recently written of {} {} streams, the most CloudWatch \
+         searches at once; events only in the other {dropped} are left out.{advice}",
+        read + dropped,
+        kind.flag(),
+    ))
 }
 
 /// Which streams one read covers.
@@ -725,6 +761,7 @@ mod tests {
             &[LogType::Api, LogType::Authenticator],
             &target(),
             "prod (us-east-1)",
+            Surface::Command,
         );
 
         assert!(
@@ -746,7 +783,7 @@ mod tests {
 
     #[test]
     fn a_cluster_with_nothing_on_says_so_rather_than_listing_nothing() {
-        let message = not_enabled(LogType::Scheduler, &[], &target(), "prod");
+        let message = not_enabled(LogType::Scheduler, &[], &target(), "prod", Surface::Command);
 
         assert!(
             message.contains("No control-plane log type is switched on."),
@@ -754,6 +791,67 @@ mod tests {
         );
         assert!(!message.contains("largest"), "{message}");
         assert!(message.contains("\"scheduler\""), "{message}");
+    }
+
+    #[test]
+    fn in_the_dashboard_a_type_that_is_off_points_at_t_and_r_not_at_flags() {
+        let message = not_enabled(
+            LogType::Audit,
+            &[LogType::Api],
+            &target(),
+            "prod",
+            Surface::Dashboard,
+        );
+
+        assert!(
+            message.contains("Switched on now: api (press t to change type)."),
+            "{message}"
+        );
+        assert!(!message.contains("--type"), "{message}");
+        assert!(
+            message.contains(&target().enable_command(LogType::Audit)),
+            "{message}"
+        );
+        assert!(
+            message.ends_with("Once it is on, press r to look again."),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn in_the_dashboard_a_cluster_with_nothing_on_still_says_so() {
+        let message = not_enabled(LogType::Api, &[], &target(), "prod", Surface::Dashboard);
+
+        assert!(
+            message.contains("No control-plane log type is switched on."),
+            "{message}"
+        );
+        assert!(!message.contains("press t"), "{message}");
+    }
+
+    #[test]
+    fn nothing_left_out_is_nothing_to_say() {
+        assert_eq!(left_out(LogType::Api, 3, 0, Surface::Command), None);
+        assert_eq!(left_out(LogType::Api, 3, 0, Surface::Dashboard), None);
+    }
+
+    #[test]
+    fn streams_left_out_are_counted_and_only_the_command_line_is_told_to_read_less() {
+        let command = left_out(LogType::ControllerManager, 100, 7, Surface::Command).unwrap();
+        assert!(
+            command.starts_with(
+                "Reading the 100 most recently written of 107 controller-manager streams"
+            ),
+            "{command}"
+        );
+        assert!(command.contains("the other 7 are left out."), "{command}");
+        assert!(
+            command.ends_with("A shorter --since needs fewer streams."),
+            "{command}"
+        );
+
+        let dashboard = left_out(LogType::ControllerManager, 100, 7, Surface::Dashboard).unwrap();
+        assert!(dashboard.ends_with("are left out."), "{dashboard}");
     }
 
     // --- since -----------------------------------------------------------

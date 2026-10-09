@@ -37,6 +37,16 @@ pub const INSTALL_URL: &str = launch::AWS_INSTALL_URL;
 /// The oldest AWS CLI major version `eks` is written against.
 pub const REQUIRED_MAJOR: u32 = 2;
 
+/// Where a call was made from, which changes only the advice: a flag to pass
+/// on the command line, or a key to press in the dashboard.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Surface {
+    /// `eks control-plane-logs` or `eks logs`.
+    Command,
+    /// The dashboard's control-plane pane.
+    Dashboard,
+}
+
 /// One run of the AWS CLI.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Call {
@@ -356,9 +366,15 @@ impl Failure {
     /// The sentence for a person having a bad day. `call` is what failed,
     /// `profile` the profile it ran as (for advice that names one), and
     /// `found` the `aws --version` line when a usage error made it worth
-    /// asking.
+    /// asking. `surface` decides whether the advice names a flag or a key.
     #[must_use]
-    pub fn explain(&self, call: &Call, profile: &str, found: Option<&str>) -> String {
+    pub fn explain(
+        &self,
+        call: &Call,
+        profile: &str,
+        found: Option<&str>,
+        surface: Surface,
+    ) -> String {
         let command = call.short();
         match self {
             Self::Missing { why } => format!(
@@ -392,8 +408,15 @@ impl Failure {
             ),
             Self::Expired { detail } => format!(
                 "AWS refused `{command}` because the credentials for profile {profile:?} \
-                 have expired ({detail}).\n\
-                 Sign in again, e.g. `aws sso login --profile {profile}`, and re-run this."
+                 have expired ({detail}).\n{}",
+                match surface {
+                    Surface::Command => format!(
+                        "Sign in again, e.g. `aws sso login --profile {profile}`, and re-run this."
+                    ),
+                    Surface::Dashboard => {
+                        "Press L to sign in again; the pane reads again once you have.".to_owned()
+                    }
+                }
             ),
             Self::NoCredentials => format!(
                 "`{command}` found no AWS credentials for profile {profile:?}.\n\
@@ -406,18 +429,28 @@ impl Failure {
                  `AWS_CONFIG_FILE` points where the context expects."
             ),
             Self::NotFound { detail } => format!("`{command}` found nothing: {detail}"),
-            Self::Throttled => format!(
-                "AWS is throttling `{command}`, and the AWS CLI's own retries ran out.\n\
-                 Wait a minute and try again, or ask for a shorter `--since`."
-            ),
+            // The dashboard tries again by itself, and says so beside this.
+            Self::Throttled => match surface {
+                Surface::Command => format!(
+                    "AWS is throttling `{command}`, and the AWS CLI's own retries ran out.\n\
+                     Wait a minute and try again, or ask for a shorter `--since`."
+                ),
+                Surface::Dashboard => {
+                    format!("AWS is throttling `{command}`, and the AWS CLI's own retries ran out.")
+                }
+            },
             Self::Unreachable { detail } => format!(
                 "`{command}` could not reach AWS: {detail}\n\
                  Check your network, proxy, and VPN."
             ),
             Self::TimedOut { limit } => format!(
                 "`{command}` did not finish within {} and was stopped.\n\
-                 If AWS is just slow, allow longer with `--timeout {}`.",
+                 If AWS is just slow, {} with `--timeout {}`.",
                 format::exact_duration(*limit),
+                match surface {
+                    Surface::Command => "allow longer",
+                    Surface::Dashboard => "start eks",
+                },
                 format::exact_duration(limit.saturating_mul(4)),
             ),
             Self::Other { detail } if detail.is_empty() => {
@@ -574,7 +607,7 @@ mod tests {
                 principal: None,
             }
         );
-        let message = failure.explain(&filter_call(), "prod", None);
+        let message = failure.explain(&filter_call(), "prod", None, Surface::Command);
         assert!(message.contains("`eks:DescribeCluster`"), "{message}");
         assert!(message.contains("you are not allowed"), "{message}");
         assert!(message.contains("Ask whoever manages IAM"), "{message}");
@@ -690,7 +723,7 @@ mod tests {
             Failure::Other {
                 detail: String::new()
             }
-            .explain(&filter_call(), "prod", None),
+            .explain(&filter_call(), "prod", None, Surface::Command),
             "`aws logs filter-log-events` failed without saying why."
         );
     }
@@ -741,7 +774,12 @@ mod tests {
 
     #[test]
     fn a_missing_cli_says_which_version_to_install_and_where() {
-        let message = Failure::Missing { why: not_on_path() }.explain(&filter_call(), "prod", None);
+        let message = Failure::Missing { why: not_on_path() }.explain(
+            &filter_call(),
+            "prod",
+            None,
+            Surface::Command,
+        );
         assert!(
             message.contains(
                 "`aws` is not in any of the 4 directories on the PATH eks was started with"
@@ -756,7 +794,12 @@ mod tests {
     fn a_cli_the_shell_finds_and_eks_does_not_is_fixed_on_path_not_in_a_kubeconfig() {
         // eks chose to run `aws` here, not the kubeconfig, so the advice is
         // about the environment eks starts in.
-        let message = Failure::Missing { why: not_on_path() }.explain(&filter_call(), "prod", None);
+        let message = Failure::Missing { why: not_on_path() }.explain(
+            &filter_call(),
+            "prod",
+            None,
+            Surface::Command,
+        );
         assert!(message.contains("`type aws`"), "{message}");
         assert!(message.contains("on the PATH eks starts with"), "{message}");
         assert!(!message.contains("command:"), "{message}");
@@ -772,6 +815,7 @@ mod tests {
             &filter_call(),
             "prod",
             Some("aws-cli/1.29.62 Python/3.11.4 Linux/6.1 botocore/1.31.62"),
+            Surface::Command,
         );
 
         assert!(message.contains("aws-cli/1.29.62"), "{message}");
@@ -785,7 +829,12 @@ mod tests {
             detail: "Unknown options: --frobnicate".to_owned(),
         };
 
-        let message = failure.explain(&filter_call(), "prod", Some("aws-cli/2.17.0 Python/3.11"));
+        let message = failure.explain(
+            &filter_call(),
+            "prod",
+            Some("aws-cli/2.17.0 Python/3.11"),
+            Surface::Command,
+        );
 
         assert!(message.contains("--frobnicate"), "{message}");
         assert!(message.contains("bug in eks"), "{message}");
@@ -796,7 +845,7 @@ mod tests {
         let message = Failure::Expired {
             detail: "Token has expired and refresh failed".to_owned(),
         }
-        .explain(&filter_call(), "prod-admin", None);
+        .explain(&filter_call(), "prod-admin", None, Surface::Command);
         assert!(
             message.contains("aws sso login --profile prod-admin"),
             "{message}"
@@ -808,9 +857,55 @@ mod tests {
         let message = Failure::TimedOut {
             limit: Duration::from_secs(30),
         }
-        .explain(&filter_call(), "prod", None);
+        .explain(&filter_call(), "prod", None, Surface::Command);
         assert!(message.contains("within 30s"), "{message}");
         assert!(message.contains("--timeout 2m"), "{message}");
+    }
+
+    #[test]
+    fn in_the_dashboard_an_expired_session_points_at_l_not_at_re_running() {
+        let failure = Failure::Expired {
+            detail: "Token has expired and refresh failed".to_owned(),
+        };
+
+        let message = failure.explain(&filter_call(), "prod-admin", None, Surface::Dashboard);
+
+        assert!(message.contains("profile \"prod-admin\""), "{message}");
+        assert!(message.contains("Press L to sign in again"), "{message}");
+        assert!(!message.contains("re-run"), "{message}");
+    }
+
+    #[test]
+    fn in_the_dashboard_throttling_names_no_flag_the_pane_cannot_take() {
+        let message = Failure::Throttled.explain(&filter_call(), "prod", None, Surface::Dashboard);
+
+        assert!(message.contains("throttling"), "{message}");
+        assert!(!message.contains("--since"), "{message}");
+    }
+
+    #[test]
+    fn in_the_dashboard_a_timeout_says_to_start_eks_with_a_longer_one() {
+        let message = Failure::TimedOut {
+            limit: Duration::from_secs(30),
+        }
+        .explain(&filter_call(), "prod", None, Surface::Dashboard);
+
+        assert!(
+            message.contains("start eks with `--timeout 2m`"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn advice_that_names_no_flag_or_key_is_the_same_on_both_surfaces() {
+        let failure = Failure::Denied {
+            action: "logs:FilterLogEvents".to_owned(),
+            principal: None,
+        };
+        assert_eq!(
+            failure.explain(&filter_call(), "prod", None, Surface::Command),
+            failure.explain(&filter_call(), "prod", None, Surface::Dashboard),
+        );
     }
 
     #[test]

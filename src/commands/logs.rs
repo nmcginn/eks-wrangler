@@ -24,7 +24,7 @@ use kube::Client;
 use kube::api::Api;
 
 use crate::aws::LoginMode;
-use crate::aws::cli::Failure;
+use crate::aws::cli::{Failure, Surface};
 use crate::aws::eks::Target;
 use crate::aws::insights::{self, Found, Record, Search, Wanted};
 use crate::aws::logs::{self, Event, Since, Tail};
@@ -269,6 +269,7 @@ async fn from_cloudwatch(
         target: &target,
         login: AwsLogin::before(&resolved, &label, request.login)?,
         budget: request.budget,
+        surface: Surface::Command,
     };
 
     let since = request.since.unwrap_or_default();
@@ -415,10 +416,7 @@ async fn follow(
             }
             Err(error) if passing(&error) => {
                 if !failing {
-                    sinks.note(&format!(
-                        "{error:#}\nTrying again every {}s.",
-                        logs::POLL.as_secs()
-                    ));
+                    sinks.note(&cloudwatch::retrying(&error));
                     failing = true;
                 }
             }

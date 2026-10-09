@@ -348,6 +348,61 @@ fn container_logs() -> App {
     app
 }
 
+/// `C` from the sidebar, with the first read of the audit log in.
+fn control_plane_logs() -> App {
+    let mut app = overview();
+    app.toggle_focus();
+    app.on_key(press(KeyCode::Char('C')));
+    app.apply_control_plane(ControlPlaneUpdate::Read {
+        lines: vec![
+            "2026-10-09T06:12:40Z  Admin/alice  get  pods shop/api-7f9c  200".to_owned(),
+            "2026-10-09T06:12:41Z  Admin/alice  delete  pods shop/api-7f9c  200".to_owned(),
+            "2026-10-09T06:12:44Z  system:serviceaccount:kube-system:replicaset-controller  \
+             create  pods shop/api-7f9c-x2x4q  201"
+                .to_owned(),
+            "2026-10-09T06:13:02Z  ci-deployer  patch  deployments shop/api  409".to_owned(),
+        ],
+        note: None,
+    });
+    app
+}
+
+/// `C`, then `T` round to the scheduler, which this cluster does not send
+/// to CloudWatch.
+fn control_plane_off() -> App {
+    let mut app = overview();
+    app.toggle_focus();
+    app.on_key(press(KeyCode::Char('C')));
+    // Back past `api` and round to the last type.
+    app.on_key(press(KeyCode::Char('T')));
+    app.on_key(press(KeyCode::Char('T')));
+    app.apply_control_plane(ControlPlaneUpdate::Off(
+        "beta (us-east-1) does not send its scheduler log to CloudWatch. Switched on now: api \
+         and audit (press t to change type).\n\
+         EKS only writes the types someone has switched on, and eks never switches one on for \
+         you: CloudWatch charges for every gigabyte it ingests and stores.\n\
+         To switch it on (only events from then on are recorded):\n  \
+         aws eks update-cluster-config --name beta --region us-east-1 --logging \
+         '{\"clusterLogging\":[{\"types\":[\"scheduler\"],\"enabled\":true}]}'\n\
+         Once it is on, press r to look again."
+            .to_owned(),
+    ));
+    app
+}
+
+/// `C`, with the first read waiting out throttling.
+fn control_plane_retrying() -> App {
+    let mut app = overview();
+    app.toggle_focus();
+    app.on_key(press(KeyCode::Char('C')));
+    app.apply_control_plane(ControlPlaneUpdate::Retrying(
+        "AWS is throttling `aws logs filter-log-events`, and the AWS CLI's own retries ran out.\n\
+         Trying again every 5s."
+            .to_owned(),
+    ));
+    app
+}
+
 #[test]
 fn the_overview_while_the_first_node_listing_is_in_flight() {
     insta::assert_snapshot!(text(&frame(&app(), WIDTH, HEIGHT)));
@@ -439,6 +494,26 @@ fn the_containers_and_events_of_a_pod() {
 #[test]
 fn the_log_of_a_container_that_has_exited() {
     insta::assert_snapshot!(text(&frame(&container_logs(), WIDTH, HEIGHT)));
+}
+
+#[test]
+fn the_audit_log_of_the_control_plane() {
+    insta::assert_snapshot!(text(&frame(&control_plane_logs(), WIDTH, HEIGHT)));
+}
+
+#[test]
+fn a_control_plane_log_type_that_is_switched_off() {
+    insta::assert_snapshot!(text(&frame(&control_plane_off(), WIDTH, HEIGHT)));
+}
+
+#[test]
+fn a_control_plane_log_waiting_out_throttling() {
+    insta::assert_snapshot!(text(&frame(&control_plane_retrying(), WIDTH, HEIGHT)));
+}
+
+#[test]
+fn the_control_plane_log_on_an_80_by_24_terminal() {
+    insta::assert_snapshot!(text(&frame(&control_plane_logs(), 80, 24)));
 }
 
 #[test]
@@ -667,6 +742,9 @@ fn every_view() -> Vec<(&'static str, App)> {
         ("node pods", node_pods()),
         ("pod containers", pod_containers()),
         ("container logs", container_logs()),
+        ("control plane logs", control_plane_logs()),
+        ("control plane off", control_plane_off()),
+        ("control plane retrying", control_plane_retrying()),
         ("shell refused", shell_refused()),
         ("pod ports", pod_ports()),
         ("forwarding", forwarding_with_one_lost()),
@@ -695,6 +773,14 @@ fn the_containers_and_events_of_a_pod_in_colour() {
 fn the_log_of_a_container_in_colour() {
     insta::assert_snapshot!(styled(
         &frame(&container_logs(), WIDTH, HEIGHT),
+        Theme::dark()
+    ));
+}
+
+#[test]
+fn the_control_plane_log_in_colour() {
+    insta::assert_snapshot!(styled(
+        &frame(&control_plane_logs(), WIDTH, HEIGHT),
         Theme::dark()
     ));
 }

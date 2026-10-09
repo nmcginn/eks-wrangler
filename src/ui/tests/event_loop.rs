@@ -103,6 +103,8 @@ struct Run {
     /// How many of those forwards' handles the loop had dropped — each one
     /// a port closed — by the time it quit, or shortly after.
     forwards_stopped: Arc<AtomicUsize>,
+    /// The control-plane reads the loop started, and how many it stopped.
+    control_plane: ControlPlaneStub,
 }
 
 /// How the stubs behind `x` and `f` answer.
@@ -119,6 +121,9 @@ struct Stubs {
     /// What every forward started with `f` reports, at once, before it
     /// waits to be stopped.
     forward_events: Vec<ForwardEvent>,
+    /// What every control-plane read started with `C` or `t` reports, at
+    /// once, before it waits to be stopped.
+    control_plane: Vec<ControlPlaneUpdate>,
 }
 
 impl Default for Stubs {
@@ -128,6 +133,7 @@ impl Default for Stubs {
             held: false,
             session: Ok(()),
             forward_events: Vec::new(),
+            control_plane: Vec::new(),
         }
     }
 }
@@ -233,6 +239,53 @@ fn forward_starter(
     })
 }
 
+/// The stub behind `C`, and what it saw.
+struct ControlPlaneStub {
+    fetcher: ControlPlaneFetcher,
+    /// The reads the loop started, by type, in order.
+    reads: Rc<RefCell<Vec<LogType>>>,
+    /// How many of those reads' handles the loop had dropped, by the time it
+    /// quit or shortly after.
+    stopped: Arc<AtomicUsize>,
+}
+
+impl ControlPlaneStub {
+    fn reads(&self) -> Vec<LogType> {
+        self.reads.borrow().clone()
+    }
+}
+
+/// The stub behind `C`: records each type it is asked for, hands back
+/// `stubs.control_plane` already queued, and counts each read whose handle
+/// the loop drops.
+fn control_plane_reader(stubs: &Stubs) -> ControlPlaneStub {
+    let reads: Rc<RefCell<Vec<LogType>>> = Rc::default();
+    let stopped = Arc::new(AtomicUsize::new(0));
+    let (started, dropped) = (Rc::clone(&reads), Arc::clone(&stopped));
+    let updates = stubs.control_plane.clone();
+    let fetcher: ControlPlaneFetcher = Box::new(move |_, kind| {
+        started.borrow_mut().push(kind);
+        let (tx, rx) = mpsc::channel();
+        for update in updates.clone() {
+            tx.send(update).unwrap();
+        }
+        let stopped = Arc::clone(&dropped);
+        let (_, handle) =
+            crate::commands::spawn_stream(move |_: mpsc::Sender<()>, stop| async move {
+                let _updates = tx;
+                if stop.await.is_ok() {
+                    stopped.fetch_add(1, Ordering::SeqCst);
+                }
+            });
+        (rx, handle)
+    });
+    ControlPlaneStub {
+        fetcher,
+        reads,
+        stopped,
+    }
+}
+
 fn ctrl_c() -> Event {
     Event::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL))
 }
@@ -246,6 +299,16 @@ fn run_loop(app: App, script: Vec<Event>, terminal_answers: Option<&[u8]>) -> Ru
     run_loop_with(app, script, terminal_answers, &Stubs::default())
 }
 
+/// `script`, then `q` `q` to quit.
+fn then_quit(script: Vec<Event>) -> Rc<RefCell<VecDeque<Event>>> {
+    let events: Rc<RefCell<VecDeque<Event>>> = Rc::new(RefCell::new(script.into()));
+    events.borrow_mut().extend([
+        Event::Key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE)),
+        Event::Key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE)),
+    ]);
+    events
+}
+
 /// [`run_loop`], with `x`'s checks and session answering as `exec` says.
 fn run_loop_with(
     app: App,
@@ -254,11 +317,7 @@ fn run_loop_with(
     exec: &Stubs,
 ) -> Run {
     let log: Log = Rc::default();
-    let events: Rc<RefCell<VecDeque<Event>>> = Rc::new(RefCell::new(script.into()));
-    events.borrow_mut().extend([
-        Event::Key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE)),
-        Event::Key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE)),
-    ]);
+    let events = then_quit(script);
 
     let mut terminal = Terminal::new(Recording {
         inner: TestBackend::new(100, 24),
@@ -297,10 +356,12 @@ fn run_loop_with(
     let forwards_started: Rc<RefCell<Vec<PodPort>>> = Rc::default();
     let forwards_stopped = Arc::new(AtomicUsize::new(0));
     let start_forward = forward_starter(exec, &forwards_started, &forwards_stopped);
+    let control_plane = control_plane_reader(exec);
     let drill = DrillFetchers {
         spawn_pods: &spawn_pods,
         spawn_containers: &spawn_containers,
         spawn_logs: &spawn_logs,
+        spawn_control_plane: &control_plane.fetcher,
         prepare_exec: &prepare_exec,
         start_forward: &start_forward,
     };
@@ -357,6 +418,7 @@ fn run_loop_with(
         exec_checks: exec_checks.borrow().clone(),
         forwards_started: forwards_started.borrow().clone(),
         forwards_stopped,
+        control_plane,
     }
 }
 
@@ -813,8 +875,14 @@ fn forward_8080() -> Vec<Event> {
 /// Wait up to two seconds for `count` forwards' threads to have been told
 /// to stop — their handles dropped, their ports closed.
 fn stopped(run: &Run, count: usize) -> bool {
+    reaches(&run.forwards_stopped, count)
+}
+
+/// Whether `counter` reaches `count` within a couple of seconds: a dropped
+/// handle is seen on the stream's own thread, not this one.
+fn reaches(counter: &AtomicUsize, count: usize) -> bool {
     let deadline = std::time::Instant::now() + Duration::from_secs(2);
-    while run.forwards_stopped.load(Ordering::SeqCst) < count {
+    while counter.load(Ordering::SeqCst) < count {
         if std::time::Instant::now() > deadline {
             return false;
         }
@@ -924,4 +992,98 @@ fn a_successful_l_starts_again_a_forward_refused_for_credentials() {
     );
 
     assert_eq!(run.forwards_started.len(), 2, "the forward was not retried");
+}
+
+// --- `C`: the control plane's logs ---
+
+fn reading(updates: Vec<ControlPlaneUpdate>) -> Stubs {
+    Stubs {
+        control_plane: updates,
+        ..Stubs::default()
+    }
+}
+
+fn key(c: char) -> Event {
+    Event::Key(press(KeyCode::Char(c)))
+}
+
+#[test]
+fn c_starts_one_read_of_the_audit_log_and_esc_stops_it() {
+    let run = run_loop(app(), vec![key('C'), Event::Key(press(KeyCode::Esc))], None);
+
+    assert_eq!(run.control_plane.reads(), [LogType::Audit]);
+    assert!(reaches(&run.control_plane.stopped, 1));
+}
+
+#[test]
+fn a_read_s_lines_are_on_the_next_frame() {
+    let run = run_loop_with(
+        app(),
+        vec![key('C'), key('j'), ctrl_c()],
+        None,
+        &reading(vec![ControlPlaneUpdate::Read {
+            lines: vec!["2026-10-09T06:12:40Z  Admin/alice  delete  pods shop/api  200".to_owned()],
+            note: None,
+        }]),
+    );
+
+    let screen = text(&run.screen);
+    assert!(
+        screen.contains("2026-10-09T06:12:40Z  Admin/alice  delete  pods shop/api  200"),
+        "{screen}"
+    );
+    assert!(screen.contains("Control plane › audit"), "{screen}");
+}
+
+#[test]
+fn t_reads_the_next_type_and_stops_the_read_before_it() {
+    let run = run_loop(app(), vec![key('C'), key('t'), key('T'), ctrl_c()], None);
+
+    assert_eq!(
+        run.control_plane.reads(),
+        [LogType::Audit, LogType::Authenticator, LogType::Audit]
+    );
+    assert!(reaches(&run.control_plane.stopped, 2));
+}
+
+#[test]
+fn r_reads_a_type_that_was_off_again() {
+    let run = run_loop_with(
+        app(),
+        vec![key('C'), key('r'), ctrl_c()],
+        None,
+        &reading(vec![ControlPlaneUpdate::Off("off".to_owned())]),
+    );
+
+    assert_eq!(run.control_plane.reads(), [LogType::Audit, LogType::Audit]);
+}
+
+#[test]
+fn r_leaves_a_read_that_is_going_alone() {
+    let run = run_loop_with(
+        app(),
+        vec![key('C'), key('r'), key('r'), ctrl_c()],
+        None,
+        &reading(vec![ControlPlaneUpdate::Read {
+            lines: Vec::new(),
+            note: None,
+        }]),
+    );
+
+    assert_eq!(run.control_plane.reads(), [LogType::Audit]);
+}
+
+#[test]
+fn a_successful_l_reads_again_the_control_plane_log_whose_refusal_offered_it() {
+    let refused = ControlPlaneUpdate::Failed(FetchError {
+        message: "AWS refused: expired".to_owned(),
+        credentials: true,
+    });
+    // `j` gives the loop a pass to take the refusal before `L` is pressed.
+    let mut script = vec![key('C'), key('j')];
+    script.extend(l_then_back_out());
+
+    let run = run_loop_with(app(), script, None, &reading(vec![refused]));
+
+    assert_eq!(run.control_plane.reads(), [LogType::Audit, LogType::Audit]);
 }

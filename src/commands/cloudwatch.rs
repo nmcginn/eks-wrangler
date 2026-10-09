@@ -11,7 +11,7 @@ use std::io;
 
 use anyhow::{Context as _, Result};
 
-use crate::aws::cli::{self, Call, Failure};
+use crate::aws::cli::{self, Call, Failure, Surface};
 use crate::aws::eks::Target;
 use crate::aws::logs::{self, Event};
 use crate::commands::credentials::AwsLogin;
@@ -30,6 +30,8 @@ pub(crate) struct Aws<'a> {
     pub(crate) target: &'a Target,
     pub(crate) login: AwsLogin,
     pub(crate) budget: Budget,
+    /// Whose advice a failure gets: a flag's, or a key's.
+    pub(crate) surface: Surface,
 }
 
 /// A call that failed, not yet explained.
@@ -96,7 +98,7 @@ impl Aws<'_> {
         };
         tracing::debug!(%error, "AWS CLI call failed");
         Err(Explained {
-            message: failure.explain(&call, self.login.profile(), found.as_deref()),
+            message: failure.explain(&call, self.login.profile(), found.as_deref(), self.surface),
             failure,
         }
         .into())
@@ -173,6 +175,12 @@ pub(crate) async fn read_pages(
 /// does: throttling, the network, a call outliving `--timeout`.
 pub(crate) fn passing(error: &anyhow::Error) -> bool {
     failure(error).is_some_and(Failure::passes)
+}
+
+/// What to say while a failure that passes is waited out: the failure, and
+/// that the read will be tried again.
+pub(crate) fn retrying(error: &anyhow::Error) -> String {
+    format!("{error:#}\nTrying again every {}s.", logs::POLL.as_secs())
 }
 
 /// What a failed call was, when the error is one [`Aws::recover`] explained.

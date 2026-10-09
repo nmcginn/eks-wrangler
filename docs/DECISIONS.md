@@ -1280,3 +1280,41 @@ by eks can only be fixed in `PATH`. The lookup is a few `stat` calls and runs
 only after a start has failed. eks does not expand `~` or ask the user's shell
 for its aliases itself, because that would let it run what kubectl will not,
 and the user would see a different failure the next time they used kubectl.
+
+### 133. Control-plane logs in the dashboard: `C` from the sidebar, the container log's buffer, and failures that pass are waited out
+
+- **Opened, not drilled into.** `C` with the sidebar focused opens
+  `View::ControlPlaneLogs { kind }` for the highlighted cluster. The log is
+  about the cluster, so `C` does nothing from the detail pane, where it would
+  read as being about the highlighted row. `Esc` goes back to the node list
+  with the sidebar focused. On the sidebar the footer shows `C audit log` in
+  place of `enter open`, since `Enter` opens nothing there. `C audit log` is
+  no wider than `enter open`, so `q quit` still fits at 90 columns.
+- **`t`/`T` step through the five types**, in the order EKS documents them,
+  starting at `audit` as the command does. `kind` is part of `View`, so a type
+  change is a view change and the old read is dropped, as `p` drops a
+  container log. A type bar above the log marks the current type. It wraps
+  rather than clipping, so the marked type stays visible on a narrow pane.
+- **One buffer.** The pane uses `ui::logs::Log`, so scrolling, follow, wrap,
+  `/`, and `n`/`N` behave as in a container's log. Lines are the command's own
+  `audit::line`, uncoloured, and split at newlines. The pane colours an audit
+  line's response code with `audit::severity`, as the CLI does.
+- **The stream** (`control_plane_logs::spawn_dashboard`) makes the CLI's calls
+  (`describe`, `read_events`, `Tail`, a relist every minute) over the CLI's
+  default hour, then polls every 5 s. Every read sends an `Update::Read`,
+  even an empty one, so the pane stops loading when the window has been read.
+  Dropping the handle drops the read in progress and kills the `aws` child.
+- **Nothing prompts.** The login offer is `LoginMode::Never`, and the `aws`
+  children already run without a terminal (decision 120). An expired session
+  arrives as `Failed` with `credentials`, which arms `L`. After the login the
+  pane reads again from the start of the window: a session that expired
+  mid-follow has lines that end where it did.
+- **Failures that pass are waited out from the first call**, not only once
+  following has begun, as the CLI does. A pane can be left open far longer
+  than a command runs. Until the first read succeeds the pane shows
+  `LogsState::Retrying`. A type that is off is `Unavailable`, not an error.
+  `r` reads again only once the pane has stopped short.
+- **Advice names keys, not flags.** `aws::cli::Surface` lets
+  `Failure::explain` and `logs::not_enabled` word the same failure for either
+  surface: `press L` instead of "re-run this", `press t` instead of
+  `--type`, and no `--since` advice for throttling or for streams left out.

@@ -777,3 +777,284 @@ fn follow_rides_out_a_throttled_poll_and_says_so_once() {
     assert!(notes.contains("Trying again every 5s."), "{notes}");
     assert!(notes.contains("Reading again."), "{notes}");
 }
+
+// --- the dashboard's pane ---------------------------------------------------
+//
+// `C` in the dashboard reads through `spawn_dashboard`, in this process. The
+// stand-in is found through the kubeconfig's own `exec` environment, which
+// every `aws` call is given, so no test here touches this process's `PATH`.
+
+mod dashboard {
+    use std::sync::mpsc::{Receiver, RecvTimeoutError};
+
+    use eks::aws::logs::LogType;
+    use eks::commands::StreamHandle;
+    use eks::commands::control_plane_logs::{Update, spawn_dashboard};
+    use eks::k8s::page::Budget;
+    use eks::kubeconfig::KubeConfig;
+
+    use super::*;
+
+    impl World {
+        /// [`World::kubeconfig`], with the stand-in's `PATH` and state
+        /// directory in the helper's environment.
+        fn dashboard_kubeconfig(&self) -> PathBuf {
+            let path = self.home.path().join("kubeconfig");
+            let config = format!(
+                r"apiVersion: v1
+kind: Config
+current-context: {ARN}
+clusters:
+- name: {ARN}
+  cluster:
+    server: https://ABCDEF.gr7.us-east-1.eks.amazonaws.com
+contexts:
+- name: {ARN}
+  context:
+    cluster: {ARN}
+    user: {ARN}
+users:
+- name: {ARN}
+  user:
+    exec:
+      apiVersion: client.authentication.k8s.io/v1beta1
+      command: aws
+      args: [--region, us-east-1, eks, get-token, --cluster-name, prod, --output, json, --profile, prod-admin]
+      env:
+      - name: PATH
+        value: {path}
+      - name: FAKE_AWS_DIR
+        value: {dir}
+",
+                path = path_with(&self.bin),
+                dir = self.dir.display(),
+            );
+            std::fs::write(&path, config).unwrap();
+            path
+        }
+
+        /// What `C` starts, for `kind`.
+        fn pane(&self, kind: LogType) -> (Receiver<Update>, StreamHandle) {
+            let path = self.dashboard_kubeconfig();
+            let config = KubeConfig::load_from(std::slice::from_ref(&path)).unwrap();
+            spawn_dashboard(
+                config,
+                vec![path],
+                ARN.to_owned(),
+                kind,
+                Budget::of(Duration::from_secs(10)),
+            )
+        }
+    }
+
+    /// The next update, waiting longer than one poll for it.
+    fn next(rx: &Receiver<Update>) -> Update {
+        rx.recv_timeout(Duration::from_secs(15))
+            .expect("the pane heard nothing")
+    }
+
+    fn read(update: Update) -> (Vec<String>, Option<String>) {
+        match update {
+            Update::Read { lines, note } => (lines, note),
+            other => panic!("expected a read, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_pane_reads_the_window_in_time_order_then_only_what_is_new() {
+        // Inside the pane's last hour, as CloudWatch would only return: the
+        // repeat in the second read is dropped because it was shown, not
+        // because it fell out of the window.
+        let t = now_ms() - 120_000;
+        let world = World::new();
+        world.answer("describe.json", AUDIT_ON);
+        world.answer(
+            "poll-1.json",
+            &page(
+                &[
+                    audit(t + 1_000, "b", "delete", "api", 200),
+                    audit(t, "a", "get", "api", 200),
+                ],
+                None,
+            ),
+        );
+        world.answer(
+            "poll-2.json",
+            &page(
+                &[
+                    audit(t + 1_000, "b", "delete", "api", 200),
+                    audit(t + 2_000, "c", "patch", "api", 409),
+                ],
+                None,
+            ),
+        );
+
+        let (rx, _handle) = world.pane(LogType::Audit);
+        let (first, note) = read(next(&rx));
+        let (second, _) = read(next(&rx));
+
+        assert_eq!(first.len(), 2, "{first:#?}");
+        assert!(
+            first[0].ends_with("  Admin/alice  get  pods shop/api  200"),
+            "{first:#?}"
+        );
+        assert!(
+            first[1].ends_with("  Admin/alice  delete  pods shop/api  200"),
+            "{first:#?}"
+        );
+        assert_eq!(note, None);
+        assert_eq!(second.len(), 1, "{second:#?}");
+        assert!(
+            second[0].ends_with("  Admin/alice  patch  pods shop/api  409"),
+            "{second:#?}"
+        );
+    }
+
+    #[test]
+    fn an_empty_window_is_still_a_read_so_the_pane_stops_loading() {
+        let world = World::new();
+        world.answer("describe.json", AUDIT_ON);
+
+        let (rx, _handle) = world.pane(LogType::Audit);
+
+        assert_eq!(read(next(&rx)), (Vec::new(), None));
+    }
+
+    #[test]
+    fn a_type_that_is_off_is_explained_with_the_pane_s_own_keys_and_nothing_is_read() {
+        let world = World::new();
+        world.answer("describe.json", AUDIT_ON);
+
+        let (rx, _handle) = world.pane(LogType::Scheduler);
+
+        let Update::Off(advice) = next(&rx) else {
+            panic!("expected the type to be off");
+        };
+        assert!(
+            advice.starts_with("prod (us-east-1) does not send its scheduler log to CloudWatch."),
+            "{advice}"
+        );
+        assert!(advice.contains("press t to change type"), "{advice}");
+        assert!(advice.contains("aws eks update-cluster-config"), "{advice}");
+        assert!(advice.contains("press r to look again"), "{advice}");
+        assert!(!advice.contains("--type"), "{advice}");
+        assert!(
+            !world
+                .calls()
+                .iter()
+                .any(|call| call.starts_with("logs filter-log-events")),
+            "{:#?}",
+            world.calls()
+        );
+        // Nothing more is coming: the stream has ended.
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(5)).unwrap_err(),
+            RecvTimeoutError::Disconnected
+        );
+    }
+
+    #[test]
+    fn an_expired_session_stops_the_pane_offers_l_and_never_logs_in_by_itself() {
+        let world = World::new();
+        world.answer("describe.json", AUDIT_ON);
+        world.answer("expired", "");
+
+        let (rx, _handle) = world.pane(LogType::Audit);
+
+        let Update::Failed(error) = next(&rx) else {
+            panic!("expected the read to fail");
+        };
+        assert!(error.credentials, "{error:?}");
+        assert!(
+            error.message.contains("Press L to sign in again"),
+            "{error:?}"
+        );
+        assert!(
+            !world
+                .calls()
+                .iter()
+                .any(|call| call.starts_with("sso login")),
+            "{:#?}",
+            world.calls()
+        );
+    }
+
+    #[test]
+    fn a_missing_permission_stops_the_pane_without_offering_l() {
+        let world = World::new();
+        world.answer(
+            "describe.err",
+            "An error occurred (AccessDeniedException) when calling the DescribeCluster \
+             operation: User: arn:aws:sts::111122223333:assumed-role/ReadOnly/alice is not \
+             authorized to perform: eks:DescribeCluster on resource: x",
+        );
+
+        let (rx, _handle) = world.pane(LogType::Audit);
+
+        let Update::Failed(error) = next(&rx) else {
+            panic!("expected the read to fail");
+        };
+        assert!(!error.credentials, "{error:?}");
+        assert!(error.message.contains("`eks:DescribeCluster`"), "{error:?}");
+    }
+
+    #[test]
+    fn a_throttled_first_call_is_waited_out_rather_than_ending_the_pane() {
+        let world = World::new();
+        world.answer("describe.json", AUDIT_ON);
+        world.answer(
+            "poll-1.err",
+            "An error occurred (ThrottlingException) when calling the FilterLogEvents \
+             operation (reached max retries: 2): Rate exceeded",
+        );
+        world.answer(
+            "poll-2.json",
+            &page(&[audit(T0, "a", "get", "api", 200)], None),
+        );
+
+        let (rx, _handle) = world.pane(LogType::Audit);
+
+        let Update::Retrying(message) = next(&rx) else {
+            panic!("expected the pane to wait the throttling out");
+        };
+        assert!(message.contains("AWS is throttling"), "{message}");
+        assert!(message.contains("Trying again every 5s."), "{message}");
+        assert!(!message.contains("--since"), "{message}");
+        let (lines, _) = read(next(&rx));
+        assert_eq!(
+            lines,
+            ["2026-10-07T06:21:02Z  Admin/alice  get  pods shop/api  200"]
+        );
+    }
+
+    #[test]
+    fn dropping_the_handle_ends_a_read_in_progress_at_once() {
+        let world = World::new();
+        world.answer("describe.json", AUDIT_ON);
+        world.answer("poll-1.sleep", "30");
+
+        let (rx, handle) = world.pane(LogType::Audit);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !world
+            .calls()
+            .iter()
+            .any(|call| call.starts_with("logs filter-log-events"))
+        {
+            assert!(Instant::now() < deadline, "the read never started");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        let dropped = Instant::now();
+        drop(handle);
+
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(10)).unwrap_err(),
+            RecvTimeoutError::Disconnected
+        );
+        assert!(dropped.elapsed() < Duration::from_secs(10));
+        // And nothing polls after it.
+        let calls = world.calls().len();
+        std::thread::sleep(Duration::from_secs(6));
+        assert_eq!(world.calls().len(), calls, "{:#?}", world.calls());
+    }
+}
