@@ -25,4 +25,4 @@ expression: "text(&frame(&app, WIDTH, HEIGHT))"
 │                              ││                                                                  │
 │                              ││                                                                  │
 └──────────────────────────────┘└──────────────────────────────────────────────────────────────────┘
- tab/→ switch/drill   j/k move   enter open   ←/esc back   r refresh   s/S sort   q quit   / filter
+ tab/→ switch/drill   j/k move   C audit log   ←/esc back   r refresh   s/S sort   q quit   / filter

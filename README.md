@@ -554,6 +554,13 @@ ingests and stores. A missing `logs:FilterLogEvents` or `eks:DescribeCluster`
 permission is named, and an expired Identity Center session gets the same
 login offer as every other command.
 
+In the dashboard, `C` on the cluster list opens the same view for the
+highlighted cluster: the last hour of the audit log, followed as new events
+arrive. `t` and `T` step through the five types, `/` searches, and `f`, `w`,
+and the scrolling keys work as they do in a container's log. A type that is
+switched off shows the same advice, and `r` looks again once it is on. An
+expired session offers `L`, and the pane reads again after the login.
+
 ### Long listings and long sessions
 
 The token `aws eks get-token` prints is good for fifteen minutes. `eks` runs the
@@ -845,20 +852,22 @@ change, and the next command prints normally underneath it.
 | Key | Action |
 | --- | --- |
 | `Tab` | Switch focus between the cluster list and the detail pane |
-| `j` / `k`, `↓` / `↑` | Move the highlight — or scroll a container's log, once you are drilled in that far |
+| `j` / `k`, `↓` / `↑` | Move the highlight — or scroll a log, once one is open |
 | `Home` / `End` | Jump to first / last — or to the oldest / newest line of a log |
-| `PageUp` / `PageDown` | Scroll a container's log a page at a time |
+| `PageUp` / `PageDown` | Scroll a log a page at a time |
 | `Enter` | Drill in — a node's pods, a pod's containers, a container's log |
 | `Esc` | Back out one level; quits once there is nowhere left to back out to |
-| `r` | Refresh the node pane now |
+| `r` | Refresh the node pane now — and read a control-plane log again once it has stopped |
+| `C` | On the cluster list: open the highlighted cluster's control-plane logs, at the audit log. See [The control plane's own logs](#the-control-planes-own-logs) |
+| `t` / `T` | In the control-plane logs: the next / previous log type |
 | `L` | Log in to AWS again — only offered when the pane is showing a credential failure |
 | `x` | Open a shell in the highlighted pod or container, or the one whose log is open; `Esc` cancels while it is being checked. See [A shell in a container](#a-shell-in-a-container) |
-| `f` | Toggle following a container's log — or, on a port in a pod's containers pane, forward it to localhost |
+| `f` | Toggle following a log — or, on a port in a pod's containers pane, forward it to localhost |
 | `F` | Stop the highlighted port's forward, or dismiss one that stopped by itself |
 | `c` | Clear forwards that stopped by themselves from the strip |
-| `w` | Toggle line wrap in a container's log |
+| `w` | Toggle line wrap in a log |
 | `p` | Switch a container's log between its current instance and its previous one |
-| `/` | Search a container's log — jumps to the nearest match, `Esc` clears it |
+| `/` | Search a log — jumps to the nearest match, `Esc` clears it |
 | `n` / `N` | Jump to the next / previous match, wrapping past either end |
 | `q`, `Ctrl-C` | Quit |
 

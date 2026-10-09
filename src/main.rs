@@ -574,33 +574,8 @@ fn dashboard(
         })
     };
 
-    // The deepest level: called once each time drilling into a container
-    // changes which one the detail pane is showing, and again whenever `p`
-    // switches it between that container's current log and its previous
-    // instance's. `budget` still bounds connecting and opening the log, but
-    // not the `follow`ed read after that — see `commands::pods::stream_logs`.
-    let spawn_logs: ui::LogsFetcher = {
-        let config = config.clone();
-        let paths = paths.to_vec();
-        let store = store.clone();
-        Box::new(
-            move |context: &str, namespace: &str, pod: &str, container: &str, previous: bool| {
-                pods::spawn_stream_logs(
-                    config.clone(),
-                    paths.clone(),
-                    Some(context.to_owned()),
-                    pods::LogRequest {
-                        namespace: namespace.to_owned(),
-                        pod: pod.to_owned(),
-                        container: container.to_owned(),
-                        previous,
-                    },
-                    budget,
-                    store.clone(),
-                )
-            },
-        )
-    };
+    let spawn_logs = log_streamer(config, paths, budget, store.clone());
+    let spawn_control_plane = control_plane_reader(config, paths, budget);
 
     // Kicked off before the terminal takes over, so the fetch is already in
     // flight for the first frame — the loading state a bare `eks` shows is
@@ -618,11 +593,65 @@ fn dashboard(
         spawn_pods: &spawn_pods,
         spawn_containers: &spawn_containers,
         spawn_logs: &spawn_logs,
+        spawn_control_plane: &spawn_control_plane,
         prepare_exec: &prepare_exec,
         start_forward: &start_forward,
     };
 
     ui::run(app, nodes_rx, &spawn_nodes, &drill, refresh, &foreground)
+}
+
+/// The deepest level: called once each time drilling into a container
+/// changes which one the detail pane is showing, and again whenever `p`
+/// switches it between that container's current log and its previous
+/// instance's. `budget` still bounds connecting and opening the log, but not
+/// the `follow`ed read after that — see `commands::pods::stream_logs`.
+fn log_streamer(
+    config: &KubeConfig,
+    paths: &[PathBuf],
+    budget: Budget,
+    store: Store,
+) -> ui::LogsFetcher {
+    let config = config.clone();
+    let paths = paths.to_vec();
+    Box::new(
+        move |context: &str, namespace: &str, pod: &str, container: &str, previous: bool| {
+            pods::spawn_stream_logs(
+                config.clone(),
+                paths.clone(),
+                Some(context.to_owned()),
+                pods::LogRequest {
+                    namespace: namespace.to_owned(),
+                    pod: pod.to_owned(),
+                    container: container.to_owned(),
+                    previous,
+                },
+                budget,
+                store.clone(),
+            )
+        },
+    )
+}
+
+/// What `C` from the sidebar runs: a cluster's control-plane log, read
+/// through the AWS CLI rather than the cluster, so it needs no credential
+/// store; the `aws` children never prompt (decision 120).
+fn control_plane_reader(
+    config: &KubeConfig,
+    paths: &[PathBuf],
+    budget: Budget,
+) -> ui::ControlPlaneFetcher {
+    let config = config.clone();
+    let paths = paths.to_vec();
+    Box::new(move |context: &str, kind| {
+        control_plane_logs::spawn_dashboard(
+            config.clone(),
+            paths.clone(),
+            context.to_owned(),
+            kind,
+            budget,
+        )
+    })
 }
 
 /// What `f` on a port runs: a forward on a thread of its own, for as long

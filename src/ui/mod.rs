@@ -19,7 +19,9 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, List, ListItem, ListState, Padding, Paragraph, Wrap};
 use ratatui::{Frame, Terminal};
 
+use crate::aws::logs::LogType;
 use crate::cluster::ClusterView;
+use crate::commands::control_plane_logs::Update as ControlPlaneUpdate;
 use crate::commands::exec::{Plan, Target as ExecTarget};
 use crate::commands::nodes::NodesFetch;
 use crate::commands::pods::{ContainersFetch, PodsFetch, selectors_for};
@@ -100,6 +102,14 @@ pub type ContainersFetcher =
 /// the only way the stream this starts ever stops.
 pub type LogsFetcher =
     Box<dyn Fn(&str, &str, &str, &str, bool) -> (mpsc::Receiver<LogEvent>, StreamHandle)>;
+
+/// Starts reading one control-plane log type of the named context's cluster
+/// from CloudWatch, and keeps polling for more until the returned
+/// [`StreamHandle`] is dropped — see
+/// [`crate::commands::control_plane_logs::spawn_dashboard`]. Like
+/// [`LogsFetcher`]'s, dropping the handle is what stops it.
+pub type ControlPlaneFetcher =
+    Box<dyn Fn(&str, LogType) -> (mpsc::Receiver<ControlPlaneUpdate>, StreamHandle)>;
 
 /// Checks, on a background thread, that a shell can be opened in a container
 /// of the named context, and plans the session if so — see
@@ -281,6 +291,23 @@ pub enum View {
         /// second trigger.
         previous: bool,
     },
+    /// One of the selected cluster's control-plane logs, from CloudWatch.
+    /// Opened with `C` from the sidebar, not drilled into: it belongs to
+    /// the cluster rather than to any node or pod (decision 133). `kind`
+    /// is on `View` for the reason `previous` is above: `t` changing it is
+    /// a view change, and the event loop starts the new read off that.
+    ControlPlaneLogs { kind: LogType },
+}
+
+impl View {
+    /// Whether this view is a log, where `j`/`k`/`Home`/`End` scroll text
+    /// rather than move a highlight, and `/` searches rather than filters.
+    fn is_log(&self) -> bool {
+        matches!(
+            self,
+            Self::ContainerLogs { .. } | Self::ControlPlaneLogs { .. }
+        )
+    }
 }
 
 /// The `/` fuzzy filter over the detail pane's current row list.
@@ -886,7 +913,9 @@ impl App {
     fn exec_target(&self) -> Option<Result<ExecTarget, String>> {
         let focused = self.focus == Focus::Detail;
         match &self.view {
-            View::Overview => None,
+            // A control-plane log is about the cluster, so there is no
+            // container here for a shell to open in.
+            View::Overview | View::ControlPlaneLogs { .. } => None,
             View::NodePods { .. } if !focused => Some(Err(
                 "Press tab to move to the pod list, then x on a pod to open a shell in it."
                     .to_owned(),
@@ -1312,6 +1341,13 @@ impl App {
                 self.logs = LogsState::Loading;
                 true
             }
+            // Read again from the start of the window, rather than resumed:
+            // after a session that ran out mid-follow, the lines on screen
+            // stop where it did.
+            View::ControlPlaneLogs { .. } if self.logs.has_stopped_short() => {
+                self.logs = LogsState::Loading;
+                true
+            }
             _ => false,
         }
     }
@@ -1347,7 +1383,9 @@ impl App {
             // containers, already in the spec's own order, and `s` has
             // nothing to do here rather than a third ordering invented for a
             // list this short.
-            View::PodContainers { .. } | View::ContainerLogs { .. } => {}
+            View::PodContainers { .. }
+            | View::ContainerLogs { .. }
+            | View::ControlPlaneLogs { .. } => {}
         }
     }
 
@@ -1369,7 +1407,9 @@ impl App {
                 self.pod_direction = reverse(self.pod_direction);
                 self.sort_pods();
             }
-            View::PodContainers { .. } | View::ContainerLogs { .. } => {}
+            View::PodContainers { .. }
+            | View::ContainerLogs { .. }
+            | View::ControlPlaneLogs { .. } => {}
         }
     }
 
@@ -1385,7 +1425,7 @@ impl App {
     /// following keystroke is query text belonging to that pane, so it
     /// should be the one drawing the focus border.
     fn start_filter(&mut self) {
-        if matches!(self.view, View::ContainerLogs { .. }) {
+        if self.view.is_log() {
             self.focus = Focus::Detail;
             if let LogsState::Streaming(log) = &mut self.logs {
                 log.start_search();
@@ -1515,7 +1555,9 @@ impl App {
                 self.pod_resource_sort =
                     ResourceSort::Editing(self.pod_resource_sort.query().to_owned());
             }
-            View::PodContainers { .. } | View::ContainerLogs { .. } => {}
+            View::PodContainers { .. }
+            | View::ContainerLogs { .. }
+            | View::ControlPlaneLogs { .. } => {}
         }
     }
 
@@ -1552,7 +1594,9 @@ impl App {
                     self.sort_pods();
                 }
             }
-            View::PodContainers { .. } | View::ContainerLogs { .. } => {}
+            View::PodContainers { .. }
+            | View::ContainerLogs { .. }
+            | View::ControlPlaneLogs { .. } => {}
         }
         Flow::Continue
     }
@@ -1693,7 +1737,9 @@ impl App {
             View::Overview => {}
             View::NodePods { .. } => self.pods = PodsState::Loading,
             View::PodContainers { .. } => self.containers = ContainersState::Loading,
-            View::ContainerLogs { .. } => self.logs = LogsState::Loading,
+            View::ContainerLogs { .. } | View::ControlPlaneLogs { .. } => {
+                self.logs = LogsState::Loading;
+            }
         }
     }
 
@@ -1736,7 +1782,7 @@ impl App {
                     previous: false,
                 })
             }
-            View::ContainerLogs { .. } => None,
+            View::ContainerLogs { .. } | View::ControlPlaneLogs { .. } => None,
         }
     }
 
@@ -1812,7 +1858,10 @@ impl App {
     /// there's no view depth left to unwind.
     fn retreat(&mut self) -> Flow {
         match &self.view {
-            View::NodePods { .. } | View::PodContainers { .. } | View::ContainerLogs { .. } => {
+            View::NodePods { .. }
+            | View::PodContainers { .. }
+            | View::ContainerLogs { .. }
+            | View::ControlPlaneLogs { .. } => {
                 self.back_out_one_level();
                 Flow::Continue
             }
@@ -1864,6 +1913,12 @@ impl App {
                 self.containers = ContainersState::default();
             }
             View::NodePods { .. } => self.leave_detail_view(),
+            // Back where `C` was pressed: the node list, with the sidebar
+            // holding focus.
+            View::ControlPlaneLogs { .. } => {
+                self.leave_detail_view();
+                self.focus = Focus::Sidebar;
+            }
             View::Overview => {}
         }
     }
@@ -1898,7 +1953,7 @@ impl App {
             // Not a row list: `j`/`k`/`Home`/`End` scroll the log itself in
             // this view rather than moving a highlight, so there is no count
             // for them to be bounded against.
-            View::ContainerLogs { .. } => 0,
+            View::ContainerLogs { .. } | View::ControlPlaneLogs { .. } => 0,
         }
     }
 
@@ -2092,6 +2147,61 @@ impl App {
         };
     }
 
+    /// `C` from the sidebar: open the selected cluster's control-plane logs
+    /// in the detail pane, at the type `eks control-plane-logs` reads unless
+    /// told otherwise, or at the type already showing.
+    ///
+    /// From the sidebar only: the log belongs to the cluster the sidebar
+    /// highlights, and from the detail pane `C` would read as being about
+    /// the row highlighted there. Whatever the detail pane was showing is
+    /// left, as a cluster switch leaves it, and focus moves to the log so
+    /// its keys work at once.
+    fn open_control_plane(&mut self) {
+        if self.focus != Focus::Sidebar || self.selected_cluster().is_none() {
+            return;
+        }
+        let kind = match self.view {
+            View::ControlPlaneLogs { kind } => kind,
+            _ => LogType::Audit,
+        };
+        self.leave_detail_view();
+        self.view = View::ControlPlaneLogs { kind };
+        self.focus = Focus::Detail;
+        self.logs = LogsState::Loading;
+    }
+
+    /// `t`/`T`: show the next or previous control-plane log type, in the
+    /// order EKS documents them, wrapping at both ends. A no-op outside the
+    /// control-plane pane.
+    fn cycle_log_type(&mut self, forward: bool) {
+        let View::ControlPlaneLogs { kind } = &mut self.view else {
+            return;
+        };
+        let count = LogType::ALL.len();
+        let index = LogType::ALL
+            .iter()
+            .position(|each| each == kind)
+            .unwrap_or(0);
+        let next = if forward {
+            (index + 1) % count
+        } else {
+            (index + count - 1) % count
+        };
+        *kind = LogType::ALL[next];
+        self.logs = LogsState::Loading;
+    }
+
+    /// What the control-plane stream has to say. A failure that signing in
+    /// again could fix arms `L`, as a refusal does in every other pane;
+    /// nothing here disarms it, for the reason [`Self::apply_log_event`]
+    /// gives.
+    pub fn apply_control_plane(&mut self, update: ControlPlaneUpdate) {
+        if matches!(&update, ControlPlaneUpdate::Failed(error) if error.credentials) {
+            self.credentials_lost = true;
+        }
+        self.logs.apply_update(update);
+    }
+
     /// Handle a key press.
     ///
     /// Supports both arrow keys and vim-style `j`/`k`, because the people who
@@ -2194,31 +2304,34 @@ impl App {
             // footer hint appears under exactly this condition too.
             KeyCode::Char('L') if self.credentials_lost => return Flow::Login,
             KeyCode::Char('x') => return self.start_exec(),
+            KeyCode::Char('C') => self.open_control_plane(),
+            KeyCode::Char(c @ ('t' | 'T')) => self.cycle_log_type(c == 't'),
+            // A control-plane read that stopped is read again on `r`, the
+            // key its own advice names: a type switched on since, or a
+            // failure that has cleared. The event loop starts the read.
+            KeyCode::Char('r')
+                if matches!(self.view, View::ControlPlaneLogs { .. })
+                    && self.logs.has_stopped_short() =>
+            {
+                self.logs = LogsState::Loading;
+            }
             // The container-logs pane has no rows to move a highlight
             // through — `j`/`k`/`Home`/`End`/`PageUp`/`PageDown` scroll its
             // text instead, the same keys a pager uses.
             KeyCode::Char('j') | KeyCode::Down
-                if self.focus == Focus::Detail
-                    && matches!(self.view, View::ContainerLogs { .. }) =>
+                if self.focus == Focus::Detail && self.view.is_log() =>
             {
                 self.scroll_logs_down(1);
             }
             KeyCode::Char('k') | KeyCode::Up
-                if self.focus == Focus::Detail
-                    && matches!(self.view, View::ContainerLogs { .. }) =>
+                if self.focus == Focus::Detail && self.view.is_log() =>
             {
                 self.scroll_logs_up(1);
             }
-            KeyCode::PageDown
-                if self.focus == Focus::Detail
-                    && matches!(self.view, View::ContainerLogs { .. }) =>
-            {
+            KeyCode::PageDown if self.focus == Focus::Detail && self.view.is_log() => {
                 self.scroll_logs_down(logs::PAGE);
             }
-            KeyCode::PageUp
-                if self.focus == Focus::Detail
-                    && matches!(self.view, View::ContainerLogs { .. }) =>
-            {
+            KeyCode::PageUp if self.focus == Focus::Detail && self.view.is_log() => {
                 self.scroll_logs_up(logs::PAGE);
             }
             KeyCode::Char('w') => self.toggle_log_wrap(),
@@ -2232,16 +2345,10 @@ impl App {
                 Focus::Sidebar => self.select_previous(),
                 Focus::Detail => self.select_previous_detail_row(),
             },
-            KeyCode::Home
-                if self.focus == Focus::Detail
-                    && matches!(self.view, View::ContainerLogs { .. }) =>
-            {
+            KeyCode::Home if self.focus == Focus::Detail && self.view.is_log() => {
                 self.jump_logs_to_start();
             }
-            KeyCode::End
-                if self.focus == Focus::Detail
-                    && matches!(self.view, View::ContainerLogs { .. }) =>
-            {
+            KeyCode::End if self.focus == Focus::Detail && self.view.is_log() => {
                 self.jump_logs_to_end();
             }
             KeyCode::Home => match self.focus {
@@ -2456,6 +2563,10 @@ pub struct DrillFetchers<'a> {
     pub spawn_pods: &'a PodsFetcher,
     pub spawn_containers: &'a ContainersFetcher,
     pub spawn_logs: &'a LogsFetcher,
+    /// `C`'s control-plane log, which is opened from the sidebar rather than
+    /// drilled into, and travels here because it is read the way
+    /// `spawn_logs` is.
+    pub spawn_control_plane: &'a ControlPlaneFetcher,
     pub prepare_exec: &'a ExecPreparer,
     /// `f`'s forwards, which outlive the pane they were started from.
     pub start_forward: &'a ForwardStarter,
@@ -2478,12 +2589,14 @@ impl std::fmt::Debug for DrillFetchers<'_> {
 /// `View` gains. `logs_handle` is held only so it is not dropped early and is
 /// never read directly — dropping it, via [`Self::clear`] or by being
 /// overwritten, is the cancellation itself (see
-/// [`crate::commands::spawn_stream`]).
+/// [`crate::commands::spawn_stream`]). It is the handle of whichever log is
+/// open, a container's or the control plane's: the two never share a screen.
 #[derive(Default)]
 struct Inflight {
     pods: Option<mpsc::Receiver<Result<PodsFetch, FetchError>>>,
     containers: Option<mpsc::Receiver<Result<ContainersFetch, FetchError>>>,
     logs: Option<mpsc::Receiver<LogEvent>>,
+    control_plane: Option<mpsc::Receiver<ControlPlaneUpdate>>,
     logs_handle: Option<StreamHandle>,
 }
 
@@ -2495,7 +2608,13 @@ impl Inflight {
     fn clear(&mut self) {
         self.pods = None;
         self.containers = None;
+        self.end_logs();
+    }
+
+    /// Stop whichever log is open.
+    fn end_logs(&mut self) {
         self.logs = None;
+        self.control_plane = None;
         drop(self.logs_handle.take());
     }
 }
@@ -2691,6 +2810,9 @@ where
         };
 
         let view_before = app.view().clone();
+        // `r` on a control-plane log that stopped short reads it again in
+        // place, which no view change announces; this is how it is seen.
+        let stopped_before = app.logs().has_stopped_short();
         // Captured the same way as `view_before`, and read the same way
         // below: a commit through `l`/`F` is a fetch trigger in its own
         // right, and the only way to notice one is to compare before and
@@ -2756,7 +2878,7 @@ where
             inflight.clear();
             refetch(spawn_nodes, &mut nodes_rx, selected_context.as_deref());
             next_refresh = schedule(refresh);
-        } else if *app.view() != view_before {
+        } else if *app.view() != view_before || reads_again(key, stopped_before, &app) {
             // Not an `else if` on the selection check above by accident: a
             // cluster change already forces the view back to `Overview`
             // through `leave_detail_view`, so re-deriving the same outcome
@@ -2818,6 +2940,13 @@ fn take_arrivals(
     if let Some(rx) = &inflight.logs {
         while let Ok(event) = rx.try_recv() {
             app.apply_log_event(event);
+        }
+    }
+    // Drained the same way: the first read of a busy cluster's audit log is
+    // one update, but a stalled pane catching up can be several.
+    if let Some(rx) = &inflight.control_plane {
+        while let Ok(update) = rx.try_recv() {
+            app.apply_control_plane(update);
         }
     }
 }
@@ -2887,8 +3016,7 @@ fn start_drill_fetch(
     match app.view() {
         View::NodePods { node } => {
             inflight.containers = None;
-            inflight.logs = None;
-            drop(inflight.logs_handle.take());
+            inflight.end_logs();
             // Only when drilling *forward* into this node — `Esc` backing
             // out of that node's `PodContainers` also lands here, and the
             // listing it left behind is still current, so `apply_containers`
@@ -2901,8 +3029,7 @@ fn start_drill_fetch(
             }
         }
         View::PodContainers { namespace, pod, .. } => {
-            inflight.logs = None;
-            drop(inflight.logs_handle.take());
+            inflight.end_logs();
             if matches!(app.containers(), ContainersState::Loading)
                 && let Some(context) = context
             {
@@ -2922,14 +3049,27 @@ fn start_drill_fetch(
             // cancelled by dropping its `StreamHandle`, so switching modes
             // without dropping the old one first would leave it running
             // uselessly alongside the new one.
-            inflight.logs = None;
-            drop(inflight.logs_handle.take());
+            inflight.end_logs();
             if matches!(app.logs(), LogsState::Loading)
                 && let Some(context) = context
             {
                 let (rx, handle) =
                     (drill.spawn_logs)(context, namespace, pod, container, *previous);
                 inflight.logs = Some(rx);
+                inflight.logs_handle = Some(handle);
+            }
+        }
+        View::ControlPlaneLogs { kind } => {
+            // Unconditional for the reason `ContainerLogs`' is: `t` changes
+            // this view within itself, and `r` restarts it in place.
+            inflight.pods = None;
+            inflight.containers = None;
+            inflight.end_logs();
+            if matches!(app.logs(), LogsState::Loading)
+                && let Some(context) = context
+            {
+                let (rx, handle) = (drill.spawn_control_plane)(context, *kind);
+                inflight.control_plane = Some(rx);
                 inflight.logs_handle = Some(handle);
             }
         }
@@ -2976,7 +3116,10 @@ fn refetch(
 fn pods_refresh_target(view: &View) -> Option<&str> {
     match view {
         View::NodePods { node } => Some(node),
-        View::Overview | View::PodContainers { .. } | View::ContainerLogs { .. } => None,
+        View::Overview
+        | View::PodContainers { .. }
+        | View::ContainerLogs { .. }
+        | View::ControlPlaneLogs { .. } => None,
     }
 }
 
@@ -2998,6 +3141,12 @@ fn refetch_pods(
     if let (Some(context), Some(node)) = (selected_context, pods_refresh_target(view)) {
         inflight.pods = Some((drill.spawn_pods)(context, node, selectors));
     }
+}
+
+/// Whether `key` was `r` on a log that had stopped short, and is now loading
+/// again in place: a fetch to start that no view change announces.
+fn reads_again(key: KeyEvent, stopped_before: bool, app: &App) -> bool {
+    is_refresh_key(key) && stopped_before && matches!(app.logs(), LogsState::Loading)
 }
 
 /// When the next automatic refresh is due, or never.
@@ -3248,6 +3397,7 @@ fn draw_detail(frame: &mut Frame, area: Rect, app: &App) {
             container,
             ..
         } => format!(" Overview › {node} › {pod} › {container} "),
+        View::ControlPlaneLogs { kind } => format!(" Control plane › {kind} "),
     };
     let block = Block::bordered()
         .title(title)
@@ -3332,7 +3482,14 @@ fn draw_detail(frame: &mut Frame, area: Rect, app: &App) {
             );
         }
         View::ContainerLogs { previous, .. } => {
-            logs::draw(frame, sections[1], app.logs(), *previous, theme);
+            let pane = logs::Pane::Container {
+                previous: *previous,
+            };
+            logs::draw(frame, sections[1], app.logs(), pane, theme);
+        }
+        View::ControlPlaneLogs { kind } => {
+            let pane = logs::Pane::ControlPlane(*kind);
+            logs::draw(frame, sections[1], app.logs(), pane, theme);
         }
     }
 }
@@ -3352,6 +3509,29 @@ fn quit_warning(running: usize) -> String {
         1 => "press esc/q again to quit and end the port forward".to_owned(),
         n => format!("press esc/q again to quit and end {n} port forwards"),
     }
+}
+
+/// The control-plane pane's footer: the container log's keys, with `t` for
+/// `p`, and `r` only while there is something for it to read again. No
+/// `tab/→`: there is nothing to drill into, and `←` is the way back to the
+/// sidebar.
+fn control_plane_hints(app: &App) -> Vec<(&'static str, &'static str)> {
+    let mut hints = vec![
+        ("j/k", "scroll"),
+        ("t/T", "type"),
+        ("f", "follow"),
+        ("w", "wrap"),
+        ("←/esc", "back"),
+        ("q", "quit"),
+        ("/", "search"),
+    ];
+    if app.logs().has_stopped_short() {
+        hints.insert(1, ("r", "read again"));
+    }
+    if app.log_search_active() {
+        hints.push(("n/N", "next/prev match"));
+    }
+    hints
 }
 
 fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
@@ -3424,11 +3604,21 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
             hints.push(("n/N", "next/prev match"));
         }
         hints
+    } else if matches!(app.view(), View::ControlPlaneLogs { .. }) {
+        control_plane_hints(app)
     } else {
         let mut hints = vec![
             ("tab/→", "switch/drill"),
             ("j/k", "move"),
-            ("enter", "open"),
+            // `enter` opens nothing from the sidebar, so its slot goes to
+            // the one thing that is opened from there, named for the log it
+            // opens at: `t` shows the others once it is open. No wider than
+            // `enter open`, so `q quit` stays on screen at ninety columns.
+            if app.focus() == Focus::Sidebar {
+                ("C", "audit log")
+            } else {
+                ("enter", "open")
+            },
             ("←/esc", "back"),
             ("r", "refresh"),
             // The container list has no ordering for `s`/`S` to change (see
@@ -3581,7 +3771,10 @@ mod tests {
     fn streaming(state: &LogsState) -> &logs::Log {
         match state {
             LogsState::Streaming(log) => Some(log),
-            LogsState::Loading | LogsState::Error(_) | LogsState::Unavailable(_) => None,
+            LogsState::Loading
+            | LogsState::Retrying(_)
+            | LogsState::Error(_)
+            | LogsState::Unavailable(_) => None,
         }
         .expect("expected Streaming")
     }
@@ -7184,6 +7377,332 @@ mod tests {
         render_app(&app, 1, 1);
         // Too short for the strip to have a row of its own beside the body.
         render_app(&app, 30, 3);
+    }
+
+    // --- `C`: the control plane's logs ---------------------------------
+
+    /// `C` pressed on a fresh app, with the sidebar focused as it starts.
+    fn app_with_control_plane() -> App {
+        let mut app = app();
+        app.on_key(press(KeyCode::Char('C')));
+        app
+    }
+
+    fn control_plane_read(lines: &[&str]) -> ControlPlaneUpdate {
+        ControlPlaneUpdate::Read {
+            lines: lines.iter().map(|line| (*line).to_owned()).collect(),
+            note: None,
+        }
+    }
+
+    #[test]
+    fn c_from_the_sidebar_opens_the_audit_log_and_focuses_it() {
+        let app = app_with_control_plane();
+
+        assert_eq!(
+            app.view(),
+            &View::ControlPlaneLogs {
+                kind: LogType::Audit
+            }
+        );
+        assert_eq!(app.focus(), Focus::Detail);
+        assert_eq!(app.logs(), &LogsState::Loading);
+    }
+
+    #[test]
+    fn c_from_the_detail_pane_does_nothing() {
+        let mut app = app();
+        app.toggle_focus();
+
+        app.on_key(press(KeyCode::Char('C')));
+
+        assert_eq!(app.view(), &View::Overview);
+        assert_eq!(app.focus(), Focus::Detail);
+    }
+
+    #[test]
+    fn c_with_no_clusters_in_the_kubeconfig_does_nothing() {
+        let mut app = App::new(Vec::new());
+
+        app.on_key(press(KeyCode::Char('C')));
+
+        assert_eq!(app.view(), &View::Overview);
+    }
+
+    #[test]
+    fn c_from_the_sidebar_leaves_a_drill_down_behind() {
+        let mut app = app_with_pod();
+        app.toggle_focus();
+        assert_eq!(app.focus(), Focus::Sidebar);
+
+        app.on_key(press(KeyCode::Char('C')));
+
+        assert!(matches!(app.view(), View::ControlPlaneLogs { .. }));
+        assert_eq!(app.pods().rows(), []);
+    }
+
+    #[test]
+    fn c_again_from_the_sidebar_keeps_the_type_already_showing() {
+        let mut app = app_with_control_plane();
+        app.on_key(press(KeyCode::Char('t')));
+        app.toggle_focus();
+        assert_eq!(app.focus(), Focus::Sidebar);
+
+        app.on_key(press(KeyCode::Char('C')));
+
+        assert_eq!(
+            app.view(),
+            &View::ControlPlaneLogs {
+                kind: LogType::Authenticator
+            }
+        );
+    }
+
+    #[test]
+    fn t_and_shift_t_step_through_every_type_and_wrap_at_both_ends() {
+        let mut app = app_with_control_plane();
+        let kind = |app: &App| match app.view() {
+            View::ControlPlaneLogs { kind } => Some(*kind),
+            _ => None,
+        };
+
+        let mut forward = Vec::new();
+        for _ in 0..LogType::ALL.len() {
+            app.on_key(press(KeyCode::Char('t')));
+            forward.push(kind(&app).unwrap());
+        }
+        assert_eq!(
+            forward,
+            [
+                LogType::Authenticator,
+                LogType::ControllerManager,
+                LogType::Scheduler,
+                LogType::Api,
+                LogType::Audit,
+            ]
+        );
+
+        app.on_key(press(KeyCode::Char('T')));
+        assert_eq!(kind(&app), Some(LogType::Api));
+        app.on_key(press(KeyCode::Char('T')));
+        assert_eq!(kind(&app), Some(LogType::Scheduler));
+    }
+
+    #[test]
+    fn changing_type_drops_the_lines_of_the_last_one() {
+        let mut app = app_with_control_plane();
+        app.apply_control_plane(control_plane_read(&["an audit line"]));
+
+        app.on_key(press(KeyCode::Char('t')));
+
+        assert_eq!(app.logs(), &LogsState::Loading);
+    }
+
+    #[test]
+    fn t_anywhere_else_does_nothing() {
+        let mut app = app_with_container();
+        app.on_key(press(KeyCode::Enter));
+        let before = app.view().clone();
+
+        app.on_key(press(KeyCode::Char('t')));
+
+        assert_eq!(app.view(), &before);
+    }
+
+    #[test]
+    fn esc_backs_out_of_the_control_plane_to_the_sidebar_it_was_opened_from() {
+        let mut app = app_with_control_plane();
+        app.apply_control_plane(control_plane_read(&["a line"]));
+
+        assert_eq!(app.on_key(press(KeyCode::Esc)), Flow::Continue);
+
+        assert_eq!(app.view(), &View::Overview);
+        assert_eq!(app.focus(), Focus::Sidebar);
+        assert_eq!(app.logs(), &LogsState::Loading);
+        assert!(!app.quit_pending());
+    }
+
+    #[test]
+    fn j_and_k_scroll_the_control_plane_log() {
+        let mut app = app_with_control_plane();
+        let lines: Vec<String> = (0..30).map(|n| format!("line {n}")).collect();
+        let lines: Vec<&str> = lines.iter().map(String::as_str).collect();
+        app.apply_control_plane(control_plane_read(&lines));
+
+        app.on_key(press(KeyCode::Char('k')));
+
+        assert!(!streaming(app.logs()).follow());
+        app.on_key(press(KeyCode::End));
+        assert!(streaming(app.logs()).follow());
+    }
+
+    #[test]
+    fn slash_searches_the_control_plane_log() {
+        let mut app = app_with_control_plane();
+        app.apply_control_plane(control_plane_read(&["get pods", "delete pods"]));
+
+        app.on_key(press(KeyCode::Char('/')));
+
+        assert!(app.is_searching_log());
+        assert!(!app.is_filtering());
+    }
+
+    #[test]
+    fn f_and_w_follow_and_wrap_the_control_plane_log() {
+        let mut app = app_with_control_plane();
+        app.apply_control_plane(control_plane_read(&["a line"]));
+
+        app.on_key(press(KeyCode::Char('f')));
+        app.on_key(press(KeyCode::Char('w')));
+
+        assert!(!streaming(app.logs()).follow());
+        assert!(streaming(app.logs()).wrap());
+    }
+
+    #[test]
+    fn x_in_the_control_plane_opens_no_shell() {
+        let mut app = app_with_control_plane();
+
+        assert_eq!(app.on_key(press(KeyCode::Char('x'))), Flow::Continue);
+        assert!(!app.exec_preparing());
+    }
+
+    #[test]
+    fn a_read_refused_for_an_expired_session_offers_l() {
+        let mut app = app_with_control_plane();
+
+        app.apply_control_plane(ControlPlaneUpdate::Failed(refused(
+            "AWS refused `aws eks describe-cluster`",
+        )));
+
+        assert!(app.credentials_lost());
+        assert_eq!(app.on_key(press(KeyCode::Char('L'))), Flow::Login);
+    }
+
+    #[test]
+    fn any_other_failure_does_not_offer_l() {
+        let mut app = app_with_control_plane();
+
+        app.apply_control_plane(ControlPlaneUpdate::Failed(failed("AWS refused: denied")));
+
+        assert!(!app.credentials_lost());
+    }
+
+    #[test]
+    fn after_l_a_control_plane_log_that_stopped_is_read_again() {
+        for stopped in [
+            ControlPlaneUpdate::Failed(refused("expired")),
+            ControlPlaneUpdate::Off("off".to_owned()),
+        ] {
+            let mut app = app_with_control_plane();
+            app.apply_control_plane(stopped);
+
+            assert!(app.retry_failed_detail());
+            assert_eq!(app.logs(), &LogsState::Loading);
+        }
+    }
+
+    #[test]
+    fn after_l_a_control_plane_log_that_failed_mid_follow_is_read_again_from_the_start() {
+        let mut app = app_with_control_plane();
+        app.apply_control_plane(control_plane_read(&["a line"]));
+        app.apply_control_plane(ControlPlaneUpdate::Failed(refused("expired")));
+
+        assert!(app.retry_failed_detail());
+        assert_eq!(app.logs(), &LogsState::Loading);
+    }
+
+    #[test]
+    fn after_l_a_control_plane_log_that_is_reading_is_left_alone() {
+        let mut app = app_with_control_plane();
+        app.apply_control_plane(control_plane_read(&["a line"]));
+
+        assert!(!app.retry_failed_detail());
+        assert!(matches!(app.logs(), LogsState::Streaming(_)));
+    }
+
+    #[test]
+    fn r_reads_a_control_plane_log_again_only_once_it_has_stopped() {
+        let mut app = app_with_control_plane();
+        app.apply_control_plane(control_plane_read(&["a line"]));
+        app.on_key(press(KeyCode::Char('r')));
+        assert!(matches!(app.logs(), LogsState::Streaming(_)));
+
+        app.apply_control_plane(ControlPlaneUpdate::Off("off".to_owned()));
+        app.on_key(press(KeyCode::Char('r')));
+        assert_eq!(app.logs(), &LogsState::Loading);
+    }
+
+    #[test]
+    fn the_sidebar_footer_offers_c_where_enter_would_open_nothing() {
+        let app = app();
+        assert_eq!(app.focus(), Focus::Sidebar);
+
+        let footer = footer_of(&app, 100);
+
+        assert!(footer.contains("C audit log"), "{footer}");
+        assert!(!footer.contains("enter open"), "{footer}");
+        assert!(footer.contains("q quit"), "{footer}");
+    }
+
+    #[test]
+    fn the_detail_footer_still_offers_enter() {
+        let mut app = app();
+        app.toggle_focus();
+
+        let footer = footer_of(&app, 100);
+
+        assert!(footer.contains("enter open"), "{footer}");
+        assert!(!footer.contains("C audit log"), "{footer}");
+    }
+
+    #[test]
+    fn the_control_plane_footer_offers_its_own_keys_and_r_only_once_it_has_stopped() {
+        let mut app = app_with_control_plane();
+        app.apply_control_plane(control_plane_read(&["a line"]));
+
+        let reading = footer_of(&app, 120);
+        assert!(reading.contains("t/T type"), "{reading}");
+        assert!(reading.contains("f follow"), "{reading}");
+        assert!(reading.contains("/ search"), "{reading}");
+        assert!(!reading.contains("read again"), "{reading}");
+        assert!(!reading.contains("p previous"), "{reading}");
+        assert!(!reading.contains("x shell"), "{reading}");
+
+        app.apply_control_plane(ControlPlaneUpdate::Failed(failed("denied")));
+        let stopped = footer_of(&app, 120);
+        assert!(stopped.contains("r read again"), "{stopped}");
+    }
+
+    #[test]
+    fn the_control_plane_breadcrumb_names_the_type() {
+        let mut app = app_with_control_plane();
+        app.on_key(press(KeyCode::Char('T')));
+
+        let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+        let screen = terminal.backend().to_string();
+
+        assert!(screen.contains("Control plane › api"), "{screen}");
+    }
+
+    #[test]
+    fn switching_clusters_leaves_the_control_plane_log() {
+        let mut app = app_with_control_plane();
+
+        app.leave_detail_view();
+
+        assert_eq!(app.view(), &View::Overview);
+    }
+
+    #[test]
+    fn the_control_plane_log_draws_on_a_tiny_terminal() {
+        let mut app = app_with_control_plane();
+        app.apply_control_plane(control_plane_read(&["a line"]));
+        for (width, height) in [(1, 1), (10, 4), (40, 8)] {
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            terminal.draw(|frame| draw(frame, &app)).unwrap();
+        }
     }
 
     mod event_loop;

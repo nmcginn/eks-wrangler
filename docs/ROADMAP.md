@@ -35,14 +35,6 @@ names of things.
   (and the API path asks for timestamps and strips them) or API lines carry
   `null`. Decided, it is one PR.
 
-- [ ] **Control-plane logs in the dashboard.** A cluster-level pane, opened
-  from the sidebar, that shows the CLI's control-plane log view with the
-  same type switch, `/` search, follow, and not-enabled advice, streamed off
-  the render thread with cancellation, like the container-logs pane. The
-  `aws` children it starts run non-interactively, under the same rule as the
-  dashboard's credential helpers (decision 120). An expired session sets
-  `credentials_lost` and offers `L`.
-
 ---
 
 ## Done
@@ -160,6 +152,7 @@ names of things.
 
 - [x] `eks control-plane-logs`: five types, `--since`, `--grep`, `--follow`, `--json`, audit as one line per request. (123, 129)
 - [x] `eks logs`: the API server while the pod runs, Container Insights once it is gone, every CloudWatch line labelled. (131)
+- [x] Control-plane logs in the dashboard: `C` from the sidebar, `t`/`T` through the types, waiting out failures that pass. (133)
 
 ---
 
