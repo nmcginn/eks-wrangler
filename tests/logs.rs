@@ -110,7 +110,18 @@ fn route(target: &str) -> (&'static str, &'static str, String) {
             } else {
                 "line one\nline two\n"
             };
-            ("200 OK", "text/plain", body.to_owned())
+            // As the kubelet answers `timestamps=true`: each line's time,
+            // with nanoseconds, and one space.
+            let body = if query.contains("timestamps=true") {
+                body.lines()
+                    .zip(1..)
+                    .map(|(line, n)| format!("2026-10-07T06:21:0{n}.123456789Z {line}\n"))
+                    .collect::<Vec<_>>()
+                    .concat()
+            } else {
+                body.to_owned()
+            };
+            ("200 OK", "text/plain", body)
         }
         _ => (
             "404 Not Found",
@@ -336,6 +347,14 @@ fn stderr(output: &Output) -> String {
     String::from_utf8(output.stderr.clone()).unwrap()
 }
 
+/// stdout as JSON Lines: every line must parse on its own.
+fn json_lines(output: &Output) -> Vec<serde_json::Value> {
+    stdout(output)
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap_or_else(|error| panic!("{error}: {line:?}")))
+        .collect()
+}
+
 // --- A running pod -----------------------------------------------------------
 
 #[test]
@@ -351,6 +370,83 @@ fn a_running_pod_is_read_from_the_cluster_unlabelled_and_cloudwatch_is_never_ask
     assert_eq!(requests.len(), 1, "{requests:#?}");
     assert!(requests[0].contains("container=app"), "{}", requests[0]);
     assert!(!requests[0].contains("tailLines"), "{}", requests[0]);
+}
+
+#[test]
+fn a_running_pod_s_lines_are_never_timestamped_without_json() {
+    let world = World::new();
+
+    let output = world.eks(&["logs", "api"]);
+
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(
+        !world.log_requests()[0].contains("timestamps"),
+        "{:#?}",
+        world.log_requests()
+    );
+}
+
+#[test]
+fn json_reads_a_running_pod_with_the_kubelet_s_times_as_a_field() {
+    let world = World::new();
+
+    let output = world.eks(&["logs", "api", "--json"]);
+
+    assert!(output.status.success(), "{}", stderr(&output));
+    let requests = world.log_requests();
+    assert!(requests[0].contains("timestamps=true"), "{}", requests[0]);
+    assert_eq!(
+        json_lines(&output),
+        [
+            serde_json::json!({
+                "time": "2026-10-07T06:21:01.123Z",
+                "source": "api",
+                "namespace": "shop",
+                "pod": "api-live-1",
+                "container": "app",
+                "stream": null,
+                "log": "line one",
+            }),
+            serde_json::json!({
+                "time": "2026-10-07T06:21:02.123Z",
+                "source": "api",
+                "namespace": "shop",
+                "pod": "api-live-1",
+                "container": "app",
+                "stream": null,
+                "log": "line two",
+            }),
+        ]
+    );
+    assert_eq!(world.calls(), Vec::<String>::new());
+}
+
+#[test]
+fn json_with_previous_reads_the_instance_before() {
+    let world = World::new();
+
+    let output = world.eks(&["logs", "api-live", "-p", "--json"]);
+
+    assert!(output.status.success(), "{}", stderr(&output));
+    let lines = json_lines(&output);
+    assert_eq!(lines.len(), 1, "{lines:#?}");
+    assert_eq!(lines[0]["log"], "before the crash");
+    assert_eq!(lines[0]["time"], "2026-10-07T06:21:01.123Z");
+}
+
+#[test]
+fn json_leaves_stdout_empty_when_the_command_fails() {
+    let world = World::new();
+
+    let output = world.eks(&["logs", "fresh", "-p", "--json"]);
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        stderr(&output).contains("has not restarted"),
+        "{}",
+        stderr(&output)
+    );
+    assert_eq!(stdout(&output), "");
 }
 
 #[test]
@@ -472,6 +568,62 @@ fn a_pod_that_is_gone_is_read_from_container_insights_with_every_line_labelled()
     );
     assert!(calls[0].contains("--region us-east-1"), "{}", calls[0]);
     assert!(calls[1].contains("--starting-token t2"), "{}", calls[1]);
+}
+
+#[test]
+fn json_reads_a_gone_pod_from_cloudwatch_with_the_source_said_as_a_field() {
+    let world = World::new();
+    world.answer(
+        "poll-1.json",
+        &page(
+            &[
+                line(
+                    T0 + 2_123,
+                    "api-7d9f-xk2",
+                    "app",
+                    "stderr",
+                    "panic: out of memory",
+                ),
+                line(T0, "api-7d9f-xk2", "app", "stdout", "listening on :8080"),
+            ],
+            None,
+        ),
+    );
+
+    let output = world.eks(&["logs", "api-7d9f", "--json"]);
+
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(
+        json_lines(&output),
+        [
+            serde_json::json!({
+                "time": "2026-10-07T06:21:02.000Z",
+                "source": "cloudwatch",
+                "namespace": "shop",
+                "pod": "api-7d9f-xk2",
+                "container": "app",
+                "stream": "stdout",
+                "log": "listening on :8080",
+            }),
+            serde_json::json!({
+                "time": "2026-10-07T06:21:04.123Z",
+                "source": "cloudwatch",
+                "namespace": "shop",
+                "pod": "api-7d9f-xk2",
+                "container": "app",
+                "stream": "stderr",
+                "log": "panic: out of memory",
+            }),
+        ]
+    );
+    // The note about where the lines come from is still said, on stderr,
+    // where it cannot corrupt the stream a script reads.
+    assert!(
+        stderr(&output).contains("Reading app's lines in the last 1h from CloudWatch"),
+        "{}",
+        stderr(&output)
+    );
+    assert_eq!(world.log_requests(), Vec::<String>::new());
 }
 
 #[test]
@@ -627,4 +779,49 @@ fn follow_on_a_gone_pod_prints_lines_still_on_their_way() {
         "{}",
         stderr(&output)
     );
+}
+
+#[test]
+fn json_follow_on_a_gone_pod_prints_one_object_per_line_as_lines_arrive() {
+    let world = World::new();
+    let now = now_ms();
+    world.answer(
+        "poll-1.json",
+        &page(
+            &[line(now - 2_000, "api-7d9f-xk2", "app", "stdout", "first")],
+            None,
+        ),
+    );
+    world.answer(
+        "poll-2.json",
+        &page(
+            &[
+                line(now - 2_000, "api-7d9f-xk2", "app", "stdout", "first"),
+                line(now - 1_000, "api-7d9f-xk2", "app", "stderr", "last words"),
+            ],
+            None,
+        ),
+    );
+
+    let mut child = world
+        .command(&["logs", "api-7d9f", "-f", "--json"])
+        .spawn()
+        .unwrap();
+    let mut lines = BufReader::new(child.stdout.take().unwrap()).lines();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut seen: Vec<serde_json::Value> = Vec::new();
+    while seen.len() < 2 && Instant::now() < deadline {
+        match lines.next() {
+            Some(Ok(line)) => seen.push(serde_json::from_str(&line).unwrap()),
+            _ => break,
+        }
+    }
+    child.kill().unwrap();
+    let output = child.wait_with_output().unwrap();
+
+    assert_eq!(seen.len(), 2, "{seen:#?}\n{}", stderr(&output));
+    assert_eq!(seen[0]["log"], "first");
+    assert_eq!(seen[1]["log"], "last words");
+    assert_eq!(seen[1]["stream"], "stderr");
+    assert!(seen.iter().all(|line| line["source"] == "cloudwatch"));
 }

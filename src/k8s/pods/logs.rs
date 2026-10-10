@@ -10,6 +10,7 @@
 //! [`crate::commands::spawn_stream`] so leaving the pane can actually cancel
 //! the read rather than merely stop waiting for one.
 
+use k8s_openapi::jiff::Timestamp;
 use kube::api::LogParams;
 
 use crate::aws::logs::Since;
@@ -50,12 +51,18 @@ pub fn params(container: &str, previous: bool) -> LogParams {
 /// line the kubelet kept, and a command whose output is piped into `grep` or
 /// a file should too. `--since` narrows it instead. `--previous` turns
 /// `follow` off for [`params`]' reason: that instance has stopped.
+///
+/// `timestamps` is `--json`'s: the kubelet then starts each line with the
+/// time it was written, which [`split_timestamp`] takes off again so the
+/// line can carry it as a field. Plain output never asks, so a pipe gets
+/// exactly what `kubectl logs` would give it.
 #[must_use]
 pub fn command_params(
     container: &str,
     previous: bool,
     follow: bool,
     since: Option<Since>,
+    timestamps: bool,
 ) -> LogParams {
     let (since_seconds, since_time) = match since {
         None => (None, None),
@@ -71,7 +78,25 @@ pub fn command_params(
         previous,
         since_seconds,
         since_time,
+        timestamps,
         ..LogParams::default()
+    }
+}
+
+/// A line read with `timestamps=true`, split into the kubelet's time and the
+/// line the container printed.
+///
+/// The kubelet writes the time as RFC 3339 with nanoseconds and one space
+/// before the line, so the split is at the first space. A line whose prefix
+/// does not read as a time (an API server that ignored the parameter) is
+/// returned whole with no time: the line is the thing asked for, and losing
+/// its first word to a parse would be worse than a `null`.
+#[must_use]
+pub fn split_timestamp(line: &str) -> (Option<Timestamp>, &str) {
+    let (prefix, rest) = line.split_once(' ').unwrap_or((line, ""));
+    match prefix.parse::<Timestamp>() {
+        Ok(at) => (Some(at), rest),
+        Err(_) => (None, line),
     }
 }
 
@@ -121,7 +146,7 @@ mod tests {
 
     #[test]
     fn the_command_reads_every_line_kept_unless_since_narrows_it() {
-        let lp = command_params("app", false, false, None);
+        let lp = command_params("app", false, false, None, false);
 
         assert_eq!(lp.container.as_deref(), Some("app"));
         assert_eq!(lp.tail_lines, None);
@@ -129,6 +154,65 @@ mod tests {
         assert_eq!(lp.since_time, None);
         assert!(!lp.follow);
         assert!(!lp.previous);
+        assert!(
+            !lp.timestamps,
+            "plain output is what `kubectl logs` prints, with no time in front"
+        );
+    }
+
+    #[test]
+    fn the_command_asks_for_timestamps_only_when_told_to() {
+        assert!(command_params("app", false, true, None, true).timestamps);
+        assert!(!command_params("app", false, true, None, false).timestamps);
+    }
+
+    #[test]
+    fn a_kubelet_timestamp_is_split_from_the_line_it_starts() {
+        let (at, line) = split_timestamp("2026-10-07T06:21:02.123456789Z GET /orders 200");
+
+        assert_eq!(at, Some("2026-10-07T06:21:02.123456789Z".parse().unwrap()));
+        assert_eq!(line, "GET /orders 200");
+    }
+
+    #[test]
+    fn only_the_first_space_separates_time_from_line() {
+        let (_, line) = split_timestamp("2026-10-07T06:21:02.1Z   indented  twice ");
+
+        assert_eq!(line, "  indented  twice ");
+    }
+
+    #[test]
+    fn an_empty_line_keeps_its_time() {
+        assert_eq!(
+            split_timestamp("2026-10-07T06:21:02Z "),
+            (Some("2026-10-07T06:21:02Z".parse().unwrap()), "")
+        );
+        // A kubelet that dropped the trailing space as well.
+        assert_eq!(
+            split_timestamp("2026-10-07T06:21:02Z"),
+            (Some("2026-10-07T06:21:02Z".parse().unwrap()), "")
+        );
+    }
+
+    #[test]
+    fn a_line_without_a_time_in_front_is_kept_whole() {
+        assert_eq!(
+            split_timestamp("listening on :8080"),
+            (None, "listening on :8080")
+        );
+        assert_eq!(split_timestamp(""), (None, ""));
+        assert_eq!(
+            split_timestamp("2026-13-45 nope"),
+            (None, "2026-13-45 nope")
+        );
+    }
+
+    #[test]
+    fn a_time_with_an_offset_is_still_a_time() {
+        let (at, line) = split_timestamp("2026-10-07T08:21:02+02:00 hello");
+
+        assert_eq!(at, Some("2026-10-07T06:21:02Z".parse().unwrap()));
+        assert_eq!(line, "hello");
     }
 
     #[test]
@@ -138,19 +222,20 @@ mod tests {
             false,
             true,
             Some(Since::Ago(std::time::Duration::from_secs(900))),
+            false,
         );
         assert_eq!(ago.since_seconds, Some(900));
         assert!(ago.follow);
 
         let at = "2026-10-07T05:00:00Z".parse().unwrap();
-        let instant = command_params("app", false, false, Some(Since::At(at)));
+        let instant = command_params("app", false, false, Some(Since::At(at)), false);
         assert_eq!(instant.since_time, Some(at));
         assert_eq!(instant.since_seconds, None);
     }
 
     #[test]
     fn the_command_never_follows_a_previous_instance() {
-        let lp = command_params("app", true, true, None);
+        let lp = command_params("app", true, true, None, false);
 
         assert!(lp.previous);
         assert!(!lp.follow);
