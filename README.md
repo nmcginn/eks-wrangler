@@ -436,6 +436,7 @@ eks logs api                  # every line the kubelet kept
 eks logs api -f               # and keep printing, until Ctrl-C
 eks logs api -p               # the instance before the last restart
 eks logs api --since 15m      # only the last 15 minutes
+eks logs api --json | jq -r 'select(.stream == "stderr") | .log'
 ```
 
 While the pod is running, this is `kubectl logs`. When no running pod's name
@@ -463,6 +464,19 @@ A cluster without Container Insights gets the `aws eks create-addon` command
 that sets it up; lines are only kept from then on. A cluster that ships
 container logs to another group can name it in the config file, as
 `log_group`.
+
+`--json` prints each line as one JSON object (JSON Lines, so `-f` works too)
+with `time`, `source` (`api` or `cloudwatch`), `namespace`, `pod`,
+`container`, `stream`, and `log`. Every line has a `time`, to the
+millisecond: for a running pod, `eks` asks the kubelet to stamp each line and
+moves the stamp into the field. `stream` is `stdout` or `stderr` for a line
+from CloudWatch and `null` for one from the cluster, which does not say. The
+note about where the lines come from still goes to stderr.
+
+```
+$ eks logs api-7d9f --json
+{"time":"2026-10-07T06:21:02.000Z","source":"cloudwatch","namespace":"shop","pod":"api-7d9f8c6b5-xk2pq","container":"app","stream":"stdout","log":"listening on :8080"}
+```
 
 ### A pod, a service, or a deployment on localhost
 
@@ -691,7 +705,7 @@ exit, and stdout stays empty. `eks contexts --json` cannot be combined with
 | `--sort <ORDER>` | Order the listing. Pods: `name` (default), `restarts`, `age`, `cpu`, `memory`, `cpu-share`, `memory-share`. Nodes: `name` (default), `status`, `cpu`, `memory`, `cpu-requested`, `memory-requested`, `pods`, `age` |
 | `--sort-reverse` | Reverse `--sort`; unrankable rows stay at the end. Either flag adds a line under the table naming the order |
 | `--wide` | Add the extra columns `kubectl -o wide` shows. Pods: `IP`, `NOMINATED NODE`, `READINESS GATES`. Nodes: `INTERNAL-IP`, `EXTERNAL-IP`, `OS-IMAGE`, `KERNEL-VERSION`, `CONTAINER-RUNTIME` |
-| `--json` | Print the listing as JSON instead of a table (`eks contexts`, `eks current`, `eks nodes`, `eks pods`). See [JSON output](#json-output). `eks control-plane-logs --json` prints one object per event, per line |
+| `--json` | Print the listing as JSON instead of a table (`eks contexts`, `eks current`, `eks nodes`, `eks pods`). See [JSON output](#json-output). `eks control-plane-logs --json` and `eks logs --json` print one object per event or line, per line |
 | `--kubeconfig <PATH>` | Override the kubeconfig search path |
 | `--timeout <DURATION>` | How long to wait for any one request to the cluster, or any one AWS CLI run. Default `30s`; `0` waits for as long as it takes |
 | `--refresh <DURATION>` | How often the dashboard refreshes its panes in the background. Falls back to the config file's `refresh`, then to `15s`; `0` turns automatic refresh off (`r` still refreshes on demand) |

@@ -1258,8 +1258,7 @@ toolchain that builds and the pin is never downloaded there.
   `-l` or `--field-selector` was given.
 - **Shared AWS handling.** `commands::cloudwatch` holds `Aws`, the login
   retry, and paging for both CloudWatch commands.
-- **No `--json` yet.** Whether an API line gets a time (it has none unless
-  `timestamps=true` is asked for) is the reviewer's call.
+- **`--json`** came later, in decision 134.
 
 ### 132. A program that will not start is diagnosed, not guessed at
 
@@ -1318,3 +1317,23 @@ and the user would see a different failure the next time they used kubectl.
   `Failure::explain` and `logs::not_enabled` word the same failure for either
   surface: `press L` instead of "re-run this", `press t` instead of
   `--type`, and no `--since` advice for throttling or for streams left out.
+
+### 134. `eks logs --json`: JSON Lines, and every line carries a time
+
+- **Shape.** One object per line, as `control-plane-logs --json` prints, because
+  a follow never ends: `time`, `source` (`api` or `cloudwatch`), `namespace`,
+  `pod`, `container`, `stream`, `log`. The same fields from either source, so
+  a script need not know which one answered. `source` replaces the
+  `[cloudwatch …]` label; the stderr notes are unchanged.
+- **Every line has a time.** With `--json` only, the API server is asked for
+  `timestamps=true` and `k8s_logs::split_timestamp` moves the kubelet's stamp
+  into `time`. A `null` on every API line would have made `time` a field no
+  script could rely on. Plain output never asks, so it stays what `kubectl
+  logs` prints. A line whose first word is not a time is kept whole, with
+  `time: null`.
+- **Milliseconds**, `…02.123Z`, as `control-plane-logs --json` writes them, so
+  every time eks prints is fixed-width and sorts as text. CloudWatch's are
+  milliseconds already; the kubelet's nanoseconds are truncated.
+- **`stream`** is `stdout`/`stderr` from Container Insights and `null` from
+  the API server, which interleaves the two without saying. A field Fluent
+  Bit left out is `null`, never `""`.

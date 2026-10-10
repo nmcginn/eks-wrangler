@@ -25,15 +25,7 @@ whether it gets that person from "which pod is it?" to an answer without
 reaching for `kubectl` or the AWS console, and without already knowing the
 names of things.
 
-### Milestone 7 — CloudWatch
-
-- [ ] **`--json` for `eks logs`.** JSON Lines as `control-plane-logs --json`
-  prints them: `source` (`api` or `cloudwatch`), `namespace`, `pod`,
-  `container`, `stream`, and `log`. *Open question for the reviewer:* an API
-  line has no time unless the log is opened with `timestamps=true`, which
-  makes the kubelet prefix each line; either every JSON line carries a time
-  (and the API path asks for timestamps and strips them) or API lines carry
-  `null`. Decided, it is one PR.
+Nothing is scheduled. Pull the next task up from the ideas below.
 
 ---
 
@@ -153,6 +145,7 @@ names of things.
 - [x] `eks control-plane-logs`: five types, `--since`, `--grep`, `--follow`, `--json`, audit as one line per request. (123, 129)
 - [x] `eks logs`: the API server while the pod runs, Container Insights once it is gone, every CloudWatch line labelled. (131)
 - [x] Control-plane logs in the dashboard: `C` from the sidebar, `t`/`T` through the types, waiting out failures that pass. (133)
+- [x] `--json` for `eks logs`: JSON Lines from either source, every line with a time. (134)
 
 ---
 

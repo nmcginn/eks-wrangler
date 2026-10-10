@@ -29,6 +29,7 @@ use k8s_openapi::jiff::Timestamp;
 use serde::Serialize;
 use serde_json::Number;
 
+use crate::aws::insights::Record;
 use crate::cluster::ClusterView;
 use crate::k8s::metrics::{self, Sample};
 use crate::k8s::nodes::{self, NodeRow};
@@ -227,6 +228,78 @@ pub fn failure<T>(result: &Result<T, String>) -> Result<(), &str> {
         Ok(_) => Ok(()),
         Err(explanation) => Err(explanation),
     }
+}
+
+/// Where one of `eks logs --json`'s lines was read from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LogSource {
+    /// The API server: the pod was running.
+    Api,
+    /// Container Insights' group: the pod was gone.
+    Cloudwatch,
+}
+
+/// One container log line, as `eks logs --json` prints it: one JSON object
+/// per line of output (JSON Lines), because a follow never ends.
+///
+/// The fields are the same whichever source the line came from, so a script
+/// need not know which one answered. `time` is when the line was written:
+/// the kubelet's stamp for an API line, CloudWatch's for the other. Either
+/// is printed to the millisecond, as `control-plane-logs --json` prints its
+/// times, so every `time` this tool writes sorts as text. `stream` is
+/// `stdout` or `stderr` where the source says, and `null` for an API line:
+/// the API server interleaves the two and does not say which was which.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LogLine<'a> {
+    pub time: Option<Timestamp>,
+    pub source: LogSource,
+    pub namespace: &'a str,
+    pub pod: &'a str,
+    pub container: &'a str,
+    pub stream: Option<&'a str>,
+    pub log: &'a str,
+}
+
+impl<'a> LogLine<'a> {
+    /// A line Container Insights kept. A field Fluent Bit left out is `null`,
+    /// not an empty string.
+    #[must_use]
+    pub fn cloudwatch(record: &'a Record) -> Self {
+        Self {
+            time: Timestamp::from_millisecond(record.timestamp).ok(),
+            source: LogSource::Cloudwatch,
+            namespace: &record.namespace,
+            pod: &record.pod,
+            container: &record.container,
+            stream: Some(record.stream.as_str()),
+            log: &record.log,
+        }
+    }
+}
+
+/// [`LogLine`] as one line of JSON, without the newline.
+pub fn log_line<'a>(line: &LogLine<'a>) -> Result<String, serde_json::Error> {
+    #[derive(Serialize)]
+    struct Wire<'a> {
+        time: Option<String>,
+        source: LogSource,
+        namespace: Option<&'a str>,
+        pod: Option<&'a str>,
+        container: Option<&'a str>,
+        stream: Option<&'a str>,
+        log: &'a str,
+    }
+    let present = |text: &'a str| Some(text).filter(|text| !text.is_empty());
+    serde_json::to_string(&Wire {
+        time: line.time.map(|at| format!("{at:.3}")),
+        source: line.source,
+        namespace: present(line.namespace),
+        pod: present(line.pod),
+        container: present(line.container),
+        stream: line.stream.and_then(present),
+        log: line.log,
+    })
 }
 
 /// One node. Field names follow the table's columns where there is one, in
@@ -1061,5 +1134,127 @@ mod tests {
         assert_eq!(Output::json(true), Output::Json);
         assert_eq!(Output::json(false), Output::Table);
         assert_eq!(Output::default(), Output::Table);
+    }
+
+    // --- eks logs --------------------------------------------------------
+
+    fn record(stream: &str) -> Record {
+        Record {
+            timestamp: 1_791_354_062_123,
+            id: "3780".to_owned(),
+            namespace: "shop".to_owned(),
+            pod: "api-7d9f-xk2".to_owned(),
+            container: "app".to_owned(),
+            instance: "3f2a".to_owned(),
+            stream: stream.to_owned(),
+            log: "panic: out of memory".to_owned(),
+        }
+    }
+
+    #[test]
+    fn a_cloudwatch_line_names_its_source_pod_container_and_stream() {
+        let record = record("stderr");
+        let line = log_line(&LogLine::cloudwatch(&record)).unwrap();
+
+        assert_eq!(
+            line,
+            r#"{"time":"2026-10-07T06:21:02.123Z","source":"cloudwatch","namespace":"shop","pod":"api-7d9f-xk2","container":"app","stream":"stderr","log":"panic: out of memory"}"#
+        );
+    }
+
+    #[test]
+    fn an_api_line_has_every_field_with_a_null_stream() {
+        let line = log_line(&LogLine {
+            time: Some("2026-10-07T06:21:02.123456789Z".parse().unwrap()),
+            source: LogSource::Api,
+            namespace: "shop",
+            pod: "api-live-1",
+            container: "app",
+            stream: None,
+            log: "GET /orders 200",
+        })
+        .unwrap();
+
+        assert_eq!(
+            parse(&line),
+            json!({
+                "time": "2026-10-07T06:21:02.123Z",
+                "source": "api",
+                "namespace": "shop",
+                "pod": "api-live-1",
+                "container": "app",
+                "stream": null,
+                "log": "GET /orders 200",
+            })
+        );
+    }
+
+    #[test]
+    fn a_log_line_is_one_line_however_its_text_reads() {
+        // A container can print anything; none of it may break the framing.
+        let text = "tab\there \"quoted\" \u{1b}[31mred\u{1b}[0m back\\slash \u{e9}t\u{e9}";
+        let line = log_line(&LogLine {
+            time: None,
+            source: LogSource::Api,
+            namespace: "shop",
+            pod: "api-live-1",
+            container: "app",
+            stream: None,
+            log: text,
+        })
+        .unwrap();
+
+        assert!(!line.contains('\n'), "{line}");
+        assert_eq!(parse(&line)["log"], text);
+    }
+
+    #[test]
+    fn an_unknown_time_or_a_field_fluent_bit_left_out_is_null_not_empty() {
+        let mut bare = record("");
+        bare.namespace = String::new();
+        bare.container = String::new();
+        bare.timestamp = i64::MAX;
+
+        let value = parse(&log_line(&LogLine::cloudwatch(&bare)).unwrap());
+
+        assert_eq!(value["time"], Value::Null);
+        assert_eq!(value["namespace"], Value::Null);
+        assert_eq!(value["container"], Value::Null);
+        assert_eq!(value["stream"], Value::Null);
+        assert_eq!(value["pod"], "api-7d9f-xk2");
+    }
+
+    #[test]
+    fn an_empty_line_is_an_empty_string_not_a_null() {
+        let mut blank = record("stdout");
+        blank.log = String::new();
+
+        let value = parse(&log_line(&LogLine::cloudwatch(&blank)).unwrap());
+
+        assert_eq!(value["log"], "");
+    }
+
+    #[test]
+    fn times_print_to_the_millisecond_whatever_precision_they_were_read_at() {
+        let at = |text: &str| {
+            let line = log_line(&LogLine {
+                time: Some(text.parse().unwrap()),
+                source: LogSource::Api,
+                namespace: "shop",
+                pod: "p",
+                container: "c",
+                stream: None,
+                log: "",
+            })
+            .unwrap();
+            parse(&line)["time"].as_str().unwrap().to_owned()
+        };
+
+        assert_eq!(at("2026-10-07T06:21:02Z"), "2026-10-07T06:21:02.000Z");
+        assert_eq!(at("2026-10-07T06:21:02.1Z"), "2026-10-07T06:21:02.100Z");
+        assert_eq!(
+            at("2026-10-07T06:21:02.123999999Z"),
+            "2026-10-07T06:21:02.123Z"
+        );
     }
 }

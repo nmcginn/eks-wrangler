@@ -414,6 +414,7 @@ fn run_logs(
         label_selector: global.selector.as_deref(),
         field_selector: global.field_selector.as_deref(),
         log_group: user_config.log_group.as_deref(),
+        output: Output::json(args.json),
         palette: stdout_palette(color, resolved_theme(global, user_config)),
         budget: global.timeout,
         login: global.login,

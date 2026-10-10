@@ -674,6 +674,11 @@ name the containers that are there when the one asked for is not. Fluent
 Bit's stream names start with the node, so they cannot narrow the read.
 `--follow` on a gone pod reuses `Tail` to poll for lines still in transit.
 
+`--json` changes only the last step of each path: an API line goes through
+`k8s_logs::split_timestamp` (the stream was opened with `timestamps=true`)
+and a CloudWatch record through `json::LogLine::cloudwatch`, and both are
+written by `json::log_line`, one object per line.
+
 ## Testing
 
 Run `make test`. The suite needs no cluster, no credentials, and no network, and

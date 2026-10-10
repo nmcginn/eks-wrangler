@@ -10,6 +10,11 @@
 //! note on stderr says which pod it was and where its lines come from, so a
 //! reader always knows which of the two they are looking at.
 //!
+//! With `--json` each line is instead one JSON object ([`json::LogLine`]),
+//! which says the same thing as a field: `source` is `api` or `cloudwatch`.
+//! The API server is then asked for `timestamps=true`, so that a line from
+//! either source carries the time it was written.
+//!
 //! Every decision is a pure function in [`insights`], [`pick`], or
 //! [`k8s_logs`]; this module is the I/O between them.
 
@@ -34,6 +39,7 @@ use crate::commands::credentials::{self, AwsLogin};
 use crate::commands::exec::{self, Located, with_context_hint};
 use crate::commands::nodes::target_cluster;
 use crate::commands::pods::selectors_for;
+use crate::json::{self, LogLine, LogSource, Output};
 use crate::k8s;
 use crate::k8s::client;
 use crate::k8s::page::Budget;
@@ -65,6 +71,8 @@ pub struct Request<'a> {
     pub field_selector: Option<&'a str>,
     /// `log_group` from the config file.
     pub log_group: Option<&'a str>,
+    /// `--json`: one [`json::LogLine`] per line, not the line as printed.
+    pub output: Output,
     pub palette: Palette,
     pub budget: Budget,
     pub login: LoginMode,
@@ -191,8 +199,14 @@ async fn live(
     }
 
     let api: Api<Pod> = Api::namespaced(client.clone(), namespace);
-    let params =
-        k8s_logs::command_params(&container, request.previous, request.follow, request.since);
+    let json = request.output == Output::Json;
+    let params = k8s_logs::command_params(
+        &container,
+        request.previous,
+        request.follow,
+        request.since,
+        json,
+    );
     let stream = request
         .budget
         .wrap(api.log_stream(&name, &params))
@@ -202,6 +216,21 @@ async fn live(
     let mut lines = stream.lines();
     while let Some(line) = lines.next().await {
         let line = line.with_context(|| format!("the log stream for {container} broke"))?;
+        let line = if json {
+            let (time, log) = k8s_logs::split_timestamp(&line);
+            json::log_line(&LogLine {
+                time,
+                source: LogSource::Api,
+                namespace,
+                pod: &name,
+                container: &container,
+                stream: None,
+                log,
+            })
+            .context("could not write the line as JSON")?
+        } else {
+            line
+        };
         if !sinks.line(&line)? {
             return Ok(());
         }
@@ -319,11 +348,15 @@ async fn from_cloudwatch(
     if pages.stalled {
         sinks.note(cloudwatch::STALLED);
     }
-    if !print(sinks, &found.lines, request.palette)? {
+    let format = Format {
+        output: request.output,
+        palette: request.palette,
+    };
+    if !print(sinks, &found.lines, format)? {
         return Ok(());
     }
     if request.follow && !request.previous {
-        return follow(&mut aws, &read, &found, tail, request.palette, sinks).await;
+        return follow(&mut aws, &read, &found, tail, format, sinks).await;
     }
     Ok(())
 }
@@ -369,10 +402,22 @@ impl Read<'_> {
     }
 }
 
+/// How CloudWatch's lines are printed.
+#[derive(Debug, Clone, Copy)]
+struct Format {
+    output: Output,
+    palette: Palette,
+}
+
 /// Print CloudWatch's lines. `false` once the reader has gone.
-fn print(sinks: &mut Sinks<'_>, lines: &[Record], palette: Palette) -> Result<bool> {
+fn print(sinks: &mut Sinks<'_>, lines: &[Record], format: Format) -> Result<bool> {
     for record in lines {
-        if !sinks.line(&insights::line(record, palette))? {
+        let line = match format.output {
+            Output::Json => json::log_line(&LogLine::cloudwatch(record))
+                .context("could not write the line as JSON")?,
+            Output::Table => insights::line(record, format.palette),
+        };
+        if !sinks.line(&line)? {
             return Ok(false);
         }
     }
@@ -388,7 +433,7 @@ async fn follow(
     read: &Read<'_>,
     found: &Found,
     mut tail: Tail,
-    palette: Palette,
+    format: Format,
     sinks: &mut Sinks<'_>,
 ) -> Result<()> {
     sinks.note(&format!(
@@ -410,7 +455,7 @@ async fn follow(
                     .filter_map(insights::record)
                     .filter(|record| found.admits(record))
                     .collect();
-                if !print(sinks, &lines, palette)? {
+                if !print(sinks, &lines, format)? {
                     return Ok(());
                 }
             }

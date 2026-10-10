@@ -386,6 +386,12 @@ pub struct LogsArgs {
     /// Keep printing new lines as they are written, until Ctrl-C.
     #[arg(long, short = 'f')]
     pub follow: bool,
+
+    /// Print each line as one line of JSON: `time`, `source` (`api` or
+    /// `cloudwatch`), `namespace`, `pod`, `container`, `stream` (`stdout` or
+    /// `stderr`; `null` from the API server, which does not say), and `log`.
+    #[arg(long)]
+    pub json: bool,
 }
 
 /// `eks port-forward`'s own arguments.
@@ -510,6 +516,16 @@ mod tests {
         assert!(!args.previous);
         assert_eq!(args.since, None);
         assert!(!args.follow);
+        assert!(!args.json);
+    }
+
+    #[test]
+    fn logs_takes_json_beside_every_other_flag() {
+        let args = logs_args(&["eks", "logs", "api", "-f", "-p", "--json", "-C", "app"]);
+        assert!(args.json);
+        assert!(args.follow);
+        assert!(args.previous);
+        assert_eq!(args.container.as_deref(), Some("app"));
     }
 
     #[test]
