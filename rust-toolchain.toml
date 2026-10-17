@@ -5,6 +5,6 @@
 # pull request of its own, carrying whatever the new clippy asks for.
 # The MSRV job is unaffected: scripts/msrv.sh runs `cargo +<rust-version>`.
 [toolchain]
-channel = "1.99.0"
+channel = "1.99.1"
 components = ["clippy", "rustfmt"]
 profile = "minimal"
