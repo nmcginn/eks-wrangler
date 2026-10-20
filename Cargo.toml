@@ -27,7 +27,7 @@ anyhow = "1.0.104"
 # An `ExecCredential` hands back a client certificate as PEM, and `kube` only
 # takes one in a kubeconfig's base64 spelling. `kube` already builds this
 # exact version, so a certificate credential costs one call, not a new crate.
-base64 = "0.22.1"
+base64 = "0.23.1"
 clap = { version = "4.6.6", features = ["derive", "env", "wrap_help"] }
 # `eks completions`/`eks man` render straight from the same `Cli` definition
 # `clap` already parses with, so a flag added there can never drift out of
